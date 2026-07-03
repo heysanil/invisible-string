@@ -5,7 +5,9 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent } from "@testing-library/react";
+
+import { renderWithRouter } from "../test/router";
 
 ensureDomForThisFile();
 
@@ -30,18 +32,20 @@ afterEach(cleanup);
 
 const { FixtureChatShell } = await import("../components/chat/FixtureChatShell");
 
-test("fixture shell lists every canned session and renders the active thread", () => {
-  const view = render(<FixtureChatShell />);
+test("fixture shell lists every canned session and renders the active thread", async () => {
+  const view = renderWithRouter(<FixtureChatShell />);
+  // RouterProvider resolves its initial route asynchronously.
+  await view.findAllByText("Marketing copilot");
   // All four fixture workflows appear in the list (chips).
   for (const name of ["Marketing copilot", "Ops assistant", "Issue triage", "Release bot"]) {
     expect(view.getAllByText(name).length).toBeGreaterThan(0);
   }
 });
 
-test("selecting the parked fixture session shows its approval card", () => {
-  const view = render(<FixtureChatShell />);
+test("selecting the parked fixture session shows its approval card", async () => {
+  const view = renderWithRouter(<FixtureChatShell />);
   // Switch to the Ops assistant (parked-approval) session.
-  fireEvent.click(view.getAllByText("Ops assistant")[0]!);
+  fireEvent.click((await view.findAllByText("Ops assistant"))[0]!);
   expect(view.getByText(/Approve tool call: gmail_send/)).toBeTruthy();
   expect(view.getByRole("button", { name: "Approve" })).toBeTruthy();
 });

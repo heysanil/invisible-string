@@ -73,15 +73,16 @@ test("dock navigation switches routes", async () => {
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/workflows");
   });
-  expect(await view.findByText("No workflows yet")).toBeTruthy();
+  // The demo session has no active organization resolved (the org-plugin
+  // hooks are empty), so every workspace-scoped section shows its gate
+  // rather than firing resource fetches — workflows included.
+  expect(await view.findByText("No active workspace")).toBeTruthy();
 
   const contextLink = view.getByRole("link", { name: "Context" });
   fireEvent.click(contextLink);
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/context");
   });
-  // With no active workspace resolved, the context section shows its
-  // workspace gate rather than firing resource fetches.
   expect(await view.findByText("No workspace yet")).toBeTruthy();
 });
 

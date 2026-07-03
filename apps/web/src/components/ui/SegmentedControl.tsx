@@ -20,12 +20,19 @@ export interface SegmentedControlProps<T extends string> {
   label?: string;
   className?: string;
   size?: "sm" | "md";
+  /**
+   * ARIA semantics. `"tabs"` (default) renders a tablist — right for scope
+   * switchers. `"radio"` renders a radiogroup — right for single-choice
+   * pickers (e.g. model preset).
+   */
+  variant?: "tabs" | "radio";
 }
 
 /**
- * Capsule segmented control (tabs). Implements the ARIA tabs keyboard model
- * (arrow keys move + activate, Home/End jump) over a glass track. Accepts
- * either `ariaLabel` or `label` as the accessible name.
+ * Capsule segmented control. Implements the ARIA keyboard model (arrow keys
+ * move + activate, Home/End jump) over a glass track. Accepts either
+ * `ariaLabel` or `label` as the accessible name, and renders as a tablist or
+ * a radiogroup per `variant`.
  */
 export function SegmentedControl<T extends string>({
   value,
@@ -35,9 +42,11 @@ export function SegmentedControl<T extends string>({
   label,
   className,
   size = "md",
+  variant = "tabs",
 }: SegmentedControlProps<T>) {
   const refs = useRef<Array<HTMLButtonElement | null>>([]);
   const accessibleName = ariaLabel ?? label;
+  const isRadio = variant === "radio";
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
@@ -70,7 +79,7 @@ export function SegmentedControl<T extends string>({
 
   return (
     <div
-      role="tablist"
+      role={isRadio ? "radiogroup" : "tablist"}
       aria-label={accessibleName}
       onKeyDown={onKeyDown}
       className={cn(
@@ -87,8 +96,9 @@ export function SegmentedControl<T extends string>({
               refs.current[index] = el;
             }}
             type="button"
-            role="tab"
-            aria-selected={active}
+            role={isRadio ? "radio" : "tab"}
+            aria-selected={isRadio ? undefined : active}
+            aria-checked={isRadio ? active : undefined}
             tabIndex={active ? 0 : -1}
             onClick={() => onChange(option.value)}
             className={cn(

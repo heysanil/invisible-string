@@ -216,7 +216,7 @@ function Builder({
         variant: "success",
         message: "Draft published — starting a session in Chat.",
       });
-      navigate({ to: "/chat" });
+      navigate({ to: "/chat", search: { workflow: workflow.id } });
     } finally {
       setRunDraftPending(false);
     }

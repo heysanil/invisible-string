@@ -1,8 +1,9 @@
 /**
  * Thread header: session title, workflow chip + pinned version, resolved
- * model chip, and an "Edit workflow ↗" link into the builder (stub route).
+ * model chip, and an "Edit workflow ↗" link into the builder route.
  */
 import { ArrowUpRight, Cpu, GitBranch, Zap } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 
 import { livenessOf, StatusDot, type Liveness } from "./StatusDot";
 import { Chip } from "./Chip";
@@ -66,13 +67,14 @@ export function ThreadHeader({
           ) : null}
         </div>
       </div>
-      <a
-        href={`/workflows/${workflowId}`}
+      <Link
+        to="/workflows/$workflowId"
+        params={{ workflowId }}
         className="lift inline-flex h-8 shrink-0 items-center gap-1 rounded-capsule border border-black/10 bg-white/40 px-3 text-[12.5px] font-medium text-ink-2 hover:bg-white/70 hover:text-ink"
       >
         Edit workflow
         <ArrowUpRight size={14} strokeWidth={2} aria-hidden="true" />
-      </a>
+      </Link>
     </header>
   );
 }

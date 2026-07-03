@@ -4,7 +4,7 @@
  * the create-session round-trip. Live thread rendering lives in
  * {@link ThreadContainer}; this component is the two-panel frame + list.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquare, Workflow } from "lucide-react";
 
 import type { WorkflowSummaryDto } from "@invisible-string/shared";
@@ -23,7 +23,14 @@ import { SessionList, type SessionListItem } from "./SessionList";
 import { ThreadContainer } from "./ThreadContainer";
 import { WorkflowPicker } from "./WorkflowPicker";
 
-export function ChatShell({ workspaceId }: { workspaceId: string }) {
+export function ChatShell({
+  workspaceId,
+  initialWorkflowId,
+}: {
+  workspaceId: string;
+  /** When set (from the builder's Run draft), open a new chat for this workflow. */
+  initialWorkflowId?: string;
+}) {
   const toast = useToast();
   const sessionsQuery = useSessions(workspaceId);
   const workflowsQuery = useWorkflows(workspaceId);
@@ -35,6 +42,24 @@ export function ChatShell({ workspaceId }: { workspaceId: string }) {
   const [draftWorkflow, setDraftWorkflow] = useState<WorkflowSummaryDto | null>(
     null,
   );
+
+  // Deep-link from the builder: once workflows load, open the new-chat composer
+  // for the requested workflow. Honored once so the user can freely navigate
+  // away without it re-triggering.
+  const deepLinkHandled = useRef<string | null>(null);
+  const workflows = workflowsQuery.data;
+  useEffect(() => {
+    if (!initialWorkflowId || deepLinkHandled.current === initialWorkflowId) {
+      return;
+    }
+    if (!workflows) return;
+    const match = workflows.find((w) => w.id === initialWorkflowId);
+    deepLinkHandled.current = initialWorkflowId;
+    if (match) {
+      setDraftWorkflow(match);
+      setActiveSessionId(null);
+    }
+  }, [initialWorkflowId, workflows]);
 
   const sessions: SessionListItem[] = useMemo(
     () =>

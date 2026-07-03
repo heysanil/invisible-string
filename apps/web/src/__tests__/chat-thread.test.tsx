@@ -16,6 +16,7 @@ import { RunMessage } from "../components/chat/RunMessage";
 import { WorkingBlock } from "../components/chat/WorkingBlock";
 import { Composer } from "../components/chat/Composer";
 import type { ThreadHeaderProps } from "../components/chat/ThreadHeader";
+import { renderWithRouter } from "../test/router";
 
 ensureDomForThisFile();
 // Drain a macrotask after unmount so React's scheduler flushes its pending
@@ -53,8 +54,8 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
   };
 }
 
-test("thread header shows workflow, version and model chips", () => {
-  const view = render(
+test("thread header shows workflow, version and model chips", async () => {
+  const view = renderWithRouter(
     <ThreadView
       header={HEADER}
       runs={[baseRun({ reply: { text: "Done.", streaming: false } })]}
@@ -63,7 +64,8 @@ test("thread header shows workflow, version and model chips", () => {
       onSend={() => {}}
     />,
   );
-  expect(view.getByText("Marketing copilot")).toBeTruthy();
+  // RouterProvider resolves its initial route asynchronously.
+  expect(await view.findByText("Marketing copilot")).toBeTruthy();
   expect(view.getByText("a1b2c3")).toBeTruthy();
   expect(view.getByText("deepseek/deepseek-v4-pro")).toBeTruthy();
   expect(view.getByText("Edit workflow")).toBeTruthy();

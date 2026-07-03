@@ -148,6 +148,7 @@ export function AgentEditor({
           ) : null}
         </div>
         <SegmentedControl
+          variant="radio"
           label="Model preset"
           options={MODEL_PRESET_OPTIONS}
           value={effectiveSlug}

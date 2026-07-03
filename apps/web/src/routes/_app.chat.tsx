@@ -8,10 +8,24 @@ import { Panel } from "../components/ui/Panel";
 import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import { useActiveWorkspaceId } from "../lib/workspace";
 
-export const Route = createFileRoute("/_app/chat")({ component: ChatPage });
+interface ChatSearch {
+  /** Preselected workflow to open a new chat for (from the builder's Run draft). */
+  workflow?: string;
+}
+
+export const Route = createFileRoute("/_app/chat")({
+  component: ChatPage,
+  validateSearch: (search: Record<string, unknown>): ChatSearch => ({
+    workflow:
+      typeof search.workflow === "string" && search.workflow.length > 0
+        ? search.workflow
+        : undefined,
+  }),
+});
 
 function ChatPage() {
   const { workspaceId } = useActiveWorkspaceId();
+  const { workflow: initialWorkflowId } = Route.useSearch();
 
   if (FIXTURE_MODE) return <FixtureChatShell />;
 
@@ -45,5 +59,7 @@ function ChatPage() {
     );
   }
 
-  return <ChatShell workspaceId={workspaceId} />;
+  return (
+    <ChatShell workspaceId={workspaceId} initialWorkflowId={initialWorkflowId} />
+  );
 }

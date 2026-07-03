@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
+import { renderWithRouter } from "../test/router";
 
 ensureDomForThisFile();
 
@@ -150,7 +151,7 @@ function renderContainer() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  return renderWithRouter(
     <QueryClientProvider client={client}>
       <ThreadContainer workspaceId={WS} sessionId={SESSION_ID} workflowName="Report bot" />
     </QueryClientProvider>,

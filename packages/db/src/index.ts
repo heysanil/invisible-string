@@ -1,10 +1,24 @@
 /**
- * Product database package — placeholder.
+ * @invisible-string/db — product database package.
  *
- * Phase 0 task 3 adds the Drizzle schema for all product tables
- * (mcp_connections, skills, model_presets, model_allowlist, agents,
- * workflows, workflow_versions, workflow_builds, agent_sessions, runs,
- * run_events, integrations, triggers, workers), drizzle-kit migrations,
- * and the seed script.
+ * - `schema/*`: Drizzle schema (Better Auth tables + product tables, spec §9)
+ * - `client`: `createDb(url)` typed drizzle client factory
+ * - `migrate`: programmatic migrator over ./migrations (drizzle-kit output)
+ * - `seed`: idempotent workspace seeds (`seedWorkspace`) + demo bootstrap
  */
-export const DB_PACKAGE = "@invisible-string/db";
+export * as schema from "./schema";
+export * from "./client";
+export { MIGRATIONS_FOLDER, migrateDatabase, runMigrations } from "./migrate";
+export {
+  DEFAULT_AGENT_PRESETS,
+  DEFAULT_MODEL_PRESETS,
+  DEMO_ORG,
+  DEMO_USER,
+  buildAgentPresetRows,
+  buildAllowlistRows,
+  buildModelPresetRows,
+  seedDemo,
+  seedWorkspace,
+  type AgentPresetSeed,
+  type ModelPresetSeed,
+} from "./seed";

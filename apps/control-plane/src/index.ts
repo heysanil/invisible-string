@@ -21,6 +21,7 @@ import { loadConfig, type Config } from "./config";
 import { createDb, type DbHandle } from "./db";
 import { healthPlugin, type DeepHealthDeps } from "./health";
 import { createLogger } from "./log";
+import { requestLoggerPlugin } from "./request-log";
 import { isWorkerLive } from "./runtime/scheduler";
 import { MetricsRegistry } from "./runtime/metrics";
 import {
@@ -90,6 +91,8 @@ export function buildApp(opts: {
   runtimeDeps?: RuntimeDeps | null;
   /** Deep-health probes for `GET /api/health?deep=1` (absent ⇒ shallow only). */
   health?: DeepHealthDeps;
+  /** When set, a request-scoped logger threads a per-request correlation id. */
+  logger?: Logger;
 }) {
   const { config, auth, workspaceDeps, resourceDeps } = opts;
   const app = new Elysia()
@@ -113,7 +116,11 @@ export function buildApp(opts: {
         origin: config.corsOrigins,
         credentials: true,
       }),
-    )
+    );
+  // Request-scoped correlation: mint/propagate a requestId, thread a bound
+  // child logger, and close each request with one `http.request` line.
+  if (opts.logger) app.use(requestLoggerPlugin(opts.logger));
+  app
     // Better Auth owns everything under its basePath (/api/auth).
     .mount(auth.handler)
     .use(workspacePlugin(workspaceDeps))
@@ -283,6 +290,7 @@ export function createAppStack(
     resourceDeps,
     runtimeDeps,
     health,
+    logger,
   });
   return {
     app,

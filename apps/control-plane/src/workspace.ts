@@ -228,5 +228,18 @@ export function workspacePlugin(deps: WorkspaceDeps) {
         return { workspace: result.workspace };
       },
     }),
+    // Session-only guard for user-scoped resources (`/me/...`): resolves the
+    // signed-in user without requiring an active workspace. 401 when
+    // unauthenticated. Handlers read `authUser.id` as the owner.
+    requireAuth: (enabled: true) => ({
+      resolve: async ({ status, request }) => {
+        void enabled;
+        const session = await deps.getSession(request.headers);
+        if (!session) {
+          return status(401, { error: "authentication required" });
+        }
+        return { authUser: session.user };
+      },
+    }),
   });
 }

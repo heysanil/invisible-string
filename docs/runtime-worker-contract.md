@@ -52,6 +52,8 @@ Used today by the control plane:
 
 - `POST .../eve/v1/session` `{message}` → **202** `{sessionId, continuationToken}`
 - `POST .../eve/v1/session/:id` `{continuationToken, message}` → 202
+- `POST .../eve/v1/session/:id` `{continuationToken, inputResponses:[{requestId,optionId?,text?}]}` → 202
+  (HITL resume — `POST /runs/:id/input` forwards a parked run's answer here)
 - `GET  .../eve/v1/session/:id/stream?startIndex=<n>` → NDJSON
 
 ## Env injected per agent (ensure-agent `env`)

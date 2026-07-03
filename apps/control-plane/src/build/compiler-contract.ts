@@ -25,11 +25,18 @@ export interface CompileConnection {
   /** MCP server URL. */
   url: string | null;
   /**
-   * Env var the generated connection module reads its token from
-   * (`process.env[envTokenVar]`); null when the connection has no auth.
-   * Secrets NEVER appear in generated files.
+   * Env var the generated connection module reads its BEARER token from
+   * (`process.env[envTokenVar]`); null unless the connection uses bearer auth.
+   * Secrets NEVER appear in generated files — only the env var NAME does.
    */
   envTokenVar: string | null;
+  /**
+   * Header-auth env var mapping (`header name → env var NAME`); null unless
+   * the connection uses header auth. The generated connection reads each
+   * header value from `process.env[envVar]` lazily; the dispatcher injects the
+   * decrypted values under the same names (agent-env `mcpHeaderEnvName`).
+   */
+  authHeaders: { header: string; envVar: string }[] | null;
   toolAllow: string[] | null;
   toolBlock: string[] | null;
   approvalPolicy: Record<string, unknown> | null;
@@ -41,6 +48,12 @@ export interface CompileSkill {
   name: string;
   description: string | null;
   content: string;
+  /**
+   * Attachment bytes fetched from the object store (filename → UTF-8 text).
+   * Present only when the skill has attachments; the compiler emits a
+   * packaged (`agent/skills/<slug>/SKILL.md` + siblings) skill for it.
+   */
+  files?: Record<string, string>;
 }
 
 export interface CompileRequest {

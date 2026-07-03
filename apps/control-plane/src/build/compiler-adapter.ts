@@ -178,6 +178,14 @@ function resolveConnection(
       ]);
     }
     auth = { kind: "bearerToken" };
+  } else if (connection.authHeaders !== null && connection.authHeaders.length > 0) {
+    // Header auth: each header value comes from the env var the dispatcher
+    // injects (agent-env mcpHeaderEnvName) — env var NAMES only, never values.
+    const headers: Record<string, string> = {};
+    for (const { header, envVar } of connection.authHeaders) {
+      headers[header] = envVar;
+    }
+    auth = { kind: "headers", headers };
   }
   return {
     id: connection.id,
@@ -194,11 +202,14 @@ function resolveConnection(
 }
 
 function resolveSkill(skill: CompileSkill, slug: string): ResolvedSkill {
+  const files =
+    skill.files && Object.keys(skill.files).length > 0 ? skill.files : undefined;
   return {
     id: skill.id,
     slug,
     description: skill.description?.trim() || skill.name,
     markdown: skill.content,
+    ...(files ? { files } : {}),
   };
 }
 

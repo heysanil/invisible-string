@@ -59,7 +59,7 @@ export type PickResult =
 
 /** Is this worker eligible to receive new work right now? (pure) */
 export function isWorkerLive(
-  worker: SchedulableWorker,
+  worker: Pick<SchedulableWorker, "status" | "lastHeartbeatAt">,
   now: Date,
   heartbeatTtlMs: number,
 ): boolean {

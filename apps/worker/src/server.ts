@@ -75,6 +75,27 @@ export interface WorkerStatusResponse {
     entries: { hash: string; bytes: number; lastUsedAt: string; running: boolean }[];
   };
   ports: { min: number; max: number; size: number; allocated: number };
+  /** Rolled-up gauges (docs/PLAN.md Phase 3 task 2 — worker-side metrics). */
+  metrics: {
+    runningAgents: number;
+    /** Live eve sandboxes (docker) — 0 until the sandbox reaper tracks them. */
+    sandboxCount: number;
+    maxAgents: number;
+    activeRequests: number;
+    cacheBytes: number;
+    cacheMaxBytes: number;
+  };
+}
+
+/** Response body of GET /internal/health (worker readiness). */
+export interface WorkerHealthResponse {
+  ok: boolean;
+  /** False while draining — the scheduler must stop sending work. */
+  ready: boolean;
+  draining: boolean;
+  runningAgents: number;
+  sandboxCount: number;
+  at: string;
 }
 
 export interface WorkerServer {
@@ -93,11 +114,14 @@ export function createWorkerServer(options: {
   isDraining: () => boolean;
   /** Kicks off the (async) drain; the endpoint returns 202 immediately. */
   requestDrain: () => void;
+  /** Live eve sandbox count (docker). Defaults to 0 until the reaper tracks it. */
+  sandboxCount?: () => number;
   log?: (message: string) => void;
 }): WorkerServer {
   const { config, agents, cache, ports, callbackToken, isDraining, requestDrain } =
     options;
   const log = options.log ?? (() => {});
+  const sandboxCount = options.sandboxCount ?? (() => 0);
 
   const server = Bun.serve({
     port: config.port,
@@ -160,6 +184,20 @@ export function createWorkerServer(options: {
     }
     if (url.pathname === "/internal/status" && request.method === "GET") {
       return Response.json(statusBody());
+    }
+    if (url.pathname === "/internal/health" && request.method === "GET") {
+      const draining = isDraining();
+      const body: WorkerHealthResponse = {
+        ok: true,
+        ready: !draining,
+        draining,
+        runningAgents: agents.list().length,
+        sandboxCount: sandboxCount(),
+        at: new Date().toISOString(),
+      };
+      // A draining worker is alive (200) but not ready — the scheduler reads
+      // `ready`, not the status code, to stop assigning new work.
+      return Response.json(body);
     }
     return errorResponse(404, "not_found", "unknown internal endpoint");
   }
@@ -239,6 +277,14 @@ export function createWorkerServer(options: {
         max: ports.max,
         size: ports.size,
         allocated: ports.allocatedCount(),
+      },
+      metrics: {
+        runningAgents: agents.list().length,
+        sandboxCount: sandboxCount(),
+        maxAgents: config.maxAgents,
+        activeRequests: agents.totalInflight(),
+        cacheBytes: cache.totalBytes(),
+        cacheMaxBytes: cache.maxBytes,
       },
     };
   }

@@ -2,14 +2,21 @@ import { describe, expect, test } from "bun:test";
 
 import {
   bucketIndexForDuration,
+  buildCacheHitRate,
   computeUtilization,
+  createStructuredLogger,
   emptyRunDurationHistogram,
   emptyRunsByStatus,
   internalMetricsResponseSchema,
+  isSecretFieldKey,
   makeLogEvent,
   recordRunDuration,
+  redactLogFields,
+  redactUrlCredentials,
+  REDACTION_PLACEHOLDER,
   RUN_DURATION_BUCKET_BOUNDARIES_MS,
   structuredLogEventSchema,
+  type StructuredLogEvent,
 } from "./observability";
 
 describe("structured log events", () => {
@@ -59,6 +66,162 @@ describe("structured log events", () => {
   test("empty fields object is omitted", () => {
     const event = makeLogEvent({ level: "debug", event: "x", fields: {} });
     expect("fields" in event).toBe(false);
+  });
+});
+
+describe("redaction (secrets discipline)", () => {
+  test("secret-shaped keys trip isSecretFieldKey; correlation ids do not", () => {
+    for (const key of [
+      "token",
+      "apiKey",
+      "MCP_SLACK_TOKEN",
+      "x-worker-secret",
+      "authorization",
+      "continuationToken",
+      "password",
+      "encryptionKey",
+      "jwtSecret",
+    ]) {
+      expect(isSecretFieldKey(key)).toBe(true);
+    }
+    for (const key of [
+      "workspaceId",
+      "workflowId",
+      "workflowVersionId",
+      "sessionId",
+      "runId",
+      "workerId",
+      "attempt",
+      "author",
+      "url",
+      "status",
+    ]) {
+      expect(isSecretFieldKey(key)).toBe(false);
+    }
+  });
+
+  test("known secret keys are scrubbed at every nesting depth", () => {
+    const redacted = redactLogFields({
+      workerId: "wk_1",
+      attempt: 3,
+      OPENROUTER_API_KEY: "sk-or-supersecret",
+      nested: {
+        continuationToken: "ct_leak",
+        harmless: "ok",
+        deeper: [{ x_worker_secret: "shhh" }, "plain"],
+      },
+      list: ["visible", "still-visible"],
+    });
+    expect(redacted).toEqual({
+      workerId: "wk_1",
+      attempt: 3,
+      OPENROUTER_API_KEY: REDACTION_PLACEHOLDER,
+      nested: {
+        continuationToken: REDACTION_PLACEHOLDER,
+        harmless: "ok",
+        deeper: [{ x_worker_secret: REDACTION_PLACEHOLDER }, "plain"],
+      },
+      list: ["visible", "still-visible"],
+    });
+  });
+
+  test("URL credentials are stripped even under innocuous keys", () => {
+    expect(redactUrlCredentials("postgres://user:p4ss@db:5432/world")).toBe(
+      `postgres://${REDACTION_PLACEHOLDER}@db:5432/world`,
+    );
+    const redacted = redactLogFields({
+      worldUrl: "postgres://svc:hunter2@world-db:5432/ws_v_abc",
+      address: "https://worker-1.internal:8080",
+    });
+    expect(redacted.worldUrl).toBe(
+      `postgres://${REDACTION_PLACEHOLDER}@world-db:5432/ws_v_abc`,
+    );
+    // no userinfo → untouched
+    expect(redacted.address).toBe("https://worker-1.internal:8080");
+  });
+
+  test("redactLogFields never mutates its input", () => {
+    const input = { token: "leak", keep: "yes" };
+    redactLogFields(input);
+    expect(input.token).toBe("leak");
+  });
+});
+
+describe("createStructuredLogger", () => {
+  const CLOCK = () => new Date("2026-07-03T00:00:00.000Z");
+
+  function capture(minLevel?: "debug" | "info" | "warn" | "error") {
+    const lines: StructuredLogEvent[] = [];
+    const logger = createStructuredLogger({
+      sink: (event) => lines.push(event),
+      now: CLOCK,
+      minLevel,
+      base: { workerId: "wk_1", fields: { region: "local" } },
+    });
+    return { lines, logger };
+  }
+
+  test("emits a redacted, correlation-carrying JSON event", () => {
+    const { lines, logger } = capture();
+    logger.info("dispatch.delivered", {
+      runId: "run_1",
+      durationMs: 42,
+      fields: { attempt: 1, MCP_TOKEN: "secret-value" },
+    });
+    expect(lines).toHaveLength(1);
+    const event = lines[0]!;
+    expect(structuredLogEventSchema.safeParse(event).success).toBe(true);
+    expect(event).toMatchObject({
+      at: "2026-07-03T00:00:00.000Z",
+      level: "info",
+      event: "dispatch.delivered",
+      workerId: "wk_1",
+      runId: "run_1",
+    });
+    expect(event.fields).toEqual({
+      region: "local",
+      attempt: 1,
+      MCP_TOKEN: REDACTION_PLACEHOLDER,
+      durationMs: 42,
+    });
+    // the raw secret never appears anywhere in the serialized line
+    expect(JSON.stringify(event)).not.toContain("secret-value");
+  });
+
+  test("minLevel drops lower-severity lines", () => {
+    const { lines, logger } = capture("warn");
+    logger.info("run.started");
+    logger.debug("run.started");
+    logger.warn("worker.unreachable", { fields: { attempt: 5 } });
+    logger.error("dispatch.failed");
+    expect(lines.map((l) => l.event)).toEqual([
+      "worker.unreachable",
+      "dispatch.failed",
+    ]);
+  });
+
+  test("child() propagates base correlation ids and merges fields", () => {
+    const { lines, logger } = capture();
+    const child = logger.child({ workspaceId: "org_1", fields: { phase: "3" } });
+    child.info("run.created", { runId: "run_9" });
+    const event = lines[0]!;
+    // base workerId + child workspaceId + call runId all present
+    expect(event.workerId).toBe("wk_1");
+    expect(event.workspaceId).toBe("org_1");
+    expect(event.runId).toBe("run_9");
+    expect(event.fields).toEqual({ region: "local", phase: "3" });
+  });
+
+  test("err folds name + message (never the stack) into fields", () => {
+    const { lines, logger } = capture();
+    logger.error("build.failed", { err: new TypeError("boom at postgres://u:p@h/db") });
+    const event = lines[0]!;
+    expect(event.fields?.errorName).toBe("TypeError");
+    // URL creds inside the error message are still scrubbed
+    expect(event.fields?.error).toBe(
+      `boom at postgres://${REDACTION_PLACEHOLDER}@h/db`,
+    );
+    expect(JSON.stringify(event)).not.toContain("stack");
   });
 });
 
@@ -119,12 +282,19 @@ describe("GET /internal/metrics DTO", () => {
     });
   });
 
+  test("buildCacheHitRate is 0-safe", () => {
+    expect(buildCacheHitRate(0, 0)).toBe(0);
+    expect(buildCacheHitRate(3, 1)).toBe(0.75);
+    expect(buildCacheHitRate(1, 0)).toBe(1);
+  });
+
   test("a full metrics snapshot round-trips through the schema", () => {
     const snapshot = {
       generatedAt: "2026-07-03T00:00:00.000Z",
       queueDepth: 4,
       activeRuns: 2,
       runsByStatus: emptyRunsByStatus(),
+      activeSessions: 7,
       runDuration: recordRunDuration(emptyRunDurationHistogram(), 1234),
       workers: [
         {
@@ -141,10 +311,13 @@ describe("GET /internal/metrics DTO", () => {
         webhook: { received: 10, dispatched: 9, failed: 1 },
         slack: { received: 3, dispatched: 3, failed: 0 },
       },
+      buildCache: { hits: 6, misses: 2, hitRate: buildCacheHitRate(6, 2) },
     };
     const parsed = internalMetricsResponseSchema.parse(snapshot);
     expect(parsed.workers[0]?.utilization).toBe(0.25);
     expect(parsed.triggers.webhook?.failed).toBe(1);
+    expect(parsed.activeSessions).toBe(7);
+    expect(parsed.buildCache.hitRate).toBe(0.75);
   });
 
   test("rejects a negative queue depth", () => {
@@ -154,9 +327,11 @@ describe("GET /internal/metrics DTO", () => {
         queueDepth: -1,
         activeRuns: 0,
         runsByStatus: emptyRunsByStatus(),
+        activeSessions: 0,
         runDuration: emptyRunDurationHistogram(),
         workers: [],
         triggers: {},
+        buildCache: { hits: 0, misses: 0, hitRate: 0 },
       }).success,
     ).toBe(false);
   });

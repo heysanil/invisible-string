@@ -147,6 +147,10 @@ export async function dispatchTriggerRun(
   const { db, runtime } = deps;
   const hash = input.ready.version.contentHash;
 
+  // Observe every ingress-triggered dispatch on the fleet metrics registry
+  // (GET /internal/metrics), keyed by the real trigger type (webhook/form/slack).
+  deps.metrics.recordTrigger(input.triggerType, "received");
+
   const { worker } = await selectWorker(db, {
     heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
     defaultMaxAgents: runtime.maxAgentsPerWorker,
@@ -223,6 +227,7 @@ export async function dispatchTriggerRun(
     await assertModelAllowlistedAtDispatch(db, input.organizationId, input.ready.version);
   } catch (error) {
     if (!isRuntimeApiError(error)) throw error;
+    deps.metrics.recordTrigger(input.triggerType, "failed");
     const detail = error.message;
     await deps.runStore.markRun(run.id, {
       status: "failed",
@@ -259,6 +264,7 @@ export async function dispatchTriggerRun(
       triggerEvent as unknown as Record<string, unknown>,
     );
   } catch (error) {
+    deps.metrics.recordTrigger(input.triggerType, "failed");
     await failDispatch(deps, run.id, error, isNewSession ? { failSessionId: session.id } : {});
     throw error; // unreachable — failDispatch always throws
   }
@@ -277,6 +283,7 @@ export async function dispatchTriggerRun(
 
   startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
 
+  deps.metrics.recordTrigger(input.triggerType, "dispatched");
   return { session, run, dispatched: true };
 }
 

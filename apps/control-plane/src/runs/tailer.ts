@@ -35,11 +35,19 @@
 import type {
   AgentSessionStatus,
   EveStreamEvent,
+  Logger,
   RunStatus,
 } from "@invisible-string/shared";
 
 import type { RunEventBus } from "./bus";
 import type { RunStore } from "./store";
+
+/** Terminal-run notification (metrics seam): status + wall-clock of the tail. */
+export type RunFinishedHook = (info: {
+  runId: string;
+  status: Extract<RunStatus, "succeeded" | "failed" | "waiting" | "canceled">;
+  durationMs: number;
+}) => void;
 
 // ── NDJSON parsing ──────────────────────────────────────────────────────────
 
@@ -157,6 +165,10 @@ export interface TailRunOptions {
   maxReconnectAttempts?: number;
   /** Base reconnect backoff in ms (default 500; ×2 per attempt). */
   reconnectDelayMs?: number;
+  /** Metrics seam: called once when the run reaches a terminal state. */
+  onFinish?: RunFinishedHook;
+  /** Structured run-lifecycle logging (started/terminal). Optional. */
+  logger?: Logger;
 }
 
 export interface CancelOptions {
@@ -195,8 +207,12 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     maxWallClockMs,
     maxReconnectAttempts = 5,
     reconnectDelayMs = 500,
+    onFinish,
+    logger,
   } = options;
 
+  const log = logger?.child({ runId, sessionId: agentSessionId });
+  const tailStartedAt = Date.now();
   const abort = new AbortController();
   let cancelReason: string | null = null;
   // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
@@ -228,6 +244,13 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     });
     if (sessionStatus) await store.markSession(agentSessionId, sessionStatus);
     publishStatus(status, error ?? null);
+    const durationMs = Date.now() - tailStartedAt;
+    onFinish?.({ runId, status, durationMs });
+    const level = status === "failed" ? "warn" : "info";
+    log?.emit(level, `run.${status}`, {
+      durationMs,
+      ...(error !== undefined ? { fields: { reason: error } } : {}),
+    });
   };
 
   const wallClockTimer = setTimeout(() => {
@@ -258,6 +281,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       ...(seq === 0 ? { startedAt: new Date() } : {}),
     });
     publishStatus("running");
+    log?.info("run.started", { fields: { resumed: seq > 0 } });
 
     let attempt = 0;
     try {
@@ -388,6 +412,10 @@ export class RunTailerManager {
       maxWallClockMs: number;
       maxReconnectAttempts?: number;
       reconnectDelayMs?: number;
+      /** Metrics seam propagated to every tail (run-duration histogram). */
+      onFinish?: RunFinishedHook;
+      /** Structured run-lifecycle logger propagated to every tail. */
+      logger?: Logger;
     },
   ) {}
 

@@ -156,7 +156,11 @@ the default in `createAppStack`); tests inject stubs.
 `AGENT_BUILD_ROOT` (default `/var/lib/agents`), `SSE_HEARTBEAT_MS`,
 `SCHEDULER_MAX_AGENTS_PER_WORKER` (default 20), `WORKER_SWEEP_INTERVAL_MS`
 (default = the heartbeat TTL), `WORKER_AUTH_MODE` (`shared-secret` default |
-`worker-token`).
+`worker-token`), `LOG_LEVEL` (debug|info|warn|error, default info),
+`TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
+`TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), and the Slack app
+(`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
+`SLACK_APP_REDIRECT_URL`, optional `SLACK_API_BASE_URL`).
 
 ## Phase-3 additions — scheduler pool, failover, per-worker identity
 
@@ -209,3 +213,43 @@ during rollout.
 containers carrying the eve-session label and stops those idle past the window —
 eve gives sandboxes no idle timeout of its own. Artifact LRU (20 GB) never
 evicts a running hash (unchanged).
+
+## Observability (docs/PLAN.md Phase 3 task 5)
+
+**Structured logs.** Both planes emit one JSON object per line via the shared
+core (`createStructuredLogger`, `packages/shared/src/observability.ts`) wrapped
+by each app's `src/log.ts` sink. Every line carries `at`, `level`, `event`
+(stable `<area>.<verb>` slug), an optional `msg`, the correlation ids it knows
+(`workspaceId`/`workflowId`/`workflowVersionId`/`sessionId`/`runId`/`workerId`),
+and a redaction-safe `fields` object. **Secrets discipline:** the logger runs a
+mandatory redaction pass over `fields` — any secret-shaped key (`*token*`,
+`*secret*`, `*apikey*`, `authorization`, `*credential*`, …) is replaced with
+`[redacted]` at any nesting depth, and URL credentials (`scheme://user:pass@`)
+are stripped from every string value. The worker routes its legacy
+`log(message)` calls through `stringLogAdapter` so all internal lines are JSON.
+Startup emits ONE `*.ready` line with the resolved (non-secret) config.
+
+**Control-plane `GET /internal/metrics`** (guarded by the same timing-safe
+`x-worker-secret` as the rest of `/internal/*`; NEVER public). Body is the
+shared `InternalMetricsResponse`: `queueDepth`, `activeRuns`, `runsByStatus`,
+`activeSessions`, a run-duration histogram (`runDuration`, bucket edges in ms),
+`workers[]` fleet utilization (running/max agents, `utilization` = running/max),
+per-trigger-type `triggers{received,dispatched,failed}`, and
+`buildCache{hits,misses,hitRate}`. In-memory counters (no Prometheus dep; reset
+on restart), fed by the dispatch path (trigger counts), the run tailer
+(durations), and publish (cache hits). `?format=text` (or `Accept: text/plain`)
+returns a minimal Prometheus-style exposition (`is_*` metric names) instead of
+JSON.
+
+**Health.** Control-plane `GET /api/health` → `{ ok: true }` (liveness, no IO);
+`GET /api/health?deep=1` runs a readiness probe over Postgres + object store +
+a live worker and answers **503** with per-check detail when any dependency is
+degraded (skipped checks — runtime unconfigured — never fail the probe). Worker
+`GET /internal/health` (guarded) → `{ ok, ready, draining, runningAgents,
+sandboxCount, at }`: a draining worker is alive (200) but `ready:false`.
+Worker `GET /internal/status` gains a `metrics` block (`runningAgents`,
+`sandboxCount`, `maxAgents`, `activeRequests`, `cacheBytes`, `cacheMaxBytes`).
+
+**Lifecycle.** Both planes handle SIGTERM/SIGINT: the control plane stops
+accepting connections, drains live NDJSON tailers, and closes the Postgres
+pool; the worker drains in-flight proxied requests then deregisters.

@@ -367,8 +367,10 @@ export function createAppStack(
       runtimeOverrides?.openRouterModelIds ?? createOpenRouterCatalog(),
   };
   // Copilot socket: mounted whenever a transport is available — a scripted
-  // fake (COPILOT_FAKE_SCRIPT / test override) or the real model path when a
-  // provider key exists. Keyless boots simply do not expose /copilot.
+  // fake (COPILOT_FAKE_SCRIPT / test override; dev/test ONLY — loadCopilotConfig
+  // drops the fake script under NODE_ENV=production so it can never displace
+  // the real model path in prod) or the real model path when a provider key
+  // exists. Keyless boots simply do not expose /copilot.
   const copilotConfig = loadCopilotConfig(env);
   const copilotTransport: CopilotTransport | null =
     runtimeOverrides?.copilotTransport ??

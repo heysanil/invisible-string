@@ -52,6 +52,20 @@ export function buildToolSpecs(): TransportToolSpec[] {
   });
 }
 
+/**
+ * Workspace-controlled text (connection/skill names + descriptions come from
+ * registry metadata or user input) is rendered into STRUCTURED inventory
+ * lines — flatten newlines and double quotes so hostile content cannot forge
+ * extra inventory lines or break the `name="…"` framing. Injection through
+ * these fields is already neutralized downstream (validate.ts checks ids
+ * against the inventory OBJECTS, never the prompt string), this just stops
+ * the prompt itself from being visually spoofable.
+ */
+function promptSafe(text: string, maxLength = 300): string {
+  const flat = text.replace(/\s+/g, " ").replace(/"/g, "'").trim();
+  return flat.length > maxLength ? `${flat.slice(0, maxLength - 1)}…` : flat;
+}
+
 export function buildSystemPrompt(opts: {
   draft: Record<string, unknown>;
   inventory: WorkspaceInventory;
@@ -60,19 +74,19 @@ export function buildSystemPrompt(opts: {
   const connections = inventory.connections
     .map(
       (c) =>
-        `- id=${c.id} name="${c.name}" ref=@${c.slug}${c.enabled ? "" : " (disabled)"}${c.description ? ` — ${c.description}` : ""}`,
+        `- id=${c.id} name="${promptSafe(c.name)}" ref=@${c.slug}${c.enabled ? "" : " (disabled)"}${c.description ? ` — ${promptSafe(c.description)}` : ""}`,
     )
     .join("\n");
   const skills = inventory.skills
     .map(
       (s) =>
-        `- id=${s.id} name="${s.name}" ref=@skill.${s.slug}${s.description ? ` — ${s.description}` : ""}`,
+        `- id=${s.id} name="${promptSafe(s.name)}" ref=@skill.${s.slug}${s.description ? ` — ${promptSafe(s.description)}` : ""}`,
     )
     .join("\n");
   const agents = inventory.agentPresets
     .map(
       (a) =>
-        `- id=${a.id} name="${a.name}" reasoning=${a.reasoningEffort}${a.modelPreset ? ` preset=${a.modelPreset}` : ""}${a.modelId ? ` model=${a.modelId}` : ""}${a.description ? ` — ${a.description}` : ""}`,
+        `- id=${a.id} name="${promptSafe(a.name)}" reasoning=${a.reasoningEffort}${a.modelPreset ? ` preset=${a.modelPreset}` : ""}${a.modelId ? ` model=${a.modelId}` : ""}${a.description ? ` — ${promptSafe(a.description)}` : ""}`,
     )
     .join("\n");
   const presets = inventory.modelPresets

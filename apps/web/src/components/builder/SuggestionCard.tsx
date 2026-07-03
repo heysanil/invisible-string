@@ -6,7 +6,7 @@
  * Enter applies, Delete/Backspace dismisses.
  */
 import { ArrowRight, Bot, Check, FileText, Plug, X, Zap } from "lucide-react";
-import type { ComponentType } from "react";
+import { useRef, type ComponentType } from "react";
 import type {
   AgentPresetDto,
   CopilotProposal,
@@ -40,6 +40,8 @@ export interface SuggestionCardProps {
   modelPresets: readonly ModelPresetDto[];
   onApply: () => void;
   onDismiss: () => void;
+  /** Registers the focusable card element (keyboard flow after a decision). */
+  focusRef?: (element: HTMLDivElement | null) => void;
 }
 
 export function SuggestionCard(props: SuggestionCardProps) {
@@ -52,14 +54,22 @@ export function SuggestionCard(props: SuggestionCardProps) {
     modelPresets,
     onApply,
     onDismiss,
+    focusRef,
   } = props;
-  const description = describeProposal(
+  const live = describeProposal(
     proposal,
     definition,
     resources,
     agentPresets,
     modelPresets,
   );
+  // Receipts must not drift: the description is recomputed from the LIVE
+  // definition (right for a pending preview), but once the card settles the
+  // apply itself changes the definition — freeze the last PENDING description
+  // and render receipts from that copy.
+  const frozenRef = useRef<MutationDescription>(live);
+  if (status === "pending") frozenRef.current = live;
+  const description = status === "pending" ? live : frozenRef.current;
 
   if (status !== "pending") {
     return (
@@ -83,9 +93,12 @@ export function SuggestionCard(props: SuggestionCardProps) {
 
   return (
     <div
+      ref={focusRef}
       data-testid="suggestion-card"
       role="group"
       aria-label={`Suggestion: ${description.title}`}
+      aria-keyshortcuts="Enter Delete"
+      aria-description="Press Enter to apply, Delete to dismiss"
       tabIndex={0}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;
@@ -165,7 +178,7 @@ function SuggestionPreview({
       data-testid="before-after"
       className="flex flex-wrap items-center gap-1.5 rounded-card border border-black/[0.07] bg-white/45 px-2.5 py-1.5 text-[12px]"
     >
-      <span className={cn("text-ink-4", "line-through decoration-ink-4/50")}>
+      <span className={cn("text-ink-3", "line-through decoration-ink-3/50")}>
         {description.before}
       </span>
       <ArrowRight size={12} aria-hidden="true" className="text-ink-4" />

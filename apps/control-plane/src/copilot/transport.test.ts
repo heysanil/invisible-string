@@ -121,6 +121,37 @@ describe("createKeyedScriptedTransport", () => {
     }
   });
 
+  test("repeating the SAME message on one socket yields fresh toolCallIds", async () => {
+    const transport = createKeyedScriptedTransport(SCRIPTS);
+    const first = await collect(transport, [
+      { role: "user", content: "scaffold me one" },
+    ]);
+    const second = await collect(transport, [
+      { role: "user", content: "scaffold me one" },
+      { role: "assistant", content: "Starting." },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "x",
+            toolName: "addContext",
+            output: { type: "text", value: "accepted" },
+          },
+        ],
+      },
+      { role: "assistant", content: "Outcomes: …" },
+      { role: "user", content: "scaffold me one" },
+    ]);
+    const ids = (parts: TransportPart[]) =>
+      parts
+        .filter((p) => p.type === "tool-call")
+        .map((p) => (p.type === "tool-call" ? p.toolCallId : ""));
+    // Proposal ids key suggestion cards client-side — a repeated prompt must
+    // never reuse them.
+    for (const id of ids(second)) expect(ids(first)).not.toContain(id);
+  });
+
   test("a SECOND user turn in the same session restarts step indexing", async () => {
     const transport = createKeyedScriptedTransport(SCRIPTS);
     const parts = await collect(transport, [

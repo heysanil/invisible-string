@@ -9,6 +9,12 @@
  * they return to the model as tool-error results so it self-corrects. Valid
  * calls pause the loop until the client reports the mutation outcome — the
  * outcome IS the tool result, so the model knows what was applied.
+ *
+ * History invariant: every assistant tool-call message is ALWAYS followed by
+ * a tool message pairing each call with a result — aborting mid-proposal
+ * synthesizes "aborted" results for the unresolved calls so the next turn's
+ * request is never rejected by the provider (Anthropic/OpenAI both 400 on
+ * tool_use without a matching tool_result).
  */
 import type { ModelMessage } from "ai";
 import type {
@@ -20,7 +26,11 @@ import type { CopilotConfig } from "./config";
 import type { WorkspaceInventory } from "./inventory";
 import { buildSystemPrompt, buildToolSpecs } from "./prompt";
 import type { CopilotTransport } from "./transport";
-import { validateMutation } from "./validate";
+import {
+  applyAcceptedMutation,
+  draftContextState,
+  validateMutation,
+} from "./validate";
 
 export interface MutationResult {
   outcome: CopilotMutationOutcome;
@@ -40,12 +50,22 @@ export class CopilotSession {
   private readonly pending = new Map<string, PendingProposal>();
   private abortController: AbortController | null = null;
   private turnRunning = false;
+  /**
+   * Latched when `abort()` arrives while idle — covers the race where the
+   * client's Stop lands between the user_message frame and the turn actually
+   * starting (the plugin awaits DB checks first). Consumed at the top of the
+   * next runTurn; cleared by the plugin when a NEW user_message arrives so a
+   * stale post-done abort can never kill a fresh turn.
+   */
+  private abortRequested = false;
 
   constructor(
     private readonly deps: {
       transport: CopilotTransport;
       config: CopilotConfig;
       send: (frame: CopilotServerFrame) => void;
+      /** Server-side detail sink for upstream failures (default console). */
+      logError?: (message: string, error: unknown) => void;
     },
   ) {}
 
@@ -61,9 +81,18 @@ export class CopilotSession {
     pending.resolve(result);
   }
 
-  /** Abort the in-flight turn (no-op when idle). */
+  /** Abort the in-flight turn (latched for the about-to-start turn when idle). */
   abort(): void {
-    this.abortController?.abort();
+    if (this.abortController) {
+      this.abortController.abort();
+    } else {
+      this.abortRequested = true;
+    }
+  }
+
+  /** A new user message supersedes any stale idle-abort latch. */
+  clearPendingAbort(): void {
+    this.abortRequested = false;
   }
 
   /** Abort + drop all waiters (socket closed). */
@@ -78,19 +107,26 @@ export class CopilotSession {
   /**
    * Run one user turn to completion. Sends delta/proposal frames while
    * streaming and exactly one terminal frame (done or error) at the end.
+   * Resolves with the model output tokens the turn consumed (budget metering).
    */
   async runTurn(opts: {
     message: string;
     draft: Record<string, unknown>;
     inventory: WorkspaceInventory;
-  }): Promise<void> {
+  }): Promise<number> {
     if (this.turnRunning) {
       this.deps.send({
         type: "error",
         code: "turn_in_progress",
         message: "a copilot turn is already streaming on this connection",
       });
-      return;
+      return 0;
+    }
+    if (this.abortRequested) {
+      // Stop clicked between the user_message frame and the turn starting.
+      this.abortRequested = false;
+      this.deps.send({ type: "done", reason: "aborted", outputTokens: 0 });
+      return 0;
     }
     this.turnRunning = true;
     const abortController = new AbortController();
@@ -101,6 +137,9 @@ export class CopilotSession {
       inventory: opts.inventory,
     });
     const tools = buildToolSpecs();
+    // Draft state the semantic checks run against — updated as the user
+    // accepts proposals so later calls in the same turn see their effect.
+    const draftState = draftContextState(opts.draft);
     this.messages.push({ role: "user", content: opts.message });
 
     let outputTokens = 0;
@@ -140,7 +179,7 @@ export class CopilotSession {
             this.messages.push({ role: "assistant", content: stepText });
           }
           this.deps.send({ type: "done", reason: "completed", outputTokens });
-          return;
+          return outputTokens;
         }
 
         // Record the assistant step (text + tool calls) verbatim.
@@ -158,46 +197,68 @@ export class CopilotSession {
         });
 
         // Resolve each call: invalid → tool error back to the model; valid →
-        // proposal to the client, pause until accepted/rejected.
+        // proposal to the client, pause until accepted/rejected. The results
+        // message is pushed in `finally` so an abort mid-proposal still pairs
+        // every tool call with a (synthesized) result — see header invariant.
         const toolResults: ModelMessage = { role: "tool", content: [] };
-        for (const call of toolCalls) {
-          abortController.signal.throwIfAborted();
-          const validation = validateMutation(
-            call.toolName,
-            call.input,
-            opts.inventory,
-          );
-          let resultText: string;
-          if (!validation.ok) {
-            resultText = `INVALID TOOL CALL (not shown to the user): ${validation.message}. Fix the call and try again.`;
-          } else {
-            const rationale = extractRationale(call.input);
-            this.deps.send({
-              type: "proposal",
-              proposal: {
-                id: call.toolCallId,
-                tool: validation.tool,
-                params: validation.params,
-                rationale,
-              } as never,
-            });
-            const result = await this.waitForOutcome(
-              call.toolCallId,
-              abortController.signal,
+        const resultFor = (call: ToolCall, text: string) => ({
+          type: "tool-result" as const,
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          output: { type: "text" as const, value: text },
+        });
+        const resolved = new Set<string>();
+        try {
+          for (const call of toolCalls) {
+            abortController.signal.throwIfAborted();
+            const validation = validateMutation(
+              call.toolName,
+              call.input,
+              opts.inventory,
+              draftState,
             );
-            resultText =
-              result.outcome === "accepted"
-                ? "accepted — the user applied this change to the draft"
-                : `rejected — the user dismissed this proposal${result.reason ? `: ${result.reason}` : ""}`;
+            let resultText: string;
+            if (!validation.ok) {
+              resultText = `INVALID TOOL CALL (not shown to the user): ${validation.message}. Fix the call and try again.`;
+            } else {
+              const rationale = extractRationale(call.input);
+              this.deps.send({
+                type: "proposal",
+                proposal: {
+                  id: call.toolCallId,
+                  tool: validation.tool,
+                  params: validation.params,
+                  rationale,
+                } as never,
+              });
+              const result = await this.waitForOutcome(
+                call.toolCallId,
+                abortController.signal,
+              );
+              if (result.outcome === "accepted") {
+                applyAcceptedMutation(
+                  draftState,
+                  validation.tool,
+                  validation.params,
+                );
+                resultText = "accepted — the user applied this change to the draft";
+              } else {
+                resultText = `rejected — the user dismissed this proposal${result.reason ? `: ${result.reason}` : ""}`;
+              }
+            }
+            (toolResults.content as unknown[]).push(resultFor(call, resultText));
+            resolved.add(call.toolCallId);
           }
-          (toolResults.content as unknown[]).push({
-            type: "tool-result",
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            output: { type: "text", value: resultText },
-          });
+        } finally {
+          for (const call of toolCalls) {
+            if (!resolved.has(call.toolCallId)) {
+              (toolResults.content as unknown[]).push(
+                resultFor(call, "aborted by the user before a decision"),
+              );
+            }
+          }
+          this.messages.push(toolResults);
         }
-        this.messages.push(toolResults);
       }
       // Step cap reached without a natural stop.
       throw new CopilotOverBudgetError(
@@ -209,10 +270,13 @@ export class CopilotSession {
       } else if (error instanceof CopilotOverBudgetError) {
         this.deps.send({ type: "error", code: "over_budget", message: error.message });
       } else {
+        // Upstream errors can carry provider URLs/headers/response bodies —
+        // log the detail server-side, send only a generic line to the client.
+        (this.deps.logError ?? defaultLogError)("copilot llm turn failed", error);
         this.deps.send({
           type: "error",
           code: "llm_error",
-          message: error instanceof Error ? error.message : String(error),
+          message: "the copilot model call failed — try again",
         });
       }
     } finally {
@@ -224,6 +288,7 @@ export class CopilotSession {
       this.abortController = null;
       this.turnRunning = false;
     }
+    return outputTokens;
   }
 
   private waitForOutcome(
@@ -245,6 +310,10 @@ export class CopilotSession {
       });
     });
   }
+}
+
+function defaultLogError(message: string, error: unknown): void {
+  console.error(`[copilot] ${message}:`, error);
 }
 
 /** Models often include a `rationale` in the tool input; surface it if so. */

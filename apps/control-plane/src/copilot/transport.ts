@@ -299,7 +299,10 @@ export function createKeyedScriptedTransport(
         request.abortSignal.throwIfAborted();
         yield {
           type: "tool-call",
-          toolCallId: `fake_${script!.match.replace(/\W+/g, "_")}_${stepIndex}_${index}`,
+          // Salted with the conversation length so replaying the SAME user
+          // message on one socket never reuses a proposal id (the client
+          // keys suggestion cards by id and resolves the first match).
+          toolCallId: `fake_${script!.match.replace(/\W+/g, "_")}_${request.messages.length}_${stepIndex}_${index}`,
           toolName: call.toolName,
           input: substituteInventoryIds(call.input, request.system),
         };

@@ -119,11 +119,13 @@ test("copilot scaffolds a runnable workflow from a one-liner", async ({
     "Triage each form submission",
   );
 
-  // Three applied receipts + the copilot's closing prose.
+  // Three applied receipts + the copilot's closing prose. Scoped to the
+  // thread log — the dock's sr-only announcer repeats settled messages.
   await expect(
     page.getByTestId("suggestion-receipt").filter({ hasText: "Applied" }),
   ).toHaveCount(3);
-  await expect(page.getByText("Publish when ready")).toBeVisible();
+  const thread = page.getByRole("log", { name: "Copilot conversation" });
+  await expect(thread.getByText("Publish when ready")).toBeVisible();
 
   // ── publish (real eve build) → READY ────────────────────────────────────────
   await publishAndWaitReady(page);
@@ -190,12 +192,14 @@ test("copilot edit: apply one suggestion, dismiss the other — the dismissal ne
   await expect(railCard(page, "Trigger")).not.toContainText("Schedule");
 
   // The model received both outcomes as tool results — the scripted fake's
-  // closing message echoes them verbatim.
+  // closing message echoes them verbatim. Scoped to the thread log — the
+  // dock's sr-only announcer repeats settled messages.
+  const thread = page.getByRole("log", { name: "Copilot conversation" });
   await expect(
-    page.getByText(/setInstructions: accepted — the user applied/),
+    thread.getByText(/setInstructions: accepted — the user applied/),
   ).toBeVisible();
   await expect(
-    page.getByText(/setTrigger: rejected — the user dismissed this proposal/),
+    thread.getByText(/setTrigger: rejected — the user dismissed this proposal/),
   ).toBeVisible();
 
   // Persisted state agrees: after autosave + reload, the applied instructions

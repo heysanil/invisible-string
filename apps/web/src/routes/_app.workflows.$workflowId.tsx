@@ -181,6 +181,7 @@ function Builder({
   const [copilotPrefill, setCopilotPrefill] = useState<CopilotPrefill | null>(null);
   const [flashPillar, setFlashPillar] = useState<Pillar | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function askCopilot(text: string) {
     setCopilotPrefill((current) => ({ id: (current?.id ?? 0) + 1, text }));
@@ -188,10 +189,16 @@ function Builder({
 
   function onSuggestionApplied(pillar: Pillar) {
     setFlashPillar(null);
+    // Cancel BOTH timers: a stale clear-timer from the previous apply would
+    // otherwise cut the new flash short mid-animation.
     if (flashTimer.current) clearTimeout(flashTimer.current);
+    if (flashClearTimer.current) clearTimeout(flashClearTimer.current);
     // Re-arm on the next frame so consecutive applies re-trigger the animation.
     flashTimer.current = setTimeout(() => setFlashPillar(pillar), 16);
-    setTimeout(() => setFlashPillar((p) => (p === pillar ? null : p)), 900);
+    flashClearTimer.current = setTimeout(
+      () => setFlashPillar((p) => (p === pillar ? null : p)),
+      900,
+    );
   }
 
   function changeRunAs(userId: string) {

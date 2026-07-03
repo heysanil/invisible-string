@@ -13,6 +13,8 @@ import {
   type WorkflowDefinition,
 } from "@invisible-string/shared";
 
+import { describeCron } from "./cron";
+
 // ── TRIGGER ─────────────────────────────────────────────────────────────────
 
 export interface TriggerSummary {
@@ -52,8 +54,15 @@ export function triggerSummary(
       const dm = trigger.binding.includeDirectMessages ? " · DMs" : "";
       return { typeLabel, detail: `${where} · ${how}${dm}` };
     }
-    case "schedule":
-      return { typeLabel, detail: trigger.cron };
+    case "schedule": {
+      // Humanize common cron shapes; keep the raw expression alongside so
+      // the machine token stays visible (and copyable) next to the phrase.
+      const human = describeCron(trigger.cron);
+      return {
+        typeLabel,
+        detail: human ? `${human} · ${trigger.cron}` : trigger.cron,
+      };
+    }
   }
 }
 

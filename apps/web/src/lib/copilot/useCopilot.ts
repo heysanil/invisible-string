@@ -39,7 +39,9 @@ export type CopilotThreadItem =
       proposal: CopilotProposal;
       status: SuggestionStatus;
     }
-  | { kind: "error"; id: string; text: string };
+  | { kind: "error"; id: string; text: string }
+  /** Muted system line (e.g. a mid-turn connection drop). */
+  | { kind: "notice"; id: string; text: string };
 
 export interface UseCopilotOptions {
   workspaceId: string;
@@ -58,7 +60,12 @@ export interface CopilotApi {
   items: readonly CopilotThreadItem[];
   status: CopilotSocketStatus;
   generating: boolean;
-  send: (text: string) => void;
+  /**
+   * Send a user message. Returns false (without touching the thread) when it
+   * cannot be delivered right now — socket still connecting/reconnecting or a
+   * turn already in flight — so the caller can KEEP the composer text.
+   */
+  send: (text: string) => boolean;
   stop: () => void;
   applySuggestion: (suggestionId: string) => void;
   dismissSuggestion: (suggestionId: string) => void;
@@ -90,6 +97,20 @@ function settleStreaming(current: CopilotThreadItem[]): CopilotThreadItem[] {
   );
 }
 
+/** Server error copy is protocol-speak — humanize what users may actually see. */
+function humanizeError(code: string, message: string): string {
+  switch (code) {
+    case "turn_in_progress":
+      return "Copilot is still working on the previous request — wait for it to finish (or press Stop).";
+    case "over_budget":
+      return message.includes("window")
+        ? message
+        : "That turn hit the copilot's budget limit — try a smaller request.";
+    default:
+      return message;
+  }
+}
+
 export function useCopilot(options: UseCopilotOptions): CopilotApi {
   const {
     workspaceId,
@@ -110,6 +131,9 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
   // updaters — they must stay pure).
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  // Mirror of `generating` for callbacks that must not capture stale state.
+  const generatingRef = useRef(generating);
+  generatingRef.current = generating;
 
   const socketRef = useRef<CopilotSocket | null>(null);
   // Live refs so the socket callbacks never capture stale props.
@@ -140,10 +164,16 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
         setItems(settleStreaming);
         break;
       case "error":
-        setGenerating(false);
+        // turn_in_progress means the PREVIOUS turn is still streaming — the
+        // stop affordance must survive (the real turn is still in flight).
+        if (frame.code !== "turn_in_progress") setGenerating(false);
         setItems((current) => [
           ...settleStreaming(current),
-          { kind: "error", id: nextLocalId(), text: frame.message },
+          {
+            kind: "error",
+            id: nextLocalId(),
+            text: humanizeError(frame.code, frame.message),
+          },
         ]);
         break;
     }
@@ -161,9 +191,20 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
         if (next === "reconnecting") {
           // The server session died with the socket — the in-flight turn is
           // gone. Settle the UI; pending cards stay actionable (Apply is a
-          // pure client-side draft edit).
+          // pure client-side draft edit). Leave a visible marker so the
+          // prose ("two suggestions…") can't silently disagree with what
+          // actually arrived.
+          if (generatingRef.current) {
+            setItems((current) => [
+              ...settleStreaming(current),
+              {
+                kind: "notice",
+                id: nextLocalId(),
+                text: "Connection lost — this response was cut short. Ask again to continue.",
+              },
+            ]);
+          }
           setGenerating(false);
-          setItems(settleStreaming);
         }
       },
       ...(createWebSocket ? { createWebSocket } : {}),
@@ -184,16 +225,19 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
   ]);
 
   const send = useCallback(
-    (text: string) => {
+    (text: string): boolean => {
       const trimmed = text.trim();
-      if (trimmed.length === 0) return;
+      if (trimmed.length === 0) return false;
+      // One turn at a time: sending mid-turn would orphan the user's bubble
+      // (the server answers turn_in_progress and drops the message).
+      if (generatingRef.current) return false;
       const sent = socketRef.current?.send({
         type: "user_message",
         workflowId,
         draft: getDraftRef.current() as unknown as Record<string, unknown>,
         message: trimmed,
       });
-      if (!sent) return;
+      if (!sent) return false;
       setGenerating(true);
       setItems((current) => [
         ...current,
@@ -205,6 +249,7 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
           streaming: false,
         },
       ]);
+      return true;
     },
     [workflowId],
   );

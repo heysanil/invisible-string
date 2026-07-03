@@ -125,6 +125,13 @@ export const copilotProposalSchema = z.discriminatedUnion(
 
 // ── client → server frames ───────────────────────────────────────────────────
 
+/**
+ * Hard bound on the serialized draft a client may send per turn. The draft is
+ * interpolated into the model's system prompt, so unbounded drafts would let a
+ * client inflate input-token spend on the platform key without limit.
+ */
+export const COPILOT_MAX_DRAFT_CHARS = 131_072;
+
 export const copilotUserMessageFrameSchema = z.object({
   type: z.literal("user_message"),
   /** Workflow being edited — its org must match the socket's workspace. */
@@ -132,9 +139,14 @@ export const copilotUserMessageFrameSchema = z.object({
   /**
    * The CURRENT draft as the client sees it (the client is the single
    * writer; the server never trusts its own cached copy across turns).
-   * Loose object: drafts may be mid-edit / pre-default shapes.
+   * Loose object: drafts may be mid-edit / pre-default shapes — but bounded
+   * in serialized size (see COPILOT_MAX_DRAFT_CHARS).
    */
-  draft: z.record(z.string(), z.unknown()),
+  draft: z
+    .record(z.string(), z.unknown())
+    .refine((draft) => JSON.stringify(draft).length <= COPILOT_MAX_DRAFT_CHARS, {
+      message: `draft exceeds ${COPILOT_MAX_DRAFT_CHARS} serialized characters`,
+    }),
   message: z.string().min(1).max(8_000),
 });
 
@@ -173,10 +185,12 @@ export const COPILOT_ERROR_CODES = [
   "turn_in_progress",
   /** Per-workspace concurrent copilot session cap reached. */
   "session_limit",
-  /** Per-turn token/output budget exceeded — turn was cut off. */
+  /** Per-turn OR per-workspace-window token/turn budget exceeded. */
   "over_budget",
   /** Upstream model call failed. */
   "llm_error",
+  /** Session/membership no longer valid — the socket is closed after this. */
+  "unauthorized",
 ] as const;
 
 export type CopilotErrorCode = (typeof COPILOT_ERROR_CODES)[number];

@@ -20,6 +20,7 @@ const ORG = "org-1";
 const OTHER_ORG = "org-2";
 const WORKFLOW_ID = "aaaaaaaa-1111-4222-8333-444444444444";
 const CONNECTION_ID = "bbbbbbbb-1111-4222-8333-444444444444";
+const DISABLED_CONNECTION_ID = "bbbbbbbb-2222-4222-8333-444444444444";
 const SKILL_ID = "cccccccc-1111-4222-8333-444444444444";
 const AGENT_ID = "dddddddd-1111-4222-8333-444444444444";
 
@@ -31,6 +32,13 @@ const inventory: WorkspaceInventory = {
       slug: "linear",
       description: "issue tracker",
       enabled: true,
+    },
+    {
+      id: DISABLED_CONNECTION_ID,
+      name: "Old CRM",
+      slug: "old-crm",
+      description: null,
+      enabled: false,
     },
   ],
   skills: [
@@ -96,6 +104,7 @@ afterEach(() => {
 function startServer(
   script: ScriptedStep[],
   configOverrides: Partial<CopilotConfig> = {},
+  depsOverrides: Partial<CopilotDeps> = {},
 ): TestServer {
   const transport = createScriptedTransport(script);
   const deps: CopilotDeps = {
@@ -105,6 +114,7 @@ function startServer(
     loadInventory: async () => inventory,
     workflowExists: async (workflowId, organizationId) =>
       workflowId === WORKFLOW_ID && organizationId === ORG,
+    ...depsOverrides,
   };
   const app = new Elysia().use(copilotPlugin(deps)).listen(0);
   const port = app.server!.port;
@@ -400,8 +410,9 @@ describe("copilot tool loop", () => {
     client.close();
   });
 
-  test("setInstructions with unattached @refs is bounced back", async () => {
+  test("setInstructions @refs must be ATTACHED, not merely workspace-known (compiler parity)", async () => {
     const server = startServer([
+      // Workspace-unknown ref → bounced.
       {
         toolCalls: [
           {
@@ -410,11 +421,27 @@ describe("copilot tool loop", () => {
           },
         ],
       },
+      // Known in the workspace but NOT attached to the draft → also bounced
+      // (publish would throw UNRESOLVED_REFERENCE).
       {
         toolCalls: [
           {
             toolName: "setInstructions",
-            input: { markdown: "Use @linear and @skill.triage-guide on @trigger.subject." },
+            input: { markdown: "Use @linear to file issues." },
+          },
+        ],
+      },
+      // Attach it first (accepted), then the same instructions are valid.
+      {
+        toolCalls: [
+          { toolName: "addContext", input: { kind: "connection", id: CONNECTION_ID } },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            toolName: "setInstructions",
+            input: { markdown: "Use @linear to file issues." },
           },
         ],
       },
@@ -423,17 +450,148 @@ describe("copilot tool loop", () => {
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
     client.send(userMessage());
-    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+
+    const first = await client.waitFor((f) => f.type === "proposal");
+    expect(first.type === "proposal" && first.proposal.tool).toBe("addContext");
+    client.send({
+      type: "mutation_result",
+      proposalId: first.type === "proposal" ? first.proposal.id : "",
+      outcome: "accepted",
+    });
+    const second = await client.waitFor(
+      (f) => f.type === "proposal" && f.proposal.tool === "setInstructions",
+    );
     expect(
-      proposalFrame.type === "proposal" &&
-        JSON.stringify(proposalFrame.proposal.params),
+      second.type === "proposal" && JSON.stringify(second.proposal.params),
     ).toContain("@linear");
-    const proposalId =
-      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
-    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
+    client.send({
+      type: "mutation_result",
+      proposalId: second.type === "proposal" ? second.proposal.id : "",
+      outcome: "accepted",
+    });
     await client.waitFor((f) => f.type === "done");
+    // Both invalid variants came back to the model as tool errors.
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
       "unknown connection",
+    );
+    expect(JSON.stringify(server.transport.requests[2]!.messages)).toContain(
+      "not attached",
+    );
+    client.close();
+  });
+
+  test("@trigger refs are validated against the (turn-updated) draft trigger", async () => {
+    const server = startServer([
+      // Manual trigger carries no dispatch data → bounced.
+      {
+        toolCalls: [
+          {
+            toolName: "setInstructions",
+            input: { markdown: "Read @trigger.subject first." },
+          },
+        ],
+      },
+      // Switch to a form trigger (accepted) …
+      {
+        toolCalls: [
+          {
+            toolName: "setTrigger",
+            input: {
+              trigger: {
+                type: "form",
+                fields: [
+                  { key: "subject", label: "Subject", type: "text", required: true },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      // … an unknown field key is still bounced …
+      {
+        toolCalls: [
+          {
+            toolName: "setInstructions",
+            input: { markdown: "Read @trigger.body first." },
+          },
+        ],
+      },
+      // … and the matching key now validates.
+      {
+        toolCalls: [
+          {
+            toolName: "setInstructions",
+            input: { markdown: "Read @trigger.subject first." },
+          },
+        ],
+      },
+      { text: "done." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage());
+
+    const triggerProposal = await client.waitFor((f) => f.type === "proposal");
+    expect(triggerProposal.type === "proposal" && triggerProposal.proposal.tool).toBe(
+      "setTrigger",
+    );
+    client.send({
+      type: "mutation_result",
+      proposalId:
+        triggerProposal.type === "proposal" ? triggerProposal.proposal.id : "",
+      outcome: "accepted",
+    });
+    const instructions = await client.waitFor(
+      (f) => f.type === "proposal" && f.proposal.tool === "setInstructions",
+    );
+    client.send({
+      type: "mutation_result",
+      proposalId: instructions.type === "proposal" ? instructions.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "carries no dispatch data",
+    );
+    expect(JSON.stringify(server.transport.requests[3]!.messages)).toContain(
+      "does not match any form field key",
+    );
+    client.close();
+  });
+
+  test("addContext with a DISABLED connection is bounced (publish would reject it)", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          {
+            toolName: "addContext",
+            input: { kind: "connection", id: DISABLED_CONNECTION_ID },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          { toolName: "addContext", input: { kind: "connection", id: CONNECTION_ID } },
+        ],
+      },
+      { text: "attached." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("attach the crm"));
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
+      { kind: "connection", id: CONNECTION_ID },
+    );
+    client.send({
+      type: "mutation_result",
+      proposalId:
+        proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "disabled",
     );
     client.close();
   });
@@ -482,6 +640,69 @@ describe("copilot tool loop", () => {
     expect(done).toMatchObject({ type: "done", reason: "aborted" });
     // The scripted second step was never consumed.
     expect(server.transport.requests).toHaveLength(1);
+    client.close();
+  });
+
+  test("abort mid-proposal leaves history provider-valid — the NEXT turn still works", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          { toolName: "setTrigger", input: { trigger: { type: "manual" } } },
+        ],
+      },
+      { text: "hello again" },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("first turn"));
+    await client.waitFor((f) => f.type === "proposal");
+    client.send({ type: "abort" });
+    await client.waitFor((f) => f.type === "done");
+
+    // Second turn on the same socket must reach the model with every
+    // assistant tool-call paired to a tool result (Anthropic/OpenAI both 400
+    // on dangling tool_use).
+    client.send(userMessage("second turn"));
+    await client.waitFor(
+      (f) => f.type === "done" && f.reason === "completed",
+    );
+    const secondRequest = server.transport.requests[1]!;
+    const messages = secondRequest.messages;
+    for (const [index, message] of messages.entries()) {
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      const callIds = message.content
+        .filter((part) => (part as { type?: string }).type === "tool-call")
+        .map((part) => (part as { toolCallId: string }).toolCallId);
+      if (callIds.length === 0) continue;
+      const next = messages[index + 1];
+      expect(next?.role).toBe("tool");
+      const resultIds = Array.isArray(next?.content)
+        ? next.content.map((part) => (part as { toolCallId: string }).toolCallId)
+        : [];
+      for (const id of callIds) expect(resultIds).toContain(id);
+    }
+    // The synthesized result marks the abort for the model.
+    expect(JSON.stringify(messages)).toContain(
+      "aborted by the user before a decision",
+    );
+    client.close();
+  });
+
+  test("an abort racing ahead of the turn start cancels it before any model call", async () => {
+    const server = startServer([{ text: "never reached" }], {}, {
+      // Hold the pre-turn scope check long enough for the abort to land.
+      workflowExists: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return true;
+      },
+    });
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("start"));
+    client.send({ type: "abort" });
+    const done = await client.waitFor((f) => f.type === "done");
+    expect(done).toMatchObject({ type: "done", reason: "aborted" });
+    expect(server.transport.requests).toHaveLength(0);
     client.close();
   });
 
@@ -536,6 +757,115 @@ describe("copilot session cap", () => {
   });
 });
 
+describe("copilot budget + frame bounds", () => {
+  test("per-workspace turn cap rejects further turns in the window", async () => {
+    const server = startServer([{ text: "one" }, { text: "two" }], {
+      maxTurnsPerWindow: 1,
+    });
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("first"));
+    await client.waitFor((f) => f.type === "done");
+    client.send(userMessage("second"));
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "over_budget" });
+    // Only the first turn reached the model.
+    expect(server.transport.requests).toHaveLength(1);
+    client.close();
+  });
+
+  test("per-workspace token budget accumulates across turns", async () => {
+    const server = startServer(
+      [{ text: "pricey", outputTokens: 5_000 }, { text: "cheap" }],
+      { maxTokensPerWindow: 5_000 },
+    );
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("first"));
+    await client.waitFor((f) => f.type === "done");
+    client.send(userMessage("second"));
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "over_budget" });
+    expect(server.transport.requests).toHaveLength(1);
+    client.close();
+  });
+
+  test("oversized draft is rejected at the frame boundary (input-cost bound)", async () => {
+    const server = startServer([{ text: "hi" }]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    const frame = userMessage("hello");
+    (frame.draft as Record<string, unknown>).blob = "x".repeat(140_000);
+    client.send(frame);
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "invalid_frame" });
+    expect(server.transport.requests).toHaveLength(0);
+    client.close();
+  });
+});
+
+describe("copilot per-turn re-authorization", () => {
+  test("a revoked session cannot run further turns — the socket is closed", async () => {
+    let revoked = false;
+    const server = startServer([{ text: "one" }, { text: "never" }], {}, {
+      workspaceDeps: {
+        getSession: async (headers) =>
+          revoked ? null : fakeWorkspaceDeps.getSession(headers),
+        getMembership: fakeWorkspaceDeps.getMembership,
+      },
+    });
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("first"));
+    await client.waitFor((f) => f.type === "done");
+
+    revoked = true;
+    client.send(userMessage("second"));
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "unauthorized" });
+    const closed = await client.closed;
+    expect(closed.code).toBe(1008);
+    expect(server.transport.requests).toHaveLength(1);
+  });
+
+  test("a removed membership cannot run further turns", async () => {
+    let removed = false;
+    const server = startServer([{ text: "one" }, { text: "never" }], {}, {
+      workspaceDeps: {
+        getSession: fakeWorkspaceDeps.getSession,
+        getMembership: async (userId, organizationId) =>
+          removed
+            ? null
+            : fakeWorkspaceDeps.getMembership(userId, organizationId),
+      },
+    });
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(userMessage("first"));
+    await client.waitFor((f) => f.type === "done");
+
+    removed = true;
+    client.send(userMessage("second"));
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "unauthorized" });
+    expect((await client.closed).code).toBe(1008);
+  });
+});
+
+describe("copilot config guards", () => {
+  test("COPILOT_FAKE_SCRIPT is dev/test-gated: dropped under NODE_ENV=production", () => {
+    expect(
+      loadCopilotConfig({
+        NODE_ENV: "production",
+        COPILOT_FAKE_SCRIPT: '[{"text":"fake"}]',
+      }).fakeScript,
+    ).toBeUndefined();
+    expect(
+      loadCopilotConfig({ COPILOT_FAKE_SCRIPT: '[{"text":"fake"}]' }).fakeScript,
+    ).toBe('[{"text":"fake"}]');
+  });
+});
+
 describe("validateMutation", () => {
   test("setAgent modelId must be allowlisted AND enabled", () => {
     const ok = validateMutation(
@@ -560,5 +890,36 @@ describe("validateMutation", () => {
 
   test("unknown tool name is invalid", () => {
     expect(validateMutation("dropDatabase", {}, inventory).ok).toBe(false);
+  });
+
+  test("addContext rejects disabled connections; removeContext still allows them", () => {
+    const add = validateMutation(
+      "addContext",
+      { kind: "connection", id: DISABLED_CONNECTION_ID },
+      inventory,
+    );
+    expect(add.ok).toBe(false);
+    expect(!add.ok && add.message).toContain("disabled");
+    const remove = validateMutation(
+      "removeContext",
+      { kind: "connection", id: DISABLED_CONNECTION_ID },
+      inventory,
+    );
+    expect(remove.ok).toBe(true);
+  });
+
+  test("setInstructions treats a disabled connection's slug as unknown", () => {
+    const result = validateMutation(
+      "setInstructions",
+      { markdown: "Use @old-crm for history." },
+      inventory,
+      {
+        connectionIds: new Set([DISABLED_CONNECTION_ID]),
+        skillIds: new Set(),
+        trigger: { type: "manual" },
+      },
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("unknown connection");
   });
 });

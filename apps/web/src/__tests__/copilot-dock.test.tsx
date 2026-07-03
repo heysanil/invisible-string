@@ -161,9 +161,12 @@ function sendUserMessage(socket: FakeWebSocket, text = "Help me") {
   return JSON.parse(socket.sent.at(-1)!);
 }
 
+// Open-state persistence is scoped per workspace (renderDock uses ws-1).
+const OPEN_KEY = "is.copilot.open:ws-1";
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
-  window.localStorage.setItem("is.copilot.open", "1");
+  window.localStorage.setItem(OPEN_KEY, "1");
 });
 
 afterEach(() => {
@@ -173,13 +176,24 @@ afterEach(() => {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-test("collapsed pill when closed; opening persists to localStorage", () => {
-  window.localStorage.setItem("is.copilot.open", "0");
+test("collapsed pill when closed; opening persists to the per-workspace key and focuses the composer", () => {
+  window.localStorage.setItem(OPEN_KEY, "0");
   renderDock();
   expect(FakeWebSocket.instances.length).toBe(0);
-  fireEvent.click(q().getByRole("button", { name: "Open Copilot" }));
-  expect(window.localStorage.getItem("is.copilot.open")).toBe("1");
+  const pill = q().getByRole("button", { name: "Open Copilot" });
+  expect(pill.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(pill);
+  expect(window.localStorage.getItem(OPEN_KEY)).toBe("1");
   expect(FakeWebSocket.instances.length).toBe(1);
+  // Focus lands on the composer, not <body>.
+  expect(document.activeElement).toBe(q().getByLabelText("Ask copilot"));
+});
+
+test("collapsing returns focus to the pill", () => {
+  renderDock();
+  fireEvent.click(q().getByRole("button", { name: "Collapse Copilot" }));
+  const pill = q().getByRole("button", { name: "Open Copilot" });
+  expect(document.activeElement).toBe(pill);
 });
 
 test("connects to the workspace-scoped copilot socket and sends nothing until asked", () => {
@@ -208,7 +222,11 @@ test("user_message carries workflowId + live draft; deltas stream into one messa
     socket.message({ type: "delta", text: "lo **you**" });
   });
   const thread = q().getByLabelText("Copilot conversation");
-  expect(thread.getAttribute("aria-live")).toBe("polite");
+  // The thread is a log; announcements go through a dedicated live region so
+  // screen readers are not spammed once per streamed token.
+  expect(thread.getAttribute("role")).toBe("log");
+  expect(thread.getAttribute("aria-live")).toBe("off");
+  expect(q().getByRole("status").textContent).toContain("Copilot is responding");
   expect(thread.textContent).toContain("Hello");
   expect(thread.textContent).toContain("you");
 
@@ -220,17 +238,36 @@ test("user_message carries workflowId + live draft; deltas stream into one messa
   expect(q().queryByRole("button", { name: "Stop generating" })).toBeNull();
 });
 
-test("empty-state example chips send a user_message", () => {
+test("empty-state chips are draft-aware and send a user_message", () => {
+  // The fixture draft has instructions + no context → refinement chips, not
+  // the scaffold ones (which would be destructive on a configured draft).
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
-  fireEvent.click(
-    q().getByRole("button", { name: "Set this up to triage Slack mentions" }),
-  );
+  expect(
+    q().queryByRole("button", { name: "Set this up to triage Slack mentions" }),
+  ).toBeNull();
+  fireEvent.click(q().getByRole("button", { name: "Tighten the instructions" }));
   const frame = JSON.parse(socket.sent.at(-1)!);
   expect(frame.type).toBe("user_message");
-  expect(frame.message).toBe("Set this up to triage Slack mentions");
+  expect(frame.message).toBe("Tighten the instructions");
   expect(frame.draft).toEqual(definition);
+});
+
+test("a blank draft shows scaffold chips", () => {
+  renderDock({
+    definition: {
+      trigger: { type: "manual" },
+      context: { mcpConnectionIds: [], skillIds: [] },
+      agent: { agentPresetId: PRESET_ID },
+      instructions: { markdown: "" },
+    } satisfies WorkflowDefinition,
+  });
+  const socket = lastSocket();
+  act(() => socket.open());
+  expect(
+    q().getByRole("button", { name: "Set this up to triage Slack mentions" }),
+  ).toBeTruthy();
 });
 
 test("proposal frame renders a structured card; Apply routes through dispatch and reports accepted", () => {
@@ -314,8 +351,9 @@ test("setInstructions proposal renders an inline diff", () => {
   const diff = q().getByTestId("diff-view");
   const dels = diff.querySelectorAll('[data-diff="del"]');
   const adds = diff.querySelectorAll('[data-diff="add"]');
-  expect([...dels].map((n) => n.textContent)).toEqual(["Old line"]);
-  expect([...adds].map((n) => n.textContent)).toEqual(["New line"]);
+  // Each row carries an aria-hidden +/− gutter glyph (non-color diff cue).
+  expect([...dels].map((n) => n.textContent)).toEqual(["−Old line"]);
+  expect([...adds].map((n) => n.textContent)).toEqual(["+New line"]);
   expect(diff.textContent).toContain("Shared line");
 });
 
@@ -375,6 +413,129 @@ test("reconnects after a drop; the new socket can carry the next user_message", 
     workflowId: "wf-1",
     message: "Still here?",
   });
+});
+
+test("composer keeps its text until the socket accepts the frame", () => {
+  renderDock();
+  const socket = lastSocket();
+  // Socket not open yet: submit must neither clear the composer nor lose the
+  // message silently.
+  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
+  fireEvent.input(input, { target: { value: "early bird" } });
+  fireEvent.submit(input.closest("form")!);
+  expect(socket.sent).toEqual([]);
+  expect(input.value).toBe("early bird");
+  // Once open, the same submit goes through and clears the composer.
+  act(() => socket.open());
+  fireEvent.submit(input.closest("form")!);
+  expect(JSON.parse(socket.sent.at(-1)!).message).toBe("early bird");
+  expect(input.value).toBe("");
+});
+
+test("submits are blocked while a turn is generating (no orphaned bubbles)", () => {
+  renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  sendUserMessage(socket, "first");
+  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
+  fireEvent.input(input, { target: { value: "second while busy" } });
+  fireEvent.submit(input.closest("form")!);
+  const userFrames = socket
+    .frames()
+    .filter((frame) => frame.type === "user_message");
+  expect(userFrames).toHaveLength(1);
+  // The text stays in the composer for after the turn.
+  expect(input.value).toBe("second while busy");
+});
+
+test("a mid-turn connection drop leaves a visible notice in the thread", async () => {
+  renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  sendUserMessage(socket);
+  act(() => socket.message({ type: "delta", text: "Two suggestions" }));
+  act(() => socket.drop());
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+  expect(q().getByTestId("copilot-notice").textContent).toContain(
+    "cut short",
+  );
+});
+
+test("thinking indicator shows between send and first token; pending proposal shows the follow-up hint", () => {
+  renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  sendUserMessage(socket);
+  expect(q().getByTestId("copilot-thinking").textContent).toContain("Thinking");
+  act(() => socket.message({ type: "proposal", proposal: proposal() }));
+  expect(q().getByTestId("copilot-thinking").textContent).toContain(
+    "More suggestions may follow",
+  );
+  act(() => socket.message({ type: "done", reason: "completed" }));
+  expect(q().queryByTestId("copilot-thinking")).toBeNull();
+});
+
+test("receipt description is frozen at decision time (no drift as the draft changes)", () => {
+  const emptyDefinition: WorkflowDefinition = {
+    trigger: { type: "manual" },
+    context: { mcpConnectionIds: [], skillIds: [] },
+    agent: { agentPresetId: PRESET_ID },
+    instructions: { markdown: "" },
+  };
+  const { view } = renderDock({ definition: emptyDefinition });
+  const socket = lastSocket();
+  act(() => socket.open());
+  act(() =>
+    socket.message({
+      type: "proposal",
+      proposal: proposal({
+        id: "prop-freeze",
+        tool: "setInstructions",
+        params: { markdown: "Fresh instructions" },
+      }),
+    }),
+  );
+  expect(q().getByTestId("suggestion-card").textContent).toContain(
+    "Write instructions",
+  );
+  fireEvent.click(q().getByRole("button", { name: /Apply/ }));
+  // Simulate the applied draft flowing back down: instructions now non-empty.
+  view.rerender(
+    <CopilotDock
+      workspaceId="ws-1"
+      workflowId="wf-1"
+      definition={{
+        ...emptyDefinition,
+        instructions: { markdown: "Fresh instructions" },
+      }}
+      dispatch={mock(() => {})}
+      resources={resources}
+      agentPresets={agentPresets}
+      modelPresets={[]}
+      createWebSocket={createWebSocket}
+      backoffBaseMs={1}
+    />,
+  );
+  // The receipt keeps the pending-time title instead of drifting to "Rewrite".
+  expect(q().getByTestId("suggestion-receipt").textContent).toContain(
+    "Applied — Write instructions",
+  );
+});
+
+test("applying the focused card moves focus to the composer (not <body>)", async () => {
+  renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  act(() => socket.message({ type: "proposal", proposal: proposal() }));
+  const card = q().getByTestId("suggestion-card");
+  card.focus();
+  fireEvent.keyDown(card, { key: "Enter" });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+  expect(document.activeElement).toBe(q().getByLabelText("Ask copilot"));
 });
 
 test("unmount tears the socket down without reconnecting", async () => {

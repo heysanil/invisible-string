@@ -92,6 +92,10 @@ function contextName(
   return resources.skillById.get(params.id)?.name ?? params.id;
 }
 
+function sourceCount(count: number): string {
+  return `${count} source${count === 1 ? "" : "s"}`;
+}
+
 export function describeProposal(
   proposal: CopilotProposal,
   definition: WorkflowDefinition,
@@ -121,8 +125,8 @@ export function describeProposal(
       return {
         pillar: "context",
         title: `Add ${proposal.params.kind}: ${name}`,
-        before: `${count} source${count === 1 ? "" : "s"}`,
-        after: `${count + 1} sources — + ${name}`,
+        before: sourceCount(count),
+        after: `${sourceCount(count + 1)} — + ${name}`,
       };
     }
     case "removeContext": {
@@ -133,8 +137,8 @@ export function describeProposal(
       return {
         pillar: "context",
         title: `Remove ${proposal.params.kind}: ${name}`,
-        before: `${count} source${count === 1 ? "" : "s"}`,
-        after: `${Math.max(0, count - 1)} sources — − ${name}`,
+        before: sourceCount(count),
+        after: `${sourceCount(Math.max(0, count - 1))} — − ${name}`,
       };
     }
     case "setAgent": {

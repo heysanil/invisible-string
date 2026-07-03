@@ -24,8 +24,10 @@ import { z } from "zod";
 import type { EveStreamEvent } from "./eve-events";
 import { triggerEventSchema, type TriggerEvent } from "./trigger-event";
 import {
+  formFieldSchema,
   modelPresetSlugSchema,
   reasoningEffortSchema,
+  slackTriggerBindingSchema,
   workflowDefinitionSchema,
   type WorkflowDefinition,
 } from "./workflow-definition";
@@ -1055,4 +1057,352 @@ export const listWorkspaceMembersResponseSchema = z.object({
 });
 export type ListWorkspaceMembersResponse = z.infer<
   typeof listWorkspaceMembersResponseSchema
+>;
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE 3 — TRIGGER INGRESS, INTEGRATIONS, TRIGGER BINDINGS, RUN CANCEL
+// (docs/PLAN.md Phase 3; INITIAL-SPEC.md §8 dispatch path + §10 API surface)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── POST /runs/:id/cancel — abort a run ─────────────────────────────────────
+//
+// Aborts a queued/running/waiting run (dispatcher issues eve cancel + flips
+// status to `canceled`). Idempotent: cancelling an already-terminal run
+// returns its current state without error. Body is optional.
+
+export const runCancelRequestSchema = z
+  .object({
+    /** Optional audit note recorded on the run (never shown to the model). */
+    reason: z.string().min(1).max(500).optional(),
+  })
+  .optional();
+export type RunCancelRequest = z.infer<typeof runCancelRequestSchema>;
+
+export const runCancelResponseSchema = z.object({ run: runDtoSchema });
+export type RunCancelResponse = z.infer<typeof runCancelResponseSchema>;
+
+// ── POST /t/:token — public webhook + form ingress ──────────────────────────
+//
+// The `:token` (plaintext, shown ONCE at creation) hashes to `triggers.token_hash`
+// (SHA-256). The trigger's stored `type` decides how the body is read:
+//   - webhook: the ENTIRE JSON body becomes TriggerEvent.data (arbitrary shape).
+//   - form:    { values } matched against the bound form schema →
+//              formSubmissionToTriggerData (see trigger-adapters.ts).
+// Ingress enforces rate limits + payload caps BEFORE parsing (spec §8/§11).
+// Response is 202 (async dispatch) — the run streams over GET /runs/:id/stream.
+
+/** Public payload cap for `/t/:token` bodies (bytes). Enforced at ingress. */
+export const TRIGGER_INGRESS_MAX_BODY_BYTES = 256 * 1024; // 256 KiB
+
+/**
+ * Webhook ingress body: any JSON OBJECT. Non-object bodies (arrays, scalars)
+ * are rejected so `TriggerEvent.data` (a `Record`) is always well-formed.
+ */
+export const webhookIngressRequestSchema = z.record(z.string(), z.unknown());
+export type WebhookIngressRequest = z.infer<typeof webhookIngressRequestSchema>;
+
+/** Form ingress body: submitted field values keyed by the form field `key`. */
+export const formIngressRequestSchema = z.object({
+  values: z.record(z.string(), z.unknown()),
+});
+export type FormIngressRequest = z.infer<typeof formIngressRequestSchema>;
+
+/**
+ * 202 ack for `/t/:token`. `runId`/`sessionId` let a caller poll or open the
+ * SSE stream; a form UI shows a success state. Dispatch is async — presence of
+ * ids does NOT imply the run has started.
+ */
+export const triggerIngressResponseSchema = z.object({
+  accepted: z.literal(true),
+  runId: productId,
+  sessionId: productId,
+});
+export type TriggerIngressResponse = z.infer<
+  typeof triggerIngressResponseSchema
+>;
+
+// ── POST /integrations/slack/events — Slack Events API ingress ───────────────
+//
+// One platform-level Slack app (spec §2 locked). Inbound events are
+// signature-verified (v0 HMAC) with a 5-min replay window, then routed to the
+// workspace/workflow by team_id + trigger binding. Retries carry x-slack-retry-*
+// headers and MUST be de-duplicated (idempotency by event_id).
+
+export const SLACK_SIGNATURE_HEADER = "x-slack-signature";
+export const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
+export const SLACK_RETRY_NUM_HEADER = "x-slack-retry-num";
+export const SLACK_RETRY_REASON_HEADER = "x-slack-retry-reason";
+/** Slack signing scheme version prefix (`v0=<hmac>`). */
+export const SLACK_SIGNATURE_VERSION = "v0";
+/** Reject events whose signed timestamp is older than this (spec §11). */
+export const SLACK_REPLAY_WINDOW_SECONDS = 300;
+
+/**
+ * Slack channel types we distinguish. `im` = direct message to the app;
+ * `channel`/`group`/`mpim` = a (possibly threaded) channel message.
+ */
+export const slackChannelTypeSchema = z.enum(["im", "channel", "group", "mpim"]);
+export type SlackChannelType = z.infer<typeof slackChannelTypeSchema>;
+
+/**
+ * `app_mention` inner event — someone @-mentioned the app. `text` still
+ * contains the leading `<@Uxxxx>` mention token; the adapter strips it.
+ */
+export const slackAppMentionEventSchema = z.object({
+  type: z.literal("app_mention"),
+  user: z.string().min(1).optional(),
+  text: z.string().default(""),
+  ts: z.string().min(1),
+  channel: z.string().min(1),
+  thread_ts: z.string().min(1).optional(),
+  team: z.string().min(1).optional(),
+  event_ts: z.string().min(1).optional(),
+  /** Set when a bot authored the event — the adapter ignores these (loop guard). */
+  bot_id: z.string().min(1).optional(),
+});
+export type SlackAppMentionEvent = z.infer<typeof slackAppMentionEventSchema>;
+
+/**
+ * `message` inner event — a DM (`channel_type: "im"`) or a channel/thread
+ * message. `subtype`/`bot_id` mark edits/bot echoes the adapter ignores.
+ */
+export const slackMessageEventSchema = z.object({
+  type: z.literal("message"),
+  channel: z.string().min(1),
+  channel_type: slackChannelTypeSchema.optional(),
+  user: z.string().min(1).optional(),
+  text: z.string().optional(),
+  ts: z.string().min(1),
+  thread_ts: z.string().min(1).optional(),
+  team: z.string().min(1).optional(),
+  event_ts: z.string().min(1).optional(),
+  /** e.g. "message_changed", "message_deleted", "bot_message" — ignored. */
+  subtype: z.string().min(1).optional(),
+  bot_id: z.string().min(1).optional(),
+  app_id: z.string().min(1).optional(),
+});
+export type SlackMessageEvent = z.infer<typeof slackMessageEventSchema>;
+
+/** The inner events we consume off an event_callback. */
+export const slackInnerEventSchema = z.discriminatedUnion("type", [
+  slackAppMentionEventSchema,
+  slackMessageEventSchema,
+]);
+export type SlackInnerEvent = z.infer<typeof slackInnerEventSchema>;
+
+/** One entry of `event_callback.authorizations` — who the event is authed for. */
+export const slackAuthorizationSchema = z.object({
+  enterprise_id: z.string().nullable().optional(),
+  team_id: z.string().nullable().optional(),
+  user_id: z.string().min(1),
+  is_bot: z.boolean().optional(),
+  is_enterprise_install: z.boolean().optional(),
+});
+export type SlackAuthorization = z.infer<typeof slackAuthorizationSchema>;
+
+/** Slack `event_callback` envelope — routes by `team_id`. */
+export const slackEventCallbackSchema = z.object({
+  type: z.literal("event_callback"),
+  /** Legacy verification token (do NOT authenticate on this — use signatures). */
+  token: z.string().optional(),
+  team_id: z.string().min(1),
+  api_app_id: z.string().min(1).optional(),
+  event: slackInnerEventSchema,
+  event_id: z.string().min(1).optional(),
+  event_time: z.number().int().optional(),
+  authorizations: z.array(slackAuthorizationSchema).optional(),
+});
+export type SlackEventCallback = z.infer<typeof slackEventCallbackSchema>;
+
+/** Slack URL-verification handshake (sent once when the events URL is set). */
+export const slackUrlVerificationSchema = z.object({
+  type: z.literal("url_verification"),
+  token: z.string().optional(),
+  challenge: z.string().min(1),
+});
+export type SlackUrlVerification = z.infer<typeof slackUrlVerificationSchema>;
+
+/** Full request body of `POST /integrations/slack/events`. */
+export const slackWebhookBodySchema = z.discriminatedUnion("type", [
+  slackUrlVerificationSchema,
+  slackEventCallbackSchema,
+]);
+export type SlackWebhookBody = z.infer<typeof slackWebhookBodySchema>;
+
+/** Response to the URL-verification handshake — echo the challenge verbatim. */
+export const slackUrlVerificationResponseSchema = z.object({
+  challenge: z.string().min(1),
+});
+export type SlackUrlVerificationResponse = z.infer<
+  typeof slackUrlVerificationResponseSchema
+>;
+
+/** Ack for a consumed/ignored event_callback (Slack needs a fast 200). */
+export const slackEventAckResponseSchema = z.object({ ok: z.literal(true) });
+export type SlackEventAckResponse = z.infer<typeof slackEventAckResponseSchema>;
+
+// ── Integrations (Slack install/list) ───────────────────────────────────────
+//
+//   GET  /workspaces/:workspaceId/integrations              → ListIntegrationsResponse
+//   GET  /integrations/slack/install?workspaceId=…          → 302 to Slack OAuth
+//   GET  /integrations/slack/callback?code=&state=          → upsert integration
+//   DELETE /workspaces/:workspaceId/integrations/:id        → DeleteResourceResponse
+//
+// The bot token is envelope-encrypted onto `integrations.credentials_encrypted`
+// and NEVER echoed (read DTO carries `hasCredentials` only). team_name /
+// bot_user_id / scopes are non-secret metadata on `integrations.metadata`.
+
+/** Non-secret Slack metadata stored on `integrations.metadata`. */
+export const slackIntegrationMetadataSchema = z.object({
+  teamName: z.string().min(1).optional(),
+  botUserId: z.string().min(1).optional(),
+  scopes: z.array(z.string().min(1)).default([]),
+});
+export type SlackIntegrationMetadata = z.infer<
+  typeof slackIntegrationMetadataSchema
+>;
+
+/**
+ * Trimmed shape of Slack's `oauth.v2.access` response we consume at install
+ * (raw-source DTO, like the registry DTOs). The install adapter splits this
+ * into the encrypted `access_token` and the non-secret metadata above.
+ */
+export const slackOAuthAccessResultSchema = z.object({
+  ok: z.literal(true),
+  app_id: z.string().min(1).optional(),
+  team: z.object({ id: z.string().min(1), name: z.string().min(1).optional() }),
+  /** Bot user id (the app's identity in the workspace). */
+  bot_user_id: z.string().min(1).optional(),
+  /** SECRET: the bot access token (xoxb-…) — encrypt, never echo. */
+  access_token: z.string().min(1),
+  /** Space- or comma-separated granted scopes. */
+  scope: z.string().default(""),
+  token_type: z.string().optional(),
+});
+export type SlackOAuthAccessResult = z.infer<
+  typeof slackOAuthAccessResultSchema
+>;
+
+/** OAuth redirect-back query on `/integrations/slack/callback`. */
+export const slackOAuthCallbackQuerySchema = z.object({
+  code: z.string().min(1),
+  /** CSRF/state nonce carrying the workspace id (server-signed). */
+  state: z.string().min(1),
+  error: z.string().min(1).optional(),
+});
+export type SlackOAuthCallbackQuery = z.infer<
+  typeof slackOAuthCallbackQuerySchema
+>;
+
+/** Installed integration (read). Secrets reduced to `hasCredentials`. */
+export const integrationDtoSchema = z.object({
+  id: productId,
+  /** e.g. "slack". */
+  type: z.string().min(1),
+  /** Inbound routing key (Slack team_id). */
+  externalId: z.string().min(1),
+  /** Slack team name (from metadata; null when unknown). */
+  teamName: z.string().nullable(),
+  /** Slack bot user id (from metadata; null when unknown). */
+  botUserId: z.string().nullable(),
+  scopes: z.array(z.string().min(1)),
+  hasCredentials: z.boolean(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type IntegrationDto = z.infer<typeof integrationDtoSchema>;
+
+export const listIntegrationsResponseSchema = z.object({
+  integrations: z.array(integrationDtoSchema),
+});
+export type ListIntegrationsResponse = z.infer<
+  typeof listIntegrationsResponseSchema
+>;
+
+// ── Trigger bindings ────────────────────────────────────────────────────────
+//
+//   GET  /workflows/:workflowId/triggers                        → ListTriggerBindingsResponse
+//   POST /workflows/:workflowId/triggers/webhook-token          → CreateWebhookTokenResponse (plaintext ONCE)
+//   POST /workflows/:workflowId/triggers/:id/rotate-token       → CreateWebhookTokenResponse (plaintext ONCE)
+//   PUT  /workflows/:workflowId/triggers/slack                  → GetTriggerBindingResponse
+//
+// A trigger row is created at publish from the workflow's TRIGGER pillar. The
+// webhook/form ingress token is GENERATED here, shown ONCE, and stored only as
+// a SHA-256 hash on `triggers.token_hash` (secrets discipline). `tokenSuffix`
+// (last 4 chars, non-secret) may be persisted in `triggers.binding` for display
+// — no schema change needed.
+
+/** Mirrors pgEnum `trigger_type`. */
+export const triggerTypeSchema = z.enum([
+  "manual",
+  "form",
+  "webhook",
+  "slack",
+  "schedule",
+]);
+export type TriggerTypeEnum = z.infer<typeof triggerTypeSchema>;
+
+/** Trigger binding (read). No plaintext token — `tokenSuffix` for display only. */
+export const triggerBindingDtoSchema = z.object({
+  id: productId,
+  workflowId: productId,
+  type: triggerTypeSchema,
+  enabled: z.boolean(),
+  /** True when a webhook/form ingress token exists (webhook/form triggers). */
+  hasToken: z.boolean(),
+  /** Last 4 chars of the ingress token (display hint); null when none/unknown. */
+  tokenSuffix: z.string().length(4).nullable(),
+  /** Bound form field schema (form triggers); null otherwise. */
+  formSchema: z.array(formFieldSchema).nullable(),
+  /** Slack routing binding (slack triggers); null otherwise. */
+  slackBinding: slackTriggerBindingSchema.nullable(),
+  /** Integration this trigger routes through (slack); null otherwise. */
+  integrationId: productId.nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type TriggerBindingDto = z.infer<typeof triggerBindingDtoSchema>;
+
+export const listTriggerBindingsResponseSchema = z.object({
+  triggers: z.array(triggerBindingDtoSchema),
+});
+export type ListTriggerBindingsResponse = z.infer<
+  typeof listTriggerBindingsResponseSchema
+>;
+
+export const getTriggerBindingResponseSchema = z.object({
+  trigger: triggerBindingDtoSchema,
+});
+export type GetTriggerBindingResponse = z.infer<
+  typeof getTriggerBindingResponseSchema
+>;
+
+/**
+ * Response to minting/rotating a webhook/form ingress token. `token` is the
+ * PLAINTEXT value — returned ONCE, never retrievable again (only its hash is
+ * stored). Clients must surface it immediately (copy-to-clipboard) and warn it
+ * won't be shown again. `ingressUrl` is the ready-to-use `POST /t/:token` URL.
+ */
+export const createWebhookTokenResponseSchema = z.object({
+  triggerId: productId,
+  /** Plaintext ingress token — shown ONCE. */
+  token: z.string().min(1),
+  /** Last 4 chars, for later display (also persisted, non-secret). */
+  tokenSuffix: z.string().length(4),
+  /** Fully-qualified `POST /t/:token` URL. */
+  ingressUrl: z.string().min(1),
+  createdAt: isoTimestamp,
+});
+export type CreateWebhookTokenResponse = z.infer<
+  typeof createWebhookTokenResponseSchema
+>;
+
+/** Bind/point a Slack trigger at an installed integration + routing rules. */
+export const updateSlackTriggerBindingRequestSchema = z.object({
+  /** The installed Slack `integrations` row this workflow listens through. */
+  integrationId: productId,
+  binding: slackTriggerBindingSchema,
+});
+export type UpdateSlackTriggerBindingRequest = z.infer<
+  typeof updateSlackTriggerBindingRequestSchema
 >;

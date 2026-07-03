@@ -4,8 +4,9 @@ A cloud-hosted agent workflow platform — "Claude Code / Cowork in the cloud."
 Users assemble **workflows** from four pillars (TRIGGER · CONTEXT · AGENT ·
 INSTRUCTIONS) in a chat-centric web UI; each workflow compiles to a
 self-hosted [eve](https://eve.dev) agent that runs on a stateless worker pool
-with Postgres-backed durability. Multi-tenant via Better Auth organizations,
-with an AI copilot in the builder. See `INITIAL-SPEC.md` (build brief) and
+with Postgres-backed durability, fired from chat or external triggers
+(webhook · form · Slack). Multi-tenant via Better Auth organizations, with an
+AI copilot in the builder. See `INITIAL-SPEC.md` (build brief) and
 `docs/PLAN.md` (master implementation plan).
 
 ## Quickstart
@@ -61,7 +62,8 @@ surface, built on the E1 design system (`src/styles/tokens.css` +
   authoring with drag-drop attachments (packaged into the compiled agent —
   no more publish-time 422).
 - **Settings** (`/settings`) — model presets, provider/model allowlist, agent
-  presets, members (Better Auth organization roles), and workspace rename.
+  presets, members (Better Auth organization roles), workspace rename, and
+  **Integrations** (connect the platform Slack app, per-team bot tokens).
 
 Run it against a live control plane:
 
@@ -83,10 +85,12 @@ there).
 ```
 apps/
   control-plane/   Bun + Elysia API host: auth, CRUD, compiler invocation,
-                   eve build + artifact upload, scheduler, dispatcher, SSE
-  worker/          Stateless worker: supervisor (eve start per agent),
-                   reverse proxy, idle reapers
-  web/             Vite + React SPA (chat, builder, settings)
+                   eve build + artifact upload, affinity/warm scheduler with
+                   dead-worker failover, trigger ingress (webhook/form/Slack)
+                   + dispatcher, SSE, /internal/metrics + deep health
+  worker/          Stateless worker: supervisor (eve start per agent), reverse
+                   proxy, idle + sandbox reapers, per-worker token identity
+  web/             Vite + React SPA (chat, builder, settings + integrations)
 packages/
   compiler/        Pure WorkflowDefinition -> eve project codegen
   db/              Drizzle schema, migrations, seeds (product DB)

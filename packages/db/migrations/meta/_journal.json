@@ -15,6 +15,13 @@
       "when": 1783053744106,
       "tag": "0001_medical_tarot",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783056509176,
+      "tag": "0002_glorious_harrier",
+      "breakpoints": true
     }
   ]
 }

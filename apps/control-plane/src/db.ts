@@ -1,14 +1,16 @@
 /**
- * Product database client (postgres-js + drizzle), typed over the Better
- * Auth-managed tables re-exported from `@invisible-string/db` via
- * `./auth-schema` (canonical schema + migrations live in packages/db).
+ * Product database client (postgres-js + drizzle), typed over the FULL
+ * canonical schema from `@invisible-string/db` (Better Auth tables + product
+ * tables; migrations live there too). Better Auth's adapter still receives
+ * the narrower `authSchema` map explicitly (see auth.ts) — widening the
+ * client's schema does not change auth behavior.
  */
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 
-import { authSchema } from "./auth-schema";
+import { schema } from "@invisible-string/db";
 
-export type Db = PostgresJsDatabase<typeof authSchema>;
+export type Db = PostgresJsDatabase<typeof schema> & { $client: postgres.Sql };
 
 export interface DbHandle {
   db: Db;
@@ -26,7 +28,7 @@ export function createDb(
     max: options?.max ?? 10,
     onnotice: () => {}, // silence NOTICE chatter (e.g. from migrations)
   });
-  const db = drizzle(sql, { schema: authSchema });
+  const db = drizzle(sql, { schema });
   return {
     db,
     sql,

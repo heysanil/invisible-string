@@ -1,0 +1,9 @@
+{"data":{"runtime":{"agentId":"spike-agent","agentName":"spike-agent","eveVersion":"0.19.0","modelId":"deepseek/deepseek-v4-flash"}},"type":"session.started","meta":{"at":"2026-07-03T04:17:24.601Z"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.started","meta":{"at":"2026-07-03T04:17:24.602Z"}}
+{"data":{"message":"Reply with exactly: pong","sequence":0,"turnId":"turn_0"},"type":"message.received","meta":{"at":"2026-07-03T04:17:24.618Z"}}
+{"data":{"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"step.started","meta":{"at":"2026-07-03T04:17:24.633Z"}}
+{"data":{"messageDelta":"pong","messageSoFar":"pong","sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"message.appended","meta":{"at":"2026-07-03T04:17:24.656Z"}}
+{"data":{"finishReason":"stop","message":"pong","sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"message.completed","meta":{"at":"2026-07-03T04:17:24.662Z"}}
+{"data":{"finishReason":"stop","sequence":0,"stepIndex":0,"turnId":"turn_0","usage":{"inputTokens":742,"outputTokens":1,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-07-03T04:17:24.678Z"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.completed","meta":{"at":"2026-07-03T04:17:24.700Z"}}
+{"data":{"wait":"next-user-message"},"type":"session.waiting","meta":{"at":"2026-07-03T04:17:24.705Z"}}

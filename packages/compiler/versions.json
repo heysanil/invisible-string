@@ -1,0 +1,21 @@
+{
+  "generatedAt": "2026-07-02",
+  "eve": "0.19.0",
+  "ai": "7.0.14",
+  "worldPostgres": "5.0.0-beta.20",
+  "openrouterProvider": "6.0.0-alpha.1",
+  "anthropicProvider": "4.0.7",
+  "node": "24.18.0",
+  "notes": [
+    "eve@0.19.0 is the exact npm latest as of 2026-07-02. engines.node >=24 (host Node 22 fails the engines check; use Node 24.x). Its only hard dependency is nitro@3.0.260610-beta; ai is a peer dependency at ^7.0.0 (resolved to ai@7.0.14). Optional peers (@opentelemetry/api, braintrust, just-bash, microsandbox) are not needed for the platform runtime.",
+    "eve@0.19.0 vendors the @workflow/* runtime as compiled chunks. Its package.json pins @workflow/core@5.0.0-beta.26, @workflow/world@5.0.0-beta.14, @workflow/world-local@5.0.0-beta.22, @workflow/errors@5.0.0-beta.8, @workflow/serde@5.0.0-beta.2. eve's world-compatibility check compares the world package's declared @workflow/world dependency against the expected line (major + prerelease tag).",
+    "@workflow/world-postgres@5.0.0-beta.20 chosen because its dependency @workflow/world@5.0.0-beta.14 EXACTLY matches eve 0.19.0's bundled @workflow/world (beta.19 depends on world beta.13, beta.18 on beta.12, etc. -- beta.20 is the only exact match). Its @workflow/world-local@5.0.0-beta.22 also matches eve's.",
+    "ai@7 accepts LanguageModel = GlobalProviderModelId | LanguageModelV4 | LanguageModelV3 | LanguageModelV2 (verified in ai@7.0.14 dist types), so provider packages built against @ai-sdk/provider@3 (spec v3) OR @ai-sdk/provider@4 (spec v4) both satisfy defineAgent({ model }).",
+    "@openrouter/ai-sdk-provider: npm latest (2.10.0) peer-requires ai@^6 and ERESOLVEs against eve's ai@7 (verified empirically). The 'alpha' dist-tag 6.0.0-alpha.1 declares NO ai peer dependency (deps: @openrouter/sdk, @ai-sdk/provider@^3, @ai-sdk/provider-utils@^4), emits specificationVersion 'v3' models that ai@7 accepts, installs cleanly next to ai@7.0.14, and uses the createOpenRouter({ apiKey }) -> openrouter('provider/slug') call style the compiler templates expect. Chosen: 6.0.0-alpha.1 (exact pin; alpha line -- revisit when a stable major targeting ai@7 ships).",
+    "openrouter('slug') throws AI_LoadAPIKeyError at MODEL CONSTRUCTION time when no apiKey/OPENROUTER_API_KEY is present (verified empirically) -- generated agent.ts must only construct the OpenRouter model when the key is set, or builds/boots fail keyless.",
+    "@ai-sdk/anthropic@4.0.7 is npm latest; depends on @ai-sdk/provider@4.0.2 + @ai-sdk/provider-utils@5.0.5, the same provider-spec line ai@7.0.14 uses (spec v4). anthropic('claude-...') uses hyphenated native ids (e.g. claude-opus-4-8), unlike dotted gateway ids.",
+    "zod: eve/ai tree resolves zod@4.4.3; pin 4.4.3 in generated projects (eve init scaffold deps are eve, ai, zod).",
+    "@workflow/world-postgres env contract: WORKFLOW_POSTGRES_URL (required), WORKFLOW_POSTGRES_JOB_PREFIX (per-agent isolation in a shared world DB), WORKFLOW_POSTGRES_WORKER_CONCURRENCY, WORKFLOW_POSTGRES_MAX_POOL_SIZE, WORKFLOW_LOCAL_BASE_URL (overrides the base URL the queue uses for /.well-known/workflow/v1/* run callbacks -- point it at the proxy/supervisor address in front of the agent). DB bootstrap: `npx --package=@workflow/world-postgres bootstrap` (runs setupDatabase(); creates workflow_runs/steps/events/hooks/stream_chunks + graphile-worker schema).",
+    "Custom channel routes mount at the RAW authored path (urlPath = route.path, no channel prefix; verified in eve compiler normalize-channel). A worker proxy that forwards only /eve/ and /.well-known/workflow/ will NOT reach a channel authored at POST /dispatch -- compiler templates must author trigger-channel routes under a forwarded prefix (e.g. /eve/v1/platform/<trigger>) or the proxy must forward the extra prefix."
+  ]
+}

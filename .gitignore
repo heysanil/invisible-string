@@ -7,6 +7,7 @@ coverage/
 playwright-report/
 test-results/
 artifacts/
+spike/.artifacts/
 *.log
 .DS_Store
 .env

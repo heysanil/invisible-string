@@ -1,0 +1,9 @@
+{"data":{"runtime":{"agentId":"spike-agent","agentName":"spike-agent","eveVersion":"0.19.0","modelId":"deepseek/deepseek-v4-flash"}},"type":"session.started","meta":{"at":"2026-07-03T04:17:25.452Z"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.started","meta":{"at":"2026-07-03T04:17:25.453Z"}}
+{"data":{"message":"Call the record_note tool with note: 'durability-proof'.","sequence":0,"turnId":"turn_0"},"type":"message.received","meta":{"at":"2026-07-03T04:17:25.468Z"}}
+{"data":{"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"step.started","meta":{"at":"2026-07-03T04:17:25.485Z"}}
+{"data":{"actions":[{"callId":"call_record_note","input":{"note":"durability-proof"},"kind":"tool-call","toolName":"record_note"}],"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"actions.requested","meta":{"at":"2026-07-03T04:17:25.505Z"}}
+{"data":{"finishReason":"tool-calls","sequence":0,"stepIndex":0,"turnId":"turn_0","usage":{"inputTokens":750,"outputTokens":4,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-07-03T04:17:25.515Z"}}
+{"data":{"requests":[{"action":{"callId":"call_record_note","input":{"note":"durability-proof"},"kind":"tool-call","toolName":"record_note"},"allowFreeform":false,"display":"confirmation","options":[{"id":"approve","label":"Yes"},{"id":"deny","label":"No"}],"prompt":"Approve tool call: record_note","requestId":"aitxt-nSGF8iACkY4UG2n0C6mG52yN"}],"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"input.requested","meta":{"at":"2026-07-03T04:17:25.541Z"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.completed","meta":{"at":"2026-07-03T04:17:25.545Z"}}
+{"data":{"wait":"next-user-message"},"type":"session.waiting","meta":{"at":"2026-07-03T04:17:25.560Z"}}

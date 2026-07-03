@@ -10,6 +10,8 @@ export * from "./crypto";
  */
 export const SHARED_PACKAGE = "@invisible-string/shared";
 
+export * from "./eve-events.js";
+
 export const placeholderSchema = z.object({
   ok: z.literal(true),
 });

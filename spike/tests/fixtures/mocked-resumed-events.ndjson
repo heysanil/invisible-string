@@ -1,0 +1,8 @@
+{"data":{"sequence":1,"turnId":"turn_1"},"type":"turn.started","meta":{"at":"2026-07-03T04:17:27.070Z"}}
+{"data":{"sequence":1,"stepIndex":0,"turnId":"turn_1"},"type":"step.started","meta":{"at":"2026-07-03T04:17:27.071Z"}}
+{"data":{"result":{"callId":"call_record_note","kind":"tool-result","output":{"ok":true,"recorded":"durability-proof"},"toolName":"record_note"},"sequence":1,"stepIndex":0,"status":"completed","turnId":"turn_1"},"type":"action.result","meta":{"at":"2026-07-03T04:17:27.096Z"}}
+{"data":{"messageDelta":"Used record_note for \"Call the record_note tool with note: 'durability-proof'.\": {\"ok\":true,\"recorded\":\"durability-proof\"}","messageSoFar":"Used record_note for \"Call the record_note tool with note: 'durability-proof'.\": {\"ok\":true,\"recorded\":\"durability-proof\"}","sequence":1,"stepIndex":0,"turnId":"turn_1"},"type":"message.appended","meta":{"at":"2026-07-03T04:17:27.105Z"}}
+{"data":{"finishReason":"stop","message":"Used record_note for \"Call the record_note tool with note: 'durability-proof'.\": {\"ok\":true,\"recorded\":\"durability-proof\"}","sequence":1,"stepIndex":0,"turnId":"turn_1"},"type":"message.completed","meta":{"at":"2026-07-03T04:17:27.119Z"}}
+{"data":{"finishReason":"stop","sequence":1,"stepIndex":0,"turnId":"turn_1","usage":{"inputTokens":750,"outputTokens":31,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-07-03T04:17:27.133Z"}}
+{"data":{"sequence":1,"turnId":"turn_1"},"type":"turn.completed","meta":{"at":"2026-07-03T04:17:27.156Z"}}
+{"data":{"wait":"next-user-message"},"type":"session.waiting","meta":{"at":"2026-07-03T04:17:27.162Z"}}

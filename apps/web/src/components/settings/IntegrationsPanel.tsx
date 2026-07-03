@@ -48,7 +48,17 @@ export function IntegrationsPanel({ workspaceId, canManage }: IntegrationsPanelP
       ? { tone: "success" as const, text: "Slack connected." }
       : slackParam === "denied"
         ? { tone: "warning" as const, text: "Slack connection was cancelled." }
-        : null;
+        : slackParam === "forbidden"
+          ? {
+              tone: "warning" as const,
+              text: "Finish the Slack install signed in as an admin of the workspace that started it.",
+            }
+          : slackParam === "team_already_connected"
+            ? {
+                tone: "warning" as const,
+                text: "That Slack team is already connected to another workspace here — disconnect it there first.",
+              }
+            : null;
 
   function connectSlack() {
     // Top-level navigation so the session cookie rides to the control plane.

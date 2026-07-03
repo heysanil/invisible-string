@@ -414,9 +414,12 @@ if (import.meta.main) {
         logger.error("run.reconcile_failed", { err: error });
       });
     // Dead-worker sweeper: heartbeat TTL → dead, clear parked-session affinity,
-    // reschedule + re-tail interrupted runs on a live worker.
+    // reschedule + re-tail interrupted runs on a live worker. Failover events
+    // are structured one-JSON-per-line with correlation ids (never bare
+    // console strings) — they are the highest-value operational logs.
     const sweeper = createWorkerSweeper(stack.runtime, {
-      log: (message) => console.log(`[sweeper] ${message}`),
+      logger: logger.child({ fields: { component: "sweeper" } }),
+      log: (message) => logger.info("sweeper.pass", { msg: message }),
     });
     sweeper.start();
   }

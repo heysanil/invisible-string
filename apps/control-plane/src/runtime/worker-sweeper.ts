@@ -26,6 +26,7 @@
  */
 import { and, eq, inArray, lt } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
+import type { Logger } from "@invisible-string/shared";
 
 import {
   ensureAgentOnWorker,
@@ -69,10 +70,20 @@ export interface WorkerSweeper {
 
 export function createWorkerSweeper(
   deps: RuntimeDeps,
-  options: { log?: (message: string) => void; resumeRun?: ResumeRunFn } = {},
+  options: {
+    log?: (message: string) => void;
+    /**
+     * Structured failover logging (one JSON object per line, correlation ids
+     * in the top-level slots) — the highest-value operational events. Falls
+     * back to `deps.logger`; `log` remains as a plain-string seam for tests.
+     */
+    logger?: Logger;
+    resumeRun?: ResumeRunFn;
+  } = {},
 ): WorkerSweeper {
   const { db, runtime } = deps;
   const log = options.log ?? (() => {});
+  const logger = options.logger ?? deps.logger;
   const resumeRun = options.resumeRun ?? defaultResumeRun(deps);
 
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -100,6 +111,13 @@ export function createWorkerSweeper(
       )
       .returning({ id: schema.workers.id });
     outcome.markedDead = newlyDead.length;
+    for (const dead of newlyDead) {
+      logger?.warn("worker.unreachable", {
+        workerId: dead.id,
+        msg: "heartbeat older than TTL — marked dead; failing over its runs",
+        fields: { heartbeatTtlMs: runtime.workerHeartbeatTtlMs },
+      });
+    }
 
     // 2. Every non-terminal run stranded on a dead worker (covers this pass's
     //    newly-dead AND any still-unresolved from a previous pass — scanning by
@@ -139,6 +157,12 @@ export function createWorkerSweeper(
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        logger?.error("sweeper.failover_error", {
+          runId: row.run.id,
+          sessionId: row.session.id,
+          workflowId: row.session.workflowId,
+          err: error,
+        });
       }
     }
 
@@ -166,18 +190,34 @@ export function createWorkerSweeper(
     if (run.status === "waiting") {
       await clearAffinity(session.id);
       outcome.cleared += 1;
+      logger?.info("sweeper.parked_cleared", {
+        runId: run.id,
+        sessionId: session.id,
+        workflowId: session.workflowId,
+        msg: "parked session affinity cleared — approval reschedules elsewhere",
+      });
       return;
     }
 
     // Never established an eve session (crashed mid-create) → unrecoverable.
+    // markRun is a CAS (terminal is sticky): if the in-flight dispatch beats
+    // us and the run moved on, `failed` simply does not apply.
     if (!session.eveSessionId) {
-      await deps.runStore.markRun(run.id, {
+      const marked = await deps.runStore.markRun(run.id, {
         status: "failed",
         error: "home worker died before the session was established",
         completedAt: new Date(),
       });
       await clearAffinity(session.id);
-      outcome.failed += 1;
+      if (marked) {
+        outcome.failed += 1;
+        logger?.warn("run.failed", {
+          runId: run.id,
+          sessionId: session.id,
+          workflowId: session.workflowId,
+          msg: "home worker died before the eve session was established",
+        });
+      }
       return;
     }
 
@@ -188,8 +228,17 @@ export function createWorkerSweeper(
       contentHash: row.contentHash,
       eveSessionId: session.eveSessionId,
     });
-    if (result === "resumed") outcome.resumed += 1;
-    else outcome.deferred += 1; // keep dead-affinity; retried next pass
+    if (result === "resumed") {
+      outcome.resumed += 1;
+      logger?.info("sweeper.run_resumed", {
+        runId: run.id,
+        sessionId: session.id,
+        workflowId: session.workflowId,
+        msg: "stranded run re-tailed on a fresh worker",
+      });
+    } else {
+      outcome.deferred += 1; // keep dead-affinity; retried next pass
+    }
   }
 
   async function clearAffinity(sessionId: string): Promise<void> {

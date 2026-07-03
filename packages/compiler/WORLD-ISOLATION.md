@@ -80,9 +80,17 @@ database can never see (or re-drive) another version's runs.
   `_invisible_string_world_owner` table inside each world DB and fails
   loudly if an existing database belongs to a different hash — a 12-char
   truncation collision must never silently share a world.
-- Same-version processes: multiple workers may serve the SAME version
-  concurrently against its shared per-version DB; that is homogeneous and
-  safe by design (re-enqueue re-drives only that version's runs).
+- Same-version processes: ⚠️ **at most ONE live agent process per version
+  hash, fleet-wide** (corrected — the earlier "homogeneous is safe" claim was
+  wrong). world-postgres @5.0.0-beta.20 serializes run replays with an
+  in-PROCESS map only, and `reenqueueActiveRuns` enqueues graphile jobs with
+  no idempotencyKey/queueName — a second process booting against the same
+  `ws_v_<hash12>` creates duplicate jobs for runs actively executing on the
+  first, and two pollers replay the same run concurrently (double-executed
+  side effects, racing event log). The platform enforces the single-writer
+  constraint via scheduler warm-preference + placement reservations, drain
+  ordering, and dead-worker fencing — see docs/runtime-worker-contract.md
+  "Single writer per version hash".
 
 ## Re-verify on every eve / world-postgres bump
 

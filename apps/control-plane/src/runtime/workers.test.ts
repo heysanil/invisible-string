@@ -155,4 +155,109 @@ describe.skipIf(!TEST_DATABASE_URL)("worker registry — per-worker identity", (
     const res = await call("/internal/workers/heartbeat", { id: randomUUID(), capacity }, {});
     expect(res.status).toBe(401);
   });
+
+  test("heartbeat from a DEAD worker is fenced (404), never silently 200", async () => {
+    const id = newWorkerId();
+    await call(
+      "/internal/workers/register",
+      { id, url: `http://worker-${id}:8080`, capacity, identity: { mode: "shared-secret" } },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    // Sweeper marks it dead (heartbeat gap) — simulate directly.
+    await handle.db
+      .update(schema.workers)
+      .set({ status: "dead" })
+      .where(eq(schema.workers.id, id));
+
+    const hb = await call(
+      "/internal/workers/heartbeat",
+      { id, capacity },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    expect(hb.status).toBe(404);
+    const body = (await hb.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("worker_fenced");
+    // Status must NOT be resurrected by the heartbeat.
+    const row = await handle.db.select().from(schema.workers).where(eq(schema.workers.id, id));
+    expect(row[0]!.status).toBe("dead");
+
+    // Re-register (the worker's fencing response) revives it as a fresh epoch.
+    const reg = await call(
+      "/internal/workers/register",
+      { id, url: `http://worker-${id}:8080`, capacity, identity: { mode: "shared-secret" } },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    expect(reg.status).toBe(200);
+    const revived = await handle.db.select().from(schema.workers).where(eq(schema.workers.id, id));
+    expect(revived[0]!.status).toBe("live");
+  });
+
+  test("heartbeat with draining:true flips live → draining (drain starts at t≈0)", async () => {
+    const id = newWorkerId();
+    await call(
+      "/internal/workers/register",
+      { id, url: `http://worker-${id}:8080`, capacity, identity: { mode: "shared-secret" } },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    const hb = await call(
+      "/internal/workers/heartbeat",
+      { id, capacity, draining: true },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    expect(hb.status).toBe(200);
+    const row = await handle.db.select().from(schema.workers).where(eq(schema.workers.id, id));
+    expect(row[0]!.status).toBe("draining");
+
+    // A later plain heartbeat must NOT un-drain it.
+    await call(
+      "/internal/workers/heartbeat",
+      { id, capacity },
+      { [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET },
+    );
+    const after = await handle.db.select().from(schema.workers).where(eq(schema.workers.id, id));
+    expect(after[0]!.status).toBe("draining");
+  });
+
+  test("registration allowlist rejects unprovisioned worker ids (403)", async () => {
+    const allowed = newWorkerId();
+    const rogue = newWorkerId();
+    const guarded = new Elysia().use(
+      workerRegistryPlugin({
+        db: handle.db,
+        workerSharedSecret: SECRET,
+        allowInsecureWorkerTransport: true,
+        allowedWorkerIds: [allowed],
+      }),
+    );
+    const callGuarded = (body: unknown) =>
+      guarded.handle(
+        new Request("http://localhost/internal/workers/register", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            [WORKER_BOOTSTRAP_SECRET_HEADER]: SECRET,
+          },
+          body: JSON.stringify(body),
+        }),
+      );
+
+    const rejected = await callGuarded({
+      id: rogue,
+      url: `http://worker-${rogue}:8080`,
+      capacity,
+      identity: { mode: "shared-secret" },
+    });
+    expect(rejected.status).toBe(403);
+    expect(((await rejected.json()) as { error: { code: string } }).error.code).toBe(
+      "worker_not_allowed",
+    );
+
+    const ok = await callGuarded({
+      id: allowed,
+      url: `http://worker-${allowed}:8080`,
+      capacity,
+      identity: { mode: "shared-secret" },
+    });
+    expect(ok.status).toBe(200);
+  });
 });

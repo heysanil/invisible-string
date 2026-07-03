@@ -64,10 +64,28 @@ export function triggerCarriesData(trigger: TriggerConfig): boolean {
 }
 
 /**
- * Build the `@` autocomplete option list from the live draft: form-trigger
- * field keys (`@trigger.<key>`), attached connections (`@<slug>`) and skills
- * (`@skill.<slug>`). Resources whose names slugify to "" are unaddressable
- * and omitted (the compiler rejects them at publish).
+ * The FIXED data keys the Slack adapter emits in TriggerEvent.data
+ * (packages/shared/src/trigger-adapters.ts slackEventToTriggerData) — offered
+ * in autocomplete so authors never have to guess key names that would only
+ * fail at runtime as "(not provided)".
+ */
+export const SLACK_TRIGGER_DATA_KEYS: readonly { key: string; info: string }[] = [
+  { key: "text", info: "The Slack message text (mention stripped)." },
+  { key: "user", info: "Slack user id of the sender." },
+  { key: "channel", info: "Slack channel id the message was posted in." },
+  { key: "ts", info: "Message timestamp (Slack ts)." },
+  { key: "thread_ts", info: "Thread root timestamp (the reply target)." },
+  { key: "team", info: "Slack team (workspace) id." },
+  { key: "eventType", info: "Inbound event type: app_mention or message." },
+  { key: "channelType", info: "Channel type (channel / group / im) when known." },
+];
+
+/**
+ * Build the `@` autocomplete option list from the live draft: trigger data
+ * keys (`@trigger.<key>` — form fields, the Slack adapter's fixed shape, or
+ * the webhook message convention), attached connections (`@<slug>`) and
+ * skills (`@skill.<slug>`). Resources whose names slugify to "" are
+ * unaddressable and omitted (the compiler rejects them at publish).
  */
 export function referenceOptions(sources: ReferenceSources): ReferenceOption[] {
   const options: ReferenceOption[] = [];
@@ -83,6 +101,26 @@ export function referenceOptions(sources: ReferenceSources): ReferenceOption[] {
           : "Resolved from the submitted form when a run starts.",
       });
     }
+  }
+
+  if (sources.trigger.type === "slack") {
+    for (const { key, info } of SLACK_TRIGGER_DATA_KEYS) {
+      options.push({
+        label: `@trigger.${key}`,
+        kind: "trigger",
+        detail: "slack event",
+        info,
+      });
+    }
+  }
+
+  if (sources.trigger.type === "webhook") {
+    options.push({
+      label: "@trigger.message",
+      kind: "trigger",
+      detail: "webhook body",
+      info: 'The "message" field of the posted JSON (the documented convention). Any other top-level key is addressable as @trigger.<key>.',
+    });
   }
 
   for (const connection of sources.connections) {

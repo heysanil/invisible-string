@@ -116,12 +116,34 @@ export function createWorkerServer(options: {
   requestDrain: () => void;
   /** Live eve sandbox count (docker). Defaults to 0 until the reaper tracks it. */
   sandboxCount?: () => number;
+  /**
+   * Called with the eve session id of every proxied `/eve/v1/session/:id/*`
+   * request — the sandbox reaper's idle signal (containers are labelled by
+   * eve session).
+   */
+  onSessionActivity?: (eveSessionId: string) => void;
   log?: (message: string) => void;
 }): WorkerServer {
   const { config, agents, cache, ports, callbackToken, isDraining, requestDrain } =
     options;
   const log = options.log ?? (() => {});
   const sandboxCount = options.sandboxCount ?? (() => 0);
+  const onSessionActivity = options.onSessionActivity ?? (() => {});
+
+  // Dispatch-token replay guard: each token carries a unique jti (fresh mint
+  // per ensure call); a captured token replayed inside its 60s TTL is refused.
+  const seenDispatchJtis = new Map<string, number>();
+  function dispatchJtiFresh(jti: string | undefined, expSeconds: number): boolean {
+    const now = Date.now();
+    for (const [key, expiry] of seenDispatchJtis) {
+      if (expiry <= now) seenDispatchJtis.delete(key);
+    }
+    if (jti === undefined) return true; // legacy token without jti — allow
+    if (seenDispatchJtis.has(jti)) return false;
+    // Keep until exp + max clock skew so a replay after pruning cannot win.
+    seenDispatchJtis.set(jti, expSeconds * 1000 + 60_000);
+    return true;
+  }
 
   const server = Bun.serve({
     port: config.port,
@@ -149,24 +171,34 @@ export function createWorkerServer(options: {
   // ── internal API ──────────────────────────────────────────────────────────
 
   function authorized(request: Request): boolean {
-    // Bootstrap shared secret (Phase-1 default, always accepted).
+    // Bootstrap shared secret — accepted only in `shared-secret` mode. Once a
+    // worker declares `worker-token` identity, inbound dispatches MUST carry
+    // the audience-bound dispatch token: continuing to accept the bootstrap
+    // bearer would keep the whole fleet impersonable from one leaked secret.
     const provided = request.headers.get(WORKER_BOOTSTRAP_SECRET_HEADER);
-    if (provided !== null && secretsEqual(provided, config.workerSharedSecret)) {
+    if (
+      provided !== null &&
+      config.authMode !== "worker-token" &&
+      secretsEqual(provided, config.workerSharedSecret)
+    ) {
       return true;
     }
     // Per-worker DISPATCH token (Phase-3 identity): audience-bound to THIS
-    // worker id, so a dispatch captured for another worker is rejected here.
+    // worker id, so a dispatch captured for another worker is rejected here;
+    // its unique jti is single-use within the TTL (replay guard).
     const dispatchToken = request.headers.get(DISPATCH_TOKEN_HEADER);
     const workerId = request.headers.get(WORKER_ID_HEADER);
     if (
       dispatchToken !== null &&
       (workerId === null || workerId === config.workerId)
     ) {
-      return verifyDispatchToken(
+      const check = verifyDispatchToken(
         config.workerSharedSecret,
         config.workerId,
         dispatchToken,
-      ).ok;
+      );
+      if (!check.ok) return false;
+      return dispatchJtiFresh(check.claims.jti, check.claims.exp);
     }
     return false;
   }
@@ -214,6 +246,19 @@ export function createWorkerServer(options: {
         400,
         "invalid_request",
         err instanceof Error ? err.message : "invalid JSON body",
+      );
+    }
+    // Authoritative local capacity backstop: the scheduler's view is up to a
+    // heartbeat interval stale, so the worker itself enforces maxAgents —
+    // running + boot-in-flight; re-ensuring an already-active hash is free.
+    if (
+      !agents.isActive(input.versionHash) &&
+      agents.activeCount() >= config.maxAgents
+    ) {
+      return errorResponse(
+        503,
+        "no_capacity",
+        `worker is at its agent cap (${config.maxAgents}) — schedule elsewhere`,
       );
     }
     try {
@@ -356,6 +401,10 @@ export function createWorkerServer(options: {
     if (!agents.beginRequest(hash)) {
       return errorResponse(503, "agent_stopping", `agent ${hash} is stopping`);
     }
+    // Sandbox-reaper idle signal: any proxied call addressing an eve session
+    // counts as activity for that session's sandbox.
+    const sessionMatch = /^\/eve\/v1\/session\/([^/?]+)/.exec(rest);
+    if (sessionMatch?.[1] !== undefined) onSessionActivity(sessionMatch[1]);
 
     let finished = false;
     const finish = (): void => {

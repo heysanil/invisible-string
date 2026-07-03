@@ -6,11 +6,24 @@
  *                                      status live; in `worker-token` mode the
  *                                      response carries a short-lived
  *                                      per-worker session token
- *   POST /internal/workers/heartbeat   {id, url?, capacity?} → refresh; 404 when
- *                                      the row is unknown (worker re-registers);
- *                                      rotates the session token when the caller
+ *   POST /internal/workers/heartbeat   {id, url?, capacity?, draining?} →
+ *                                      refresh; 404 when the row is unknown OR
+ *                                      when the row was marked `dead` (fenced —
+ *                                      the worker must stop its orphaned agents
+ *                                      and re-register as a fresh epoch);
+ *                                      `draining: true` flips a live row to
+ *                                      `draining` so the scheduler stops
+ *                                      routing new work at drain start; rotates
+ *                                      the session token when the caller
  *                                      authenticated with one
  *   POST /internal/workers/deregister  {id} → status dead (drain path)
+ *
+ * FENCING (zombie-dead / split-brain guard): a worker the sweeper marked
+ * `dead` (heartbeat gap > TTL) may still be alive and running agents. Its next
+ * heartbeat is answered 404 `worker_fenced` — NEVER silently 200 — so the
+ * worker stops its (possibly failed-over) agents and re-registers as a fresh
+ * epoch instead of running the same version hash concurrently with the worker
+ * the sweeper resumed those runs on (one live agent per hash per world DB).
  *
  * AUTH (docs/PLAN.md Phase 3 task 5 — per-worker identity, deferred from
  * Phase 1): the first `register` authenticates with the bootstrap
@@ -21,10 +34,16 @@
  * and it never resends the bootstrap secret. `shared-secret` mode (Phase-1
  * default) keeps guarding every call with `x-worker-secret`. Either credential
  * is accepted on heartbeat/deregister so both modes interoperate.
+ *
+ * REGISTRATION ALLOWLIST: the bootstrap secret alone lets any holder register
+ * an arbitrary worker id + URL and attract secret-bearing dispatches. When
+ * `WORKER_ALLOWED_IDS` is configured, register rejects worker ids that were
+ * not pre-provisioned (403 `worker_not_allowed`) — a leaked bootstrap secret
+ * then no longer suffices to join the fleet.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
 import {
@@ -35,6 +54,7 @@ import {
   WORKER_ID_HEADER,
   WORKER_TOKEN_HEADER,
   type ApiErrorBody,
+  type Logger,
   type WorkerIdentityDeclaration,
 } from "@invisible-string/shared";
 
@@ -48,6 +68,8 @@ interface WorkerBody {
   url?: string;
   capacity?: Record<string, unknown>;
   identity: WorkerIdentityDeclaration;
+  /** Heartbeat only: the worker has begun a graceful drain. */
+  draining?: boolean;
 }
 
 /**
@@ -101,6 +123,7 @@ function parseWorkerBody(raw: unknown, requireUrl: boolean): WorkerBody | null {
     url: body.url as string | undefined,
     capacity,
     identity: identity.data,
+    draining: body.draining === true,
   };
 }
 
@@ -111,10 +134,22 @@ export function workerRegistryPlugin(deps: {
   allowInsecureWorkerTransport?: boolean;
   /** Heartbeat cadence advertised to workers (default = ttl/3). */
   heartbeatIntervalMs?: number;
+  /**
+   * Pre-provisioned worker ids (WORKER_ALLOWED_IDS). When set, register
+   * rejects any id not on the list — the bootstrap secret alone no longer
+   * admits arbitrary workers into the fleet. Unset = allow all (dev/CI).
+   */
+  allowedWorkerIds?: readonly string[];
+  /** Structured lifecycle logging (worker.registered / worker.deregistered). */
+  logger?: Logger;
 }) {
   const { db } = deps;
   const allowInsecureHttp = deps.allowInsecureWorkerTransport === true;
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 10_000;
+  const allowedIds =
+    deps.allowedWorkerIds && deps.allowedWorkerIds.length > 0
+      ? new Set(deps.allowedWorkerIds.map((id) => id.toLowerCase()))
+      : null;
 
   function urlProblemFor(parsed: WorkerBody): string | null {
     if (parsed.url === undefined) return null;
@@ -173,6 +208,17 @@ export function workerRegistryPlugin(deps: {
           "expected {id: uuid, url: http(s) URL, capacity?, identity?}",
         );
       }
+      if (allowedIds !== null && !allowedIds.has(parsed.id.toLowerCase())) {
+        set.status = 403;
+        deps.logger?.warn("worker.register_rejected", {
+          workerId: parsed.id,
+          fields: { reason: "worker_not_allowed" },
+        });
+        return errorBody(
+          "worker_not_allowed",
+          "worker id is not on this control plane's allowlist (WORKER_ALLOWED_IDS)",
+        );
+      }
       const urlProblem = urlProblemFor(parsed);
       if (urlProblem) {
         set.status = 400;
@@ -197,6 +243,10 @@ export function workerRegistryPlugin(deps: {
             updatedAt: new Date(),
           },
         });
+      deps.logger?.info("worker.registered", {
+        workerId: parsed.id,
+        fields: { authMode: parsed.identity.mode },
+      });
 
       // Per-worker identity: mint a fresh session token (rotate on re-register).
       if (parsed.identity.mode === "worker-token") {
@@ -223,17 +273,45 @@ export function workerRegistryPlugin(deps: {
         set.status = 400;
         return errorBody("insecure_worker_url", urlProblem);
       }
+      // NEVER touch a `dead` row from a heartbeat: the sweeper may have failed
+      // that worker over already. Answer 404 so the worker fences itself
+      // (stops orphaned agents) and re-registers as a fresh epoch.
       const updated = await db
         .update(schema.workers)
         .set({
           lastHeartbeatAt: new Date(),
           ...(parsed.url ? { address: parsed.url } : {}),
           ...(parsed.capacity ? { capacity: parsed.capacity } : {}),
+          // Graceful drain start: live → draining (scheduler filters `live`,
+          // so new work stops routing here immediately). Never the reverse —
+          // a heartbeat cannot un-drain a worker.
+          ...(parsed.draining ? { status: "draining" as const } : {}),
           updatedAt: new Date(),
         })
-        .where(eq(schema.workers.id, parsed.id))
+        .where(
+          and(
+            eq(schema.workers.id, parsed.id),
+            ne(schema.workers.status, "dead"),
+          ),
+        )
         .returning({ id: schema.workers.id });
       if (updated.length === 0) {
+        const existing = await db
+          .select({ status: schema.workers.status })
+          .from(schema.workers)
+          .where(eq(schema.workers.id, parsed.id))
+          .limit(1);
+        if (existing[0]?.status === "dead") {
+          deps.logger?.warn("worker.fenced", {
+            workerId: parsed.id,
+            fields: { reason: "heartbeat_from_dead_worker" },
+          });
+          set.status = 404;
+          return errorBody(
+            "worker_fenced",
+            "worker was marked dead — stop local agents and re-register",
+          );
+        }
         // 404 → the worker re-registers on its next tick (registration.ts).
         set.status = 404;
         return errorBody("worker_not_registered", "unknown worker id — re-register");
@@ -262,6 +340,7 @@ export function workerRegistryPlugin(deps: {
         .update(schema.workers)
         .set({ status: "dead", updatedAt: new Date() })
         .where(eq(schema.workers.id, parsed.id));
+      deps.logger?.info("worker.deregistered", { workerId: parsed.id });
       return { ok: true as const };
     });
 }

@@ -417,6 +417,14 @@ export const agentSessions = pgTable(
     origin: sessionOrigin("origin").notNull(),
     /** TriggerEvent.principal: { workspaceId, userId?, source }. */
     principal: jsonb("principal").$type<Record<string, unknown>>().notNull(),
+    /**
+     * Slack thread ↔ session mapping key (`<integrationId>:<channel>:<threadTs>`,
+     * see runtime/dispatch.ts slackThreadKey). A REAL column (not jsonb) so the
+     * partial unique index below makes "one session per Slack thread" a DB
+     * invariant — two racing first-messages cannot mint two sessions — and
+     * thread-reply routing is an indexed lookup instead of a scan.
+     */
+    slackThreadKey: text("slack_thread_key"),
     /** Sticky while the session's sandbox is live on a worker. */
     affinityWorkerId: uuid("affinity_worker_id").references(() => workers.id, {
       onDelete: "set null",
@@ -437,6 +445,11 @@ export const agentSessions = pgTable(
     index("agent_sessions_eve_session_id_idx")
       .on(table.eveSessionId)
       .where(sql`${table.eveSessionId} IS NOT NULL`),
+    // One agent_session per Slack thread per workflow — enforced by the DB so
+    // two concurrent first-messages in a new thread cannot mint two sessions.
+    uniqueIndex("agent_sessions_workflow_slack_thread_key_uidx")
+      .on(table.workflowId, table.slackThreadKey)
+      .where(sql`${table.slackThreadKey} IS NOT NULL`),
   ],
 );
 

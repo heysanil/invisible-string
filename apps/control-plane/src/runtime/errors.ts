@@ -264,6 +264,19 @@ export const errors = {
     new RuntimeApiError(502, "slack_oauth_failed", `Slack OAuth failed: ${detail}`),
   slackStateInvalid: () =>
     new RuntimeApiError(400, "slack_state_invalid", "OAuth state is missing, expired, or invalid"),
+  slackInstallForbidden: () =>
+    new RuntimeApiError(
+      403,
+      "slack_install_forbidden",
+      "the Slack install must be completed by a signed-in admin of the workspace that started it",
+    ),
+  slackTeamAlreadyConnected: (teamId: string) =>
+    new RuntimeApiError(
+      409,
+      "slack_team_already_connected",
+      `Slack team ${teamId} is already connected to a different workspace — disconnect it there first`,
+      { teamId },
+    ),
 
   workspaceRunCapExceeded: (cap: number) =>
     new RuntimeApiError(

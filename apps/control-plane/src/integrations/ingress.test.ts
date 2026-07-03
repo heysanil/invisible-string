@@ -580,9 +580,20 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(new URL(location).searchParams.get("state")).toBeTruthy();
   });
 
-  test("Slack OAuth callback exchanges the code and stores encrypted creds", async () => {
+  test("Slack OAuth callback requires the initiating admin session (tenant-binding CSRF)", async () => {
+    // A valid signed state alone must NOT bind the install: without the
+    // initiating admin's session cookie the callback refuses and stores nothing.
     const state = signOAuthState(PLATFORM_JWT_SECRET, orgId);
     const res = await api("GET", `/integrations/slack/callback?code=the-code&state=${encodeURIComponent(state)}`);
+    expect(res.status).toBeGreaterThanOrEqual(300);
+    expect(res.headers.get("location")).toContain("slack=forbidden");
+    const rows = await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId));
+    expect(rows.filter((r) => r.type === "slack")).toHaveLength(0);
+  });
+
+  test("Slack OAuth callback exchanges the code and stores encrypted creds", async () => {
+    const state = signOAuthState(PLATFORM_JWT_SECRET, orgId);
+    const res = await api("GET", `/integrations/slack/callback?code=the-code&state=${encodeURIComponent(state)}`, { cookie: ownerCookie });
     expect(res.status).toBeGreaterThanOrEqual(300);
     expect(res.headers.get("location")).toContain("slack=connected");
 
@@ -598,6 +609,30 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const dto = list.integrations.find((i) => i.externalId === "T-TEST")!;
     expect(dto.hasCredentials).toBe(true);
     expect(dto.teamName).toBe("Ingress Team");
+  });
+
+  test("Slack OAuth state is single-use (replay within the TTL is refused)", async () => {
+    const state = signOAuthState(PLATFORM_JWT_SECRET, orgId);
+    const first = await api("GET", `/integrations/slack/callback?code=code-a&state=${encodeURIComponent(state)}`, { cookie: ownerCookie });
+    expect(first.headers.get("location")).toContain("slack=connected");
+    const replay = await api("GET", `/integrations/slack/callback?code=code-b&state=${encodeURIComponent(state)}`, { cookie: ownerCookie });
+    expect(replay.status).toBe(400); // slack_state_invalid
+  });
+
+  test("a Slack team connected to one org can NOT be silently re-bound by another org", async () => {
+    const other = await signUpWithOrg("Slack Thief");
+    // The thief org mints its own valid state and completes consent for the
+    // SAME Slack team — ownership must not move.
+    const state = signOAuthState(PLATFORM_JWT_SECRET, other.orgId);
+    const res = await stack.app.handle(
+      new Request(`${BASE_URL}/integrations/slack/callback?code=the-code&state=${encodeURIComponent(state)}`, {
+        headers: { cookie: other.cookie },
+      }),
+    );
+    expect(res.headers.get("location")).toContain("slack=team_already_connected");
+    const rows = await db.select().from(schema.integrations).where(eq(schema.integrations.externalId, "T-TEST"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.organizationId).toBe(orgId); // still the first org's
   });
 
   // ── Slack events: signature, mention → dispatch, thread reply = same session ─
@@ -698,6 +733,39 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     await Bun.sleep(200);
     const sessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
     expect(sessions).toHaveLength(1);
+  });
+
+  test("Slack: the message twin of an app_mention (same channel:ts) does NOT double-dispatch", async () => {
+    const wfId = await createWorkflow("Slack Twin WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
+    await publish(wfId);
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    // One user message @mentioning the bot arrives as TWO Slack events with
+    // DIFFERENT event_ids: the app_mention and its raw `message.channels` twin.
+    const ts = "1720000400.000700";
+    const mention = { type: "app_mention", user: "U9", text: "<@U0BOT> twin me", ts, channel: "C-twin", team: "T-TEST" };
+    const twin = { type: "message", channel: "C-twin", channel_type: "channel", user: "U9", text: "<@U0BOT> twin me", ts, team: "T-TEST" };
+    await postSlackEvent(mention, { eventId: randomUUID() });
+    await postSlackEvent(twin, { eventId: randomUUID() });
+
+    const session = await until(async () => {
+      const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
+      return rows.find((s) => s.origin === "slack") ?? undefined;
+    }, "twin session");
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "twin run done");
+    await Bun.sleep(200); // give a wrong second dispatch time to appear
+
+    const sessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+    expect(sessions).toHaveLength(1);
+    const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session.id));
+    expect(runs).toHaveLength(1); // exactly ONE dispatch for one user message
   });
 
   // ── disconnect ─────────────────────────────────────────────────────────────

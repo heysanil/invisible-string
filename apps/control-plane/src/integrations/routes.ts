@@ -21,7 +21,6 @@ import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
 import {
   formSubmissionToTriggerData,
-  makeLogEvent,
   parseWorkflowDraft,
   slackEventToTriggerData,
   slackTriggerBindingSchema,
@@ -35,7 +34,6 @@ import {
   type GetTriggerBindingResponse,
   type ListIntegrationsResponse,
   type ListTriggerBindingsResponse,
-  type LogEventName,
   type SlackInnerEvent,
   type SlackIntegrationMetadata,
   type SlackTriggerBinding,
@@ -43,7 +41,7 @@ import {
   type TriggerPrincipal,
 } from "@invisible-string/shared";
 
-import { workspacePlugin } from "../workspace";
+import { resolveWorkspace, workspacePlugin } from "../workspace";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import {
   dispatchTriggerRun,
@@ -78,12 +76,24 @@ import {
   upsertSlackIntegration,
   upsertTriggerType,
 } from "./service";
-import { buildSlackInstallUrl, signOAuthState, verifyOAuthState } from "./slack-oauth";
+import {
+  buildSlackInstallUrl,
+  signOAuthState,
+  verifyOAuthStateDetailed,
+  OAuthNonceCache,
+} from "./slack-oauth";
 import type { SlackClient } from "./slack-client";
 import { SlackEventDedup, verifySlackRequest } from "./slack-verify";
 import { hashIngressToken, generateIngressToken, tokenSuffix } from "./tokens";
 
 type WorkflowRow = typeof schema.workflows.$inferSelect;
+
+/**
+ * Slack event payloads are small (a few KB); cap them far below the 8 MB
+ * transport limit so an unauthenticated flooder cannot make us buffer + HMAC
+ * megabytes per request. Shares the general trigger-ingress cap (256 KiB).
+ */
+export const SLACK_EVENT_MAX_BODY_BYTES = TRIGGER_INGRESS_MAX_BODY_BYTES;
 
 export interface IntegrationDeps {
   runtime: RuntimeDeps;
@@ -99,27 +109,40 @@ export interface IntegrationDeps {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function log(level: "info" | "warn" | "error", event: LogEventName, fields: Record<string, unknown>): void {
-  // Structured, redaction-safe (no secrets, no raw payloads) — see
-  // packages/shared observability contract.
-  console.log(
-    JSON.stringify(
-      makeLogEvent({
-        level,
-        event,
-        fields: fields as Record<string, string | number | boolean | null>,
-      }),
-    ),
-  );
+/** Duck-typed Bun server (Elysia ctx.server) — only requestIP is consumed. */
+interface SocketPeerSource {
+  requestIP?(request: Request): { address?: string } | null;
 }
 
-function clientIp(request: Request): string {
-  const fwd = request.headers.get("x-forwarded-for");
-  if (fwd) {
-    const first = fwd.split(",")[0]?.trim();
-    if (first) return first;
+/**
+ * Client IP for rate limiting. X-Forwarded-For is attacker-writable, so it is
+ * only consulted when `trustProxyHops > 0`, and then from the RIGHT: with N
+ * trusted proxies the entry at `entries.length - N` is what the nearest
+ * trusted proxy recorded. With no declared proxy the socket peer address is
+ * authoritative and XFF is ignored entirely — a client cannot mint itself a
+ * fresh rate-limit bucket per request by rotating a header.
+ */
+export function clientIpFrom(
+  request: Request,
+  trustProxyHops: number,
+  server?: SocketPeerSource | null,
+): string {
+  if (trustProxyHops > 0) {
+    const fwd = request.headers.get("x-forwarded-for");
+    if (fwd) {
+      const entries = fwd
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+      if (entries.length > 0) {
+        const idx = Math.max(0, entries.length - trustProxyHops);
+        const candidate = entries[idx];
+        if (candidate) return candidate;
+      }
+    }
   }
-  return request.headers.get("x-real-ip")?.trim() || "unknown";
+  const socket = server?.requestIP?.(request)?.address;
+  return socket && socket.length > 0 ? socket : "unknown";
 }
 
 /** Pure: does an inbound Slack event start a NEW session under this binding? */
@@ -142,6 +165,14 @@ export function integrationsPlugin(deps: IntegrationDeps) {
   const { runtime, config } = deps;
   const db = runtime.db;
   const masterKey = runtime.masterKey;
+  // Structured, redaction-safe logging with correlation ids in the TOP-LEVEL
+  // slots (never buried in `fields`), through the app logger so LOG_LEVEL
+  // filtering and the mandatory redaction pass apply (observability contract).
+  const logger = runtime.logger;
+  const clientIp = (request: Request, server?: SocketPeerSource | null): string =>
+    clientIpFrom(request, config.trustProxyHops, server);
+  // Single-use OAuth install states (replay defense on top of the TTL).
+  const oauthNonces = new OAuthNonceCache();
 
   // Webhook idempotency: a source-provided key (Idempotency-Key /
   // X-Idempotency-Key header) makes redelivery return the SAME run instead of
@@ -189,13 +220,13 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       // ── PUBLIC: webhook + form ingress ────────────────────────────────────
       .post(
         "/t/:token",
-        async ({ params, request, set }): Promise<TriggerIngressResponse> => {
+        async ({ params, request, set, server }): Promise<TriggerIngressResponse> => {
           const raw = await request.text();
           if (Buffer.byteLength(raw, "utf8") > TRIGGER_INGRESS_MAX_BODY_BYTES) {
             throw errors.triggerPayloadTooLarge(TRIGGER_INGRESS_MAX_BODY_BYTES);
           }
           const token = params.token;
-          const ip = clientIp(request);
+          const ip = clientIp(request, server);
           const ipDecision = deps.ipRateLimiter.hit(`ip:${ip}`);
           if (!ipDecision.allowed) {
             set.headers["retry-after"] = String(ipDecision.retryAfterSeconds);
@@ -212,7 +243,9 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           // token_hash index. Unknown/disabled tokens 404 (existence-hiding).
           const found = await resolveTriggerByTokenHash(db, hashIngressToken(token));
           if (!found || !found.trigger.enabled) {
-            log("warn", "trigger.rejected", { reason: "unknown_or_disabled_token" });
+            logger.warn("trigger.rejected", {
+              fields: { reason: "unknown_or_disabled_token" },
+            });
             throw errors.triggerNotFound();
           }
           const { trigger, workflow } = found;
@@ -251,9 +284,10 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             workspaceId: workflow.organizationId,
             source: trigger.type,
           };
-          log("info", "trigger.received", {
+          logger.info("trigger.received", {
+            workspaceId: workflow.organizationId,
             workflowId: workflow.id,
-            triggerType: trigger.type,
+            fields: { triggerType: trigger.type },
           });
 
           const result = await dispatchTriggerRun(runtime, {
@@ -273,11 +307,16 @@ export function integrationsPlugin(deps: IntegrationDeps) {
               sessionId: result.session.id,
             });
           }
-          log(result.dispatched ? "info" : "warn", result.dispatched ? "dispatch.delivered" : "dispatch.failed", {
-            workflowId: workflow.id,
-            runId: result.run.id,
-            sessionId: result.session.id,
-          });
+          logger.emit(
+            result.dispatched ? "info" : "warn",
+            result.dispatched ? "dispatch.delivered" : "dispatch.failed",
+            {
+              workspaceId: workflow.organizationId,
+              workflowId: workflow.id,
+              runId: result.run.id,
+              sessionId: result.session.id,
+            },
+          );
 
           set.status = 202;
           return { accepted: true, runId: result.run.id, sessionId: result.session.id };
@@ -288,21 +327,42 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       // ── PUBLIC: Slack Events API ──────────────────────────────────────────
       .post(
         "/integrations/slack/events",
-        async ({ request, set }) => {
-          const raw = await request.text();
+        async ({ request, set, server }) => {
           if (!config.slack) {
             throw errors.integrationNotConfigured("slack");
           }
-          // Signature + replay window FIRST (before any parsing/routing).
+          // Cheap gates FIRST (before buffering or HMAC-ing anything): missing
+          // auth headers, per-IP budget, and a tight body cap — Slack event
+          // payloads are small, so an 8 MB HMAC per anonymous request would be
+          // free CPU burn for a flooder.
+          const signature = request.headers.get(SLACK_SIGNATURE_HEADER);
+          const timestamp = request.headers.get(SLACK_TIMESTAMP_HEADER);
+          if (!signature || !timestamp) {
+            set.status = 401;
+            return { error: { code: "slack_signature_invalid", message: "signature verification failed" } };
+          }
+          const ip = clientIp(request, server);
+          const ipDecision = deps.ipRateLimiter.hit(`slack:${ip}`);
+          if (!ipDecision.allowed) {
+            set.headers["retry-after"] = String(ipDecision.retryAfterSeconds);
+            throw errors.rateLimited(ipDecision.retryAfterSeconds);
+          }
+          const raw = await request.text();
+          if (Buffer.byteLength(raw, "utf8") > SLACK_EVENT_MAX_BODY_BYTES) {
+            throw errors.triggerPayloadTooLarge(SLACK_EVENT_MAX_BODY_BYTES);
+          }
+          // Signature + replay window (before any parsing/routing).
           const verify = verifySlackRequest({
             signingSecret: config.slack.signingSecret,
-            signature: request.headers.get(SLACK_SIGNATURE_HEADER),
-            timestamp: request.headers.get(SLACK_TIMESTAMP_HEADER),
+            signature,
+            timestamp,
             rawBody: raw,
             replayWindowSeconds: SLACK_REPLAY_WINDOW_SECONDS,
           });
           if (!verify.ok) {
-            log("warn", "trigger.rejected", { source: "slack", reason: verify.reason });
+            logger.warn("trigger.rejected", {
+              fields: { source: "slack", reason: verify.reason },
+            });
             set.status = 401;
             return { error: { code: "slack_signature_invalid", message: "signature verification failed" } };
           }
@@ -335,9 +395,9 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           // streams via the normal SSE surface; a slow ensure-agent must not
           // hold the webhook open. Failures are logged, never surfaced to Slack.
           void routeSlackEvent(body.team_id, body.event).catch((error) => {
-            log("error", "dispatch.failed", {
-              source: "slack",
-              reason: error instanceof Error ? error.message : String(error),
+            logger.error("dispatch.failed", {
+              err: error,
+              fields: { source: "slack" },
             });
           });
           return { ok: true };
@@ -345,8 +405,17 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         { parse: "none" },
       )
 
-      // ── PUBLIC: Slack OAuth callback (state-signed) ───────────────────────
-      .get("/integrations/slack/callback", async ({ query, set }) => {
+      // ── PUBLIC route, but SESSION-BOUND: Slack OAuth callback ─────────────
+      //
+      // The signed `state` alone must NOT decide which org owns the install —
+      // an attacker who can mint a state for their own org could phish a
+      // victim Slack admin into approving the consent link, landing the
+      // victim's bot token under the attacker's org (tenant-binding CSRF).
+      // The redirect back from Slack is a top-level GET to our origin, so the
+      // initiating admin's session cookie rides along: the callback requires
+      // a signed-in ADMIN of the state's workspace (same active workspace),
+      // plus a single-use nonce so a captured state cannot be replayed.
+      .get("/integrations/slack/callback", async ({ query, set, request }) => {
         const settingsUrl = `${config.publicAppUrl}/settings`;
         const redirectTo = (url: string) => {
           set.status = 302;
@@ -359,8 +428,30 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         }
         const code = typeof query.code === "string" ? query.code : "";
         const state = typeof query.state === "string" ? query.state : "";
-        const workspaceId = verifyOAuthState(config.stateSecret, state);
-        if (!code || !workspaceId) throw errors.slackStateInvalid();
+        const verified = verifyOAuthStateDetailed(config.stateSecret, state);
+        if (!code || !verified) throw errors.slackStateInvalid();
+        const workspaceId = verified.workspaceId;
+
+        // Bind the round-trip to the initiating authenticated admin session.
+        const resolution = await resolveWorkspace(
+          runtime.workspaceDeps,
+          request.headers,
+          "admin",
+          workspaceId,
+        );
+        if (!resolution.ok) {
+          logger.warn("trigger.rejected", {
+            workspaceId,
+            fields: { source: "slack.install", reason: "no_admin_session_at_callback" },
+          });
+          redirectTo(`${settingsUrl}?slack=forbidden`);
+          return;
+        }
+
+        // Single-use: a leaked/captured state is dead after its first use.
+        if (!oauthNonces.consume(verified.nonce, verified.exp)) {
+          throw errors.slackStateInvalid();
+        }
 
         const exchange = await deps.slackClient.exchangeOAuthCode({
           clientId: config.slack.clientId,
@@ -377,18 +468,30 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           botUserId: access.bot_user_id,
           scopes: access.scope ? access.scope.split(/[\s,]+/).filter((s) => s.length > 0) : [],
         };
-        await upsertSlackIntegration(db, {
-          organizationId: workspaceId,
-          teamId: access.team.id,
-          credentialsEncrypted: encryptIntegrationCredentials(
-            JSON.stringify(credentials),
-            masterKey,
-            "slack",
-            access.team.id,
-          ),
-          metadata,
+        try {
+          await upsertSlackIntegration(db, {
+            organizationId: workspaceId,
+            teamId: access.team.id,
+            credentialsEncrypted: encryptIntegrationCredentials(
+              JSON.stringify(credentials),
+              masterKey,
+              "slack",
+              access.team.id,
+            ),
+            metadata,
+          });
+        } catch (error) {
+          if (isRuntimeApiError(error) && error.code === "slack_team_already_connected") {
+            // Never silently steal a team another org already connected.
+            redirectTo(`${settingsUrl}?slack=team_already_connected`);
+            return;
+          }
+          throw error;
+        }
+        logger.info("trigger.received", {
+          workspaceId,
+          fields: { source: "slack.install" },
         });
-        log("info", "trigger.received", { source: "slack.install", workspaceId });
         redirectTo(`${settingsUrl}?slack=connected`);
       })
 
@@ -521,6 +624,26 @@ export function integrationsPlugin(deps: IntegrationDeps) {
   async function routeSlackEvent(teamId: string, event: SlackInnerEvent): Promise<void> {
     const integration = await findSlackIntegrationByTeam(db, teamId);
     if (!integration) return; // no install for this team — nothing to route
+
+    // TWIN SUPPRESSION: one channel message that @mentions the bot arrives as
+    // TWO events (`app_mention` AND `message.channels`) with DIFFERENT
+    // event_ids, so event_id dedup cannot catch it. The app_mention twin is
+    // authoritative (Slack pre-scopes it to our bot); drop the raw `message`
+    // twin so a single user message never dispatches twice. DMs are exempt —
+    // Slack sends no app_mention for IMs, the message.im IS the event.
+    const botUserId = (
+      integration.metadata as Partial<SlackIntegrationMetadata> | null
+    )?.botUserId;
+    if (
+      event.type === "message" &&
+      event.channel_type !== "im" &&
+      typeof botUserId === "string" &&
+      botUserId.length > 0 &&
+      (event.text ?? "").trimStart().startsWith(`<@${botUserId}>`)
+    ) {
+      return;
+    }
+
     const mapped = slackEventToTriggerData(event);
     if (!mapped.ok) return; // bot echo / edit / empty — ignore
 
@@ -586,27 +709,33 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         extraAgentEnv,
         ...(existingSession
           ? { existingSession }
-          : { sessionPrincipalExtra: { slackThreadKey: threadKey } }),
+          : {
+              sessionPrincipalExtra: { slackThreadKey: threadKey },
+              newSessionSlackThreadKey: threadKey,
+            }),
       };
-      log("info", "trigger.received", {
-        source: "slack",
+      logger.info("trigger.received", {
+        workspaceId: workflow.organizationId,
         workflowId: workflow.id,
-        continued: existingSession != null,
+        ...(existingSession ? { sessionId: existingSession.id } : {}),
+        fields: { source: "slack", continued: existingSession != null },
       });
       try {
         const result = await dispatchTriggerRun(runtime, dispatchInput);
-        log("info", "dispatch.delivered", {
-          source: "slack",
+        logger.info("dispatch.delivered", {
+          workspaceId: workflow.organizationId,
           workflowId: workflow.id,
           runId: result.run.id,
           sessionId: result.session.id,
+          fields: { source: "slack" },
         });
       } catch (error) {
         if (isRuntimeApiError(error) && error.code === "session_busy") continue;
-        log("error", "dispatch.failed", {
-          source: "slack",
+        logger.error("dispatch.failed", {
+          workspaceId: workflow.organizationId,
           workflowId: workflow.id,
-          reason: error instanceof Error ? error.message : String(error),
+          err: error,
+          fields: { source: "slack" },
         });
       }
     }

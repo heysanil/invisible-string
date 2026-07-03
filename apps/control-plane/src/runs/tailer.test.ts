@@ -65,8 +65,17 @@ function memoryStore(): MemoryStore {
         .map((e) => ({ seq: e.seq, event: e.event, at: new Date().toISOString() }));
     },
     async markRun(_runId, patch) {
+      // Mirror the drizzle store's CAS: terminal statuses are sticky.
+      if (
+        store.runStatus === "succeeded" ||
+        store.runStatus === "failed" ||
+        store.runStatus === "canceled"
+      ) {
+        return false;
+      }
       store.runPatches.push(patch);
       store.runStatus = patch.status;
+      return true;
     },
     async getRunStatus() {
       return store.runStatus;
@@ -261,6 +270,37 @@ describe("tailRun", () => {
     // startedAt set at start; completedAt set at terminal.
     expect(store.runPatches[0]?.startedAt).toBeInstanceOf(Date);
     expect(store.runPatches.at(-1)?.completedAt).toBeInstanceOf(Date);
+  });
+
+  test("a run already terminal (sweeper/cancel) is NEVER resurrected by a late tail (CAS)", async () => {
+    const lines = await fixtureLines("mocked-turn-events.ndjson");
+    const store = memoryStore();
+    // The sweeper failed this run while our dispatch was still in flight.
+    store.runStatus = "failed";
+    const bus = new RunEventBus();
+    const frames = collectFrames(bus, "run-1");
+    let opened = 0;
+
+    const handle = tailRun({
+      runId: "run-1",
+      agentSessionId: "sess-1",
+      openStream: async () => {
+        opened += 1;
+        return ndjsonResponse(lines);
+      },
+      store,
+      bus,
+      maxWallClockMs: 5_000,
+    });
+    await handle.done;
+
+    // The tail refused to start: no failed→running flip, no stream read,
+    // no frames published, no events persisted.
+    expect(store.runStatus).toBe("failed");
+    expect(store.runPatches).toHaveLength(0);
+    expect(opened).toBe(0);
+    expect(frames).toHaveLength(0);
+    expect(store.events).toHaveLength(0);
   });
 
   test("approval park: input.requested then session.waiting → run waiting, session waiting", async () => {

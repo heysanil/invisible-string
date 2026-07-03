@@ -47,12 +47,23 @@ export function signOAuthState(
   return `${body}.${sign(secret, body)}`;
 }
 
-/** Verify a `state` and return its workspace id, or null when invalid/expired. */
-export function verifyOAuthState(
+/** A verified state's payload (workspace binding + single-use nonce). */
+export interface VerifiedOAuthState {
+  workspaceId: string;
+  nonce: string;
+  /** Expiry, unix seconds. */
+  exp: number;
+}
+
+/**
+ * Verify a `state` and return its full payload (or null when invalid/expired).
+ * The nonce enables single-use enforcement — see {@link OAuthNonceCache}.
+ */
+export function verifyOAuthStateDetailed(
   secret: string,
   state: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
-): string | null {
+): VerifiedOAuthState | null {
   const dot = state.lastIndexOf(".");
   if (dot <= 0) return null;
   const body = state.slice(0, dot);
@@ -70,12 +81,44 @@ export function verifyOAuthState(
   if (
     typeof payload.workspaceId !== "string" ||
     payload.workspaceId.length === 0 ||
+    typeof payload.nonce !== "string" ||
+    payload.nonce.length === 0 ||
     typeof payload.exp !== "number" ||
     payload.exp < nowSeconds
   ) {
     return null;
   }
-  return payload.workspaceId;
+  return { workspaceId: payload.workspaceId, nonce: payload.nonce, exp: payload.exp };
+}
+
+/** Verify a `state` and return its workspace id, or null when invalid/expired. */
+export function verifyOAuthState(
+  secret: string,
+  state: string,
+  nowSeconds: number = Math.floor(Date.now() / 1000),
+): string | null {
+  return verifyOAuthStateDetailed(secret, state, nowSeconds)?.workspaceId ?? null;
+}
+
+/**
+ * Single-use enforcement for OAuth state nonces: a signed state is otherwise
+ * replayable for its whole TTL (only the Slack `code` is single-use).
+ * `consume` returns true the FIRST time a nonce is presented and false on any
+ * repeat; entries expire with the state's own `exp` so the cache stays small.
+ * In-process — fine under the single-control-plane deployment constraint.
+ */
+export class OAuthNonceCache {
+  private readonly consumed = new Map<string, number>();
+
+  consume(nonce: string, expSeconds: number, nowSeconds: number = Math.floor(Date.now() / 1000)): boolean {
+    // Opportunistic prune of expired entries.
+    for (const [key, exp] of this.consumed) {
+      if (exp < nowSeconds) this.consumed.delete(key);
+    }
+    if (this.consumed.has(nonce)) return false;
+    this.consumed.set(nonce, expSeconds);
+    return true;
+  }
 }
 
 export interface BuildInstallUrlInput {

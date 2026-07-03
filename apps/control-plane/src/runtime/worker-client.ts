@@ -157,15 +157,19 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
     async ensureAgent(workerAddress, contentHash, request) {
       assertSecureTransport(workerAddress);
       const headers: Record<string, string> = {
-        "x-worker-secret": options.workerSharedSecret,
         "content-type": "application/json",
       };
-      // Per-worker dispatch token (Phase-3 identity) when configured. Sent
-      // ALONGSIDE the bootstrap secret so a shared-secret worker still accepts
-      // the call; a worker-token worker verifies the audience-bound token.
+      // Per-worker dispatch token (Phase-3 identity) when configured. The
+      // bootstrap secret is NOT sent alongside it — otherwise every ensure
+      // call would hand the fleet-master secret to the (possibly compromised)
+      // worker, undercutting the whole point of per-worker identity. Workers
+      // verify dispatch tokens with their own copy of the bootstrap secret +
+      // their id, so this works against shared-secret-mode workers too.
       if (options.mintDispatchToken && request.workerId) {
         headers[DISPATCH_TOKEN_HEADER] = options.mintDispatchToken(request.workerId);
         headers[WORKER_ID_HEADER] = request.workerId;
+      } else {
+        headers["x-worker-secret"] = options.workerSharedSecret;
       }
       const { workerId: _workerId, ...ensureBody } = request;
       const res = await doFetch(

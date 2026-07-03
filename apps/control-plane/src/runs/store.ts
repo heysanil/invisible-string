@@ -3,7 +3,7 @@
  * Interface-first so the tailer unit-tests against an in-memory fake; the
  * drizzle implementation is the production path.
  */
-import { and, asc, count, eq, gt } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
   AgentSessionStatus,
@@ -34,7 +34,15 @@ export interface RunStore {
   /** Events persisted across ALL runs of the session = eve `startIndex`. */
   countSessionEvents(agentSessionId: string): Promise<number>;
   listEventsAfter(runId: string, afterSeq: number): Promise<StoredRunEvent[]>;
-  markRun(runId: string, patch: RunStatusPatch): Promise<void>;
+  /**
+   * Compare-and-swap status transition: terminal statuses (succeeded/failed/
+   * canceled) are STICKY — the update only applies while the run is still
+   * queued/running/waiting, and the return value says whether it did. This is
+   * the guard against split-brain transitions: a sweeper-failed run cannot be
+   * resurrected to `running` by a late dispatch tail, and a canceled run
+   * cannot be stomped to `failed` by a dying tail.
+   */
+  markRun(runId: string, patch: RunStatusPatch): Promise<boolean>;
   getRunStatus(runId: string): Promise<RunStatus | null>;
   markSession(agentSessionId: string, status: AgentSessionStatus): Promise<void>;
   updateSessionContinuation(
@@ -91,7 +99,7 @@ export function createDrizzleRunStore(db: Db): RunStore {
     },
 
     async markRun(runId, patch) {
-      await db
+      const updated = await db
         .update(schema.runs)
         .set({
           status: patch.status,
@@ -101,7 +109,15 @@ export function createDrizzleRunStore(db: Db): RunStore {
             ? { completedAt: patch.completedAt }
             : {}),
         })
-        .where(eq(schema.runs.id, runId));
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            // Terminal statuses are sticky (see RunStore.markRun).
+            inArray(schema.runs.status, ["queued", "running", "waiting"]),
+          ),
+        )
+        .returning({ id: schema.runs.id });
+      return updated.length > 0;
     },
 
     async getRunStatus(runId) {

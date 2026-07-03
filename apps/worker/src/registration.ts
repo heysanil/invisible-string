@@ -39,6 +39,8 @@ export interface RegisterWorkerBody {
   url: string;
   capacity: WorkerCapacity;
   identity: { mode: "shared-secret" | "worker-token" };
+  /** Heartbeat only: this worker has begun a graceful drain. */
+  draining?: boolean;
 }
 
 export interface RegistrationState {
@@ -53,6 +55,13 @@ export interface Registration {
   /** Start the register-then-heartbeat loop (idempotent). */
   start(): void;
   stop(): void;
+  /**
+   * FIRST action of a graceful drain: flag every subsequent heartbeat with
+   * `draining: true` and push one immediately (best-effort) so the control
+   * plane flips the row to `draining` and the scheduler stops routing new
+   * work here at t≈0 — not after the in-flight wait.
+   */
+  beginDrain(): Promise<void>;
   /** Best-effort deregister — never throws (control plane may be down). */
   deregister(): Promise<void>;
   state(): RegistrationState;
@@ -77,6 +86,14 @@ export function createRegistration(options: {
     runningHashes: string[];
   };
   log?: (message: string) => void;
+  /**
+   * FENCING HOOK: called when the control plane answers a heartbeat 404 —
+   * either it never knew this worker (fresh control-plane DB) or it marked it
+   * `dead` and may already have failed its runs over to another worker. The
+   * supervisor stops all local agents here BEFORE re-registering, so the same
+   * version hash never runs concurrently on two workers against one world DB.
+   */
+  onFenced?: () => Promise<void> | void;
 }): Registration {
   const { config, snapshot } = options;
   const log = options.log ?? (() => {});
@@ -85,6 +102,7 @@ export function createRegistration(options: {
   let started = false;
   let stopped = false;
   let registered = false;
+  let draining = false;
   let consecutiveFailures = 0;
   let lastError: string | null = null;
   /** Per-worker session token (worker-token mode). Rotated on each heartbeat. */
@@ -106,6 +124,7 @@ export function createRegistration(options: {
         runningHashes: counts.runningHashes,
       },
       identity: { mode: config.authMode },
+      ...(draining ? { draining: true } : {}),
     };
   }
 
@@ -167,9 +186,38 @@ export function createRegistration(options: {
           true,
         );
         if (status === 404) {
+          // Unknown row OR fenced (the sweeper marked us dead and may have
+          // failed our runs over elsewhere). Stop local agents FIRST — the
+          // same hash must never run on two workers against one world DB —
+          // then re-register promptly (no backoff: the control plane just
+          // answered, it is reachable).
           registered = false;
-          sessionToken = null; // stale row — re-register (and re-mint a token)
-          throw new Error("heartbeat -> HTTP 404 (re-registering)");
+          sessionToken = null;
+          log("heartbeat -> HTTP 404 (fenced/unknown) — stopping agents and re-registering");
+          try {
+            await options.onFenced?.();
+          } catch (err) {
+            log(
+              `onFenced hook failed (${err instanceof Error ? err.message : String(err)}) — re-registering anyway`,
+            );
+          }
+          consecutiveFailures = 0;
+          lastError = null;
+          scheduleNext();
+          return;
+        }
+        if (status === 401 || status === 403) {
+          // Expired/invalid session token (e.g. a control-plane outage longer
+          // than the token TTL — rotation only happens on a SUCCESSFUL
+          // heartbeat). Retrying with the same dead token would 401 forever;
+          // fall back to a fresh bootstrap-authenticated register instead.
+          registered = false;
+          sessionToken = null;
+          log(`heartbeat -> HTTP ${status} — credential rejected, re-registering with the bootstrap secret`);
+          consecutiveFailures = 0;
+          lastError = null;
+          scheduleNext();
+          return;
         }
         if (status < 200 || status >= 300) {
           throw new Error(`heartbeat -> HTTP ${status}`);
@@ -214,6 +262,22 @@ export function createRegistration(options: {
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;
+      }
+    },
+    async beginDrain(): Promise<void> {
+      draining = true;
+      // Best-effort immediate draining heartbeat so the scheduler stops
+      // routing to this worker NOW, not at the next tick. Failures are fine —
+      // the periodic loop (or deregister) will convey it.
+      try {
+        if (registered) {
+          await post("/internal/workers/heartbeat", heartbeatBody(), true);
+          log("draining heartbeat sent — control plane stops routing new work here");
+        }
+      } catch (err) {
+        log(
+          `draining heartbeat failed (${err instanceof Error ? err.message : String(err)}) — continuing drain`,
+        );
       }
     },
     async deregister(): Promise<void> {

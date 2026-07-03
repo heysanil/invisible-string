@@ -1,0 +1,3 @@
+ALTER TABLE "agent_sessions" ADD COLUMN "slack_thread_key" text;--> statement-breakpoint
+UPDATE "agent_sessions" SET "slack_thread_key" = "principal"->>'slackThreadKey' WHERE "id" IN (SELECT DISTINCT ON ("workflow_id", "principal"->>'slackThreadKey') "id" FROM "agent_sessions" WHERE "principal"->>'slackThreadKey' IS NOT NULL ORDER BY "workflow_id", "principal"->>'slackThreadKey', "created_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "agent_sessions_workflow_slack_thread_key_uidx" ON "agent_sessions" USING btree ("workflow_id","slack_thread_key") WHERE "agent_sessions"."slack_thread_key" IS NOT NULL;

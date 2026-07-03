@@ -23,6 +23,7 @@ import {
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
+import { errors } from "../runtime/errors";
 
 type TriggerRow = typeof schema.triggers.$inferSelect;
 type IntegrationRow = typeof schema.integrations.$inferSelect;
@@ -284,7 +285,15 @@ export async function findSlackIntegrationByTeam(
   return rows[0] ?? null;
 }
 
-/** Upsert a Slack integration for a team (install / re-install refreshes creds). */
+/**
+ * Upsert a Slack integration for a team (re-install by the SAME org refreshes
+ * creds). A Slack team already connected to a DIFFERENT organization is NEVER
+ * silently re-bound: `organizationId` is part of the integration's identity —
+ * flipping it on conflict would hand the first org's live trigger routing (and
+ * outbound bot posting) to whichever org installed last (cross-tenant
+ * credential/routing confusion). The losing installer gets a typed 409; the
+ * first org must explicitly disconnect before the team can move.
+ */
 export async function upsertSlackIntegration(
   db: Db,
   input: {
@@ -306,14 +315,20 @@ export async function upsertSlackIntegration(
     .onConflictDoUpdate({
       target: [schema.integrations.type, schema.integrations.externalId],
       set: {
-        organizationId: input.organizationId,
         credentialsEncrypted: input.credentialsEncrypted,
         metadata: input.metadata as unknown as Record<string, unknown>,
         updatedAt: new Date(),
       },
+      // Refresh only the SAME org's row — never reassign ownership.
+      setWhere: eq(schema.integrations.organizationId, input.organizationId),
     })
     .returning();
-  return rows[0]!;
+  const row = rows[0];
+  if (!row) {
+    // Conflict row exists but belongs to another organization.
+    throw errors.slackTeamAlreadyConnected(input.teamId);
+  }
+  return row;
 }
 
 export async function deleteIntegration(

@@ -29,6 +29,13 @@
       "when": 1783064482991,
       "tag": "0003_clumsy_marvel_boy",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783091502032,
+      "tag": "0004_flimsy_franklin_richards",
+      "breakpoints": true
     }
   ]
 }

@@ -18,3 +18,6 @@ spike/.artifacts/
 .vscode/
 *.local
 .claude/
+
+# Local provider key (never commit)
+.openrouter-key

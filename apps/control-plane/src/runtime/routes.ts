@@ -20,7 +20,7 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, count, eq, inArray } from "drizzle-orm";
+import { and, asc, count, eq, inArray, ne } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
 import {
@@ -372,10 +372,18 @@ export async function failDispatch(
   throw errors.workerDispatchFailed(detail);
 }
 
-/** Count the session's queued/running runs (session-serialization guard). */
+/**
+ * Count the session's active runs (session-serialization guard). `waiting`
+ * counts as busy: a parked HITL run still owns the eve session's turn — a new
+ * message dispatched into a parked session would create a SECOND tail on the
+ * same NDJSON stream once the approval resumes it (double-persisted events,
+ * corrupted startIndex resume points). One writer per eve session at a time;
+ * answer the pending approval (or cancel the run) first.
+ */
 export async function countDispatchingRuns(
   db: DbClient,
   agentSessionId: string,
+  options: { excludeRunId?: string } = {},
 ): Promise<number> {
   const rows = await db
     .select({ value: count() })
@@ -383,7 +391,8 @@ export async function countDispatchingRuns(
     .where(
       and(
         eq(schema.runs.agentSessionId, agentSessionId),
-        inArray(schema.runs.status, ["queued", "running"]),
+        inArray(schema.runs.status, ["queued", "running", "waiting"]),
+        ...(options.excludeRunId ? [ne(schema.runs.id, options.excludeRunId)] : []),
       ),
     );
   return rows[0]?.value ?? 0;
@@ -404,6 +413,8 @@ export function runtimePlugin(deps: RuntimeDeps) {
           1_000,
           Math.floor(runtime.workerHeartbeatTtlMs / 3),
         ),
+        allowedWorkerIds: runtime.workerAllowedIds,
+        logger: deps.logger,
       }),
     )
     // GET /internal/metrics — worker-plane-guarded fleet snapshot.
@@ -480,6 +491,34 @@ export function runtimePlugin(deps: RuntimeDeps) {
           .update(schema.workflows)
           .set({ publishedVersionId: version.id })
           .where(eq(schema.workflows.id, workflow.id));
+
+        // Keep live Slack routing rules in sync with what was just published:
+        // the binding's rules (mentionOnly / channelId / DMs) are part of the
+        // workflow definition, so a republish must update the persisted
+        // trigger row — otherwise ingress keeps routing on stale rules. The
+        // integration (team) pointer is user-managed and preserved; nothing
+        // happens until the user has bound a team.
+        if (definition.trigger.type === "slack") {
+          const triggerRows = await db
+            .select({
+              id: schema.triggers.id,
+              type: schema.triggers.type,
+              integrationId: schema.triggers.integrationId,
+            })
+            .from(schema.triggers)
+            .where(eq(schema.triggers.workflowId, workflow.id))
+            .limit(1);
+          const triggerRow = triggerRows[0];
+          if (triggerRow?.type === "slack" && triggerRow.integrationId) {
+            await db
+              .update(schema.triggers)
+              .set({
+                binding: definition.trigger
+                  .binding as unknown as Record<string, unknown>,
+              })
+              .where(eq(schema.triggers.id, triggerRow.id));
+          }
+        }
 
         // Kick the build (single-flight per hash; cache hit = no-op). A
         // cached-succeeded outcome resolves fast enough to await; a fresh
@@ -829,7 +868,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
         // Only a run parked on input (status `waiting`) is resolvable. Flip it
         // to queued inside the advisory lock so a double POST cannot
         // double-dispatch the same answer; the run row is REUSED (no cap
-        // change — a waiting run already holds its slot).
+        // change — a waiting run already holds its slot). One-writer guard:
+        // no OTHER run of this session may be dispatching — resuming this run
+        // while another tails the same eve stream would double-read it.
         const resumed = await db.transaction(async (tx) => {
           await lockWorkspaceRunCap(tx, workspace.organizationId);
           const rows = await tx
@@ -838,6 +879,13 @@ export function runtimePlugin(deps: RuntimeDeps) {
             .where(eq(schema.runs.id, run.id))
             .limit(1);
           if (rows[0]?.status !== "waiting") return false;
+          if (
+            (await countDispatchingRuns(tx, session.id, {
+              excludeRunId: run.id,
+            })) > 0
+          ) {
+            throw errors.sessionBusy();
+          }
           await tx
             .update(schema.runs)
             .set({ status: "queued", error: null })

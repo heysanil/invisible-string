@@ -94,11 +94,35 @@ export function createSupervisor(
       runningHashes: agents.list().map((a) => a.hash),
     }),
     log,
+    // Fenced by the control plane (heartbeat 404 — marked dead / unknown): our
+    // runs may already be failed over to another worker. Stop every local
+    // agent BEFORE re-registering so one version hash never executes on two
+    // workers against its shared world DB (single-writer-per-hash contract).
+    onFenced: async () => {
+      log("fenced by control plane — stopping all local agents before re-register");
+      await agents.stopAll();
+    },
   });
+
+  // Per-eve-session proxy activity: stamped by the HTTP surface on every
+  // proxied session call, joined by the sandbox reaper to the container's
+  // `eve.session` label so an actively-used sandbox is NEVER stopped at the
+  // 30-min mark (design correction 4 is an IDLE window, not a lifetime cap).
+  const sessionActivity = new Map<string, number>();
+  const SESSION_ACTIVITY_MAX = 10_000;
+  const noteSessionActivity = (eveSessionId: string): void => {
+    if (sessionActivity.size >= SESSION_ACTIVITY_MAX && !sessionActivity.has(eveSessionId)) {
+      const oldest = sessionActivity.keys().next().value;
+      if (oldest !== undefined) sessionActivity.delete(oldest);
+    }
+    sessionActivity.delete(eveSessionId); // re-insert to refresh iteration order
+    sessionActivity.set(eveSessionId, Date.now());
+  };
 
   // Sandbox reaper (design correction 4): eve sandboxes have no idle timeout,
   // so the worker stops docker containers labelled by eve session that have
-  // been idle past the window. Off by default (needs a docker daemon).
+  // been IDLE past the window (idle = no proxied session activity since the
+  // later of container start / last proxy call). Off by default (needs docker).
   const sandboxReaper: SandboxReaper | null = config.sandboxReaperEnabled
     ? createSandboxReaper({
         docker: createDockerCliClient({
@@ -107,6 +131,7 @@ export function createSupervisor(
           log,
         }),
         idleStopMs: config.sandboxIdleStopMs,
+        activityOf: (session) => sessionActivity.get(session),
         log,
       })
     : null;
@@ -119,6 +144,10 @@ export function createSupervisor(
     drainPromise ??= (async () => {
       draining = true;
       log("draining: refusing new ensures/requests, waiting for in-flight…");
+      // FIRST: tell the control plane (status → draining) so the scheduler
+      // stops routing new sessions here at t≈0 — otherwise every dispatch
+      // during the in-flight wait would hit our 503 and fail a user run.
+      await registration.beginDrain();
       agents.stopIdleReaper();
       sandboxReaper?.stop();
       const deadline = Date.now() + config.drainTimeoutMs;
@@ -146,6 +175,8 @@ export function createSupervisor(
     callbackToken,
     isDraining: () => draining,
     requestDrain: () => void drain(),
+    sandboxCount: () => sandboxReaper?.lastScanCount() ?? 0,
+    onSessionActivity: noteSessionActivity,
     log,
   });
 

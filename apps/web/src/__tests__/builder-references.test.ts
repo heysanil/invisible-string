@@ -58,9 +58,42 @@ test("connection slug matches the compiler's slugify (kebab, trimmed)", () => {
   expect(slugifyName("linear")).toBe("linear");
 });
 
-test("non-form triggers contribute no @trigger options", () => {
+test("manual triggers contribute no @trigger options (no dispatch data)", () => {
   const manual = referenceOptions({ ...sources, trigger: { type: "manual" } });
   expect(manual.some((o) => o.kind === "trigger")).toBe(false);
+});
+
+test("slack triggers offer the adapter's FIXED data keys", () => {
+  const slack = referenceOptions({
+    ...sources,
+    trigger: {
+      type: "slack",
+      binding: { mentionOnly: true, includeDirectMessages: false },
+    },
+  });
+  const labels = slack.filter((o) => o.kind === "trigger").map((o) => o.label);
+  expect(labels).toEqual([
+    "@trigger.text",
+    "@trigger.user",
+    "@trigger.channel",
+    "@trigger.ts",
+    "@trigger.thread_ts",
+    "@trigger.team",
+    "@trigger.eventType",
+    "@trigger.channelType",
+  ]);
+  // Each parses back as a trigger reference (grammar agreement).
+  for (const label of labels) {
+    const refs = parseReferences(label);
+    expect(refs.length).toBe(1);
+    expect(refs[0]!.kind).toBe("trigger");
+  }
+});
+
+test("webhook triggers offer the documented @trigger.message convention", () => {
+  const webhook = referenceOptions({ ...sources, trigger: { type: "webhook" } });
+  const labels = webhook.filter((o) => o.kind === "trigger").map((o) => o.label);
+  expect(labels).toEqual(["@trigger.message"]);
 });
 
 test("resources whose names slugify to empty are omitted", () => {

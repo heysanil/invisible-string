@@ -31,6 +31,14 @@ export interface IntegrationsConfig {
   stateSecret: string;
   /** Null when the Slack app is not configured on this deployment. */
   slack: SlackAppConfig | null;
+  /**
+   * Number of trusted reverse-proxy hops in front of this deployment
+   * (TRUST_PROXY_HOPS, default 0). Per-IP rate limiting derives the client IP
+   * from the X-Forwarded-For entry that the NEAREST TRUSTED proxy recorded
+   * (rightmost-untrusted) — never the attacker-controlled leftmost value.
+   * 0 = no proxy: XFF is ignored entirely and the socket peer address is used.
+   */
+  trustProxyHops: number;
 }
 
 /** Default Slack bot scopes: read mentions/DMs + reply. */
@@ -82,7 +90,12 @@ export function loadIntegrationsConfig(
     };
   }
 
-  return { publicAppUrl, stateSecret, slack };
+  const trustRaw = env.TRUST_PROXY_HOPS?.trim();
+  const trustParsed = trustRaw ? Number(trustRaw) : 0;
+  const trustProxyHops =
+    Number.isInteger(trustParsed) && trustParsed >= 0 ? trustParsed : 0;
+
+  return { publicAppUrl, stateSecret, slack, trustProxyHops };
 }
 
 /** The OAuth redirect URI Slack calls back (must match the app config). */

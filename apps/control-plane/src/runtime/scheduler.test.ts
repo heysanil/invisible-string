@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  clearAgentReservations,
   isWorkerLive,
   pickWorker,
+  reserveAgentSlot,
+  reservedAgentsOf,
   toSchedulableWorker,
   type SchedulableWorker,
   type WorkerCapacitySnapshot,
@@ -155,6 +158,66 @@ describe("pickWorker — ordering: affinity > warm > cold", () => {
     );
     expect(result.ok && result.reason).toBe("cold");
     expect(result.ok && result.worker.id).toBe("cold");
+  });
+});
+
+describe("placement reservations (thundering-herd guard)", () => {
+  test("a burst of cold placements spreads instead of stampeding one worker", () => {
+    clearAgentReservations();
+    const fleet = [
+      worker("res-a", 1_000, { capacity: { runningAgents: 0, maxAgents: 2 } }),
+      worker("res-b", 2_000, { capacity: { runningAgents: 0, maxAgents: 2 } }),
+    ];
+    // Simulate what selectWorker does: pick, then reserve the booted hash.
+    const picks: string[] = [];
+    for (const hash of ["h1", "h2", "h3", "h4"]) {
+      const result = pickWorker(fleet, {
+        now: NOW,
+        heartbeatTtlMs: TTL,
+        defaultMaxAgents: 2,
+        versionHash: hash,
+        reservedOf: (w) => reservedAgentsOf(w, NOW),
+      });
+      expect(result.ok).toBeTrue();
+      if (!result.ok) return;
+      picks.push(result.worker.id);
+      reserveAgentSlot(result.worker.id, hash, NOW.getTime());
+    }
+    // With reservations counted, the 4 placements fill BOTH workers (2+2)
+    // instead of all landing on the freshest one.
+    expect(picks.filter((id) => id === "res-a").length).toBe(2);
+    expect(picks.filter((id) => id === "res-b").length).toBe(2);
+
+    // A 5th placement finds no headroom anywhere.
+    const overflow = pickWorker(fleet, {
+      now: NOW,
+      heartbeatTtlMs: TTL,
+      defaultMaxAgents: 2,
+      versionHash: "h5",
+      reservedOf: (w) => reservedAgentsOf(w, NOW),
+    });
+    expect(overflow).toEqual({ ok: false, reason: "no_capacity" });
+    clearAgentReservations();
+  });
+
+  test("a reservation clears when the heartbeat reports the hash running", () => {
+    clearAgentReservations();
+    reserveAgentSlot("res-c", "hash-x", NOW.getTime());
+    const cold = worker("res-c", 1_000, { capacity: { runningAgents: 1 } });
+    expect(reservedAgentsOf(cold, NOW)).toBe(1);
+    const warm = worker("res-c", 1_000, {
+      capacity: { runningAgents: 1, runningHashes: ["hash-x"] },
+    });
+    expect(reservedAgentsOf(warm, NOW)).toBe(0); // reported → no longer reserved
+    clearAgentReservations();
+  });
+
+  test("a reservation expires after its TTL (failed boot self-heals)", () => {
+    clearAgentReservations();
+    reserveAgentSlot("res-d", "hash-y", NOW.getTime() - 120_000, 60_000);
+    const w = worker("res-d", 1_000, { capacity: { runningAgents: 0 } });
+    expect(reservedAgentsOf(w, NOW)).toBe(0);
+    clearAgentReservations();
   });
 });
 

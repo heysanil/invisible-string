@@ -21,7 +21,7 @@
  * dispatch primitives (ensureAgentOnWorker/startTail/failDispatch/…) so the
  * two paths share one env contract, cap discipline, and tailer wiring.
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
   SessionOrigin,
@@ -124,6 +124,15 @@ export interface DispatchTriggerInput {
    * Ignored for continuations.
    */
   sessionPrincipalExtra?: Record<string, unknown>;
+  /**
+   * Slack thread ↔ session key for a NEW slack session (see
+   * {@link slackThreadKey}). Persisted on the indexed `slack_thread_key`
+   * column; a per-key advisory lock + in-transaction re-check make two racing
+   * first-messages of one thread resolve to ONE session (the loser gets a
+   * typed `session_busy`, which Slack routing drops silently). Ignored for
+   * continuations.
+   */
+  newSessionSlackThreadKey?: string;
 }
 
 export interface DispatchTriggerResult {
@@ -191,6 +200,29 @@ export async function dispatchTriggerRun(
         ...input.principal,
         ...(input.sessionPrincipalExtra ?? {}),
       };
+      if (input.newSessionSlackThreadKey) {
+        // Serialize "first message of this Slack thread": two concurrent
+        // events with distinct event_ids would both see no existing session
+        // and mint two. The advisory lock + re-check (backed by the partial
+        // unique index on (workflow_id, slack_thread_key)) picks one winner.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${input.newSessionSlackThreadKey})::bigint)`,
+        );
+        const existing = await tx
+          .select({ id: schema.agentSessions.id })
+          .from(schema.agentSessions)
+          .where(
+            and(
+              eq(schema.agentSessions.workflowId, input.workflowId),
+              eq(
+                schema.agentSessions.slackThreadKey,
+                input.newSessionSlackThreadKey,
+              ),
+            ),
+          )
+          .limit(1);
+        if (existing.length > 0) throw errors.sessionBusy();
+      }
       const inserted = await tx
         .insert(schema.agentSessions)
         .values({
@@ -201,6 +233,7 @@ export async function dispatchTriggerRun(
           continuationToken: null,
           origin: input.origin,
           principal,
+          slackThreadKey: input.newSessionSlackThreadKey ?? null,
           affinityWorkerId: worker.id,
           status: "active",
         })
@@ -306,8 +339,10 @@ export function slackThreadKey(
 
 /**
  * Find the continuable agent_session a Slack thread maps to (same workflow,
- * slack origin, matching `principal.slackThreadKey`, not closed/errored, and
- * carrying an eve continuation token). Null when the thread is new.
+ * slack origin, matching the indexed `slack_thread_key` column, not
+ * closed/errored, and carrying an eve continuation token). Null when the
+ * thread is new. Indexed lookup — O(1) per inbound event, not a scan of the
+ * org's slack sessions.
  */
 export async function findSlackThreadSession(
   db: Db,
@@ -323,19 +358,19 @@ export async function findSlackThreadSession(
         eq(schema.agentSessions.organizationId, organizationId),
         eq(schema.agentSessions.workflowId, workflowId),
         eq(schema.agentSessions.origin, "slack"),
+        eq(schema.agentSessions.slackThreadKey, threadKey),
       ),
-    );
-  for (const row of rows) {
-    const key = (row.principal as { slackThreadKey?: unknown } | null)?.slackThreadKey;
-    if (
-      key === threadKey &&
-      row.continuationToken &&
-      row.eveSessionId &&
-      row.status !== "closed" &&
-      row.status !== "error"
-    ) {
-      return row;
-    }
+    )
+    .limit(1);
+  const row = rows[0];
+  if (
+    row &&
+    row.continuationToken &&
+    row.eveSessionId &&
+    row.status !== "closed" &&
+    row.status !== "error"
+  ) {
+    return row;
   }
   return null;
 }

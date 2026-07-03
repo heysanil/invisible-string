@@ -79,6 +79,8 @@ export interface AgentManager {
   get(hash: string): AgentInfo | undefined;
   /** Running OR currently booting — cache eviction guard (never evict these). */
   isActive(hash: string): boolean;
+  /** Running + boot-in-flight agents (authoritative local capacity gauge). */
+  activeCount(): number;
   list(): AgentInfo[];
   totalInflight(): number;
   /** Proxy request lifecycle — keeps idle/drain bookkeeping accurate. */
@@ -407,6 +409,14 @@ export function createAgentManager(options: {
 
     isActive(hash: string): boolean {
       return running.has(hash) || pending.has(hash);
+    },
+
+    activeCount(): number {
+      let count = running.size;
+      for (const hash of pending.keys()) {
+        if (!running.has(hash)) count += 1;
+      }
+      return count;
     },
 
     list(): AgentInfo[] {

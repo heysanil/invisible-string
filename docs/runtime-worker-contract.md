@@ -82,11 +82,23 @@ authenticate by token/signature (no session):
   per-IP rate limits and a 256 KiB payload cap run BEFORE parsing. → 202
   `{accepted, runId, sessionId}`; the dispatcher POSTs a `TriggerEvent` to the
   compiled agent's `/eve/v1/platform/<trigger>` channel.
-- `POST /integrations/slack/events` — Slack Events API. Signature (`v0` HMAC)
-  + 5-min replay window verified FIRST; `event_id` dedup makes Slack retries
-  idempotent; routed by `team_id` → integration → bound workflows;
-  `thread_ts ↔ agent_session` continuation (a thread reply continues that
-  thread's session).
+- `POST /integrations/slack/events` — Slack Events API. Missing auth headers,
+  per-IP rate limit, and a 256 KiB body cap are checked BEFORE the HMAC;
+  signature (`v0` HMAC) + 5-min replay window next; `event_id` dedup makes
+  Slack retries idempotent; a `message` twin of an `app_mention` (one channel
+  mention arrives as BOTH, with different event_ids) is dropped by its leading
+  bot-mention prefix; routed by `team_id` → integration → bound workflows;
+  `thread_ts ↔ agent_session` continuation via the indexed
+  `agent_sessions.slack_thread_key` column (partial unique per workflow — two
+  racing first-messages of a new thread resolve to one session). DMs
+  (`channel_type: im`) key the session on the IM channel itself, so a 1:1
+  conversation keeps one ongoing session without threading.
+
+**One run per eve session at a time (hole closed):** `waiting` (parked HITL)
+counts as busy alongside queued/running — a new message into a parked session
+is 409 `session_busy` ("answer the pending approval first"), and
+`POST /runs/:id/input` refuses while any OTHER run of the session is
+dispatching. Exactly one tail per eve NDJSON stream at any instant.
 - `GET /integrations/slack/{install,callback}` — single platform Slack app
   OAuth; per-team bot token stored envelope-encrypted, keyed by `team_id`.
 
@@ -112,6 +124,41 @@ plane, `x-worker-secret`-guarded (`src/runtime/workers.ts`).
 Contract: one world **Postgres database per workflow version**, named
 `ws_v_<first 12 hash chars>`, provisioned + bootstrapped on the first build of
 a version (`src/build/world.ts`).
+
+### ⚠️ Single writer per version hash (cross-WORKER constraint)
+
+Database-per-version isolates VERSIONS from each other, but it does NOT make
+it safe to run TWO agent processes of the SAME hash against one
+`ws_v_<hash12>` database. Verified against `@workflow/world-postgres`
+@5.0.0-beta.20:
+
+- run-replay mutual exclusion is an in-process Map (`inflightWorkflowRuns` in
+  its queue) — per PROCESS, not per database;
+- `reenqueueActiveRuns` (recovery) enqueues graphile jobs with **no
+  idempotencyKey and no graphile queueName**, so every boot of a second agent
+  process creates DUPLICATE jobs for runs actively executing on the first —
+  two pollers then replay the same run concurrently (non-memoized model calls
+  and side-effecting tool calls execute twice; the run event log races).
+
+**Hard constraint: at most one live agent process per version hash,
+fleet-wide.** The platform enforces it operationally:
+
+- the scheduler prefers the warm worker for a hash (affinity → warm → cold),
+  and in-flight placement RESERVATIONS (runtime/scheduler.ts) keep a burst of
+  cold placements from double-booting one hash;
+- graceful drain flips the worker to `draining` FIRST (immediate heartbeat
+  with `draining: true`), so no new placement lands on it while its agents
+  finish;
+- dead-worker FENCING: a worker whose heartbeat lapses is marked `dead`; its
+  next heartbeat is answered **404 `worker_fenced`** and the worker STOPS ALL
+  LOCAL AGENTS before re-registering (apps/worker registration `onFenced`) —
+  a false-dead worker can therefore never keep executing a hash the sweeper
+  already resumed elsewhere.
+
+The residual race (fenced worker's agents live until its next heartbeat,
+≤ ~10 s, while the sweeper boots the hash elsewhere) is accepted for now;
+closing it fully needs jobKey/queueName support in the world factory (tracked
+as the (b) fallback in PLAN correction 10).
 
 Why a database and not a `search_path` schema: `@workflow/world-postgres`
 @5.0.0-beta.20 hardcodes `pgSchema('workflow')` in its drizzle schema, so all
@@ -185,10 +232,22 @@ dead worker: a PARKED (`waiting`) run has its session affinity **cleared** so
 the user's approval reschedules elsewhere; a RUNNING run is **re-tailed** on a
 freshly scheduled worker (`RunTailerManager.detach` stops the stale tail without
 failing the run; the durable eve turn continues on the new worker); a run whose
-session never got an eve session is failed. Graceful drain: the worker's
-`SIGTERM` handler finishes/park in-flight requests then `deregister`s (→ `dead`);
-new work never routes to a `draining`/`dead` worker because the scheduler only
-picks `live`.
+session never got an eve session is failed (compare-and-swap: run terminal
+statuses are STICKY — `RunStore.markRun` refuses to overwrite
+succeeded/failed/canceled, so a sweeper decision and a late dispatch tail can
+never resurrect each other's outcome). Graceful drain: the worker's `SIGTERM`
+handler FIRST sends a heartbeat with `draining: true` (→ `workers.status =
+'draining'`; the scheduler only picks `live`, so new work stops routing at
+t≈0), then finishes/parks in-flight requests, stops its agents, and
+`deregister`s (→ `dead`).
+
+**Fencing (zombie-dead workers).** A heartbeat for a row already marked `dead`
+is answered **404 `worker_fenced`** — never a silent 200. The worker reacts by
+stopping ALL local agents (its runs may already be failed over) and
+re-registering as a fresh epoch. A heartbeat 401/403 (expired per-worker
+session token after a control-plane outage) likewise demotes the worker to
+re-register with the bootstrap secret instead of retrying a dead credential
+forever.
 
 **Per-worker identity (`WORKER_AUTH_MODE=worker-token`; deferred from Phase 1).**
 The bootstrap `x-worker-secret` authenticates ONLY the first `register`. In
@@ -196,12 +255,28 @@ The bootstrap `x-worker-secret` authenticates ONLY the first `register`. In
 **session token** (returned in the register response, rotated on each heartbeat
 response) which the worker re-presents via `x-worker-token` + `x-worker-id` on
 heartbeat/deregister; and a per-call **dispatch token** (`x-dispatch-token`,
-audience `worker:<id>`) on ensure-agent, verified by the worker. Both secrets
+audience `worker:<id>`, unique single-use `jti` — the worker keeps a replay
+cache for the token TTL) on ensure-agent, verified by the worker. In
+worker-token mode the dispatch token is the ONLY credential the control plane
+sends on ensure (the bootstrap secret is NOT sent alongside — it would hand the
+fleet-master secret to every worker on every call), and a worker configured
+`worker-token` REJECTS the bootstrap secret on its inbound plane. Both secrets
 are derived from the bootstrap secret + worker id (`packages/shared`
 `worker-token-crypto.ts`), so no PKI is needed and a token captured for one
 worker is useless against another. `shared-secret` mode (default) keeps the
-Phase-1 single-credential behaviour; both are accepted so the modes interoperate
-during rollout.
+Phase-1 single-credential behaviour.
+
+**Registration allowlist.** `WORKER_ALLOWED_IDS` (comma-separated worker
+UUIDs) on the control plane restricts which worker identities may register —
+without it, a leaked bootstrap secret suffices to register a rogue worker URL
+that would receive secret-bearing dispatches. Set it in any deployment where
+worker ids are provisioned out of band (production); leave unset only in local
+dev/CI where ids are random per boot.
+
+**Clock skew.** Dispatch tokens (60 s TTL) and platform JWTs (exp ≤ 120 s) are
+minted on the control-plane clock and verified on the worker/agent host clock
+with 30 s of allowance — worker hosts MUST run NTP (chrony/systemd-timesyncd);
+a host >~30 s ahead rejects every dispatch.
 
 ## Worker env (Phase-3 additions)
 
@@ -211,8 +286,18 @@ during rollout.
 `eve.session`), `DOCKER_BIN` (default `docker`). The **sandbox reaper**
 (`apps/worker/src/sandbox-reaper.ts`, design correction 4) enumerates docker
 containers carrying the eve-session label and stops those idle past the window —
-eve gives sandboxes no idle timeout of its own. Artifact LRU (20 GB) never
-evicts a running hash (unchanged).
+eve gives sandboxes no idle timeout of its own. IDLE means "no proxied
+`/eve/v1/session/:id/*` activity for that session since max(container start,
+last proxy call)" — the supervisor stamps per-session activity on every
+proxied call and the reaper joins it to the container's session label, so a
+sandbox in continuous use is never stopped mid-run (the StartedAt
+approximation alone would have been a 30-min lifetime cap). The reaper's last
+scan count feeds `sandboxCount` in `/internal/health` + `/internal/status`.
+Artifact LRU (20 GB) never evicts a running hash (unchanged).
+
+The worker also enforces `WORKER_MAX_AGENTS` itself: `ensure` for a NEW hash
+answers 503 `no_capacity` when running + boot-in-flight agents are at the cap
+(authoritative backstop under stale scheduler snapshots).
 
 ## Observability (docs/PLAN.md Phase 3 task 5)
 
@@ -252,4 +337,27 @@ Worker `GET /internal/status` gains a `metrics` block (`runningAgents`,
 
 **Lifecycle.** Both planes handle SIGTERM/SIGINT: the control plane stops
 accepting connections, drains live NDJSON tailers, and closes the Postgres
-pool; the worker drains in-flight proxied requests then deregisters.
+pool; the worker first flags itself `draining` (immediate heartbeat), drains
+in-flight proxied requests, stops its agents, then deregisters.
+
+## Deployment constraints (hard)
+
+- **Exactly ONE control-plane instance.** Run-tail dedupe
+  (RunTailerManager), the dead-worker sweeper, boot reconcile, the SSE
+  RunEventBus, scheduler placement reservations, webhook idempotency, the
+  Slack event dedup, and OAuth nonce single-use are all in-process. A second
+  replica would double-tail runs (the (run_id, seq) PK then crash-loops one
+  tail), double-sweep failovers, and split SSE subscribers from their run's
+  tail. HA needs leader election / shared state first — do not scale this
+  process horizontally.
+- **`/internal/*` must not be internet-reachable.** The worker-plane surface
+  (register/heartbeat/deregister, `/internal/metrics`) is mounted on the same
+  listener as the tenant API and guarded only by worker credentials; restrict
+  it at the ingress/L7 layer (or bind a separate interface) so a leaked
+  secret alone cannot be exercised from the internet.
+- **NTP on every host** (see clock-skew note above).
+- **Per-IP rate limiting and proxies:** set `TRUST_PROXY_HOPS=<n>` to the
+  number of reverse proxies in front of the control plane. With 0 (default)
+  `X-Forwarded-For` is ignored and the socket peer address is used; with n>0
+  the rightmost-untrusted XFF entry is used — never the attacker-controlled
+  leftmost one.

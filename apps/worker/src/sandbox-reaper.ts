@@ -15,10 +15,11 @@ export interface SandboxContainer {
   /** The eve session label value (correlation/logging). */
   session: string;
   /**
-   * Best-known last-activity epoch ms. The CLI client approximates this from
-   * the container's `State.StartedAt` (docker exposes no per-exec idle metric),
-   * so eviction is effectively a max-lifetime cap for a long-lived sandbox; the
-   * seam lets a finer activity signal replace it without touching the policy.
+   * Baseline last-activity epoch ms from docker (`State.StartedAt` — docker
+   * exposes no per-exec idle metric). The policy combines it with the
+   * supervisor's per-session proxy-activity signal (`activityOf`), so an
+   * actively-used sandbox is never stopped; StartedAt alone only bounds a
+   * sandbox whose session has had NO platform traffic at all.
    */
   lastActivityAt: number;
 }
@@ -30,13 +31,32 @@ export interface DockerClient {
   stop(containerId: string): Promise<void>;
 }
 
-/** Pure policy: which containers are idle past the window? */
+/** Best-known activity for a container: proxy activity beats StartedAt. */
+export function effectiveLastActivity(
+  container: SandboxContainer,
+  activityOf?: (session: string) => number | undefined,
+): number {
+  const proxied = activityOf?.(container.session);
+  return proxied !== undefined
+    ? Math.max(container.lastActivityAt, proxied)
+    : container.lastActivityAt;
+}
+
+/**
+ * Pure policy: which containers are idle past the window? Idle = no proxied
+ * eve-session activity (agent-manager signal) since max(container start, last
+ * proxy call) — a sandbox in continuous use is NEVER stopped at the 30-minute
+ * mark (design correction 4 mandates an IDLE window, not a lifetime cap).
+ */
 export function selectIdleSandboxes(
   containers: SandboxContainer[],
   now: number,
   idleStopMs: number,
+  activityOf?: (session: string) => number | undefined,
 ): SandboxContainer[] {
-  return containers.filter((c) => now - c.lastActivityAt >= idleStopMs);
+  return containers.filter(
+    (c) => now - effectiveLastActivity(c, activityOf) >= idleStopMs,
+  );
 }
 
 export interface SweepResult {
@@ -48,6 +68,8 @@ export interface SandboxReaper {
   sweepOnce(now?: number): Promise<SweepResult>;
   start(): void;
   stop(): void;
+  /** Containers seen by the most recent scan (worker /internal metrics). */
+  lastScanCount(): number;
 }
 
 export function createSandboxReaper(options: {
@@ -55,9 +77,15 @@ export function createSandboxReaper(options: {
   idleStopMs: number;
   /** Sweep cadence (default idleStopMs/6, clamped 30s–5min). */
   intervalMs?: number;
+  /**
+   * Last-proxy-activity per eve session id (the container's `eve.session`
+   * label value), stamped by the worker's HTTP surface. Without it the policy
+   * degrades to the docker StartedAt approximation — a max-lifetime cap.
+   */
+  activityOf?: (session: string) => number | undefined;
   log?: (message: string) => void;
 }): SandboxReaper {
-  const { docker, idleStopMs } = options;
+  const { docker, idleStopMs, activityOf } = options;
   const log = options.log ?? (() => {});
   const intervalMs =
     options.intervalMs ??
@@ -65,18 +93,24 @@ export function createSandboxReaper(options: {
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let running = false;
+  let scanned = 0;
 
   async function sweepOnce(now: number = Date.now()): Promise<SweepResult> {
     const containers = await docker.listSandboxes();
-    const idle = selectIdleSandboxes(containers, now, idleStopMs);
+    scanned = containers.length;
+    const idle = selectIdleSandboxes(containers, now, idleStopMs, activityOf);
     const stopped: string[] = [];
     for (const container of idle) {
+      // Re-read the activity signal right before stopping: the session may
+      // have resumed between the docker ps scan and this stop (ps→stop race).
+      const lastActivity = effectiveLastActivity(container, activityOf);
+      if (now - lastActivity < idleStopMs) continue;
       try {
         await docker.stop(container.id);
         stopped.push(container.id);
         log(
           `sandbox ${container.id} (session ${container.session}) idle ${
-            now - container.lastActivityAt
+            now - lastActivity
           }ms — stopped`,
         );
       } catch (error) {
@@ -110,6 +144,9 @@ export function createSandboxReaper(options: {
         clearInterval(timer);
         timer = null;
       }
+    },
+    lastScanCount(): number {
+      return scanned;
     },
   };
 }

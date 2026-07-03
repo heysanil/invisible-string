@@ -64,6 +64,56 @@ describe("sandbox reaper sweep", () => {
     expect(again.stopped).toEqual([]);
   });
 
+  test("proxy activity keeps an in-use sandbox alive past the 30-min mark (idle ≠ lifetime)", async () => {
+    // Both containers STARTED 45 min ago, but sess-active had a proxied
+    // session call 2 min ago — only the truly idle one is stopped.
+    const activity = new Map<string, number>([["sess-active", NOW - 2 * MIN]]);
+    const docker = new FakeDocker([
+      container("active", 45 * MIN),
+      container("stale", 45 * MIN),
+    ]);
+    const reaper = createSandboxReaper({
+      docker,
+      idleStopMs: 30 * MIN,
+      activityOf: (session) => activity.get(session),
+    });
+    const result = await reaper.sweepOnce(NOW);
+    expect(result.stopped).toEqual(["stale"]);
+    expect(docker.stopped).toEqual(["stale"]);
+    expect(reaper.lastScanCount()).toBe(2);
+  });
+
+  test("activity arriving between scan and stop rescues the sandbox (ps→stop race)", async () => {
+    const activity = new Map<string, number>();
+    let listed = false;
+    const stopped: string[] = [];
+    const docker: DockerClient = {
+      async listSandboxes() {
+        listed = true;
+        return [container("racy", 45 * MIN)];
+      },
+      async stop(id) {
+        stopped.push(id);
+      },
+    };
+    const reaper = createSandboxReaper({
+      docker,
+      idleStopMs: 30 * MIN,
+      activityOf: (session) => {
+        // The session resumes right after the scan: the first read (selection)
+        // sees nothing, the pre-stop re-read sees fresh activity.
+        if (listed && session === "sess-racy" && activity.has(session)) {
+          return activity.get(session);
+        }
+        activity.set("sess-racy", NOW - MIN);
+        return undefined;
+      },
+    });
+    const result = await reaper.sweepOnce(NOW);
+    expect(result.stopped).toEqual([]);
+    expect(stopped).toEqual([]);
+  });
+
   test("a stop failure does not abort the sweep of other containers", async () => {
     const docker: DockerClient = {
       async listSandboxes() {

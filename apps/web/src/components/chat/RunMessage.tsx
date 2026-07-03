@@ -4,7 +4,7 @@
  * (markdown), inline HITL approval cards, and a failure banner.
  */
 import { memo, useCallback } from "react";
-import { AlertCircle, X } from "lucide-react";
+import { AlertCircle, Ban, X } from "lucide-react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
@@ -103,6 +103,19 @@ function RunMessageImpl({
           >
             <AlertCircle size={15} className="mt-0.5 shrink-0 text-err" aria-hidden="true" />
             <span className="min-w-0">{run.error}</span>
+          </div>
+        ) : null}
+
+        {/* Cancellation is a deliberate user action, not an error — confirm it
+            in neutral ink (E1: color only as meaning) with the best-effort
+            caveat, so "everything disappeared" never reads as a glitch. */}
+        {run.status === "canceled" ? (
+          <div className="my-1.5 flex items-start gap-2 rounded-card border border-black/[0.08] bg-black/[0.03] px-3 py-2 text-[13px] text-ink-2">
+            <Ban size={15} className="mt-0.5 shrink-0 text-ink-3" aria-hidden="true" />
+            <span className="min-w-0">
+              Run canceled. The agent may finish its current step in the
+              background, but nothing more will appear here.
+            </span>
           </div>
         ) : null}
 

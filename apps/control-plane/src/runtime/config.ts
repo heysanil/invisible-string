@@ -97,6 +97,14 @@ export interface RuntimeConfig {
    * behaviour (both are accepted so the modes interoperate during rollout).
    */
   workerAuthMode: "shared-secret" | "worker-token";
+  /**
+   * Pre-provisioned worker ids (WORKER_ALLOWED_IDS, comma-separated UUIDs).
+   * When set, `POST /internal/workers/register` rejects ids not on the list —
+   * a leaked bootstrap secret alone can no longer register a rogue worker that
+   * would receive secret-bearing dispatches. Unset (default) = allow all
+   * (local dev/CI, where worker ids are random per boot).
+   */
+  workerAllowedIds?: string[];
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -209,7 +217,16 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
       env.WORKER_AUTH_MODE?.trim() === "worker-token"
         ? "worker-token"
         : "shared-secret",
+    workerAllowedIds: parseWorkerAllowedIds(env.WORKER_ALLOWED_IDS),
   };
+}
+
+function parseWorkerAllowedIds(raw: string | undefined): string[] | undefined {
+  const ids = (raw ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+  return ids.length > 0 ? ids : undefined;
 }
 
 /**

@@ -49,6 +49,67 @@ export interface SelectWorkerOptions {
   versionHash?: string;
   /** The session's current affinity worker id (sticky sandbox). */
   affinityWorkerId?: string | null;
+  /**
+   * Boot-in-flight agents to count on top of the reported `runningAgents`
+   * (heartbeat capacity is up to an interval stale, and an agent being ensured
+   * is invisible to it until ready). Defaults to the process-wide reservation
+   * registry ({@link reservedAgentsOf}); injectable for pure tests.
+   */
+  reservedOf?: (worker: SchedulableWorker, now: Date) => number;
+}
+
+// ── In-flight placement reservations ─────────────────────────────────────────
+//
+// Self-reported capacity lags by up to a heartbeat interval, so a burst of
+// cold placements inside one interval would all see the same runningAgents
+// and pile onto one worker, overshooting maxAgents unboundedly. Every
+// placement of a hash the target is NOT already warm on records a short-lived
+// reservation; selection counts live reservations as occupied slots. A
+// reservation clears when the worker's heartbeat reports the hash running
+// (it then counts via runningAgents) or when the TTL lapses (failed boot).
+// In-process registry — fine under the single-control-plane deployment
+// constraint (docs/runtime-worker-contract.md).
+
+/** Reservation lifetime — matches the worker-client ensure-agent timeout. */
+export const AGENT_RESERVATION_TTL_MS = 60_000;
+
+const agentReservations = new Map<string, Map<string, number>>();
+
+/** Record that `versionHash` is being booted on `workerId` right now. */
+export function reserveAgentSlot(
+  workerId: string,
+  versionHash: string,
+  now: number = Date.now(),
+  ttlMs: number = AGENT_RESERVATION_TTL_MS,
+): void {
+  let byHash = agentReservations.get(workerId);
+  if (!byHash) {
+    byHash = new Map();
+    agentReservations.set(workerId, byHash);
+  }
+  byHash.set(versionHash, now + ttlMs);
+}
+
+/** Live (unexpired, not-yet-reported) reservations for one worker. */
+export function reservedAgentsOf(worker: SchedulableWorker, now: Date): number {
+  const byHash = agentReservations.get(worker.id);
+  if (!byHash) return 0;
+  const running = worker.capacity.runningHashes ?? [];
+  let count = 0;
+  for (const [hash, expiresAt] of byHash) {
+    if (expiresAt <= now.getTime() || running.includes(hash)) {
+      byHash.delete(hash); // expired, or the heartbeat now reports it
+      continue;
+    }
+    count += 1;
+  }
+  if (byHash.size === 0) agentReservations.delete(worker.id);
+  return count;
+}
+
+/** Tests only: drop every reservation. */
+export function clearAgentReservations(): void {
+  agentReservations.clear();
 }
 
 export type PickReason = "affinity" | "warm" | "cold";
@@ -84,8 +145,12 @@ function isWarmOn(worker: SchedulableWorker, versionHash: string | undefined): b
   return (worker.capacity.runningHashes ?? []).includes(versionHash);
 }
 
-function hasHeadroom(worker: SchedulableWorker, defaultMaxAgents: number): boolean {
-  return runningAgentsOf(worker) < maxAgentsOf(worker, defaultMaxAgents);
+function occupiedAgentsOf(
+  worker: SchedulableWorker,
+  now: Date,
+  reservedOf: (worker: SchedulableWorker, now: Date) => number,
+): number {
+  return runningAgentsOf(worker) + reservedOf(worker, now);
 }
 
 /** Freshest-heartbeat first (deterministic tiebreak on id). */
@@ -102,6 +167,25 @@ function pickFreshest(workers: SchedulableWorker[]): SchedulableWorker | null {
 }
 
 /**
+ * Cold-placement pick: least-occupied first (running + boot-in-flight
+ * reservations), freshest heartbeat as the tiebreak — a burst of cold
+ * placements spreads instead of stampeding the single freshest worker.
+ */
+function pickLeastOccupied(
+  workers: SchedulableWorker[],
+  now: Date,
+  reservedOf: (worker: SchedulableWorker, now: Date) => number,
+): SchedulableWorker | null {
+  if (workers.length === 0) return null;
+  return workers.reduce((a, b) => {
+    const oa = occupiedAgentsOf(a, now, reservedOf);
+    const ob = occupiedAgentsOf(b, now, reservedOf);
+    if (oa !== ob) return oa < ob ? a : b;
+    return freshest(a, b);
+  });
+}
+
+/**
  * Pure worker selection (affinity → warm → cold-with-headroom). Returns a
  * discriminated result so the DB-backed caller can throw the right 503.
  */
@@ -110,8 +194,13 @@ export function pickWorker(
   options: SelectWorkerOptions,
 ): PickResult {
   const now = options.now ?? new Date();
+  const reservedOf = options.reservedOf ?? reservedAgentsOf;
   const live = workers.filter((w) => isWorkerLive(w, now, options.heartbeatTtlMs));
   if (live.length === 0) return { ok: false, reason: "no_live_worker" };
+
+  const hasHeadroom = (worker: SchedulableWorker): boolean =>
+    occupiedAgentsOf(worker, now, reservedOf) <
+    maxAgentsOf(worker, options.defaultMaxAgents);
 
   // 1. affinity — sticky sandbox. Honoured while the worker can host the
   //    session: warm on the hash (agent already there) OR has agent headroom.
@@ -119,8 +208,7 @@ export function pickWorker(
     const sticky = live.find((w) => w.id === options.affinityWorkerId);
     if (
       sticky &&
-      (isWarmOn(sticky, options.versionHash) ||
-        hasHeadroom(sticky, options.defaultMaxAgents))
+      (isWarmOn(sticky, options.versionHash) || hasHeadroom(sticky))
     ) {
       return { ok: true, worker: sticky, reason: "affinity" };
     }
@@ -131,9 +219,7 @@ export function pickWorker(
   if (warm) return { ok: true, worker: warm, reason: "warm" };
 
   // 3. any live worker with agent headroom (cold placement).
-  const cold = pickFreshest(
-    live.filter((w) => hasHeadroom(w, options.defaultMaxAgents)),
-  );
+  const cold = pickLeastOccupied(live.filter(hasHeadroom), now, reservedOf);
   if (cold) return { ok: true, worker: cold, reason: "cold" };
 
   // Live workers exist but every one is at its agent cap.
@@ -203,6 +289,14 @@ export async function selectWorker(
     throw result.reason === "no_live_worker"
       ? errors.noLiveWorker()
       : errors.noCapacity();
+  }
+  // The placement will boot an agent unless the worker is already warm on the
+  // hash — reserve the slot so concurrent selections see it as occupied.
+  if (
+    options.versionHash !== undefined &&
+    !(result.worker.capacity.runningHashes ?? []).includes(options.versionHash)
+  ) {
+    reserveAgentSlot(result.worker.id, options.versionHash);
   }
   return { worker: result.worker, reason: result.reason };
 }

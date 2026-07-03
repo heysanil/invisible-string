@@ -26,6 +26,7 @@ import {
   useTriggers,
 } from "../../lib/queries/integrations";
 import { Button } from "../ui/Button";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Select } from "../ui/Select";
 import { StatusChip } from "../ui/StatusChip";
 import { useToast } from "../ui/Toast";
@@ -77,6 +78,7 @@ function WebhookToken({
   const { toast } = useToast();
   const [revealed, setRevealed] = useState<CreateWebhookTokenResponse | null>(null);
   const [copied, setCopied] = useState(false);
+  const [confirmRotate, setConfirmRotate] = useState(false);
 
   async function generate() {
     try {
@@ -85,6 +87,8 @@ function WebhookToken({
       setCopied(false);
     } catch (error) {
       toast({ variant: "error", message: errorMessage(error, "Could not mint a token.") });
+    } finally {
+      setConfirmRotate(false);
     }
   }
 
@@ -109,7 +113,12 @@ function WebhookToken({
           size="sm"
           variant={current?.hasToken ? "ghost" : "primary"}
           loading={mint.isPending}
-          onClick={() => void generate()}
+          onClick={() => {
+            // Rotation immediately invalidates the live token for every
+            // existing caller — a destructive action needs a confirm gate.
+            if (current?.hasToken) setConfirmRotate(true);
+            else void generate();
+          }}
         >
           {current?.hasToken ? (
             <>
@@ -120,6 +129,21 @@ function WebhookToken({
           )}
         </Button>
       </div>
+
+      <ConfirmDialog
+        open={confirmRotate}
+        onClose={() => setConfirmRotate(false)}
+        onConfirm={() => void generate()}
+        title="Rotate ingress token?"
+        description={
+          current?.tokenSuffix
+            ? `This immediately invalidates the current token ending …${current.tokenSuffix}. Every existing caller breaks until it uses the new one.`
+            : "This immediately invalidates the current token. Every existing caller breaks until it uses the new one."
+        }
+        confirmLabel="Rotate token"
+        destructive
+        loading={mint.isPending}
+      />
 
       {revealed ? (
         <div className="flex flex-col gap-2 rounded-card border border-amber-400/40 bg-amber-50/60 p-3">
@@ -214,6 +238,14 @@ function SlackBinding({
   }
 
   const boundTeam = teams.find((t) => t.id === current?.integrationId);
+  // The "Bound" summary must reflect what is LIVE (persisted on the trigger
+  // row), never the unsaved draft rules — those may differ until re-bound.
+  const liveRules = current?.slackBinding ?? null;
+  const rulesDiffer =
+    liveRules !== null &&
+    (liveRules.mentionOnly !== binding.mentionOnly ||
+      liveRules.includeDirectMessages !== binding.includeDirectMessages ||
+      (liveRules.channelId ?? null) !== (binding.channelId ?? null));
 
   return (
     <section className="flex flex-col gap-3 rounded-card border border-black/[0.07] bg-white/40 p-4">
@@ -235,15 +267,24 @@ function SlackBinding({
         </Button>
       </div>
       {boundTeam ? (
-        <div className="flex items-center gap-2">
-          <StatusChip tone="success" dot>
-            Bound
-          </StatusChip>
-          <p className="text-[12.5px] text-ink-3">
-            Listening in <span className="font-medium">{boundTeam.teamName ?? boundTeam.externalId}</span>
-            {binding.mentionOnly ? " · mentions only" : " · all messages"}
-            {binding.includeDirectMessages ? " · DMs on" : ""}.
-          </p>
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <StatusChip tone="success" dot>
+              Bound
+            </StatusChip>
+            <p className="text-[12.5px] text-ink-3">
+              Listening in <span className="font-medium">{boundTeam.teamName ?? boundTeam.externalId}</span>
+              {liveRules
+                ? `${liveRules.mentionOnly ? " · mentions only" : " · all messages"}${liveRules.includeDirectMessages ? " · DMs on" : ""}.`
+                : "."}
+            </p>
+          </div>
+          {rulesDiffer ? (
+            <p className="text-[12px] text-warn">
+              Routing rules changed in the draft — click Update binding to apply
+              them to live Slack routing.
+            </p>
+          ) : null}
         </div>
       ) : (
         <p className="text-[12.5px] text-ink-4">

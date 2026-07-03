@@ -104,13 +104,23 @@ export function slackEventToTriggerData(
   }
 
   const rawText = event.type === "app_mention" ? event.text : (event.text ?? "");
-  const message =
-    event.type === "app_mention" ? cleanMentionText(rawText) : rawText.trim();
+  // Strip a leading bot mention on BOTH shapes: the `message.channels` twin of
+  // an app_mention carries the raw `<@U…>` prefix (only app_mention is
+  // pre-stripped by Slack semantics), and a DM "@bot do X" reads better bare.
+  const message = cleanMentionText(rawText);
   if (message.length === 0) {
     return { ok: false, reason: "empty message text" };
   }
 
   const threadTs = event.thread_ts ?? event.ts;
+  // Session continuity key. In a 1:1 IM the natural conversation container is
+  // the DM channel itself — users almost never thread DMs, so keying on
+  // thread_ts/ts would mint a fresh session per message and lose all memory.
+  // Channels keep thread_ts keying (a thread = a conversation).
+  const threadKey =
+    event.type === "message" && event.channel_type === "im"
+      ? event.channel
+      : threadTs;
   const data: Record<string, unknown> = {
     eventType: event.type,
     channel: event.channel,
@@ -131,7 +141,7 @@ export function slackEventToTriggerData(
     value: {
       message,
       data,
-      threadKey: threadTs,
+      threadKey,
       replyTarget: { channel: event.channel, threadTs },
     },
   };
@@ -190,7 +200,22 @@ export function formSubmissionToTriggerData(
       }
       continue;
     }
-    data[field.key] = coerceFormValue(field, raw);
+    const coerced = coerceFormValue(field, raw);
+    // A select field is an enum contract: a forged/typo'd submission must not
+    // inject arbitrary strings where instructions assume one of the declared
+    // options (mirrors the required-field check).
+    if (
+      field.type === "select" &&
+      Array.isArray(field.options) &&
+      field.options.length > 0 &&
+      (typeof coerced !== "string" || !field.options.includes(coerced))
+    ) {
+      return {
+        ok: false,
+        reason: `field "${field.key}" must be one of the declared options`,
+      };
+    }
+    data[field.key] = coerced;
   }
 
   let message = "";

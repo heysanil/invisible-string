@@ -237,11 +237,20 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   ) => {
     if (finished) return;
     finished = true;
-    await store.markRun(runId, {
+    // Compare-and-swap: markRun refuses to overwrite a terminal status. When
+    // another actor (run-cancel API, sweeper) already finalized this run, the
+    // tail steps aside — no session stomp, no duplicate status frame.
+    const marked = await store.markRun(runId, {
       status,
       error: error ?? null,
       ...(status === "waiting" ? {} : { completedAt: new Date() }),
     });
+    if (!marked) {
+      log?.info("run.finish_skipped", {
+        fields: { attemptedStatus: status, reason: "run already terminal" },
+      });
+      return;
+    }
     if (sessionStatus) await store.markSession(agentSessionId, sessionStatus);
     publishStatus(status, error ?? null);
     const durationMs = Date.now() - tailStartedAt;
@@ -276,10 +285,21 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // session-fatal and always classified.
     let sawOwnTurn = seq > 0;
 
-    await store.markRun(runId, {
+    // CAS: a run another actor already finalized (sweeper failed it while the
+    // dispatch was still in flight, or the user canceled it) must NOT be
+    // resurrected to `running` — the tail simply never starts.
+    const adopted = await store.markRun(runId, {
       status: "running",
       ...(seq === 0 ? { startedAt: new Date() } : {}),
     });
+    if (!adopted) {
+      finished = true;
+      clearTimeout(wallClockTimer);
+      log?.info("run.tail_refused", {
+        fields: { reason: "run already terminal — not resurrecting" },
+      });
+      return;
+    }
     publishStatus("running");
     log?.info("run.started", { fields: { resumed: seq > 0 } });
 

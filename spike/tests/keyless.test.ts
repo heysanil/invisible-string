@@ -5,7 +5,9 @@
  *   1. `eve build` succeeds and registers the 1-minute schedule.
  *   2. `eve start` serves /eve/v1/health through the proxy.
  *   3. Route auth fails closed: unauthenticated POST /eve/v1/session -> 401,
- *      platform-JWT-signed -> not-401 (session created).
+ *      platform-JWT-signed -> 202 Accepted (session created; eve runs the
+ *      turn asynchronously — the acceptance bullet's "200" is a 2xx in
+ *      practice).
  *   4. world-postgres bootstrap created the workflow_* tables.
  *   5. The Nitro schedule runner fires the 1-minute schedule under `eve start`.
  *
@@ -81,6 +83,9 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
   });
 
   test("proxy forwards ONLY /eve/ and /.well-known/workflow/ prefixes", async () => {
+    // Trigger channels are authored under /eve/v1/platform/<trigger> (locked
+    // route-prefix convention), so no extra prefix is forwarded; anything
+    // outside the two prefixes is rejected at the proxy.
     const blocked = await fetch(`${PROXY_URL}/dispatch`, { method: "POST" });
     expect(blocked.status).toBe(404);
     expect(await blocked.text()).toContain("not forwarded");
@@ -109,7 +114,7 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
   });
 
   test(
-    "platform-JWT-signed POST /eve/v1/session -> not 401; NDJSON stream reachable through proxy",
+    "platform-JWT-signed POST /eve/v1/session -> 202 Accepted; NDJSON stream reachable through proxy",
     async () => {
       const token = await mintPlatformJwt();
       const res = await fetch(`${PROXY_URL}/eve/v1/session`, {
@@ -120,8 +125,11 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
         },
         method: "POST",
       });
-      expect(res.status).not.toBe(401);
-      expect(res.status).toBeLessThan(300);
+      // Acceptance bullet 6 says "JWT-signed → 200"; eve actually responds
+      // 202 Accepted (session creation is async — the turn runs via the
+      // workflow queue). Assert the exact observed success status instead of
+      // the loose `not-401 && < 300` this test previously used.
+      expect(res.status).toBe(202);
       const body = (await res.json()) as { sessionId?: string; continuationToken?: string };
       expect(typeof body.sessionId).toBe("string");
       expect(typeof body.continuationToken).toBe("string");

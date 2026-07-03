@@ -1,0 +1,6 @@
+ALTER TABLE "sso_provider" ADD COLUMN "domain_verified" boolean DEFAULT false;--> statement-breakpoint
+CREATE INDEX "agent_sessions_continuation_token_idx" ON "agent_sessions" USING btree ("continuation_token") WHERE "agent_sessions"."continuation_token" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "agent_sessions_eve_session_id_idx" ON "agent_sessions" USING btree ("eve_session_id") WHERE "agent_sessions"."eve_session_id" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "workers_status_last_heartbeat_idx" ON "workers" USING btree ("status","last_heartbeat_at");--> statement-breakpoint
+ALTER TABLE "mcp_connections" ADD CONSTRAINT "mcp_connections_scope_owner_check" CHECK (("mcp_connections"."scope" = 'workspace' AND "mcp_connections"."organization_id" IS NOT NULL AND "mcp_connections"."user_id" IS NULL) OR ("mcp_connections"."scope" = 'user' AND "mcp_connections"."user_id" IS NOT NULL AND "mcp_connections"."organization_id" IS NULL));--> statement-breakpoint
+ALTER TABLE "skills" ADD CONSTRAINT "skills_scope_owner_check" CHECK (("skills"."scope" = 'workspace' AND "skills"."organization_id" IS NOT NULL AND "skills"."user_id" IS NULL) OR ("skills"."scope" = 'user' AND "skills"."user_id" IS NOT NULL AND "skills"."organization_id" IS NULL));

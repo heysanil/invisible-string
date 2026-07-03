@@ -1,6 +1,6 @@
 import {
   useId,
-  type FormEventHandler,
+  type ChangeEvent,
   type InputHTMLAttributes,
 } from "react";
 
@@ -12,24 +12,35 @@ export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   error?: string | null;
 }
 
+// Satisfies React's controlled-input contract (value without onChange warns);
+// the consumer's handler is delivered via onInput — see below.
+function noopChange() {}
+
 export function Input({
   label,
   error,
   className,
   id: idProp,
   onChange,
+  onInput,
   ...rest
 }: InputProps) {
   const autoId = useId();
   const id = idProp ?? autoId;
   const errorId = `${id}-error`;
-  // React's onChange for text inputs rides its polyfilled ChangeEventPlugin,
-  // which doesn't fire under happy-dom. Mirroring the handler onto the plain
-  // delegated `input` event keeps behavior identical in browsers (same native
-  // event; setState is idempotent) and makes the primitive testable.
-  const onInput = onChange as unknown as
-    | FormEventHandler<HTMLInputElement>
-    | undefined;
+
+  // React's onChange for text inputs rides its ChangeEventPlugin, which never
+  // emits under happy-dom (verified empirically: the delegated `input` event
+  // reaches SimpleEventPlugin — onInput fires — but no synthetic change event
+  // is produced even when the value tracker is stale). Wiring the SAME
+  // handler to both props would double-fire in real browsers, so the
+  // consumer's onChange is delivered through onInput ONLY: for text inputs
+  // both props ride the same native `input` event, so real-browser behavior
+  // is identical and the handler runs exactly once per keystroke everywhere.
+  const handleInput: InputProps["onInput"] = (event) => {
+    onInput?.(event);
+    onChange?.(event as unknown as ChangeEvent<HTMLInputElement>);
+  };
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -38,8 +49,8 @@ export function Input({
       </label>
       <input
         id={id}
-        onChange={onChange}
-        onInput={onInput}
+        onChange={noopChange}
+        onInput={handleInput}
         aria-invalid={error ? true : undefined}
         aria-describedby={error ? errorId : undefined}
         className={cn(

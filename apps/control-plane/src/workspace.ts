@@ -5,12 +5,19 @@
  *
  * - `resolveWorkspace` — pure guard logic (unit-testable with mocked lookups):
  *   401 when unauthenticated, 403 when no active workspace or not a member,
- *   403 when the member's role is below a required role.
+ *   403 when the member's role is below a required role, 403 when the
+ *   workspace id in the route path differs from the active workspace.
  * - `requireRole('owner'|'admin'|'member')` — role guard helper (owner ⊃
  *   admin ⊃ member; Better Auth stores multi-roles comma-separated).
  * - `workspacePlugin` — an Elysia macro `requireWorkspace` that resolves the
  *   Better Auth session from request headers and injects `workspace` into the
  *   handler context.
+ *
+ * IDOR guard: routes shaped `/workspaces/:workspaceId/...` (or any route with
+ * a `workspaceId` path param) are verified against the caller's active
+ * organization — membership in workspace X must never authorize a request
+ * whose path addresses workspace Y. Handlers must ALWAYS read
+ * `workspace.organizationId` (never the raw path param) for data access.
  */
 import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
@@ -75,15 +82,17 @@ export type WorkspaceResolution =
 
 /**
  * Core guard logic. Resolution order:
- * 1. no session                          → 401
- * 2. no active organization on session   → 403
- * 3. caller not a member of that org     → 403
- * 4. `requiredRole` set and role too low → 403
+ * 1. no session                                   → 401
+ * 2. no active organization on session            → 403
+ * 3. path workspace id ≠ active organization      → 403 (IDOR guard)
+ * 4. caller not a member of that org              → 403
+ * 5. `requiredRole` set and role too low          → 403
  */
 export async function resolveWorkspace(
   deps: WorkspaceDeps,
   headers: Headers,
   requiredRole?: Role,
+  pathWorkspaceId?: string,
 ): Promise<WorkspaceResolution> {
   const session = await deps.getSession(headers);
   if (!session) {
@@ -97,6 +106,18 @@ export async function resolveWorkspace(
       status: 403,
       message:
         "no active workspace — create or select an organization first",
+    };
+  }
+
+  // IDOR guard: authorization is proven against the ACTIVE organization, so
+  // a path addressing a different workspace must be rejected — membership in
+  // X must never let a caller operate on /workspaces/Y/... resources.
+  if (pathWorkspaceId !== undefined && pathWorkspaceId !== organizationId) {
+    return {
+      ok: false,
+      status: 403,
+      message:
+        "workspace id in path does not match your active workspace — switch workspaces first",
     };
   }
 
@@ -164,22 +185,42 @@ export function createWorkspaceDeps(auth: Auth, db: Db): WorkspaceDeps {
 }
 
 /**
+ * Extract the workspace id a route path claims to address. Product routes
+ * use `/workspaces/:workspaceId/...` (param name `workspaceId`); any route
+ * declaring a `workspaceId` param opts into the path↔active-workspace check.
+ */
+export function pathWorkspaceIdOf(
+  params: unknown,
+): string | undefined {
+  if (typeof params !== "object" || params === null) return undefined;
+  const value = (params as Record<string, unknown>).workspaceId;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
  * Elysia plugin exposing the `requireWorkspace` macro.
  *
  * Usage:
  *   .get("/thing", ({ workspace }) => ..., { requireWorkspace: true })
  *   .post("/admin", ..., { requireWorkspace: "admin" })   // role guard
+ *   .get("/workspaces/:workspaceId/skills", ({ workspace }) => ...,
+ *        { requireWorkspace: true }) // path id asserted == active workspace
+ *
+ * Handlers must use `workspace.organizationId` for data access — never the
+ * raw `:workspaceId` path param (the macro guarantees they are equal, but the
+ * context value is the authorized one).
  */
 export function workspacePlugin(deps: WorkspaceDeps) {
   return new Elysia({ name: "workspace" }).macro({
     requireWorkspace: (requirement: true | Role) => ({
-      resolve: async ({ status, request }) => {
+      resolve: async ({ status, request, params }) => {
         const requiredRole =
           requirement === true ? undefined : requirement;
         const result = await resolveWorkspace(
           deps,
           request.headers,
           requiredRole,
+          pathWorkspaceIdOf(params),
         );
         if (!result.ok) {
           return status(result.status, { error: result.message });

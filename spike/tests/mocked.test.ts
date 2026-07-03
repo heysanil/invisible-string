@@ -51,12 +51,32 @@ function finalAssistantText(events: NdjsonEvent[]): string {
   return last?.data?.message ?? "";
 }
 
-async function sandboxImageAvailable(): Promise<boolean> {
-  const proc = Bun.spawn(["docker", "image", "inspect", "ghcr.io/vercel/eve:latest"], {
-    stderr: "ignore",
-    stdout: "ignore",
-  });
-  return (await proc.exited) === 0;
+function sandboxImageAvailable(): boolean {
+  try {
+    const proc = Bun.spawnSync(
+      ["docker", "image", "inspect", "ghcr.io/vercel/eve:latest"],
+      { stderr: "ignore", stdout: "ignore" },
+    );
+    return proc.exitCode === 0;
+  } catch {
+    return false; // docker CLI missing entirely
+  }
+}
+
+/**
+ * Sandbox-test gate: acceptance bullet 4 must never pass vacuously. When the
+ * 645MB ghcr.io/vercel/eve:latest image is absent the test is SKIPPED with a
+ * visible reason (collection-time skipIf, not a silent in-body return) — and
+ * CI/integration runs can set SPIKE_REQUIRE_SANDBOX=1 to FAIL instead of
+ * skipping (the harness/CI setup is then responsible for pulling the image).
+ */
+const SANDBOX_REQUIRED = process.env.SPIKE_REQUIRE_SANDBOX === "1";
+const SANDBOX_IMAGE_AVAILABLE = DB_GATE_AVAILABLE && sandboxImageAvailable();
+const SANDBOX_SKIP = !SANDBOX_IMAGE_AVAILABLE && !SANDBOX_REQUIRED;
+if (DB_GATE_AVAILABLE && SANDBOX_SKIP) {
+  console.warn(
+    "[spike] SKIPPING sandbox test: ghcr.io/vercel/eve:latest not pulled — `docker pull ghcr.io/vercel/eve:latest` (or set SPIKE_REQUIRE_SANDBOX=1 to fail instead)",
+  );
 }
 
 describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless-mocked e2e (EVE_MOCK_AUTHORED_MODELS=1)", () => {
@@ -151,13 +171,13 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless-mocked e2e (EVE_MOCK_AUTHORED
   );
 
   test(
-    "custom channel POST /dispatch (JWT) starts a session via send()",
+    "custom channel POST /eve/v1/platform/dispatch (JWT) starts a session via send() THROUGH the proxy",
     async () => {
-      // Custom channel routes mount at the RAW authored path — NOT behind
-      // /eve/, so the proxy rejects it (proved in keyless.test.ts) and the
-      // dispatcher must hit the agent port directly. Friction documented in
-      // spike/REPORT.md.
-      const res = await fetch("http://127.0.0.1:4101/dispatch", {
+      // Route-prefix convention (locked): custom channel routes mount at the
+      // RAW authored path, so trigger channels are authored under
+      // /eve/v1/platform/<trigger> — already forwarded by the worker proxy.
+      // This exercises the dispatcher → proxy → channel path end-to-end.
+      const res = await fetch(`${PROXY_URL}/eve/v1/platform/dispatch`, {
         body: JSON.stringify({ message: "Reply with exactly: dispatched" }),
         headers: { authorization: `Bearer ${jwt}`, "content-type": "application/json" },
         method: "POST",
@@ -167,7 +187,7 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless-mocked e2e (EVE_MOCK_AUTHORED
       expect(body.ok).toBe(true);
       expect(typeof body.sessionId).toBe("string");
 
-      const unauth = await fetch("http://127.0.0.1:4101/dispatch", {
+      const unauth = await fetch(`${PROXY_URL}/eve/v1/platform/dispatch`, {
         body: JSON.stringify({ message: "nope" }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -281,20 +301,24 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless-mocked e2e (EVE_MOCK_AUTHORED
     180_000,
   );
 
-  test(
-    "docker() sandbox executes bash and writes a /workspace file",
+  test.skipIf(SANDBOX_SKIP)(
+    "docker() sandbox executes bash, writes /workspace/proof.txt, and the file persists across turns in-session",
     async () => {
-      if (!(await sandboxImageAvailable())) {
-        console.warn(
-          "[spike] sandbox test needs ghcr.io/vercel/eve:latest — docker pull it first; skipping assertion",
+      // SPIKE_REQUIRE_SANDBOX=1: fail loudly instead of running against a
+      // missing image (docker errors would otherwise surface confusingly).
+      if (!SANDBOX_IMAGE_AVAILABLE) {
+        throw new Error(
+          "ghcr.io/vercel/eve:latest is not pulled but SPIKE_REQUIRE_SANDBOX=1 — pull the image in CI setup",
         );
-        return;
       }
+
+      // Turn 1: write the file inside the sandbox.
       const { json } = await postJson("/eve/v1/session", {
         message:
           "Use the bash tool to run `echo spike-sandbox-ok > /workspace/proof.txt && cat /workspace/proof.txt`.",
       });
       const sessionId = json.sessionId as string;
+      const continuationToken = json.continuationToken as string;
       const events = await streamUntilTerminal(sessionId, { timeoutMs: 240_000 });
       const types = events.map((e) => e.type);
       expect(types).toContain("actions.requested");
@@ -314,7 +338,37 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless-mocked e2e (EVE_MOCK_AUTHORED
         join(ARTIFACTS_DIR, "mocked-sandbox-events.ndjson"),
         events.map((e) => JSON.stringify(e)).join("\n") + "\n",
       );
+
+      // Turn 2 (acceptance bullet 4, second clause): a FOLLOW-UP turn in the
+      // same session reads the file written in the prior turn — sandbox
+      // lifetime is sticky for the session, not per-turn.
+      const second = await postJson(`/eve/v1/session/${sessionId}`, {
+        continuationToken,
+        message: "Use the bash tool to run `cat /workspace/proof.txt`.",
+      });
+      expect(second.status).toBeLessThan(300);
+      const followUp = await streamUntilTerminal(sessionId, {
+        startIndex: events.length,
+        timeoutMs: 240_000,
+      });
+      const followUpTypes = followUp.map((e) => e.type);
+      expect(followUpTypes).not.toContain("session.started"); // same session
+      const secondBash = followUp.find(
+        (e) =>
+          e.type === "action.result" &&
+          (e as { data?: { result?: { toolName?: string } } }).data?.result?.toolName === "bash",
+      ) as { data?: { status?: string; result?: { output?: unknown } } } | undefined;
+      expect(secondBash).toBeDefined();
+      expect(secondBash?.data?.status).toBe("completed");
+      expect(JSON.stringify(secondBash?.data?.result?.output ?? "")).toContain(
+        "spike-sandbox-ok",
+      );
+
+      writeFileSync(
+        join(ARTIFACTS_DIR, "mocked-sandbox-second-turn-events.ndjson"),
+        followUp.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      );
     },
-    300_000,
+    600_000,
   );
 });

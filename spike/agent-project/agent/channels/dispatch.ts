@@ -11,14 +11,18 @@ interface DispatchBody {
 /**
  * Custom trigger channel: the control-plane dispatcher POSTs a normalized
  * envelope here; the channel starts/continues the session via send() and owns
- * outbound delivery. NOTE (proxy friction, see spike/REPORT.md): custom
- * channel routes mount at the RAW authored path, so /dispatch is NOT behind
- * the /eve/ prefix a worker proxy forwards -- compiled trigger channels must
- * live under a forwarded prefix.
+ * outbound delivery.
+ *
+ * ROUTE-PREFIX CONVENTION (locked for Phase-1 compiler templates): custom
+ * channel routes mount at the RAW authored path (spike/REPORT.md friction 7),
+ * so trigger channels are authored under `/eve/v1/platform/<trigger>` — a
+ * path the worker proxy already forwards (`/eve/` prefix). The proxy needs
+ * no extra prefix and the dispatcher→proxy→channel path is exercised
+ * end-to-end in spike/tests/mocked.test.ts.
  */
 export default defineChannel({
   routes: [
-    POST("/dispatch", async (req, { send }) => {
+    POST("/eve/v1/platform/dispatch", async (req, { send }) => {
       const auth = await routeAuth(req, [platformJwt(), localDevUnlessDisabled()]);
       if (auth instanceof Response) return auth;
 

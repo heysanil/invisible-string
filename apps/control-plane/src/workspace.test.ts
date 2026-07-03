@@ -3,6 +3,7 @@ import { Elysia } from "elysia";
 
 import {
   hasRole,
+  pathWorkspaceIdOf,
   requireRole,
   resolveWorkspace,
   workspacePlugin,
@@ -128,6 +129,30 @@ describe("resolveWorkspace", () => {
     expect(asOwner.ok).toBe(true);
   });
 
+  test("IDOR guard: 403 when the path workspace id is not the active workspace", async () => {
+    // Alice is a member of org-1 (her active workspace) but the request path
+    // addresses org-2 — must be rejected even though she IS authenticated.
+    const result = await resolveWorkspace(deps(), HEADERS, undefined, "org-2");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(403);
+      expect(result.message).toContain("does not match your active workspace");
+    }
+  });
+
+  test("IDOR guard: path id matching the active workspace passes", async () => {
+    const result = await resolveWorkspace(deps(), HEADERS, undefined, "org-1");
+    expect(result.ok).toBe(true);
+  });
+
+  test("pathWorkspaceIdOf extracts only a non-empty workspaceId param", () => {
+    expect(pathWorkspaceIdOf({ workspaceId: "org-9" })).toBe("org-9");
+    expect(pathWorkspaceIdOf({ workspaceId: "" })).toBeUndefined();
+    expect(pathWorkspaceIdOf({ id: "org-9" })).toBeUndefined();
+    expect(pathWorkspaceIdOf(undefined)).toBeUndefined();
+    expect(pathWorkspaceIdOf(null)).toBeUndefined();
+  });
+
   test("passes request headers through to the session lookup", async () => {
     let seen: Headers | undefined;
     const headers = new Headers({ cookie: "session=abc" });
@@ -154,6 +179,11 @@ describe("workspacePlugin (Elysia macro)", () => {
       .get("/admin-only", ({ workspace }) => ({ role: workspace.role }), {
         requireWorkspace: "admin",
       })
+      .get(
+        "/workspaces/:workspaceId/things",
+        ({ workspace }) => ({ organizationId: workspace.organizationId }),
+        { requireWorkspace: true },
+      )
       .get("/open", () => ({ open: true }));
   }
 
@@ -200,6 +230,25 @@ describe("workspacePlugin (Elysia macro)", () => {
     );
     expect(allowed.status).toBe(200);
     expect(await allowed.json()).toEqual({ role: "admin" });
+  });
+
+  test("IDOR regression: member of org-1 cannot address /workspaces/org-2/...", async () => {
+    const app = appWith(deps());
+    // Alice's active workspace is org-1; the path claims org-2.
+    const denied = await app.handle(
+      new Request("http://localhost/workspaces/org-2/things"),
+    );
+    expect(denied.status).toBe(403);
+    expect(((await denied.json()) as { error: string }).error).toContain(
+      "does not match your active workspace",
+    );
+
+    // The matching path passes and the handler sees the AUTHORIZED org id.
+    const allowed = await app.handle(
+      new Request("http://localhost/workspaces/org-1/things"),
+    );
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ organizationId: "org-1" });
   });
 
   test("routes without the macro stay open", async () => {

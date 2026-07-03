@@ -267,6 +267,40 @@ describe.skipIf(!RUN)("spike keyed acceptance (requires OPENROUTER_API_KEY)", ()
   );
 
   test(
+    "live MCP tool call: model calls a deepwiki tool through the connection",
+    async () => {
+      const { json } = await postJson(
+        "/eve/v1/session",
+        {
+          message:
+            "Using the deepwiki connection, ask what the vercel/next.js repository is about (use ask_question or read_wiki_structure). Then answer in one short sentence.",
+        },
+        jwt,
+      );
+      const sessionId = json.sessionId as string;
+      const events = await streamUntilTerminal(sessionId, { timeoutMs: 300_000 });
+      const types = events.map((e) => e.type);
+      expect(types).toContain("actions.requested");
+      expect(types).toContain("action.result");
+      // eve names MCP tools <connection>__<tool> (path-derived identity).
+      const mcpResult = events.find((e) => {
+        if (e.type !== "action.result") return false;
+        const toolName = (e as { data?: { result?: { toolName?: string } } })
+          .data?.result?.toolName;
+        return typeof toolName === "string" && toolName.startsWith("deepwiki__");
+      }) as { data?: { status?: string } } | undefined;
+      expect(mcpResult).toBeDefined();
+      expect(mcpResult?.data?.status).toBe("completed");
+
+      writeFileSync(
+        join(ARTIFACTS_DIR, "keyed-mcp-events.ndjson"),
+        events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      );
+    },
+    360_000,
+  );
+
+  test(
     "docker() sandbox: bash writes a /workspace file (mounted socket)",
     async () => {
       const { json } = await postJson(

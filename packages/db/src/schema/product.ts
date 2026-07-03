@@ -14,6 +14,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -158,6 +159,12 @@ export const mcpConnections = pgTable(
   (table) => [
     index("mcp_connections_organization_id_idx").on(table.organizationId),
     index("mcp_connections_user_id_idx").on(table.userId),
+    // Scope/owner consistency: exactly the owner column matching `scope` is
+    // set — no orphaned or cross-scope-ambiguous rows are representable.
+    check(
+      "mcp_connections_scope_owner_check",
+      sql`(${table.scope} = 'workspace' AND ${table.organizationId} IS NOT NULL AND ${table.userId} IS NULL) OR (${table.scope} = 'user' AND ${table.userId} IS NOT NULL AND ${table.organizationId} IS NULL)`,
+    ),
   ],
 );
 
@@ -186,6 +193,11 @@ export const skills = pgTable(
   (table) => [
     index("skills_organization_id_idx").on(table.organizationId),
     index("skills_user_id_idx").on(table.userId),
+    // Same scope/owner consistency guarantee as mcp_connections.
+    check(
+      "skills_scope_owner_check",
+      sql`(${table.scope} = 'workspace' AND ${table.organizationId} IS NOT NULL AND ${table.userId} IS NULL) OR (${table.scope} = 'user' AND ${table.userId} IS NOT NULL AND ${table.organizationId} IS NULL)`,
+    ),
   ],
 );
 
@@ -337,22 +349,32 @@ export const workflowBuilds = pgTable("workflow_builds", {
 
 // ── Runtime: workers, agent sessions, runs, run events ─────────────────────
 
-export const workers = pgTable("workers", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  /** Base URL the control plane dispatches to (e.g. http://worker-1:8080). */
-  address: text("address").notNull(),
-  status: workerStatus("status").default("live").notNull(),
-  lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-  /** { maxAgents, runningAgents, activeSessions, … } from heartbeats. */
-  capacity: jsonb("capacity")
-    .$type<Record<string, unknown>>()
-    .default(sql`'{}'::jsonb`)
-    .notNull(),
-  createdAt,
-  updatedAt,
-});
+export const workers = pgTable(
+  "workers",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /** Base URL the control plane dispatches to (e.g. http://worker-1:8080). */
+    address: text("address").notNull(),
+    status: workerStatus("status").default("live").notNull(),
+    lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    /** { maxAgents, runningAgents, activeSessions, … } from heartbeats. */
+    capacity: jsonb("capacity")
+      .$type<Record<string, unknown>>()
+      .default(sql`'{}'::jsonb`)
+      .notNull(),
+    createdAt,
+    updatedAt,
+  },
+  (table) => [
+    // Scheduler liveness query: live workers with a fresh heartbeat.
+    index("workers_status_last_heartbeat_idx").on(
+      table.status,
+      table.lastHeartbeatAt,
+    ),
+  ],
+);
 
 /**
  * Chat/eve sessions — one row per chat thread, mapping 1:1 to a durable eve
@@ -390,6 +412,14 @@ export const agentSessions = pgTable(
     index("agent_sessions_workflow_id_idx").on(table.workflowId),
     index("agent_sessions_organization_id_idx").on(table.organizationId),
     index("agent_sessions_affinity_worker_id_idx").on(table.affinityWorkerId),
+    // Dispatch hot path (spec §8 step 3): conversational triggers resolve
+    // continuationToken -> agent_session; partial to skip token-less rows.
+    index("agent_sessions_continuation_token_idx")
+      .on(table.continuationToken)
+      .where(sql`${table.continuationToken} IS NOT NULL`),
+    index("agent_sessions_eve_session_id_idx")
+      .on(table.eveSessionId)
+      .where(sql`${table.eveSessionId} IS NOT NULL`),
   ],
 );
 

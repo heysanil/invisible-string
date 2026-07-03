@@ -5,6 +5,9 @@
   "worldPostgres": "5.0.0-beta.20",
   "openrouterProvider": "6.0.0-alpha.1",
   "anthropicProvider": "4.0.7",
+  "zod": "4.4.3",
+  "typescript": "6.0.3",
+  "typesNode": "26.1.0",
   "node": "24.18.0",
   "notes": [
     "eve@0.19.0 is the exact npm latest as of 2026-07-02. engines.node >=24 (host Node 22 fails the engines check; use Node 24.x). Its only hard dependency is nitro@3.0.260610-beta; ai is a peer dependency at ^7.0.0 (resolved to ai@7.0.14). Optional peers (@opentelemetry/api, braintrust, just-bash, microsandbox) are not needed for the platform runtime.",
@@ -15,7 +18,7 @@
     "openrouter('slug') throws AI_LoadAPIKeyError at MODEL CONSTRUCTION time when no apiKey/OPENROUTER_API_KEY is present (verified empirically) -- generated agent.ts must only construct the OpenRouter model when the key is set, or builds/boots fail keyless.",
     "@ai-sdk/anthropic@4.0.7 is npm latest; depends on @ai-sdk/provider@4.0.2 + @ai-sdk/provider-utils@5.0.5, the same provider-spec line ai@7.0.14 uses (spec v4). anthropic('claude-...') uses hyphenated native ids (e.g. claude-opus-4-8), unlike dotted gateway ids.",
     "zod: eve/ai tree resolves zod@4.4.3; pin 4.4.3 in generated projects (eve init scaffold deps are eve, ai, zod).",
-    "@workflow/world-postgres env contract: WORKFLOW_POSTGRES_URL (required), WORKFLOW_POSTGRES_JOB_PREFIX (per-agent isolation in a shared world DB), WORKFLOW_POSTGRES_WORKER_CONCURRENCY, WORKFLOW_POSTGRES_MAX_POOL_SIZE, WORKFLOW_LOCAL_BASE_URL (overrides the base URL the queue uses for /.well-known/workflow/v1/* run callbacks -- point it at the proxy/supervisor address in front of the agent). DB bootstrap: `npx --package=@workflow/world-postgres bootstrap` (runs setupDatabase(); creates workflow_runs/steps/events/hooks/stream_chunks + graphile-worker schema).",
-    "Custom channel routes mount at the RAW authored path (urlPath = route.path, no channel prefix; verified in eve compiler normalize-channel). A worker proxy that forwards only /eve/ and /.well-known/workflow/ will NOT reach a channel authored at POST /dispatch -- compiler templates must author trigger-channel routes under a forwarded prefix (e.g. /eve/v1/platform/<trigger>) or the proxy must forward the extra prefix."
+    "@workflow/world-postgres env contract: WORKFLOW_POSTGRES_URL (required), WORKFLOW_POSTGRES_JOB_PREFIX (job-name prefix ONLY -- it does NOT isolate agents sharing a world DB: reenqueueActiveRuns re-enqueues ALL active runs regardless of prefix, so a booting agent re-drives other agents' runs; see spike/REPORT.md finding 11. Isolation plan of record: one world schema per workflow version), WORKFLOW_POSTGRES_WORKER_CONCURRENCY, WORKFLOW_POSTGRES_MAX_POOL_SIZE, WORKFLOW_LOCAL_BASE_URL (overrides the base URL the queue uses for /.well-known/workflow/v1/* run callbacks -- point it at the proxy/supervisor address in front of the agent). DB bootstrap: `npx --package=@workflow/world-postgres bootstrap` (runs setupDatabase(); creates workflow_runs/steps/events/hooks/stream_chunks + graphile-worker schema).",
+    "Custom channel routes mount at the RAW authored path (urlPath = route.path, no channel prefix; verified in eve compiler normalize-channel). DECIDED (route-prefix convention for Phase-1 templates): trigger channels are authored under /eve/v1/platform/<trigger>, which the worker proxy already forwards via the /eve/ prefix -- no extra proxy prefix needed. Proven end-to-end through the proxy in spike/tests/mocked.test.ts (spike channel authored at POST /eve/v1/platform/dispatch)."
   ]
 }

@@ -84,11 +84,13 @@ Event inventory frozen in `packages/shared/src/eve-events.ts` (14 types live-obs
    listener (PPID 1, port still bound). Supervisors must kill the process
    group / track the listener PID (spike harness uses `lsof -ti tcp:<port>`).
 7. **Custom channel routes mount at the RAW authored path** (verified in
-   eve's compiler: `urlPath = route.path`, no channel prefix). `POST
-   /dispatch` is unreachable through a proxy that forwards only `/eve/` +
-   `/.well-known/workflow/`. Compiler templates must author trigger-channel
-   routes under a forwarded prefix (e.g. `/eve/v1/platform/<trigger>`) or the
-   worker proxy must forward the extra paths.
+   eve's compiler: `urlPath = route.path`, no channel prefix). A route like
+   `POST /dispatch` is unreachable through a proxy that forwards only `/eve/`
+   + `/.well-known/workflow/`. RESOLVED — locked convention: trigger channels
+   are authored under `/eve/v1/platform/<trigger>` (rides the forwarded
+   `/eve/` prefix; no proxy change). The spike channel now lives at `POST
+   /eve/v1/platform/dispatch` and is exercised THROUGH the proxy in
+   spike/tests/mocked.test.ts.
 8. **world-postgres bootstrap**: `node_modules/.bin/bootstrap` (or `npx
    --package=@workflow/world-postgres bootstrap`), reads
    `WORKFLOW_POSTGRES_URL`. Tables land in the `workflow` schema (plus

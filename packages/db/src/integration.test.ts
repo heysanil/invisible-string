@@ -286,6 +286,59 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     ]);
   });
 
+  test("scope/owner CHECK constraints reject inconsistent mcp_connections and skills rows", async () => {
+    // Valid rows on both sides of the enum pass.
+    await db.insert(schema.mcpConnections).values({
+      scope: "workspace",
+      organizationId: orgId,
+      name: `mcp-ws-${suffix}`,
+      source: "custom",
+      url: "https://mcp.example.com/mcp",
+    });
+    await db.insert(schema.skills).values({
+      scope: "user",
+      userId,
+      name: `skill-user-${suffix}`,
+      content: "# skill",
+    });
+
+    const invalid: {
+      table: "mcp" | "skill";
+      row: Record<string, unknown>;
+    }[] = [
+      // workspace scope without organization_id (orphan)
+      { table: "mcp", row: { scope: "workspace", userId } },
+      // user scope without user_id (orphan)
+      { table: "mcp", row: { scope: "user", organizationId: orgId } },
+      // both owners set (cross-scope ambiguity)
+      { table: "mcp", row: { scope: "workspace", organizationId: orgId, userId } },
+      // neither owner set
+      { table: "skill", row: { scope: "user" } },
+      { table: "skill", row: { scope: "workspace", userId } },
+    ];
+    for (const { table, row } of invalid) {
+      let checkError: unknown;
+      try {
+        if (table === "mcp") {
+          await db.insert(schema.mcpConnections).values({
+            name: `mcp-bad-${suffix}`,
+            source: "custom",
+            ...row,
+          } as typeof schema.mcpConnections.$inferInsert);
+        } else {
+          await db.insert(schema.skills).values({
+            name: `skill-bad-${suffix}`,
+            content: "# bad",
+            ...row,
+          } as typeof schema.skills.$inferInsert);
+        }
+      } catch (error) {
+        checkError = error;
+      }
+      expect(errorText(checkError)).toMatch(/scope_owner_check|check constraint/);
+    }
+  });
+
   test("better-auth login session accepts activeOrganizationId", async () => {
     await db.insert(schema.session).values({
       id: `login-${suffix}`,

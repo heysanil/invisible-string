@@ -16,6 +16,19 @@ interface FieldErrors {
   password?: string;
 }
 
+const FIELD_IDS = {
+  name: "signup-name",
+  email: "signup-email",
+  password: "signup-password",
+} as const;
+const FIELD_ORDER = ["name", "email", "password"] as const;
+
+/** Move focus to the first invalid field so keyboard/SR users get a cue. */
+function focusFirstError(errors: FieldErrors) {
+  const first = FIELD_ORDER.find((field) => errors[field]);
+  if (first) document.getElementById(FIELD_IDS[first])?.focus();
+}
+
 function SignupPage() {
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -27,7 +40,7 @@ function SignupPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  function validate(): boolean {
+  function validate(): FieldErrors {
     const errors: FieldErrors = {};
     if (!name.trim()) errors.name = "Enter your name.";
     if (!email.trim()) errors.email = "Enter your email.";
@@ -36,7 +49,7 @@ function SignupPage() {
     else if (password.length < PASSWORD_MIN_LENGTH)
       errors.password = `Use at least ${PASSWORD_MIN_LENGTH} characters.`;
     setFieldErrors(errors);
-    return Object.keys(errors).length === 0;
+    return errors;
   }
 
   function connectionFailed() {
@@ -51,7 +64,11 @@ function SignupPage() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
-    if (!validate()) return;
+    const errors = validate();
+    if (Object.keys(errors).length > 0) {
+      focusFirstError(errors);
+      return;
+    }
     setSubmitting(true);
     try {
       const { error } = await signUp.email({
@@ -77,6 +94,7 @@ function SignupPage() {
     <AuthCard title="Create your account" subtitle="A workspace for your agents">
       <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
         <Input
+          id={FIELD_IDS.name}
           label="Name"
           type="text"
           name="name"
@@ -90,6 +108,7 @@ function SignupPage() {
           error={fieldErrors.name ?? null}
         />
         <Input
+          id={FIELD_IDS.email}
           label="Email"
           type="email"
           name="email"
@@ -103,6 +122,7 @@ function SignupPage() {
           error={fieldErrors.email ?? null}
         />
         <Input
+          id={FIELD_IDS.password}
           label="Password"
           type="password"
           name="password"

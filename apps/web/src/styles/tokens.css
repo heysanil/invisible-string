@@ -28,6 +28,10 @@
   --glass-bg-soft: rgba(255, 255, 255, 0.5);
   --glass-border: rgba(255, 255, 255, 0.7);
   --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+  /* Deliberate emphasis for the floating dock capsule — one step above the
+     E1 panel range so the dock reads as the top "island"; retune with
+     --glass-shadow, not independently. */
+  --glass-shadow-raised: 0 12px 40px rgba(0, 0, 0, 0.12);
   --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.8);
   --glass-blur: 24px;
   --surface-solid: #f7f7f7;
@@ -94,7 +98,7 @@
     background: var(--glass-bg-soft);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-capsule);
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12), var(--glass-highlight);
+    box-shadow: var(--glass-shadow-raised), var(--glass-highlight);
     -webkit-backdrop-filter: blur(28px) saturate(140%);
     backdrop-filter: blur(28px) saturate(140%);
   }

@@ -1,4 +1,6 @@
 # Dex test IdP for local dev + CI (OIDC SSO against Better Auth).
+# LOCAL-ONLY credentials: the static client secret and bcrypt password below
+# are public throwaway dev values — never reuse them outside localhost/CI.
 issuer: http://localhost:5556/dex
 
 storage:

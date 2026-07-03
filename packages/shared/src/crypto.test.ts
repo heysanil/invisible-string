@@ -138,6 +138,49 @@ describe("encryptSecret / decryptSecret", () => {
   });
 });
 
+describe("aadContext (per-row/tenant binding)", () => {
+  const CTX_A = "ws-a:mcp_connections:auth_config_encrypted:row-1";
+  const CTX_B = "ws-b:mcp_connections:auth_config_encrypted:row-2";
+
+  test("round-trips with the same context", () => {
+    const k = key();
+    const env = encryptSecret("tenant secret", k, CTX_A);
+    expect(decryptSecret(env, k, CTX_A)).toBe("tenant secret");
+  });
+
+  test("an envelope relocated to another row/tenant fails to decrypt", () => {
+    const k = key();
+    const env = encryptSecret("workspace A secret", k, CTX_A);
+    // Confused-deputy scenario: the intact envelope tuple is presented under
+    // workspace B's row context — must fail authentication, not leak A's value.
+    expect(() => decryptSecret(env, k, CTX_B)).toThrow(EnvelopeError);
+  });
+
+  test("context-bound envelopes do not decrypt without the context (and vice versa)", () => {
+    const k = key();
+    const bound = encryptSecret("bound", k, CTX_A);
+    expect(() => decryptSecret(bound, k)).toThrow(EnvelopeError);
+    const unbound = encryptSecret("unbound", k);
+    expect(() => decryptSecret(unbound, k, CTX_A)).toThrow(EnvelopeError);
+  });
+
+  test("rotation preserves the context binding", () => {
+    const oldKey = key();
+    const newKey = key();
+    const env = encryptSecret("rotate me", oldKey, CTX_A);
+    // Rotation must present the same context to unwrap/re-wrap the data key.
+    expect(() => rotateEnvelope(env, oldKey, newKey)).toThrow(EnvelopeError);
+    const rotated = rotateEnvelope(env, oldKey, newKey, CTX_A);
+    expect(decryptSecret(rotated, newKey, CTX_A)).toBe("rotate me");
+    expect(() => decryptSecret(rotated, newKey, CTX_B)).toThrow(EnvelopeError);
+  });
+
+  test("rejects an empty context string (likely an interpolation bug)", () => {
+    const k = key();
+    expect(() => encryptSecret("x", k, "")).toThrow(/non-empty/);
+  });
+});
+
 describe("rotateEnvelope (master-key rotation)", () => {
   test("re-wraps the data key without touching the payload", () => {
     const oldKey = key();

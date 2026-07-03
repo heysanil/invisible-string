@@ -157,6 +157,12 @@ export const ssoProvider = pgTable("sso_provider", {
   providerId: text("provider_id").notNull().unique(),
   organizationId: text("organization_id"),
   domain: text("domain").notNull(),
+  /**
+   * sso({ domainVerification: { enabled: true } }) gates sign-ins on this
+   * flag: providers cannot mint/link accounts for a domain until its owner
+   * proves control (DNS TXT token flow). Defaults false at registration.
+   */
+  domainVerified: boolean("domain_verified").default(false),
 });
 
 export const userRelations = relations(user, ({ many }) => ({

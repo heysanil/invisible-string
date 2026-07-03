@@ -15,6 +15,15 @@ interface FieldErrors {
   password?: string;
 }
 
+const FIELD_IDS = { email: "login-email", password: "login-password" } as const;
+const FIELD_ORDER = ["email", "password"] as const;
+
+/** Move focus to the first invalid field so keyboard/SR users get a cue. */
+function focusFirstError(errors: FieldErrors) {
+  const first = FIELD_ORDER.find((field) => errors[field]);
+  if (first) document.getElementById(FIELD_IDS[first])?.focus();
+}
+
 function LoginPage() {
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -25,13 +34,13 @@ function LoginPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  function validate(): boolean {
+  function validate(): FieldErrors {
     const errors: FieldErrors = {};
     if (!email.trim()) errors.email = "Enter your email.";
     else if (!isValidEmail(email.trim())) errors.email = "Enter a valid email address.";
     if (!password) errors.password = "Enter your password.";
     setFieldErrors(errors);
-    return Object.keys(errors).length === 0;
+    return errors;
   }
 
   function connectionFailed() {
@@ -46,7 +55,11 @@ function LoginPage() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
-    if (!validate()) return;
+    const errors = validate();
+    if (Object.keys(errors).length > 0) {
+      focusFirstError(errors);
+      return;
+    }
     setSubmitting(true);
     try {
       const { error } = await signIn.email({ email: email.trim(), password });
@@ -68,6 +81,7 @@ function LoginPage() {
     <AuthCard title="Welcome back" subtitle="Sign in to your workspace">
       <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
         <Input
+          id={FIELD_IDS.email}
           label="Email"
           type="email"
           name="email"
@@ -81,6 +95,7 @@ function LoginPage() {
           error={fieldErrors.email ?? null}
         />
         <Input
+          id={FIELD_IDS.password}
           label="Password"
           type="password"
           name="password"

@@ -18,6 +18,24 @@ describe("loadConfig", () => {
     expect(config.corsOrigins).toEqual(["http://localhost:5173"]);
     expect(config.trustedOrigins).toEqual([]);
     expect(config.encryptionMasterKey).toBeUndefined();
+    expect(config.requireEmailVerification).toBe(false);
+  });
+
+  test("parses AUTH_REQUIRE_EMAIL_VERIFICATION", () => {
+    for (const [raw, expected] of [
+      ["1", true],
+      ["true", true],
+      ["0", false],
+      ["false", false],
+    ] as const) {
+      expect(
+        loadConfig({ ...validEnv, AUTH_REQUIRE_EMAIL_VERIFICATION: raw })
+          .requireEmailVerification,
+      ).toBe(expected);
+    }
+    expect(() =>
+      loadConfig({ ...validEnv, AUTH_REQUIRE_EMAIL_VERIFICATION: "maybe" }),
+    ).toThrow(/AUTH_REQUIRE_EMAIL_VERIFICATION/);
   });
 
   test("honors explicit values", () => {

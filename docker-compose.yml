@@ -1,3 +1,13 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCAL DEV / CI ONLY — NOT A PRODUCTION TOPOLOGY.
+#
+# Every credential in this file (Postgres dev/dev, MinIO dev/devdevdev, Dex
+# client secret + static user in infra/dex-config.yaml) is a hardcoded,
+# public, throwaway DEV credential bound to localhost. Do NOT lift this file
+# into any shared, staging, or production environment. The documented
+# production topology (docs/PLAN.md) is defined separately and must source
+# ALL secrets from environment/secret managers — never from this file.
+# ─────────────────────────────────────────────────────────────────────────────
 name: invisible-string
 
 services:

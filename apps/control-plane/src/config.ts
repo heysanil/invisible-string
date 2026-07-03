@@ -25,6 +25,13 @@ export interface Config {
    * Optional until the first secret-bearing feature ships; validated when set.
    */
   encryptionMasterKey: MasterKey | undefined;
+  /**
+   * Block email/password sign-in until the address is verified
+   * (AUTH_REQUIRE_EMAIL_VERIFICATION=1). Default off: local/CI stacks have no
+   * mailer; production must enable it before any trust decision reads
+   * `emailVerified` (account linking, domain-based org membership).
+   */
+  requireEmailVerification: boolean;
 }
 
 export class ConfigError extends Error {
@@ -98,6 +105,12 @@ export function loadConfig(env: Env = process.env): Config {
     }
   }
 
+  const requireEmailVerification = parseBoolean(
+    env.AUTH_REQUIRE_EMAIL_VERIFICATION,
+    "AUTH_REQUIRE_EMAIL_VERIFICATION",
+    problems,
+  );
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -108,6 +121,7 @@ export function loadConfig(env: Env = process.env): Config {
     corsOrigins,
     trustedOrigins,
     encryptionMasterKey,
+    requireEmailVerification,
   };
 }
 
@@ -135,6 +149,19 @@ function parsePort(raw: string | undefined, problems: string[]): number {
     return 3000;
   }
   return port;
+}
+
+function parseBoolean(
+  raw: string | undefined,
+  name: string,
+  problems: string[],
+): boolean {
+  const value = raw?.trim();
+  if (!value) return false;
+  if (["1", "true", "yes"].includes(value.toLowerCase())) return true;
+  if (["0", "false", "no"].includes(value.toLowerCase())) return false;
+  problems.push(`${name} must be a boolean (1/0/true/false), got "${value}"`);
+  return false;
 }
 
 function splitList(raw: string | undefined): string[] | undefined {

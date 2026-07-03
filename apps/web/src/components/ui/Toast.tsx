@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -49,10 +50,42 @@ const DOT: Record<ToastVariant, string> = {
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const nextId = useRef(0);
+  // Auto-dismiss timers, tracked so they can be paused (hover/focus — WCAG
+  // 2.2.1: users must get time to read actionable toasts) and cleared on
+  // provider unmount (no setState-after-unmount in tests/HMR).
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
+  const durations = useRef(new Map<number, number>());
 
   const dismiss = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    timers.current.delete(id);
+    durations.current.delete(id);
     setToasts((list) => list.filter((t) => t.id !== id));
   }, []);
+
+  const schedule = useCallback(
+    (id: number, duration: number) => {
+      timers.current.set(
+        id,
+        setTimeout(() => dismiss(id), duration),
+      );
+    },
+    [dismiss],
+  );
+
+  /** Pause every pending auto-dismiss (pointer over / focus in the region). */
+  const pauseAll = useCallback(() => {
+    for (const timer of timers.current.values()) clearTimeout(timer);
+    timers.current.clear();
+  }, []);
+
+  /** Resume auto-dismiss with each toast's full duration (simple + safe). */
+  const resumeAll = useCallback(() => {
+    for (const [id, duration] of durations.current) {
+      if (!timers.current.has(id)) schedule(id, duration);
+    }
+  }, [schedule]);
 
   const toast = useCallback(
     (options: ToastOptions) => {
@@ -66,17 +99,34 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           variant: options.variant ?? "info",
         },
       ]);
-      setTimeout(() => dismiss(id), options.duration ?? 5000);
+      const duration = options.duration ?? 5000;
+      durations.current.set(id, duration);
+      schedule(id, duration);
     },
-    [dismiss],
+    [schedule],
   );
+
+  // Clear every pending timer when the provider unmounts.
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+    };
+  }, []);
 
   const value = useMemo(() => ({ toast }), [toast]);
 
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div className="pointer-events-none fixed inset-x-0 bottom-6 z-100 flex flex-col items-center gap-2 px-4">
+      <div
+        onPointerEnter={pauseAll}
+        onPointerLeave={resumeAll}
+        onFocus={pauseAll}
+        onBlur={resumeAll}
+        className="pointer-events-none fixed inset-x-0 bottom-6 z-100 flex flex-col items-center gap-2 px-4"
+      >
         {toasts.map((t) => (
           <div
             key={t.id}

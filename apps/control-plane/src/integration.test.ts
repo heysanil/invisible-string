@@ -12,9 +12,11 @@
  * - email/password sign-up → create organization → set active → the login
  *   session carries `activeOrganizationId`, creator role is `owner`
  * - the workspace-scoping macro end-to-end against real session storage
- * - SSO: register Dex as a generic OIDC provider via the sso plugin API and
- *   assert the sign-in redirect URL shape (authorization endpoint, client_id,
- *   redirect_uri = /api/auth/sso/callback/dex, response_type=code, state).
+ * - SSO: registration is organization-scoped and owner/admin-gated; sign-in
+ *   through a provider is refused until its domain is verified; a verified
+ *   provider yields the expected redirect URL shape (authorization endpoint,
+ *   client_id, redirect_uri = /api/auth/sso/callback/dex, response_type=code,
+ *   state).
  *
  * NOT covered here — Phase 2 Playwright E2E will drive the full browser
  * dance against the compose stack: follow the sign-in redirect to Dex, log
@@ -178,18 +180,9 @@ describe.skipIf(!TEST_DATABASE_URL)(
       expect(anon.status).toBe(401);
     });
 
-    test("SSO: register Dex (OIDC) and assert the sign-in redirect shape", async () => {
-      const { headers } = await signUp();
+    /** Build an OIDC config for Dex, preferring live discovery. */
+    async function dexOidcConfig() {
       const discovery = await probeDexDiscovery();
-
-      // providerId must be "dex" (it is baked into Dex's registered redirect
-      // URI) — remove any row left by a previous run so the test is idempotent.
-      await stack.dbHandle.db
-        .delete(ssoProvider)
-        .where(eq(ssoProvider.providerId, "dex"));
-
-      // Prefer live discovery against Dex; fall back to explicit endpoints
-      // (skipDiscovery) so this test still runs DB-only environments.
       const oidcConfig = discovery
         ? { clientId: "invisible-string", clientSecret: "dev-secret" }
         : {
@@ -200,17 +193,109 @@ describe.skipIf(!TEST_DATABASE_URL)(
             tokenEndpoint: `${DEX_ISSUER}/token`,
             jwksEndpoint: `${DEX_ISSUER}/keys`,
           };
+      return { discovery, oidcConfig };
+    }
+
+    /** Sign up a user with an active organization they own; return both. */
+    async function signUpWithOrg() {
+      const { headers, email } = await signUp();
+      const org = await stack.auth.api.createOrganization({
+        body: { name: "SSO Workspace", slug: `ws-${randomUUID().slice(0, 8)}` },
+        headers,
+      });
+      await stack.auth.api.setActiveOrganization({
+        body: { organizationId: org!.id },
+        headers,
+      });
+      return { headers, email, orgId: org!.id };
+    }
+
+    test("SSO hardening: providers cannot be registered without an organization, by non-members, or by non-admin members", async () => {
+      const { oidcConfig } = await dexOidcConfig();
+      const providerBody = (providerId: string) => ({
+        providerId,
+        issuer: DEX_ISSUER,
+        domain: "example.com",
+        oidcConfig,
+      });
+
+      // (a) No organizationId → rejected by the before-hook (user-owned
+      // providers, the self-registration hole, are not representable).
+      const { headers: ownerHeaders, orgId } = await signUpWithOrg();
+      await expect(
+        stack.auth.api.registerSSOProvider({
+          body: providerBody(`nope-${randomUUID().slice(0, 8)}`),
+          headers: ownerHeaders,
+        }),
+      ).rejects.toThrow(/organizationId required/);
+
+      // (b) An authenticated user who is NOT a member of the target org.
+      const { headers: strangerHeaders } = await signUp();
+      await expect(
+        stack.auth.api.registerSSOProvider({
+          body: { ...providerBody(`nope-${randomUUID().slice(0, 8)}`), organizationId: orgId },
+          headers: strangerHeaders,
+        }),
+      ).rejects.toThrow(/not a member/i);
+
+      // (c) A plain member (not owner/admin) of the org.
+      const memberSignUp = await signUp();
+      const memberSession = await stack.auth.api.getSession({
+        headers: memberSignUp.headers,
+      });
+      await stack.auth.api.addMember({
+        body: {
+          userId: memberSession!.user.id,
+          organizationId: orgId,
+          role: "member",
+        },
+      });
+      await expect(
+        stack.auth.api.registerSSOProvider({
+          body: { ...providerBody(`nope-${randomUUID().slice(0, 8)}`), organizationId: orgId },
+          headers: memberSignUp.headers,
+        }),
+      ).rejects.toThrow(/owner or admin/i);
+    });
+
+    test("SSO: org owner registers Dex (OIDC); sign-in is refused until the domain is verified, then redirects correctly", async () => {
+      const { discovery, oidcConfig } = await dexOidcConfig();
+      const { headers, orgId } = await signUpWithOrg();
+
+      // providerId must be "dex" (it is baked into Dex's registered redirect
+      // URI) — remove any row left by a previous run so the test is idempotent.
+      await stack.dbHandle.db
+        .delete(ssoProvider)
+        .where(eq(ssoProvider.providerId, "dex"));
 
       const provider = await stack.auth.api.registerSSOProvider({
         body: {
           providerId: "dex",
           issuer: DEX_ISSUER,
           domain: "example.com",
+          organizationId: orgId,
           oidcConfig,
         },
         headers,
       });
       expect(provider).toBeTruthy();
+
+      // domainVerification.enabled: a freshly registered provider is NOT
+      // domain-verified and must not be able to serve sign-ins (i.e. an
+      // attacker-registered IdP claiming someone else's domain cannot mint
+      // accounts for it).
+      await expect(
+        stack.auth.api.signInSSO({
+          body: { providerId: "dex", callbackURL: `${BASE_URL}/` },
+        }),
+      ).rejects.toThrow();
+
+      // Simulate the DNS TXT verification completing (the real flow serves
+      // /sso/verify-domain; direct row update keeps this test hermetic).
+      await stack.dbHandle.db
+        .update(ssoProvider)
+        .set({ domainVerified: true })
+        .where(eq(ssoProvider.providerId, "dex"));
 
       const signIn = await stack.auth.api.signInSSO({
         body: {

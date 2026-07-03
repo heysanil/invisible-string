@@ -66,7 +66,9 @@ test("dock navigation switches routes", async () => {
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/context");
   });
-  expect(await view.findByText("No context sources yet")).toBeTruthy();
+  // With no active workspace resolved, the context section shows its
+  // workspace gate rather than firing resource fetches.
+  expect(await view.findByText("No workspace yet")).toBeTruthy();
 });
 
 test("active dock item is marked with aria-current", async () => {

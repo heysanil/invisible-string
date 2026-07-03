@@ -39,6 +39,14 @@ export function ensureDomForThisFile(): void {
     globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   });
   afterAll(async () => {
+    // React 19's scheduler drives concurrent work through a MessageChannel;
+    // a task can still be queued when a test file ends. Unregistering
+    // happy-dom first would leave that task to flush with no `window`
+    // (`schedulerEvent = window.event` → ReferenceError "between tests").
+    // Drain the macrotask queue while `window` still exists before tearing
+    // the DOM down.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
     if (GlobalRegistrator.isRegistered) {
       await GlobalRegistrator.unregister();
     }

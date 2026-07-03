@@ -17,6 +17,14 @@ import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppContextRouteImport } from './routes/_app.context'
 import { Route as AppChatRouteImport } from './routes/_app.chat'
+import { Route as AppSettingsIndexRouteImport } from './routes/_app.settings.index'
+import { Route as AppContextIndexRouteImport } from './routes/_app.context.index'
+import { Route as AppSettingsWorkspaceRouteImport } from './routes/_app.settings.workspace'
+import { Route as AppSettingsModelsRouteImport } from './routes/_app.settings.models'
+import { Route as AppSettingsMembersRouteImport } from './routes/_app.settings.members'
+import { Route as AppSettingsAllowlistRouteImport } from './routes/_app.settings.allowlist'
+import { Route as AppSettingsAgentsRouteImport } from './routes/_app.settings.agents'
+import { Route as AppContextSkillsSkillIdRouteImport } from './routes/_app.context.skills.$skillId'
 
 const SignupRoute = SignupRouteImport.update({
   id: '/signup',
@@ -57,24 +65,78 @@ const AppChatRoute = AppChatRouteImport.update({
   path: '/chat',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSettingsIndexRoute = AppSettingsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppContextIndexRoute = AppContextIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppContextRoute,
+} as any)
+const AppSettingsWorkspaceRoute = AppSettingsWorkspaceRouteImport.update({
+  id: '/workspace',
+  path: '/workspace',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppSettingsModelsRoute = AppSettingsModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppSettingsMembersRoute = AppSettingsMembersRouteImport.update({
+  id: '/members',
+  path: '/members',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppSettingsAllowlistRoute = AppSettingsAllowlistRouteImport.update({
+  id: '/allowlist',
+  path: '/allowlist',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppSettingsAgentsRoute = AppSettingsAgentsRouteImport.update({
+  id: '/agents',
+  path: '/agents',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
+const AppContextSkillsSkillIdRoute = AppContextSkillsSkillIdRouteImport.update({
+  id: '/skills/$skillId',
+  path: '/skills/$skillId',
+  getParentRoute: () => AppContextRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
   '/chat': typeof AppChatRoute
-  '/context': typeof AppContextRoute
-  '/settings': typeof AppSettingsRoute
+  '/context': typeof AppContextRouteWithChildren
+  '/settings': typeof AppSettingsRouteWithChildren
   '/workflows': typeof AppWorkflowsRoute
+  '/settings/agents': typeof AppSettingsAgentsRoute
+  '/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/settings/members': typeof AppSettingsMembersRoute
+  '/settings/models': typeof AppSettingsModelsRoute
+  '/settings/workspace': typeof AppSettingsWorkspaceRoute
+  '/context/': typeof AppContextIndexRoute
+  '/settings/': typeof AppSettingsIndexRoute
+  '/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
   '/chat': typeof AppChatRoute
-  '/context': typeof AppContextRoute
-  '/settings': typeof AppSettingsRoute
   '/workflows': typeof AppWorkflowsRoute
+  '/settings/agents': typeof AppSettingsAgentsRoute
+  '/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/settings/members': typeof AppSettingsMembersRoute
+  '/settings/models': typeof AppSettingsModelsRoute
+  '/settings/workspace': typeof AppSettingsWorkspaceRoute
+  '/context': typeof AppContextIndexRoute
+  '/settings': typeof AppSettingsIndexRoute
+  '/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -83,9 +145,17 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
   '/_app/chat': typeof AppChatRoute
-  '/_app/context': typeof AppContextRoute
-  '/_app/settings': typeof AppSettingsRoute
+  '/_app/context': typeof AppContextRouteWithChildren
+  '/_app/settings': typeof AppSettingsRouteWithChildren
   '/_app/workflows': typeof AppWorkflowsRoute
+  '/_app/settings/agents': typeof AppSettingsAgentsRoute
+  '/_app/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/_app/settings/members': typeof AppSettingsMembersRoute
+  '/_app/settings/models': typeof AppSettingsModelsRoute
+  '/_app/settings/workspace': typeof AppSettingsWorkspaceRoute
+  '/_app/context/': typeof AppContextIndexRoute
+  '/_app/settings/': typeof AppSettingsIndexRoute
+  '/_app/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -97,15 +167,29 @@ export interface FileRouteTypes {
     | '/context'
     | '/settings'
     | '/workflows'
+    | '/settings/agents'
+    | '/settings/allowlist'
+    | '/settings/members'
+    | '/settings/models'
+    | '/settings/workspace'
+    | '/context/'
+    | '/settings/'
+    | '/context/skills/$skillId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/login'
     | '/signup'
     | '/chat'
+    | '/workflows'
+    | '/settings/agents'
+    | '/settings/allowlist'
+    | '/settings/members'
+    | '/settings/models'
+    | '/settings/workspace'
     | '/context'
     | '/settings'
-    | '/workflows'
+    | '/context/skills/$skillId'
   id:
     | '__root__'
     | '/'
@@ -116,6 +200,14 @@ export interface FileRouteTypes {
     | '/_app/context'
     | '/_app/settings'
     | '/_app/workflows'
+    | '/_app/settings/agents'
+    | '/_app/settings/allowlist'
+    | '/_app/settings/members'
+    | '/_app/settings/models'
+    | '/_app/settings/workspace'
+    | '/_app/context/'
+    | '/_app/settings/'
+    | '/_app/context/skills/$skillId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -183,20 +275,112 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppChatRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings/': {
+      id: '/_app/settings/'
+      path: '/'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof AppSettingsIndexRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/context/': {
+      id: '/_app/context/'
+      path: '/'
+      fullPath: '/context/'
+      preLoaderRoute: typeof AppContextIndexRouteImport
+      parentRoute: typeof AppContextRoute
+    }
+    '/_app/settings/workspace': {
+      id: '/_app/settings/workspace'
+      path: '/workspace'
+      fullPath: '/settings/workspace'
+      preLoaderRoute: typeof AppSettingsWorkspaceRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/settings/models': {
+      id: '/_app/settings/models'
+      path: '/models'
+      fullPath: '/settings/models'
+      preLoaderRoute: typeof AppSettingsModelsRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/settings/members': {
+      id: '/_app/settings/members'
+      path: '/members'
+      fullPath: '/settings/members'
+      preLoaderRoute: typeof AppSettingsMembersRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/settings/allowlist': {
+      id: '/_app/settings/allowlist'
+      path: '/allowlist'
+      fullPath: '/settings/allowlist'
+      preLoaderRoute: typeof AppSettingsAllowlistRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/settings/agents': {
+      id: '/_app/settings/agents'
+      path: '/agents'
+      fullPath: '/settings/agents'
+      preLoaderRoute: typeof AppSettingsAgentsRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/context/skills/$skillId': {
+      id: '/_app/context/skills/$skillId'
+      path: '/skills/$skillId'
+      fullPath: '/context/skills/$skillId'
+      preLoaderRoute: typeof AppContextSkillsSkillIdRouteImport
+      parentRoute: typeof AppContextRoute
+    }
   }
 }
 
+interface AppContextRouteChildren {
+  AppContextIndexRoute: typeof AppContextIndexRoute
+  AppContextSkillsSkillIdRoute: typeof AppContextSkillsSkillIdRoute
+}
+
+const AppContextRouteChildren: AppContextRouteChildren = {
+  AppContextIndexRoute: AppContextIndexRoute,
+  AppContextSkillsSkillIdRoute: AppContextSkillsSkillIdRoute,
+}
+
+const AppContextRouteWithChildren = AppContextRoute._addFileChildren(
+  AppContextRouteChildren,
+)
+
+interface AppSettingsRouteChildren {
+  AppSettingsAgentsRoute: typeof AppSettingsAgentsRoute
+  AppSettingsAllowlistRoute: typeof AppSettingsAllowlistRoute
+  AppSettingsMembersRoute: typeof AppSettingsMembersRoute
+  AppSettingsModelsRoute: typeof AppSettingsModelsRoute
+  AppSettingsWorkspaceRoute: typeof AppSettingsWorkspaceRoute
+  AppSettingsIndexRoute: typeof AppSettingsIndexRoute
+}
+
+const AppSettingsRouteChildren: AppSettingsRouteChildren = {
+  AppSettingsAgentsRoute: AppSettingsAgentsRoute,
+  AppSettingsAllowlistRoute: AppSettingsAllowlistRoute,
+  AppSettingsMembersRoute: AppSettingsMembersRoute,
+  AppSettingsModelsRoute: AppSettingsModelsRoute,
+  AppSettingsWorkspaceRoute: AppSettingsWorkspaceRoute,
+  AppSettingsIndexRoute: AppSettingsIndexRoute,
+}
+
+const AppSettingsRouteWithChildren = AppSettingsRoute._addFileChildren(
+  AppSettingsRouteChildren,
+)
+
 interface AppRouteChildren {
   AppChatRoute: typeof AppChatRoute
-  AppContextRoute: typeof AppContextRoute
-  AppSettingsRoute: typeof AppSettingsRoute
+  AppContextRoute: typeof AppContextRouteWithChildren
+  AppSettingsRoute: typeof AppSettingsRouteWithChildren
   AppWorkflowsRoute: typeof AppWorkflowsRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppChatRoute: AppChatRoute,
-  AppContextRoute: AppContextRoute,
-  AppSettingsRoute: AppSettingsRoute,
+  AppContextRoute: AppContextRouteWithChildren,
+  AppSettingsRoute: AppSettingsRouteWithChildren,
   AppWorkflowsRoute: AppWorkflowsRoute,
 }
 

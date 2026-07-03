@@ -211,6 +211,57 @@
     transition-delay: 120ms;
   }
 
+  /* --- Overlays (modal / drawer) ------------------------------------------- */
+  @keyframes overlay-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes dialog-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes drawer-in {
+    from {
+      opacity: 0;
+      transform: translateX(16px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  .overlay-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: flex;
+    background: rgba(30, 32, 38, 0.28);
+    -webkit-backdrop-filter: blur(2px);
+    backdrop-filter: blur(2px);
+    animation: overlay-in var(--dur) var(--ease-out) both;
+  }
+
+  .dialog-enter {
+    animation: dialog-in var(--dur) var(--ease-out) both;
+  }
+
+  .drawer-enter {
+    animation: drawer-in var(--dur) var(--ease-out) both;
+  }
+
   /* --- Small primitives ------------------------------------------------------ */
   @keyframes spinner-spin {
     to {
@@ -224,6 +275,53 @@
     border: 1.5px solid currentColor;
     border-top-color: transparent;
     animation: spinner-spin 0.7s linear infinite;
+  }
+
+  /* --- CodeMirror (markdown skill editor) --------------------------------- */
+  .cm-host .cm-editor {
+    height: 100%;
+    background: transparent;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 13px;
+  }
+
+  .cm-host .cm-editor.cm-focused {
+    outline: none;
+  }
+
+  .cm-host .cm-scroller {
+    padding: 12px 14px;
+    line-height: 1.6;
+  }
+
+  .cm-host .cm-content {
+    caret-color: var(--ink);
+  }
+
+  .cm-host .cm-cursor {
+    border-left-color: var(--ink);
+  }
+
+  .cm-host .cm-selectionBackground,
+  .cm-host .cm-focused .cm-selectionBackground {
+    background: rgba(17, 17, 17, 0.12) !important;
+  }
+
+  .cm-host .cm-placeholder {
+    color: var(--ink-4);
+  }
+
+  .cm-host .cm-gutters {
+    background: transparent;
+    border: none;
+    color: var(--ink-4);
+  }
+
+  /* Focus ring on the wrapper, not the inner content */
+  .cm-host:focus-within {
+    outline: 2px solid var(--ink);
+    outline-offset: 1px;
+    border-color: transparent;
   }
 
   /* Future tool names / @refs — ink on 8% black chips, ui-monospace */

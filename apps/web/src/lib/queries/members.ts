@@ -18,11 +18,15 @@ export function fetchWorkspaceMembers(workspaceId: string, signal?: AbortSignal)
   );
 }
 
-export function useWorkspaceMembers(workspaceId: string) {
+export function useWorkspaceMembers(
+  workspaceId: string,
+  options: { enabled?: boolean } = {},
+) {
   return useQuery({
     queryKey: queryKeys.members.list(workspaceId),
     queryFn: ({ signal }) => fetchWorkspaceMembers(workspaceId, signal),
     select: (data) => data.members,
     staleTime: 60_000,
+    enabled: (options.enabled ?? true) && workspaceId.length > 0,
   });
 }

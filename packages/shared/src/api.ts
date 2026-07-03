@@ -95,6 +95,31 @@ export const modelProviderSchema = z.enum(["anthropic", "openrouter"]);
 export type ModelProvider = z.infer<typeof modelProviderSchema>;
 
 /**
+ * Provider-aware model-id SHAPE check (keyed-acceptance papercut: a
+ * malformed id sails through allowlisting/publish and only fails at run time
+ * with a provider error). This can't prove an id exists — the control plane
+ * additionally consults OpenRouter's public catalog when reachable — but it
+ * catches the whole wrong-provider-grammar class up front:
+ * - openrouter ids are `vendor/slug` (optionally `:variant`), e.g.
+ *   `deepseek/deepseek-v4-flash`, `openai/gpt-5.2:extended`
+ * - anthropic (native API) ids are hyphenated, NO vendor prefix, e.g.
+ *   `claude-opus-4-8` — a slash means someone pasted a gateway/OpenRouter id
+ */
+export function modelIdShapeProblem(
+  provider: ModelProvider,
+  modelId: string,
+): string | null {
+  if (provider === "openrouter") {
+    return /^[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*(?::[\w.-]+)?$/i.test(modelId)
+      ? null
+      : `"${modelId}" is not an OpenRouter model id — expected "vendor/model" (e.g. "deepseek/deepseek-v4-flash")`;
+  }
+  return modelId.includes("/")
+    ? `"${modelId}" is not an Anthropic model id — native ids have no "/" (e.g. "claude-opus-4-8"); for OpenRouter-routed models pick the openrouter provider`
+    : null;
+}
+
+/**
  * Better Auth organization roles. `member.role` is open text upstream, so
  * DTOs read `string` — these are the roles the UI understands.
  */
@@ -933,11 +958,18 @@ export type ModelAllowlistEntryDto = z.infer<
   typeof modelAllowlistEntryDtoSchema
 >;
 
-export const addModelAllowlistEntryRequestSchema = z.object({
-  provider: modelProviderSchema,
-  modelId: z.string().trim().min(1).max(200),
-  enabled: z.boolean().default(true),
-});
+export const addModelAllowlistEntryRequestSchema = z
+  .object({
+    provider: modelProviderSchema,
+    modelId: z.string().trim().min(1).max(200),
+    enabled: z.boolean().default(true),
+  })
+  .superRefine((entry, ctx) => {
+    const problem = modelIdShapeProblem(entry.provider, entry.modelId);
+    if (problem !== null) {
+      ctx.addIssue({ code: "custom", path: ["modelId"], message: problem });
+    }
+  });
 export type AddModelAllowlistEntryRequest = z.infer<
   typeof addModelAllowlistEntryRequestSchema
 >;

@@ -44,6 +44,10 @@ import { RunEventBus } from "./runs/bus";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { resourcesPlugin } from "./resources/plugin";
+import {
+  createOpenRouterCatalog,
+  type OpenRouterModelIds,
+} from "./resources/openrouter-catalog";
 import { createRegistryClient, type RegistryClient } from "./resources/registry";
 import type { ResourceDeps } from "./resources/common";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
@@ -92,6 +96,8 @@ export interface RuntimeOverrides {
   registry?: RegistryClient;
   /** Slack Web API client (stubbed against a fake Slack server in tests). */
   slackClient?: SlackClient;
+  /** OpenRouter catalog lookup for allowlist validation (stubbed in tests). */
+  openRouterModelIds?: OpenRouterModelIds;
 }
 
 /** Assemble the Elysia app from already-constructed pieces (testable). */
@@ -337,6 +343,10 @@ export function createAppStack(
     registry:
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
+    // Advisory allowlist-add validation against OpenRouter's public model
+    // catalog (fail-open when unreachable — resources/openrouter-catalog.ts).
+    openRouterModelIds:
+      runtimeOverrides?.openRouterModelIds ?? createOpenRouterCatalog(),
   };
   // Deep-health probes: DB always; object store + live-worker count only when
   // the runtime is configured (a Phase-0-style boot degrades to the DB check).

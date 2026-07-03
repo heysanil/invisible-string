@@ -65,6 +65,12 @@ export const errors = {
       "model_not_allowlisted",
       `model "${modelId}" is not on this workspace's model allowlist`,
     ),
+  modelUnknownToOpenRouter: (modelId: string) =>
+    new RuntimeApiError(
+      422,
+      "model_unknown_to_openrouter",
+      `OpenRouter does not list a model "${modelId}" — check the id on openrouter.ai/models (runs on it would fail at model-call time)`,
+    ),
   contextResourceNotFound: (kind: "mcp_connection" | "skill", id: string) =>
     new RuntimeApiError(
       422,

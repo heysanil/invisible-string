@@ -26,6 +26,7 @@ import type { CompileWorkflowFn } from "../build/compiler-contract";
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
 import type { WorkspaceDeps } from "../workspace";
+import type { OpenRouterModelIds } from "./openrouter-catalog";
 import type { RegistryClient } from "./registry";
 
 /** Everything the Phase-2 resource CRUD routes need. */
@@ -38,6 +39,12 @@ export interface ResourceDeps {
   /** Object store for skill attachments (undefined when S3 is unconfigured). */
   artifacts: ArtifactStore | undefined;
   registry: RegistryClient;
+  /**
+   * OpenRouter model-catalog lookup for allowlist-add validation (advisory,
+   * fail-open — see resources/openrouter-catalog.ts). Optional: tests and
+   * offline deployments skip the existence check entirely.
+   */
+  openRouterModelIds?: OpenRouterModelIds;
 }
 
 /** Resource owner: an organization (workspace scope) or a user (user scope). */

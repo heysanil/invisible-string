@@ -14,6 +14,7 @@ import {
   listSessionsQuerySchema,
   mcpAuthWriteSchema,
   mcpConnectionDtoSchema,
+  modelIdShapeProblem,
   parseWorkflowDraft,
   postMessageRequestSchema,
   registryServerSummarySchema,
@@ -294,6 +295,41 @@ describe("model preset + allowlist schemas", () => {
       modelId: "claude-sonnet-5",
     });
     expect(parsed.enabled).toBe(true);
+  });
+
+  test("allowlist add enforces provider-aware id shape (keyed-run papercut: malformed ids used to fail only at run time)", () => {
+    // openrouter ids are vendor/slug (optionally :variant).
+    for (const good of [
+      "deepseek/deepseek-v4-flash",
+      "z-ai/glm-5.2",
+      "openai/gpt-5.2:extended",
+    ]) {
+      expect(
+        addModelAllowlistEntryRequestSchema.safeParse({
+          provider: "openrouter",
+          modelId: good,
+        }).success,
+      ).toBe(true);
+    }
+    for (const bad of ["claude-sonnet-5", "deepseek/", "/model", "a b/c"]) {
+      expect(
+        addModelAllowlistEntryRequestSchema.safeParse({
+          provider: "openrouter",
+          modelId: bad,
+        }).success,
+      ).toBe(false);
+    }
+    // anthropic native ids never carry a vendor prefix.
+    expect(
+      addModelAllowlistEntryRequestSchema.safeParse({
+        provider: "anthropic",
+        modelId: "anthropic/claude-opus-4-8",
+      }).success,
+    ).toBe(false);
+    expect(
+      modelIdShapeProblem("openrouter", "no-vendor-prefix"),
+    ).toContain("vendor/model");
+    expect(modelIdShapeProblem("anthropic", "claude-opus-4-8")).toBeNull();
   });
 });
 

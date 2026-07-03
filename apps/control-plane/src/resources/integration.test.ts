@@ -321,6 +321,8 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
   const artifacts = createMemoryArtifactStore();
   let stack: AppStack;
   let db: AppStack["dbHandle"]["db"];
+  /** Stubbed OpenRouter catalog state: null = unreachable (fail-open). */
+  let openRouterCatalogIds: ReadonlySet<string> | null = null;
 
   let ownerCookie: string;
   let orgId: string;
@@ -385,7 +387,17 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
         SSE_HEARTBEAT_MS: "50",
         AGENT_BUILD_ROOT: join(tmpdir(), "invisible-string-res-builds"),
       },
-      { compile: stubCompile, buildSteps: fakeBuildSteps(), artifacts, registry: stubRegistry },
+      {
+        compile: stubCompile,
+        buildSteps: fakeBuildSteps(),
+        artifacts,
+        registry: stubRegistry,
+        // Stubbed OpenRouter catalog: null = "unavailable" (fail-open), so
+        // the fake `vendor/...` ids used across this suite stay allowlistable
+        // regardless of network; individual tests set `openRouterCatalogIds`
+        // to exercise the catalog check.
+        openRouterModelIds: async () => openRouterCatalogIds,
+      },
     );
     db = stack.dbHandle.db;
 
@@ -658,6 +670,49 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     });
     expect(bad.status).toBe(422);
     expect(((await bad.json()) as { error: { code: string } }).error.code).toBe("model_not_allowlisted");
+  });
+
+  test("allowlist add validates OpenRouter ids: shape 422s, catalog-unknown 422s, catalog-known passes, catalog-down fails open (keyed-run papercut: invalid ids used to fail only at run time)", async () => {
+    // Wrong grammar for the provider — schema-level 422 (no catalog needed).
+    const badShape = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+      cookie: ownerCookie,
+      body: { provider: "openrouter", modelId: "no-vendor-prefix" },
+    });
+    expect(badShape.status).toBe(422);
+    expect(((await badShape.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
+    const gatewayIdOnAnthropic = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+      cookie: ownerCookie,
+      body: { provider: "anthropic", modelId: "anthropic/claude-opus-4-8" },
+    });
+    expect(gatewayIdOnAnthropic.status).toBe(422);
+
+    // Catalog reachable: unknown id → typed 422; known id → 201. (The
+    // gateway-slug/OpenRouter-slug confusion is exactly the keyed-run case:
+    // "moonshot/kimi-k3" vs OpenRouter's real "moonshotai/kimi-k3".)
+    openRouterCatalogIds = new Set(["moonshotai/kimi-k3"]);
+    try {
+      const unknown = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+        cookie: ownerCookie,
+        body: { provider: "openrouter", modelId: "moonshot/kimi-k3" },
+      });
+      expect(unknown.status).toBe(422);
+      expect(((await unknown.json()) as { error: { code: string } }).error.code).toBe("model_unknown_to_openrouter");
+
+      const known = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+        cookie: ownerCookie,
+        body: { provider: "openrouter", modelId: "moonshotai/kimi-k3" },
+      });
+      expect(known.status).toBe(201);
+    } finally {
+      openRouterCatalogIds = null;
+    }
+
+    // Catalog unreachable (null): fail OPEN — the add succeeds unchecked.
+    const failOpen = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+      cookie: ownerCookie,
+      body: { provider: "openrouter", modelId: "vendor/offline-model" },
+    });
+    expect(failOpen.status).toBe(201);
   });
 
   test("agent presets: CRUD + model override validated against the allowlist", async () => {

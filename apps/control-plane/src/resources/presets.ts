@@ -26,6 +26,7 @@ import {
 
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
+import { catalogHasModel } from "./openrouter-catalog";
 import {
   agentPresetDto,
   modelAllowlistEntryDto,
@@ -119,6 +120,17 @@ export async function addModelAllowlistEntry(
   body: unknown,
 ): Promise<GetModelAllowlistEntryResponse> {
   const input = parseBody(addModelAllowlistEntryRequestSchema, body);
+  // Advisory OpenRouter-catalog check (keyed-acceptance papercut: an
+  // OpenRouter-invalid id used to surface only at RUN time as a provider
+  // error). Fail-OPEN: `null` means the catalog was unreachable — allowlist
+  // the id unchecked rather than couple workspace config to openrouter.ai
+  // availability. The id's SHAPE was already schema-validated.
+  if (input.provider === "openrouter" && deps.openRouterModelIds) {
+    const knownIds = await deps.openRouterModelIds();
+    if (knownIds !== null && !catalogHasModel(knownIds, input.modelId)) {
+      throw errors.modelUnknownToOpenRouter(input.modelId);
+    }
+  }
   const rows = await deps.db
     .insert(schema.modelAllowlist)
     .values({

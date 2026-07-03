@@ -326,6 +326,15 @@ export const workflowVersions = pgTable(
     contentHash: text("content_hash").notNull(),
     compilerVersion: text("compiler_version").notNull(),
     eveVersion: text("eve_version").notNull(),
+    /**
+     * Provider+model RESOLVED at publish (preset→model + allowlist check) and
+     * compiled into the version's agent.ts. Dispatch reads these to inject
+     * exactly ONE provider key matching what was compiled — re-resolving at
+     * session time could disagree with the baked model if workspace presets
+     * changed after publish. Nullable only for pre-Phase-1 rows.
+     */
+    modelProvider: modelProvider("model_provider"),
+    modelId: text("model_id"),
     buildStatus: buildStatus("build_status").default("pending").notNull(),
     createdAt,
   },

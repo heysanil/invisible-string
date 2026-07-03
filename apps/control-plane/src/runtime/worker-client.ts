@@ -134,6 +134,26 @@ export interface CreateWorkerClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * ensure-agent attempts per call (1 original + 1 retry). The retry fires ONLY
+ * on a client-side timeout: a COLD first boot (artifact download + extract +
+ * node boot + world/graphile migration) can outlast the request timeout while
+ * the worker keeps booting — the supervisor's ensure is single-flight per
+ * hash and reuses ready agents, so a retry joins the in-flight boot (or
+ * fast-returns once ready) instead of 502-failing the very first session on
+ * a fresh version. HTTP errors are NOT retried (deterministic failures).
+ * Scheduler placement reservations must outlive timeout × attempts
+ * (scheduler.setAgentReservationTtlMs, wired in index.ts).
+ */
+export const ENSURE_AGENT_MAX_ATTEMPTS = 2;
+
+function isTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  );
+}
+
 export function createWorkerClient(options: CreateWorkerClientOptions): WorkerClient {
   const doFetch = options.fetchImpl ?? fetch;
   const timeoutMs = options.requestTimeoutMs ?? 60_000;
@@ -156,33 +176,51 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
   return {
     async ensureAgent(workerAddress, contentHash, request) {
       assertSecureTransport(workerAddress);
-      const headers: Record<string, string> = {
-        "content-type": "application/json",
-      };
-      // Per-worker dispatch token (Phase-3 identity) when configured. The
-      // bootstrap secret is NOT sent alongside it — otherwise every ensure
-      // call would hand the fleet-master secret to the (possibly compromised)
-      // worker, undercutting the whole point of per-worker identity. Workers
-      // verify dispatch tokens with their own copy of the bootstrap secret +
-      // their id, so this works against shared-secret-mode workers too.
-      if (options.mintDispatchToken && request.workerId) {
-        headers[DISPATCH_TOKEN_HEADER] = options.mintDispatchToken(request.workerId);
-        headers[WORKER_ID_HEADER] = request.workerId;
-      } else {
-        headers["x-worker-secret"] = options.workerSharedSecret;
-      }
       const { workerId: _workerId, ...ensureBody } = request;
-      const res = await doFetch(
-        `${workerAddress.replace(/\/+$/, "")}/internal/agents/ensure`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ versionHash: contentHash, ...ensureBody }),
-          signal: AbortSignal.timeout(timeoutMs),
-        },
-      );
-      if (!res.ok) {
-        throw new Error(`ensure-agent failed: ${await readError(res)}`);
+      const attempt = async (): Promise<void> => {
+        // Headers are built PER ATTEMPT: dispatch tokens are single-use
+        // (worker jti replay guard), so a retry must mint a fresh one.
+        const headers: Record<string, string> = {
+          "content-type": "application/json",
+        };
+        // Per-worker dispatch token (Phase-3 identity) when configured. The
+        // bootstrap secret is NOT sent alongside it — otherwise every ensure
+        // call would hand the fleet-master secret to the (possibly
+        // compromised) worker, undercutting the whole point of per-worker
+        // identity. Workers verify dispatch tokens with their own copy of the
+        // bootstrap secret + their id, so this works against
+        // shared-secret-mode workers too.
+        if (options.mintDispatchToken && request.workerId) {
+          headers[DISPATCH_TOKEN_HEADER] = options.mintDispatchToken(request.workerId);
+          headers[WORKER_ID_HEADER] = request.workerId;
+        } else {
+          headers["x-worker-secret"] = options.workerSharedSecret;
+        }
+        const res = await doFetch(
+          `${workerAddress.replace(/\/+$/, "")}/internal/agents/ensure`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ versionHash: contentHash, ...ensureBody }),
+            signal: AbortSignal.timeout(timeoutMs),
+          },
+        );
+        if (!res.ok) {
+          throw new Error(`ensure-agent failed: ${await readError(res)}`);
+        }
+      };
+      for (let attempts = 1; ; attempts += 1) {
+        try {
+          await attempt();
+          return;
+        } catch (error) {
+          // Timeouts only — the worker may still be mid-boot (cold artifact
+          // pull); its single-flight ensure makes another attempt safe and
+          // usually fast. Everything else propagates unchanged.
+          if (attempts >= ENSURE_AGENT_MAX_ATTEMPTS || !isTimeoutError(error)) {
+            throw error;
+          }
+        }
       }
     },
 

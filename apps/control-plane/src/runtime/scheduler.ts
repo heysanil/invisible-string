@@ -70,8 +70,21 @@ export interface SelectWorkerOptions {
 // In-process registry — fine under the single-control-plane deployment
 // constraint (docs/runtime-worker-contract.md).
 
-/** Reservation lifetime — matches the worker-client ensure-agent timeout. */
+/**
+ * Default reservation lifetime. The EFFECTIVE lifetime must cover the
+ * worker-client's whole ensure budget (request timeout × retry attempts) —
+ * a reservation that lapses while a cold boot is still ensuring lets
+ * concurrent placements over-place onto the booting worker. index.ts wires
+ * the configured budget via {@link setAgentReservationTtlMs}.
+ */
 export const AGENT_RESERVATION_TTL_MS = 60_000;
+
+let reservationTtlMs = AGENT_RESERVATION_TTL_MS;
+
+/** Wire the reservation lifetime to the configured ensure budget (index.ts). */
+export function setAgentReservationTtlMs(ms: number): void {
+  reservationTtlMs = ms;
+}
 
 const agentReservations = new Map<string, Map<string, number>>();
 
@@ -80,7 +93,7 @@ export function reserveAgentSlot(
   workerId: string,
   versionHash: string,
   now: number = Date.now(),
-  ttlMs: number = AGENT_RESERVATION_TTL_MS,
+  ttlMs: number = reservationTtlMs,
 ): void {
   let byHash = agentReservations.get(workerId);
   if (!byHash) {

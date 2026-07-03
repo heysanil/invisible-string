@@ -22,7 +22,7 @@ import { createDb, type DbHandle } from "./db";
 import { healthPlugin, type DeepHealthDeps } from "./health";
 import { createLogger } from "./log";
 import { requestLoggerPlugin } from "./request-log";
-import { isWorkerLive } from "./runtime/scheduler";
+import { isWorkerLive, setAgentReservationTtlMs } from "./runtime/scheduler";
 import { MetricsRegistry } from "./runtime/metrics";
 import {
   createArtifactStore,
@@ -52,6 +52,7 @@ import { runtimePlugin, type RuntimeDeps } from "./runtime/routes";
 import { createWorkerSweeper } from "./runtime/worker-sweeper";
 import {
   createWorkerClient,
+  ENSURE_AGENT_MAX_ATTEMPTS,
   type WorkerClient,
 } from "./runtime/worker-client";
 import { mintDispatchToken } from "@invisible-string/shared";
@@ -243,6 +244,12 @@ export function createRuntimeDeps(opts: {
               mintDispatchToken(runtime.workerSharedSecret, workerId).token
           : undefined,
     });
+  // Placement reservations must outlive the worker-client's whole ensure
+  // budget (timeout × attempts) or concurrent cold placements over-place
+  // onto a still-booting worker once the reservation lapses.
+  setAgentReservationTtlMs(
+    runtime.workerRequestTimeoutMs * ENSURE_AGENT_MAX_ATTEMPTS,
+  );
   const runStore = createDrizzleRunStore(db);
   const bus = new RunEventBus();
   const metrics = new MetricsRegistry();

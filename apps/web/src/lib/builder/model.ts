@@ -118,6 +118,7 @@ export function definitionOf(state: BuilderState): WorkflowDefinition {
 export type BuilderAction =
   | { type: "focusPillar"; pillar: Pillar }
   | { type: "setTriggerType"; triggerType: TriggerType }
+  | { type: "setTrigger"; trigger: TriggerConfig }
   | { type: "addFormField" }
   | { type: "updateFormField"; index: number; patch: Partial<FormField> }
   | { type: "removeFormField"; index: number }
@@ -194,6 +195,11 @@ export function builderReducer(
   switch (action.type) {
     case "focusPillar":
       return { ...state, activePillar: action.pillar };
+
+    case "setTrigger":
+      // Whole-config replacement (copilot suggestions land here) — same
+      // draft-preserving path as manual edits.
+      return withTrigger(state, action.trigger);
 
     case "setTriggerType": {
       if (state.definition.trigger.type === action.triggerType) return state;

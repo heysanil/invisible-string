@@ -11,6 +11,7 @@
  * - envelope crypto (AES-256-GCM)
  */
 export * from "./api";
+export * from "./copilot";
 export * from "./crypto";
 export * from "./eve-events";
 export * from "./observability";

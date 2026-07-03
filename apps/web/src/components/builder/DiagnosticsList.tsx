@@ -3,13 +3,20 @@ import { AlertTriangle, Info } from "lucide-react";
 import type { PillarDiagnostic } from "../../lib/builder/diagnostics";
 import { cn } from "../../lib/cn";
 
-/** Inline list of a pillar's diagnostics, shown atop its focused editor. */
+/**
+ * Inline list of a pillar's diagnostics, shown atop its focused editor.
+ * When `onAskCopilot` is provided, a subtle "✦ ask copilot to fix" affordance
+ * pre-fills the copilot composer with the issue list.
+ */
 export function DiagnosticsList({
   diagnostics,
+  onAskCopilot,
 }: {
   diagnostics: readonly PillarDiagnostic[];
+  onAskCopilot?: (prompt: string) => void;
 }) {
   if (diagnostics.length === 0) return null;
+  const count = diagnostics.length;
   return (
     <ul className="flex flex-col gap-1.5">
       {diagnostics.map((diagnostic, index) => {
@@ -34,6 +41,23 @@ export function DiagnosticsList({
           </li>
         );
       })}
+      {onAskCopilot ? (
+        <li className="flex justify-end">
+          <button
+            type="button"
+            onClick={() =>
+              onAskCopilot(
+                `Fix ${count === 1 ? "this issue" : `these ${count} issues`}: ${diagnostics
+                  .map((d) => d.message)
+                  .join("; ")}`,
+              )
+            }
+            className="lift inline-flex items-center gap-1 rounded-capsule px-2 py-1 text-[11.5px] font-medium text-ink-3 hover:bg-black/[0.04] hover:text-ink"
+          >
+            ✦ {count} issue{count === 1 ? "" : "s"} — ask copilot to fix
+          </button>
+        </li>
+      ) : null}
     </ul>
   );
 }

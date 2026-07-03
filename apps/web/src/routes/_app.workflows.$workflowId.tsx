@@ -12,7 +12,7 @@ import { parseWorkflowDraft } from "@invisible-string/shared";
 
 import { AgentEditor } from "../components/builder/AgentEditor";
 import { ContextEditor } from "../components/builder/ContextEditor";
-import { CopilotDock } from "../components/builder/CopilotDock";
+import { CopilotDock, type CopilotPrefill } from "../components/builder/CopilotDock";
 import { DiagnosticsList } from "../components/builder/DiagnosticsList";
 import { InstructionsPanel } from "../components/builder/InstructionsPanel";
 import { LiveTriggerConfig } from "../components/builder/LiveTriggerConfig";
@@ -22,7 +22,7 @@ import { Spinner } from "../components/ui/Spinner";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Panel } from "../components/ui/Panel";
 import { useToast } from "../components/ui/Toast";
-import { PILLAR_LABELS, emptyDefinition } from "../lib/builder/model";
+import { PILLAR_LABELS, emptyDefinition, type Pillar } from "../lib/builder/model";
 import { countIssues } from "../lib/builder/diagnostics";
 import { useContextResources } from "../lib/builder/resources";
 import {
@@ -176,6 +176,24 @@ function Builder({
   const [runAsUserId, setRunAsUserId] = useState(workflow.runAsUserId);
   const [runDraftPending, setRunDraftPending] = useState(false);
 
+  // Copilot plumbing: composer prefill (from diagnostics affordances) and the
+  // pillar-card flash after an applied suggestion.
+  const [copilotPrefill, setCopilotPrefill] = useState<CopilotPrefill | null>(null);
+  const [flashPillar, setFlashPillar] = useState<Pillar | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function askCopilot(text: string) {
+    setCopilotPrefill((current) => ({ id: (current?.id ?? 0) + 1, text }));
+  }
+
+  function onSuggestionApplied(pillar: Pillar) {
+    setFlashPillar(null);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    // Re-arm on the next frame so consecutive applies re-trigger the animation.
+    flashTimer.current = setTimeout(() => setFlashPillar(pillar), 16);
+    setTimeout(() => setFlashPillar((p) => (p === pillar ? null : p)), 900);
+  }
+
   function changeRunAs(userId: string) {
     setRunAsUserId(userId);
     updateWorkflow.mutate(
@@ -251,6 +269,7 @@ function Builder({
           onRunDraft={onRunDraft}
           runDraftPending={runDraftPending}
           canPublish={controller.canPublish}
+          flashPillar={flashPillar}
         />
 
         <Panel className="panel-enter flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -261,7 +280,10 @@ function Builder({
           <div aria-hidden="true" className="mx-6 h-px bg-black/[0.06]" />
           <div className="thin-scroll flex-1 overflow-y-auto p-6">
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
-              <DiagnosticsList diagnostics={diagnostics.pillars[activePillar]} />
+              <DiagnosticsList
+                diagnostics={diagnostics.pillars[activePillar]}
+                onAskCopilot={askCopilot}
+              />
               {activePillar === "trigger" ? (
                 <>
                   <TriggerEditor definition={definition} dispatch={dispatch} />
@@ -314,7 +336,17 @@ function Builder({
           </div>
         </Panel>
 
-        <CopilotDock />
+        <CopilotDock
+          workspaceId={workspaceId}
+          workflowId={workflow.id}
+          definition={definition}
+          dispatch={dispatch}
+          resources={resources}
+          agentPresets={agentPresets}
+          modelPresets={modelPresets}
+          prefill={copilotPrefill}
+          onApplied={onSuggestionApplied}
+        />
       </div>
     </div>
   );

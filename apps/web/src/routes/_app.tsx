@@ -2,6 +2,7 @@ import { createFileRoute, Navigate, Outlet } from "@tanstack/react-router";
 
 import { AppShell } from "../components/AppShell";
 import { Spinner } from "../components/ui/Spinner";
+import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import { useSession } from "../lib/auth-client";
 
 export const Route = createFileRoute("/_app")({ component: AppLayout });
@@ -13,6 +14,16 @@ export const Route = createFileRoute("/_app")({ component: AppLayout });
  */
 function AppLayout() {
   const { data: session, isPending } = useSession();
+
+  // Fixture mode is a backendless design/E2E harness — skip the auth gate so
+  // canned screens render without a control plane.
+  if (FIXTURE_MODE) {
+    return (
+      <AppShell>
+        <Outlet />
+      </AppShell>
+    );
+  }
 
   if (isPending) {
     return (

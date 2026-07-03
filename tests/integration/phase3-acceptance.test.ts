@@ -389,6 +389,11 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
         AGENT_READY_TIMEOUT_MS: "120000",
         AGENT_PORT_MIN: String(agentPortMin),
         AGENT_PORT_MAX: String(agentPortMax),
+        // The control-plane tailer holds a live NDJSON stream open per active
+        // session to follow future turns, so a graceful drain always trips its
+        // in-flight wait. Keep that wait short here — the drain still stops the
+        // agents and deregisters cleanly (exit 0), just without a 30s stall.
+        DRAIN_TIMEOUT_MS: "3000",
       },
       stdout: "inherit",
       stderr: "inherit",
@@ -411,8 +416,10 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
 
   async function stopWorker(worker: ManagedWorker, signal: "SIGTERM" | "SIGKILL"): Promise<number | null> {
     worker.proc.kill(signal);
+    // Generous fallback: a graceful drain waits DRAIN_TIMEOUT_MS for in-flight,
+    // then stops its eve agents (graphile graceful shutdown is ~10s each).
     const timer =
-      signal === "SIGTERM" ? setTimeout(() => worker.proc.kill("SIGKILL"), 40_000) : null;
+      signal === "SIGTERM" ? setTimeout(() => worker.proc.kill("SIGKILL"), 90_000) : null;
     await worker.proc.exited.catch(() => {});
     if (timer) clearTimeout(timer);
     const idx = workers.indexOf(worker);
@@ -857,6 +864,22 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       expect(reply.authorization).toBe(`Bearer ${SLACK_BOT_TOKEN}`);
 
       // ── follow-up in the SAME thread continues the SAME session ──
+      // Wait for the mention's run to fully finish first: a thread reply that
+      // lands while the first turn is still in flight is rejected 409
+      // session_busy (one run per session) and dropped by the Slack router.
+      await until(
+        async () => {
+          const rows = await db
+            .select({ status: schema.runs.status })
+            .from(schema.runs)
+            .where(eq(schema.runs.agentSessionId, slackSession.id));
+          return rows.length > 0 && rows.every((r) => r.status === "succeeded" || r.status === "failed")
+            ? true
+            : undefined;
+        },
+        "mention run to finish before the thread reply",
+        4 * 60_000,
+      );
       const before2 = slack.posted.length;
       await postSlackEvent(
         {

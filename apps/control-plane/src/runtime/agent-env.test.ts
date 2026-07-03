@@ -32,6 +32,7 @@ const RUNTIME: RuntimeConfig = {
   sseHeartbeatMs: 15_000,
   worldMaxPoolSize: 5,
   worldWorkerConcurrency: 5,
+  workerRequestTimeoutMs: 120_000,
   allowInsecureWorkerTransport: false,
   workerAuthMode: "shared-secret",
 };

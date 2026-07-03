@@ -27,6 +27,14 @@ function resolveModel(): LanguageModel {
 
 export default defineAgent({
   model: resolveModel(),
+  // Verbatim context window — REQUIRED for OpenRouter models. eve build
+  // evaluates this file and otherwise resolves the window from its
+  // AI-Gateway model catalog, which cannot resolve module-backed OpenRouter
+  // models (gateway id "openrouter/<id>" has no catalog slug) and knows
+  // some ids under different slugs (z-ai/glm-5.2 vs zai/glm-5.2) — either
+  // way "does not have known AI Gateway context window metadata" fails the
+  // build (spike/agent-project documented this escape hatch).
+  modelContextWindowTokens: 1048576,
   reasoning: "medium",
   experimental: {
     workflow: {

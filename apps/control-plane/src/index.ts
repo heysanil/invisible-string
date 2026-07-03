@@ -230,6 +230,10 @@ export function createRuntimeDeps(opts: {
     createWorkerClient({
       workerSharedSecret: runtime.workerSharedSecret,
       allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
+      // ensure-agent pulls + boots the agent synchronously; a COLD first
+      // boot can exceed a fixed 60s (WORKER_REQUEST_TIMEOUT_MS, default 120s
+      // — observed >60s on the keyed acceptance's first real-model boot).
+      requestTimeoutMs: runtime.workerRequestTimeoutMs,
       // Per-worker dispatch tokens when the worker plane runs in worker-token
       // mode (Phase-3 identity); the bootstrap secret is still sent alongside
       // so the modes interoperate during rollout.

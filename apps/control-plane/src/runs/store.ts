@@ -43,7 +43,11 @@ export interface RunStore {
    * cannot be stomped to `failed` by a dying tail.
    */
   markRun(runId: string, patch: RunStatusPatch): Promise<boolean>;
-  getRunStatus(runId: string): Promise<RunStatus | null>;
+  /** Status + failure detail — the SSE snapshot terminal frame must carry
+   *  the run's error to late subscribers, not just the bare status. */
+  getRunStatus(
+    runId: string,
+  ): Promise<{ status: RunStatus; error: string | null } | null>;
   markSession(agentSessionId: string, status: AgentSessionStatus): Promise<void>;
   updateSessionContinuation(
     agentSessionId: string,
@@ -122,11 +126,11 @@ export function createDrizzleRunStore(db: Db): RunStore {
 
     async getRunStatus(runId) {
       const rows = await db
-        .select({ status: schema.runs.status })
+        .select({ status: schema.runs.status, error: schema.runs.error })
         .from(schema.runs)
         .where(eq(schema.runs.id, runId))
         .limit(1);
-      return rows[0]?.status ?? null;
+      return rows[0] ?? null;
     },
 
     async markSession(agentSessionId, status) {

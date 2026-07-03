@@ -189,7 +189,28 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
           cwd: projectDir,
           // bun test leaks NODE_ENV=test which flips eve into mock-model mode
           // (REPORT finding 5) — pin production for build determinism.
-          env: { NODE_ENV: "production" },
+          //
+          // OPENROUTER_API_KEY placeholder (NOT a secret — a fixed public
+          // sentinel): `eve build` EVALUATES agent.ts and bakes the model
+          // ROUTING into .eve/compile/compiled-agent-manifest.json. Built
+          // keyless, the generated resolveModel() falls back to the model-id
+          // string and eve bakes `routing: {kind: "gateway"}` — the runtime
+          // then routes every turn to Vercel AI Gateway and IGNORES the
+          // real key injected at agent spawn (observed live: keyed
+          // acceptance turns failed with GatewayError "received no
+          // credentials" while OPENROUTER_API_KEY was present in the agent
+          // env). With any non-empty key at build time the manifest bakes
+          // `routing: {kind: "external", provider: "openrouter"}` +
+          // `source: agent.ts`, and the runtime re-evaluates resolveModel()
+          // with the REAL spawn-time env. The placeholder value never
+          // reaches the artifact (verified: no occurrence in .output/.eve)
+          // and never serves traffic. Anthropic needs no placeholder —
+          // @ai-sdk/anthropic resolves its key lazily at request time, so
+          // its builds already bake module-backed routing.
+          env: {
+            NODE_ENV: "production",
+            OPENROUTER_API_KEY: "eve-build-routing-placeholder",
+          },
           timeoutMs: 300_000,
         },
       );

@@ -23,6 +23,27 @@ function reasoningLine(effort: ReasoningEffort | undefined): string {
   return effort === undefined ? "" : `\n  reasoning: ${tsString(effort)},`;
 }
 
+/**
+ * Context windows for the workspace-seeded OpenRouter models (source of
+ * truth: OpenRouter /models `context_length`, verified 2026-07-03 — the
+ * runtime calls OpenRouter, not the upstream vendor). Models outside the
+ * seed set get a conservative default: the value only tunes eve's compaction
+ * threshold, and compacting early is safe while compacting late overflows.
+ */
+const OPENROUTER_CONTEXT_WINDOW_TOKENS: Readonly<Record<string, number>> = {
+  "z-ai/glm-5.2": 1_048_576,
+  "deepseek/deepseek-v4-pro": 1_048_576,
+  "deepseek/deepseek-v4-flash": 1_048_576,
+};
+const DEFAULT_OPENROUTER_CONTEXT_WINDOW_TOKENS = 131_072;
+
+function openrouterContextWindowTokens(modelId: string): number {
+  return (
+    OPENROUTER_CONTEXT_WINDOW_TOKENS[modelId] ??
+    DEFAULT_OPENROUTER_CONTEXT_WINDOW_TOKENS
+  );
+}
+
 const WORLD_BLOCK = `  experimental: {
     workflow: {
       // Durability: all session/run state lives in Postgres, not local disk.
@@ -81,7 +102,15 @@ function resolveModel(): LanguageModel {
 }
 
 export default defineAgent({
-  model: resolveModel(),${reasoningLine(reasoning)}
+  model: resolveModel(),
+  // Verbatim context window — REQUIRED for OpenRouter models. eve build
+  // evaluates this file and otherwise resolves the window from its
+  // AI-Gateway model catalog, which cannot resolve module-backed OpenRouter
+  // models (gateway id "openrouter/<id>" has no catalog slug) and knows
+  // some ids under different slugs (z-ai/glm-5.2 vs zai/glm-5.2) — either
+  // way "does not have known AI Gateway context window metadata" fails the
+  // build (spike/agent-project documented this escape hatch).
+  modelContextWindowTokens: ${openrouterContextWindowTokens(resolvedModel.modelId)},${reasoningLine(reasoning)}
 ${WORLD_BLOCK}
 });
 `;

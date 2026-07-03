@@ -78,7 +78,9 @@ function memoryStore(): MemoryStore {
       return true;
     },
     async getRunStatus() {
-      return store.runStatus;
+      return store.runStatus === null
+        ? null
+        : { status: store.runStatus, error: null };
     },
     async markSession(_sessionId, status) {
       store.sessionStatus = status;

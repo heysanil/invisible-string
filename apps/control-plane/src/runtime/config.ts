@@ -82,6 +82,14 @@ export interface RuntimeConfig {
   worldMaxPoolSize: number;
   worldWorkerConcurrency: number;
   /**
+   * Timeout for non-streaming worker calls (WORKER_REQUEST_TIMEOUT_MS,
+   * default 120s). ensure-agent is synchronous in v1 — it pulls the artifact
+   * and boots the agent, and a COLD first boot (download + extract + node
+   * boot + world/graphile migration) can exceed 60s, which 502s the very
+   * first session on a fresh version (observed in the keyed acceptance run).
+   */
+  workerRequestTimeoutMs: number;
+  /**
    * Allow http:// worker addresses (ALLOW_INSECURE_WORKER_TRANSPORT=1).
    * LOCAL DEV/CI ONLY: agent env maps (provider keys, JWT secrets, decrypted
    * MCP tokens) travel to workers over this transport — production must use
@@ -182,6 +190,12 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     5,
     problems,
   );
+  const workerRequestTimeoutMs = parsePositiveInt(
+    env.WORKER_REQUEST_TIMEOUT_MS,
+    "WORKER_REQUEST_TIMEOUT_MS",
+    120_000,
+    problems,
+  );
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -211,6 +225,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     sseHeartbeatMs,
     worldMaxPoolSize,
     worldWorkerConcurrency,
+    workerRequestTimeoutMs,
     allowInsecureWorkerTransport:
       env.ALLOW_INSECURE_WORKER_TRANSPORT?.trim() === "1",
     workerAuthMode:

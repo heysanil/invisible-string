@@ -130,9 +130,11 @@ export function createRunSseResponse(options: RunSseOptions): Response {
       // 4. If the run is already parked/finished, emit closure and stop —
       //    otherwise stay subscribed (live-follow).
       if (!closed && !sawTerminalStatus) {
-        const status = await store.getRunStatus(runId);
-        if (status !== null && isStreamTerminalStatus(status)) {
-          sendStatusFrame({ runId, status });
+        const run = await store.getRunStatus(runId);
+        if (run !== null && isStreamTerminalStatus(run.status)) {
+          // Carry the failure detail on the snapshot frame too — a client
+          // connecting AFTER the run failed must see WHY, not a bare status.
+          sendStatusFrame({ runId, status: run.status, error: run.error });
         }
       }
 

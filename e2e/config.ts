@@ -15,6 +15,8 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
+import { COPILOT_FAKE_SCRIPT_JSON } from "./support/copilot-script.ts";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const E2E_DIR = HERE;
 export const REPO_ROOT = resolve(HERE, "..");
@@ -110,6 +112,9 @@ export function controlPlaneEnv(): Record<string, string> {
     AGENT_BUILD_ROOT: AGENT_ROOT,
     NPM_CACHE_DIR,
     SSE_HEARTBEAT_MS: "500",
+    // Copilot: deterministic scripted fake LLM (never a real model call in
+    // the browser harness) — keyed scripts shared with e2e/specs/copilot.e2e.ts.
+    COPILOT_FAKE_SCRIPT: COPILOT_FAKE_SCRIPT_JSON,
   };
 }
 

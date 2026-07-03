@@ -72,9 +72,8 @@ import {
   type CopilotDeps,
 } from "./copilot/plugin";
 import {
+  createFakeTransport,
   createModelTransport,
-  createScriptedTransport,
-  parseFakeScript,
   type CopilotTransport,
 } from "./copilot/transport";
 import {
@@ -374,7 +373,7 @@ export function createAppStack(
   const copilotTransport: CopilotTransport | null =
     runtimeOverrides?.copilotTransport ??
     (copilotConfig.fakeScript
-      ? createScriptedTransport(parseFakeScript(copilotConfig.fakeScript))
+      ? createFakeTransport(copilotConfig.fakeScript)
       : (
             copilotConfig.provider === "anthropic"
               ? env.ANTHROPIC_API_KEY

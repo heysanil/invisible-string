@@ -218,6 +218,12 @@ export const errors = {
   // ── 5xx: platform-side problems ───────────────────────────────────────────
   noLiveWorker: () =>
     new RuntimeApiError(503, "no_live_worker", "no live worker available to run this session"),
+  noCapacity: () =>
+    new RuntimeApiError(
+      503,
+      "no_capacity",
+      "every live worker is at its agent capacity — retry shortly",
+    ),
   providerKeyMissing: (provider: string) =>
     new RuntimeApiError(
       500,

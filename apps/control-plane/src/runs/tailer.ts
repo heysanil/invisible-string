@@ -165,6 +165,14 @@ export interface RunTailHandle {
   done: Promise<void>;
   /** Stop tailing and mark the run (`canceled` UI action or shutdown). */
   cancel(reason?: string): void;
+  /**
+   * Stop tailing WITHOUT marking the run terminal — used by the dead-worker
+   * sweeper to detach a stale tail (its worker died) so the run can be
+   * re-tailed against a freshly scheduled worker. The run keeps its current
+   * DB status (e.g. `running`); the durable eve turn continues and the new
+   * tail resumes from the persisted seq.
+   */
+  detach(): void;
 }
 
 export function tailRun(options: TailRunOptions): RunTailHandle {
@@ -182,6 +190,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const abort = new AbortController();
   let cancelReason: string | null = null;
   let finished = false;
+  // Detach (dead-worker failover) aborts the loop but leaves the run's status
+  // untouched so a re-tail on another worker can pick it up.
+  let detaching = false;
 
   const publishStatus = (status: RunStatus, error?: string | null) => {
     bus.publish(runId, {
@@ -282,6 +293,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           // Stream ended without a terminal event → treat like a drop.
           throw new Error("stream ended before a terminal event");
         } catch (error) {
+          if (detaching) return; // failover: leave the run for a re-tail
           if (abort.signal.aborted) {
             await finishRun("failed", null, cancelReason ?? "run tail aborted");
             return;
@@ -301,6 +313,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             reconnectDelayMs * 2 ** (attempt - 1),
             abort.signal,
           );
+          if (detaching) return; // failover during backoff
           if (abort.signal.aborted) {
             await finishRun("failed", null, cancelReason ?? "run tail aborted");
             return;
@@ -317,6 +330,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     done,
     cancel(reason) {
       cancelReason ??= reason ?? "run canceled";
+      abort.abort();
+    },
+    detach() {
+      detaching = true;
       abort.abort();
     },
   };
@@ -369,6 +386,18 @@ export class RunTailerManager {
 
   get(runId: string): RunTailHandle | undefined {
     return this.handles.get(runId);
+  }
+
+  /**
+   * Detach a tail (dead-worker failover) WITHOUT marking its run terminal, and
+   * wait for it to fully stop so the caller can start a fresh tail for the same
+   * run without the manager returning the stale handle. No-op when absent.
+   */
+  async detach(runId: string): Promise<void> {
+    const handle = this.handles.get(runId);
+    if (!handle) return;
+    handle.detach();
+    await handle.done; // `done.finally` removes it from the map
   }
 
   /** Number of live tails (observability/tests). */

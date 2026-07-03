@@ -25,12 +25,15 @@ const RUNTIME: RuntimeConfig = {
   maxRunWallClockMs: 600_000,
   maxConcurrentRunsPerWorkspace: 5,
   workerHeartbeatTtlMs: 30_000,
+  maxAgentsPerWorker: 20,
+  workerSweepIntervalMs: 30_000,
   npmCacheDir: "/tmp/npm-cache",
   buildRoot: "/var/lib/agents",
   sseHeartbeatMs: 15_000,
   worldMaxPoolSize: 5,
   worldWorkerConcurrency: 5,
   allowInsecureWorkerTransport: false,
+  workerAuthMode: "shared-secret",
 };
 
 const HASH = "abcdef0123456789abcdef0123456789";

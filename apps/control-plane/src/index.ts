@@ -41,10 +41,12 @@ import type { ResourceDeps } from "./resources/common";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { runtimePlugin, type RuntimeDeps } from "./runtime/routes";
+import { createWorkerSweeper } from "./runtime/worker-sweeper";
 import {
   createWorkerClient,
   type WorkerClient,
 } from "./runtime/worker-client";
+import { mintDispatchToken } from "@invisible-string/shared";
 import {
   createWorkspaceDeps,
   workspacePlugin,
@@ -156,6 +158,14 @@ export function createRuntimeDeps(opts: {
     createWorkerClient({
       workerSharedSecret: runtime.workerSharedSecret,
       allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
+      // Per-worker dispatch tokens when the worker plane runs in worker-token
+      // mode (Phase-3 identity); the bootstrap secret is still sent alongside
+      // so the modes interoperate during rollout.
+      mintDispatchToken:
+        runtime.workerAuthMode === "worker-token"
+          ? (workerId) =>
+              mintDispatchToken(runtime.workerSharedSecret, workerId).token
+          : undefined,
     });
   const runStore = createDrizzleRunStore(db);
   const bus = new RunEventBus();
@@ -249,5 +259,11 @@ if (import.meta.main) {
       .catch((error) => {
         console.error("run reconciliation failed:", error);
       });
+    // Dead-worker sweeper: heartbeat TTL → dead, clear parked-session affinity,
+    // reschedule + re-tail interrupted runs on a live worker.
+    const sweeper = createWorkerSweeper(stack.runtime, {
+      log: (message) => console.log(`[sweeper] ${message}`),
+    });
+    sweeper.start();
   }
 }

@@ -49,6 +49,36 @@ export interface WorkerConfig {
   /** Advertised capacity: max concurrent agent processes (WORKER_MAX_AGENTS, default 20). */
   maxAgents: number;
   /**
+   * Worker-plane auth mode (WORKER_AUTH_MODE, default `shared-secret`). In
+   * `worker-token` mode the worker declares its identity at register, keeps the
+   * per-worker session token from the response, and presents it (with
+   * `x-worker-id`) on heartbeat/deregister instead of resending the bootstrap
+   * secret. Inbound dispatches are still accepted with either the bootstrap
+   * secret or a per-worker dispatch token.
+   */
+  authMode: "shared-secret" | "worker-token";
+  /**
+   * Stop docker sandboxes idle longer than this (SANDBOX_IDLE_STOP_MS, default
+   * 30 min — design correction 4: eve gives sandboxes NO idle timeout, so the
+   * worker enforces one). The reaper enumerates containers labelled by eve
+   * session and stops the idle ones.
+   */
+  sandboxIdleStopMs: number;
+  /** docker CLI the sandbox reaper shells out to (DOCKER_BIN, default `docker`). */
+  dockerBin: string;
+  /**
+   * Container label key eve stamps on sandbox containers, used to enumerate
+   * them (SANDBOX_LABEL, default `eve.session`). Only containers carrying this
+   * label are candidates for reaping — the worker never touches unlabeled
+   * containers.
+   */
+  sandboxLabelKey: string;
+  /**
+   * Enable the sandbox reaper (SANDBOX_REAPER_ENABLED, default off). Requires a
+   * reachable docker daemon; the compose worker image mounts the socket.
+   */
+  sandboxReaperEnabled: boolean;
+  /**
    * Node runtime used to launch compiled agents (WORKER_NODE_BIN). eve agents
    * require Node 24.x. Defaults to the newest mise-installed node 24, then
    * `node` on PATH (the production worker image ships Node 24 as `node`).
@@ -190,6 +220,21 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
     10_000,
     problems,
   );
+  const sandboxIdleStopMs = parseIntVar(
+    env.SANDBOX_IDLE_STOP_MS,
+    "SANDBOX_IDLE_STOP_MS",
+    30 * 60_000,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    problems,
+  );
+  const authMode =
+    env.WORKER_AUTH_MODE?.trim() === "worker-token"
+      ? ("worker-token" as const)
+      : ("shared-secret" as const);
+  const dockerBin = env.DOCKER_BIN?.trim() || "docker";
+  const sandboxLabelKey = env.SANDBOX_LABEL?.trim() || "eve.session";
+  const sandboxReaperEnabled = env.SANDBOX_REAPER_ENABLED?.trim() === "1";
 
   const nodeBin = resolveNodeBin(env, problems);
 
@@ -211,6 +256,11 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
     drainTimeoutMs,
     heartbeatIntervalMs,
     maxAgents,
+    authMode,
+    sandboxIdleStopMs,
+    dockerBin,
+    sandboxLabelKey,
+    sandboxReaperEnabled,
     nodeBin,
   };
 }

@@ -122,4 +122,59 @@ the default in `createAppStack`); tests inject stubs.
 `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_BASE_URL`,
 `MAX_RUN_WALL_CLOCK_MS` (default 600000), `MAX_CONCURRENT_RUNS_PER_WORKSPACE`
 (default 5), `WORKER_HEARTBEAT_TTL_MS` (default 30000), `NPM_CACHE_DIR`,
-`AGENT_BUILD_ROOT` (default `/var/lib/agents`), `SSE_HEARTBEAT_MS`.
+`AGENT_BUILD_ROOT` (default `/var/lib/agents`), `SSE_HEARTBEAT_MS`,
+`SCHEDULER_MAX_AGENTS_PER_WORKER` (default 20), `WORKER_SWEEP_INTERVAL_MS`
+(default = the heartbeat TTL), `WORKER_AUTH_MODE` (`shared-secret` default |
+`worker-token`).
+
+## Phase-3 additions — scheduler pool, failover, per-worker identity
+
+**Scheduler (`runtime/scheduler.ts`).** `selectWorker(db, {versionHash,
+affinityWorkerId?, heartbeatTtlMs, defaultMaxAgents})` picks in order:
+session **affinity** (the sticky worker while live and able to host it) →
+artifact-**warm** (a live worker already running the hash, from
+`workers.capacity.runningHashes`) → any **live** worker with agent headroom
+(`runningAgents < maxAgents`, per-worker cap ~20). Exhaustion is a typed 503:
+`no_live_worker` (none live) or `no_capacity` (all full).
+
+**Worker capacity report.** Register + every heartbeat now carry
+`capacity = {maxAgents, runningAgents, activeRequests, runningHashes}`. The
+scheduler reads `runningHashes` for the warm preference; `maxAgents` for the
+per-worker cap.
+
+**Liveness state machine + failover.** `workers.status` is
+`live | draining | dead`. A control-plane sweeper (`runtime/worker-sweeper.ts`,
+started at boot, interval `WORKER_SWEEP_INTERVAL_MS`) marks heartbeat-stale
+`live`/`draining` workers `dead`, then for every non-terminal run stranded on a
+dead worker: a PARKED (`waiting`) run has its session affinity **cleared** so
+the user's approval reschedules elsewhere; a RUNNING run is **re-tailed** on a
+freshly scheduled worker (`RunTailerManager.detach` stops the stale tail without
+failing the run; the durable eve turn continues on the new worker); a run whose
+session never got an eve session is failed. Graceful drain: the worker's
+`SIGTERM` handler finishes/park in-flight requests then `deregister`s (→ `dead`);
+new work never routes to a `draining`/`dead` worker because the scheduler only
+picks `live`.
+
+**Per-worker identity (`WORKER_AUTH_MODE=worker-token`; deferred from Phase 1).**
+The bootstrap `x-worker-secret` authenticates ONLY the first `register`. In
+`worker-token` mode the control plane then mints a short-lived per-worker HS256
+**session token** (returned in the register response, rotated on each heartbeat
+response) which the worker re-presents via `x-worker-token` + `x-worker-id` on
+heartbeat/deregister; and a per-call **dispatch token** (`x-dispatch-token`,
+audience `worker:<id>`) on ensure-agent, verified by the worker. Both secrets
+are derived from the bootstrap secret + worker id (`packages/shared`
+`worker-token-crypto.ts`), so no PKI is needed and a token captured for one
+worker is useless against another. `shared-secret` mode (default) keeps the
+Phase-1 single-credential behaviour; both are accepted so the modes interoperate
+during rollout.
+
+## Worker env (Phase-3 additions)
+
+`WORKER_AUTH_MODE` (`shared-secret` default | `worker-token`),
+`SANDBOX_REAPER_ENABLED=1` (default off; needs a docker daemon),
+`SANDBOX_IDLE_STOP_MS` (default 1800000 = 30 min), `SANDBOX_LABEL` (default
+`eve.session`), `DOCKER_BIN` (default `docker`). The **sandbox reaper**
+(`apps/worker/src/sandbox-reaper.ts`, design correction 4) enumerates docker
+containers carrying the eve-session label and stops those idle past the window —
+eve gives sandboxes no idle timeout of its own. Artifact LRU (20 GB) never
+evicts a running hash (unchanged).

@@ -18,7 +18,11 @@
  *   → 202 (async — the turn runs in the durable queue)
  * - `GET /eve/v1/session/:id/stream?startIndex=N` → NDJSON
  */
-import type { EveInputResponse } from "@invisible-string/shared";
+import {
+  DISPATCH_TOKEN_HEADER,
+  WORKER_ID_HEADER,
+  type EveInputResponse,
+} from "@invisible-string/shared";
 
 export interface EnsureAgentRequest {
   /** Presigned artifact GET URL (tar.gz of the built agent). */
@@ -28,6 +32,13 @@ export interface EnsureAgentRequest {
    * only; the supervisor must never write these to disk or logs).
    */
   env: Record<string, string>;
+  /**
+   * Target worker id — enables the per-worker DISPATCH token (Phase-3 identity)
+   * when the client is configured with `mintDispatchToken`. The token's
+   * audience is `worker:<id>`, so a captured dispatch cannot be replayed at a
+   * different worker.
+   */
+  workerId?: string;
 }
 
 export interface EveSessionCreated {
@@ -92,6 +103,12 @@ export interface CreateWorkerClientOptions {
   /** Per-request timeout for non-streaming calls (default 60s — ensure-agent
    *  may pull + boot the agent synchronously in v1). */
   requestTimeoutMs?: number;
+  /**
+   * When set, mint a per-worker DISPATCH token for each ensure-agent call
+   * (Phase-3 worker identity; `worker-token` mode). The worker verifies it via
+   * `x-dispatch-token` in addition to (or instead of) the bootstrap secret.
+   */
+  mintDispatchToken?: (workerId: string) => string;
   fetchImpl?: typeof fetch;
 }
 
@@ -117,15 +134,24 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
   return {
     async ensureAgent(workerAddress, contentHash, request) {
       assertSecureTransport(workerAddress);
+      const headers: Record<string, string> = {
+        "x-worker-secret": options.workerSharedSecret,
+        "content-type": "application/json",
+      };
+      // Per-worker dispatch token (Phase-3 identity) when configured. Sent
+      // ALONGSIDE the bootstrap secret so a shared-secret worker still accepts
+      // the call; a worker-token worker verifies the audience-bound token.
+      if (options.mintDispatchToken && request.workerId) {
+        headers[DISPATCH_TOKEN_HEADER] = options.mintDispatchToken(request.workerId);
+        headers[WORKER_ID_HEADER] = request.workerId;
+      }
+      const { workerId: _workerId, ...ensureBody } = request;
       const res = await doFetch(
         `${workerAddress.replace(/\/+$/, "")}/internal/agents/ensure`,
         {
           method: "POST",
-          headers: {
-            "x-worker-secret": options.workerSharedSecret,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({ versionHash: contentHash, ...request }),
+          headers,
+          body: JSON.stringify({ versionHash: contentHash, ...ensureBody }),
           signal: AbortSignal.timeout(timeoutMs),
         },
       );

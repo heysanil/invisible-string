@@ -21,7 +21,13 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
-import type { ApiErrorBody } from "@invisible-string/shared";
+import {
+  verifyDispatchToken,
+  DISPATCH_TOKEN_HEADER,
+  WORKER_BOOTSTRAP_SECRET_HEADER,
+  WORKER_ID_HEADER,
+  type ApiErrorBody,
+} from "@invisible-string/shared";
 
 import { AgentBootError, type AgentManager, type EnsureAgentInput } from "./agents";
 import { ArtifactError, type ArtifactCache } from "./cache";
@@ -119,9 +125,26 @@ export function createWorkerServer(options: {
   // ── internal API ──────────────────────────────────────────────────────────
 
   function authorized(request: Request): boolean {
-    const provided = request.headers.get("x-worker-secret");
-    if (provided === null) return false;
-    return secretsEqual(provided, config.workerSharedSecret);
+    // Bootstrap shared secret (Phase-1 default, always accepted).
+    const provided = request.headers.get(WORKER_BOOTSTRAP_SECRET_HEADER);
+    if (provided !== null && secretsEqual(provided, config.workerSharedSecret)) {
+      return true;
+    }
+    // Per-worker DISPATCH token (Phase-3 identity): audience-bound to THIS
+    // worker id, so a dispatch captured for another worker is rejected here.
+    const dispatchToken = request.headers.get(DISPATCH_TOKEN_HEADER);
+    const workerId = request.headers.get(WORKER_ID_HEADER);
+    if (
+      dispatchToken !== null &&
+      (workerId === null || workerId === config.workerId)
+    ) {
+      return verifyDispatchToken(
+        config.workerSharedSecret,
+        config.workerId,
+        dispatchToken,
+      ).ok;
+    }
+    return false;
   }
 
   async function internal(request: Request, url: URL): Promise<Response> {

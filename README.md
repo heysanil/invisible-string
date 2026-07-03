@@ -39,6 +39,45 @@ The spike's keyed tests (real model calls) additionally require
 
 Copy `.env.example` to `.env` and fill in secrets before running the apps.
 
+## Web app
+
+The SPA (`apps/web`, Vite + React + TanStack Router) is the whole product
+surface, built on the E1 design system (`src/styles/tokens.css` +
+`src/components/ui`). Four sections:
+
+- **Chat** (`/chat`) — start a session with a published workflow and watch its
+  runs stream live (working blocks, streamed reply, inline HITL approvals).
+  Resumable SSE per run with `Last-Event-ID`; one active run per session
+  (`session_busy` handled inline). "Edit workflow ↗" deep-links into the
+  builder.
+- **Workflows** (`/workflows`, `/workflows/:id`) — the hybrid builder: a
+  pillar rail (TRIGGER · CONTEXT · AGENT · INSTRUCTIONS) with focused editors,
+  `@`-reference autocomplete in the instructions (CodeMirror 6), debounced
+  autosave → dry-run compile with diagnostics routed onto the pillar cards,
+  and Publish / Run-draft (Run draft publishes then opens a new chat via
+  `/chat?workflow=<id>`).
+- **Context** (`/context`) — MCP connections (workspace + personal), the MCP
+  registry browser + install (write-once encrypted secrets), and skills
+  authoring with drag-drop attachments (packaged into the compiled agent —
+  no more publish-time 422).
+- **Settings** (`/settings`) — model presets, provider/model allowlist, agent
+  presets, members (Better Auth organization roles), and workspace rename.
+
+Run it against a live control plane:
+
+```sh
+# terminal 1 — API host
+bun run --cwd apps/control-plane dev
+# terminal 2 — SPA (reads VITE_API_URL, default http://localhost:3000)
+bun run --cwd apps/web dev
+```
+
+Design/E2E preview without a backend: `VITE_FIXTURE_MODE=1 bun run --cwd
+apps/web dev` renders the chat surface from canned fixtures.
+
+Screenshots of each section live in `docs/screenshots/` (see the placeholder
+there).
+
 ## Repo map
 
 ```
@@ -53,6 +92,6 @@ packages/
   db/              Drizzle schema, migrations, seeds (product DB)
   shared/          TriggerEvent, pillar schemas, eve event types, API contracts
 infra/             docker-compose init scripts + Dex IdP config
-docs/              Design spec + master plan
-.github/           CI (typecheck + unit tests)
+docs/              Design spec + master plan (+ screenshots/)
+.github/           CI (typecheck + unit tests + web build; gated integration)
 ```

@@ -27,6 +27,12 @@ jobs:
       - name: Test
         run: bun test
 
+      # Production build of the SPA — tsc project build + Vite bundle. Catches
+      # bundler-only breakage (module resolution, code-split chunks) the
+      # typecheck/test lanes don't exercise.
+      - name: Web build
+        run: bun run --cwd apps/web build
+
   integration:
     name: Gated integration tests (compose)
     runs-on: ubuntu-latest

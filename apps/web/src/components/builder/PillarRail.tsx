@@ -69,6 +69,8 @@ export interface PillarRailProps {
   onRunDraft: () => void;
   runDraftPending: boolean;
   canPublish: boolean;
+  /** Pillar to flash/settle after a copilot suggestion lands (or null). */
+  flashPillar?: Pillar | null;
 }
 
 export function PillarRail(props: PillarRailProps) {
@@ -122,6 +124,7 @@ export function PillarRail(props: PillarRailProps) {
             key={pillar}
             pillar={pillar}
             active={pillar === activePillar}
+            flash={pillar === props.flashPillar}
             issueCount={pillarIssueCount(diagnostics, pillar)}
             summary={
               <PillarSummary
@@ -199,12 +202,14 @@ export function PillarRail(props: PillarRailProps) {
 function PillarCard({
   pillar,
   active,
+  flash,
   issueCount,
   summary,
   onClick,
 }: {
   pillar: Pillar;
   active: boolean;
+  flash?: boolean;
   issueCount: number;
   summary: React.ReactNode;
   onClick: () => void;
@@ -217,6 +222,7 @@ function PillarCard({
       aria-current={active ? "true" : undefined}
       className={cn(
         "lift group flex flex-col gap-1.5 rounded-card border p-3 text-left",
+        flash && "pillar-flash",
         active
           ? "border-ink/85 bg-white shadow-[0_2px_12px_rgba(0,0,0,0.07)]"
           : "border-white/60 bg-white/35 hover:bg-white/55",

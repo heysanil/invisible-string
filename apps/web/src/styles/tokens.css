@@ -185,6 +185,22 @@
     animation: panel-in 240ms var(--ease-out) both;
   }
 
+  /* Copilot-applied pillar card: brief flash, then settle. */
+  @keyframes pillar-flash-kf {
+    0% {
+      background-color: rgba(0, 0, 0, 0.08);
+      transform: translateY(-1px);
+    }
+    100% {
+      background-color: transparent;
+      transform: translateY(0);
+    }
+  }
+
+  .pillar-flash {
+    animation: pillar-flash-kf 700ms var(--ease-out) both;
+  }
+
   /* --- Tooltip (ink capsule) ------------------------------------------------ */
   .tooltip {
     position: absolute;

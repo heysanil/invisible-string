@@ -8,6 +8,8 @@ import { cn } from "../../lib/cn";
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   label: string;
+  /** Keep the label for screen readers but hide it visually. */
+  srOnlyLabel?: boolean;
   /** Inline validation message rendered below the field. */
   error?: string | null;
 }
@@ -18,6 +20,7 @@ function noopChange() {}
 
 export function Input({
   label,
+  srOnlyLabel,
   error,
   className,
   id: idProp,
@@ -44,7 +47,13 @@ export function Input({
 
   return (
     <div className="flex flex-col gap-1.5">
-      <label htmlFor={id} className="px-1 text-[13px] font-medium text-ink-2">
+      <label
+        htmlFor={id}
+        className={cn(
+          "px-1 text-[13px] font-medium text-ink-2",
+          srOnlyLabel && "sr-only",
+        )}
+      >
         {label}
       </label>
       <input

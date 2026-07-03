@@ -17,6 +17,8 @@ import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppContextRouteImport } from './routes/_app.context'
 import { Route as AppChatRouteImport } from './routes/_app.chat'
+import { Route as AppWorkflowsIndexRouteImport } from './routes/_app.workflows.index'
+import { Route as AppWorkflowsWorkflowIdRouteImport } from './routes/_app.workflows.$workflowId'
 
 const SignupRoute = SignupRouteImport.update({
   id: '/signup',
@@ -57,6 +59,16 @@ const AppChatRoute = AppChatRouteImport.update({
   path: '/chat',
   getParentRoute: () => AppRoute,
 } as any)
+const AppWorkflowsIndexRoute = AppWorkflowsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppWorkflowsRoute,
+} as any)
+const AppWorkflowsWorkflowIdRoute = AppWorkflowsWorkflowIdRouteImport.update({
+  id: '/$workflowId',
+  path: '/$workflowId',
+  getParentRoute: () => AppWorkflowsRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -65,7 +77,9 @@ export interface FileRoutesByFullPath {
   '/chat': typeof AppChatRoute
   '/context': typeof AppContextRoute
   '/settings': typeof AppSettingsRoute
-  '/workflows': typeof AppWorkflowsRoute
+  '/workflows': typeof AppWorkflowsRouteWithChildren
+  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/workflows/': typeof AppWorkflowsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -74,7 +88,8 @@ export interface FileRoutesByTo {
   '/chat': typeof AppChatRoute
   '/context': typeof AppContextRoute
   '/settings': typeof AppSettingsRoute
-  '/workflows': typeof AppWorkflowsRoute
+  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/workflows': typeof AppWorkflowsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -85,7 +100,9 @@ export interface FileRoutesById {
   '/_app/chat': typeof AppChatRoute
   '/_app/context': typeof AppContextRoute
   '/_app/settings': typeof AppSettingsRoute
-  '/_app/workflows': typeof AppWorkflowsRoute
+  '/_app/workflows': typeof AppWorkflowsRouteWithChildren
+  '/_app/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/_app/workflows/': typeof AppWorkflowsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -97,6 +114,8 @@ export interface FileRouteTypes {
     | '/context'
     | '/settings'
     | '/workflows'
+    | '/workflows/$workflowId'
+    | '/workflows/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -105,6 +124,7 @@ export interface FileRouteTypes {
     | '/chat'
     | '/context'
     | '/settings'
+    | '/workflows/$workflowId'
     | '/workflows'
   id:
     | '__root__'
@@ -116,6 +136,8 @@ export interface FileRouteTypes {
     | '/_app/context'
     | '/_app/settings'
     | '/_app/workflows'
+    | '/_app/workflows/$workflowId'
+    | '/_app/workflows/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -183,21 +205,49 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppChatRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/workflows/': {
+      id: '/_app/workflows/'
+      path: '/'
+      fullPath: '/workflows/'
+      preLoaderRoute: typeof AppWorkflowsIndexRouteImport
+      parentRoute: typeof AppWorkflowsRoute
+    }
+    '/_app/workflows/$workflowId': {
+      id: '/_app/workflows/$workflowId'
+      path: '/$workflowId'
+      fullPath: '/workflows/$workflowId'
+      preLoaderRoute: typeof AppWorkflowsWorkflowIdRouteImport
+      parentRoute: typeof AppWorkflowsRoute
+    }
   }
 }
+
+interface AppWorkflowsRouteChildren {
+  AppWorkflowsWorkflowIdRoute: typeof AppWorkflowsWorkflowIdRoute
+  AppWorkflowsIndexRoute: typeof AppWorkflowsIndexRoute
+}
+
+const AppWorkflowsRouteChildren: AppWorkflowsRouteChildren = {
+  AppWorkflowsWorkflowIdRoute: AppWorkflowsWorkflowIdRoute,
+  AppWorkflowsIndexRoute: AppWorkflowsIndexRoute,
+}
+
+const AppWorkflowsRouteWithChildren = AppWorkflowsRoute._addFileChildren(
+  AppWorkflowsRouteChildren,
+)
 
 interface AppRouteChildren {
   AppChatRoute: typeof AppChatRoute
   AppContextRoute: typeof AppContextRoute
   AppSettingsRoute: typeof AppSettingsRoute
-  AppWorkflowsRoute: typeof AppWorkflowsRoute
+  AppWorkflowsRoute: typeof AppWorkflowsRouteWithChildren
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppChatRoute: AppChatRoute,
   AppContextRoute: AppContextRoute,
   AppSettingsRoute: AppSettingsRoute,
-  AppWorkflowsRoute: AppWorkflowsRoute,
+  AppWorkflowsRoute: AppWorkflowsRouteWithChildren,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

@@ -1,28 +1,14 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { Plus, Zap } from "lucide-react";
-
-import { SectionPage } from "../components/SectionPage";
-import { Button } from "../components/ui/Button";
-import { EmptyState } from "../components/ui/EmptyState";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/_app/workflows")({
-  component: WorkflowsPage,
+  component: WorkflowsLayout,
 });
 
-function WorkflowsPage() {
-  return (
-    <SectionPage title="Workflows" listHint="Workflows you build will appear here.">
-      <EmptyState
-        icon={Zap}
-        title="No workflows yet"
-        description="Assemble a trigger, context, agent, and instructions into an agent that runs in the cloud."
-        action={
-          <Button variant="ghost" size="sm">
-            <Plus size={14} aria-hidden="true" />
-            New workflow
-          </Button>
-        }
-      />
-    </SectionPage>
-  );
+/**
+ * Pass-through layout for the Workflows section. `/workflows` renders the list
+ * (index route); `/workflows/:id` renders the full-bleed hybrid builder — the
+ * two are siblings, so this layout is just the outlet.
+ */
+function WorkflowsLayout() {
+  return <Outlet />;
 }

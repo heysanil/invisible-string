@@ -11,7 +11,7 @@ import { useActiveWorkspaceId } from "../lib/workspace";
 export const Route = createFileRoute("/_app/chat")({ component: ChatPage });
 
 function ChatPage() {
-  const workspaceId = useActiveWorkspaceId();
+  const { workspaceId } = useActiveWorkspaceId();
 
   if (FIXTURE_MODE) return <FixtureChatShell />;
 

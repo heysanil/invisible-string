@@ -145,11 +145,16 @@ describe("generated content invariants", () => {
     expect(form).toContain("routeAuth(req, platformAuth())");
     expect(form).toContain("PLATFORM_CALLBACK_URL");
 
-    const slack = compile(slackFixture.definition, slackFixture.deps)
-      .files.get("agent/channels/slack.ts")!;
+    const compiledSlack = compile(slackFixture.definition, slackFixture.deps);
+    const slack = compiledSlack.files.get("agent/channels/slack.ts")!;
     expect(slack).toContain('POST<SlackReplyTarget>("/eve/v1/platform/slack"');
-    expect(slack).toContain("chat.postMessage");
-    expect(slack).toContain("SLACK_BOT_TOKEN");
+    // Outbound delivery lives in the standalone, testable agent/lib/slack.ts
+    // (slack-outbound.test.ts drives it against a stub Slack server).
+    expect(slack).toContain("postSlackReply(channel.state, data.message)");
+    const slackLib = compiledSlack.files.get("agent/lib/slack.ts")!;
+    expect(slackLib).toContain("chat.postMessage");
+    expect(slackLib).toContain("SLACK_BOT_TOKEN");
+    expect(slackLib).toContain("SLACK_API_BASE_URL");
   });
 
   test("trigger ref markers are baked into the channel", () => {

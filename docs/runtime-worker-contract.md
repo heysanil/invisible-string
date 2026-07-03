@@ -68,6 +68,37 @@ Used today by the control plane:
 | `OPENROUTER_BASE_URL` | passthrough when set (test harnesses) |
 | `MCP_<NAME>_TOKEN` | decrypted MCP connection tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time |
 | `EVE_MOCK_AUTHORED_MODELS` | TEST HARNESS ONLY passthrough (set on the control plane → forwarded per agent); eve serves turns with its built-in mock model |
+| `SLACK_BOT_TOKEN` | Slack-triggered versions ONLY: the team's decrypted bot token, injected by the dispatcher at ensure-agent time so the compiled Slack channel (`agent/lib/slack.ts`) can post the terminal reply via `chat.postMessage`. Never baked into generated code. |
+| `SLACK_API_BASE_URL` | Slack-triggered versions in non-production deployments: redirects the agent's outbound Slack calls at a stub (`SLACK_API_BASE_URL` on the control plane, forwarded only when non-default). |
+
+## Phase-3 trigger ingress (control-plane public surface)
+
+Trigger ingress lives on the control plane, not the worker. Public endpoints
+authenticate by token/signature (no session):
+
+- `POST /t/:token` — webhook + form ingress. The `:token` (plaintext, shown
+  ONCE at mint) is SHA-256-hashed and matched against `triggers.token_hash`
+  (constant-time indexed lookup; plaintext is never stored). Per-token +
+  per-IP rate limits and a 256 KiB payload cap run BEFORE parsing. → 202
+  `{accepted, runId, sessionId}`; the dispatcher POSTs a `TriggerEvent` to the
+  compiled agent's `/eve/v1/platform/<trigger>` channel.
+- `POST /integrations/slack/events` — Slack Events API. Signature (`v0` HMAC)
+  + 5-min replay window verified FIRST; `event_id` dedup makes Slack retries
+  idempotent; routed by `team_id` → integration → bound workflows;
+  `thread_ts ↔ agent_session` continuation (a thread reply continues that
+  thread's session).
+- `GET /integrations/slack/{install,callback}` — single platform Slack app
+  OAuth; per-team bot token stored envelope-encrypted, keyed by `team_id`.
+
+`POST /runs/:id/cancel` stops the tailer and marks the run `canceled`
+(idempotent). Best-effort re: eve's turn — eve exposes no session-cancel HTTP
+route, so the platform stops streaming and records the cancellation while eve's
+own turn parks/caps out server-side.
+
+DISPATCH-TIME MODEL ALLOWLIST RE-VALIDATION (spec §7): before running, the
+dispatcher re-checks the version's COMPILED model against the CURRENT workspace
+allowlist; a now-disallowed model FAILS the run (a visible failed run, never
+executed) rather than dispatching.
 
 The supervisor adds `PORT`, `NODE_ENV=production` (REPORT finding 5) and
 `WORKFLOW_LOCAL_BASE_URL=${publicUrl}/agents/<hash>` (its own proxy base —

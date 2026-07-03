@@ -15,6 +15,7 @@ import { ContextEditor } from "../components/builder/ContextEditor";
 import { CopilotDock } from "../components/builder/CopilotDock";
 import { DiagnosticsList } from "../components/builder/DiagnosticsList";
 import { InstructionsPanel } from "../components/builder/InstructionsPanel";
+import { LiveTriggerConfig } from "../components/builder/LiveTriggerConfig";
 import { PillarRail } from "../components/builder/PillarRail";
 import { TriggerEditor } from "../components/builder/TriggerEditor";
 import { Spinner } from "../components/ui/Spinner";
@@ -262,7 +263,23 @@ function Builder({
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
               <DiagnosticsList diagnostics={diagnostics.pillars[activePillar]} />
               {activePillar === "trigger" ? (
-                <TriggerEditor definition={definition} dispatch={dispatch} />
+                <>
+                  <TriggerEditor definition={definition} dispatch={dispatch} />
+                  {definition.trigger.type === "webhook" ||
+                  definition.trigger.type === "form" ||
+                  definition.trigger.type === "slack" ? (
+                    <LiveTriggerConfig
+                      workspaceId={workspaceId}
+                      workflowId={workflow.id}
+                      triggerType={definition.trigger.type}
+                      slackBinding={
+                        definition.trigger.type === "slack"
+                          ? definition.trigger.binding
+                          : undefined
+                      }
+                    />
+                  ) : null}
+                </>
               ) : null}
               {activePillar === "context" ? (
                 <ContextEditor

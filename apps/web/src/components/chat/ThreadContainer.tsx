@@ -29,6 +29,7 @@ import { titleFromMessage } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
 import {
   invalidateSessionLists,
+  useCancelRun,
   usePostMessage,
   usePostRunInput,
   useSession,
@@ -73,6 +74,7 @@ export function ThreadContainer({
   const { data, isLoading, isError, error } = useSession(sessionId);
   const postMessage = usePostMessage(workspaceId);
   const postInput = usePostRunInput(workspaceId);
+  const cancelRun = useCancelRun(workspaceId);
 
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
@@ -154,6 +156,19 @@ export function ThreadContainer({
   // memoized RunMessage rows would see a new onRespond every token and repaint.
   const postInputMutate = postInput.mutate;
   const reopenStream = streams.reopen;
+  const cancelMutate = cancelRun.mutate;
+  const onCancel = useCallback(
+    (runId: string) => {
+      setBusyNotice(null);
+      cancelMutate(
+        { runId },
+        {
+          onError: (mutationError) => setBusyNotice(errorMessage(mutationError)),
+        },
+      );
+    },
+    [cancelMutate],
+  );
   const respond = useCallback(
     (runId: string, response: RunInputRequest) => {
       setInputError(null);
@@ -226,6 +241,8 @@ export function ThreadContainer({
       runs={runViews}
       isChatOrigin={session.origin === "chat"}
       onRespond={respond}
+      onCancel={onCancel}
+      cancelingRunId={cancelRun.isPending ? (cancelRun.variables?.runId ?? null) : null}
       pendingInput={pendingInput}
       inputError={inputError}
       onSend={send}

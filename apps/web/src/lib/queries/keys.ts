@@ -88,4 +88,14 @@ export const queryKeys = {
   members: {
     list: (workspaceId: string) => ["members", workspaceId] as const,
   },
+  integrations: {
+    all: (workspaceId: string) => ["integrations", workspaceId] as const,
+    list: (workspaceId: string) => ["integrations", workspaceId, "list"] as const,
+  },
+  triggers: {
+    all: (workspaceId: string, workflowId: string) =>
+      ["triggers", workspaceId, workflowId] as const,
+    list: (workspaceId: string, workflowId: string) =>
+      ["triggers", workspaceId, workflowId, "list"] as const,
+  },
 } as const;

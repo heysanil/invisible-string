@@ -16,7 +16,12 @@ import {
 import { emitAgentTs } from "./codegen/agent";
 import { emitEveChannel, emitTriggerChannel } from "./codegen/channels";
 import { emitConnection } from "./codegen/connections";
-import { emitEnvLib, emitPlatformAuthLib, emitTriggerEventLib } from "./codegen/libs";
+import {
+  emitEnvLib,
+  emitPlatformAuthLib,
+  emitSlackLib,
+  emitTriggerEventLib,
+} from "./codegen/libs";
 import { emitPackageJson, emitTsconfig } from "./codegen/project";
 import { emitSchedule } from "./codegen/schedules";
 import { emitSkill } from "./codegen/skills";
@@ -355,6 +360,12 @@ export function compile(
     trigger.type === "slack"
   ) {
     files.set("agent/lib/trigger-event.ts", emitTriggerEventLib());
+    // The Slack channel posts its terminal reply through the Slack Web API
+    // (agent/lib/slack.ts) — a standalone, dependency-free helper so it stays
+    // unit-testable against a stub server (slack-outbound.test.ts).
+    if (trigger.type === "slack") {
+      files.set("agent/lib/slack.ts", emitSlackLib());
+    }
     files.set(
       `agent/channels/${trigger.type}.ts`,
       emitTriggerChannel(trigger.type, rendered.triggerRefPaths),

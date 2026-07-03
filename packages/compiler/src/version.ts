@@ -14,4 +14,4 @@
  * - minor: new emitted files or new optional behavior
  * - major: changed generated-code semantics or env contract
  */
-export const COMPILER_VERSION = "2.0.0";
+export const COMPILER_VERSION = "2.1.0";

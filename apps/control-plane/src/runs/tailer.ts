@@ -159,12 +159,22 @@ export interface TailRunOptions {
   reconnectDelayMs?: number;
 }
 
+export interface CancelOptions {
+  /**
+   * Terminal status to mark the run with when the tail stops. Default
+   * `failed` (wall-clock expiry / shutdown interruption); the run-cancel API
+   * passes `canceled` so a user abort is recorded as a clean cancellation,
+   * not a failure.
+   */
+  status?: "failed" | "canceled";
+}
+
 export interface RunTailHandle {
   runId: string;
   /** Resolves when the tail has fully stopped (terminal, canceled, or dead). */
   done: Promise<void>;
   /** Stop tailing and mark the run (`canceled` UI action or shutdown). */
-  cancel(reason?: string): void;
+  cancel(reason?: string, options?: CancelOptions): void;
 }
 
 export function tailRun(options: TailRunOptions): RunTailHandle {
@@ -181,6 +191,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
 
   const abort = new AbortController();
   let cancelReason: string | null = null;
+  // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
+  // unless a user cancel flipped this flag, which marks it "canceled".
+  let canceledByUser = false;
   let finished = false;
 
   const publishStatus = (status: RunStatus, error?: string | null) => {
@@ -283,7 +296,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           throw new Error("stream ended before a terminal event");
         } catch (error) {
           if (abort.signal.aborted) {
-            await finishRun("failed", null, cancelReason ?? "run tail aborted");
+            await finishRun(
+              canceledByUser ? "canceled" : "failed",
+              canceledByUser ? "active" : null,
+              cancelReason ?? "run tail aborted",
+            );
             return;
           }
           attempt = consumedThisConnect > 0 ? 1 : attempt + 1;
@@ -302,7 +319,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             abort.signal,
           );
           if (abort.signal.aborted) {
-            await finishRun("failed", null, cancelReason ?? "run tail aborted");
+            await finishRun(
+              canceledByUser ? "canceled" : "failed",
+              canceledByUser ? "active" : null,
+              cancelReason ?? "run tail aborted",
+            );
             return;
           }
         }
@@ -315,8 +336,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   return {
     runId,
     done,
-    cancel(reason) {
+    cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
+      if (options?.status === "canceled") canceledByUser = true;
       abort.abort();
     },
   };
@@ -369,6 +391,22 @@ export class RunTailerManager {
 
   get(runId: string): RunTailHandle | undefined {
     return this.handles.get(runId);
+  }
+
+  /**
+   * Cancel a specific run's live tail (user abort), marking it `canceled` and
+   * awaiting a clean stop. Returns true when a live tail was cancelled; false
+   * when the run had no active tail (parked/queued/terminal — the caller marks
+   * the row directly). Best-effort re: eve's turn: eve exposes no session-
+   * cancel HTTP route (see the module header), so the platform stops streaming
+   * and records the cancellation; eve's own turn parks/caps out server-side.
+   */
+  async cancelRun(runId: string, reason?: string): Promise<boolean> {
+    const handle = this.handles.get(runId);
+    if (!handle) return false;
+    handle.cancel(reason, { status: "canceled" });
+    await handle.done;
+    return true;
   }
 
   /** Number of live tails (observability/tests). */

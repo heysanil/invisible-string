@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./crypto";
+
 /**
  * Shared contracts package — placeholder.
  *

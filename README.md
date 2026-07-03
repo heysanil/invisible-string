@@ -65,6 +65,36 @@ surface, built on the E1 design system (`src/styles/tokens.css` +
   presets, members (Better Auth organization roles), workspace rename, and
   **Integrations** (connect the platform Slack app, per-team bot tokens).
 
+## Copilot (builder assistant)
+
+The builder's docked right rail is an AI copilot (spec §12): it reads the
+current draft definition plus the workspace inventory (MCP connections,
+skills, agent presets, model presets, allowlist) and proposes edits as
+**typed mutations** — `setTrigger`, `addContext`, `removeContext`,
+`setAgent`, `setModelPreset`, `setInstructions` — streamed over
+`WS /workspaces/:workspaceId/copilot` (shared frame protocol in
+`packages/shared/src/copilot.ts`). Every proposal renders as a structured
+Apply/Dismiss card with a preview (inline diff for instructions,
+before→after otherwise); the server **never** mutates the draft — accepted
+mutations are applied client-side through the builder controller (the same
+reducer manual edits use, so autosave/dry-run/diagnostics just work), and
+each accept/reject is fed back into the model's tool loop. Invalid tool
+calls (unknown ids, non-allowlisted models, dangling `@references`) bounce
+back to the model server-side and never reach the UI.
+
+The copilot runs a Claude model via **OpenRouter on the platform key**
+(`COPILOT_PROVIDER=openrouter`, default model `anthropic/claude-sonnet-5`);
+a direct-Anthropic path exists but stays inactive without
+`ANTHROPIC_API_KEY`. The socket is only mounted when a provider key (or the
+scripted test fake) is available — keyless boots simply run without
+`/copilot`. Config knobs (all optional): `COPILOT_MODEL`,
+`COPILOT_PROVIDER`, `COPILOT_MAX_SESSIONS` (per-workspace cap, default 2),
+`COPILOT_MAX_OUTPUT_TOKENS` (per-turn budget, default 8192),
+`COPILOT_MAX_STEPS` (tool-loop round-trip cap, default 12), and
+`COPILOT_FAKE_SCRIPT` (deterministic scripted LLM for tests). Unit and
+integration suites use the scripted fake; the single real-model smoke is
+gated behind `COPILOT_KEYED=1` + `OPENROUTER_API_KEY`.
+
 Run it against a live control plane:
 
 ```sh

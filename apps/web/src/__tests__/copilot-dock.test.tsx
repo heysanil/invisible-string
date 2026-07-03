@@ -1,8 +1,9 @@
 /**
- * Copilot dock behavior against a scripted fake WebSocket: hello on connect,
- * streamed thread, suggestion frame → card per mutation type, Apply →
- * controller action + accepted report, Dismiss → rejected report, reconnect
- * resends the draft, a11y roles, and open-state persistence.
+ * Copilot dock behavior against a scripted fake WebSocket: streamed thread,
+ * proposal frame → card per mutation tool, Apply → controller action +
+ * accepted mutation_result, Dismiss → rejected mutation_result, abort,
+ * reconnect, a11y roles, and open-state persistence. Frames follow the
+ * shared protocol in packages/shared/src/copilot.ts.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -11,7 +12,7 @@ import { act } from "react";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import type {
   AgentPresetDto,
-  CopilotSuggestion,
+  CopilotProposal,
   WorkflowDefinition,
 } from "@invisible-string/shared";
 
@@ -83,6 +84,7 @@ const q = () => within(document.body);
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 const PRESET_ID = "a1111111-1111-4111-8111-111111111111";
+const CONN_ID = "b1111111-1111-4111-8111-111111111111";
 
 const definition: WorkflowDefinition = {
   trigger: { type: "manual" },
@@ -94,7 +96,7 @@ const definition: WorkflowDefinition = {
 const resources = {
   connections: [],
   skills: [],
-  connectionById: new Map([["conn-1", { id: "conn-1", name: "zendesk" }]]),
+  connectionById: new Map([[CONN_ID, { id: CONN_ID, name: "zendesk" }]]),
   skillById: new Map(),
   isPending: false,
   isError: false,
@@ -104,12 +106,11 @@ const agentPresets = [
   { id: PRESET_ID, name: "General" },
 ] as unknown as readonly AgentPresetDto[];
 
-function suggestion(overrides: Partial<CopilotSuggestion> = {}): CopilotSuggestion {
+function proposal(overrides: Partial<CopilotProposal> = {}): CopilotProposal {
   return {
-    id: "sug-1",
-    rationale: "Support asks arrive in Slack.",
-    mutation: {
-      kind: "setTrigger",
+    id: "prop-1",
+    tool: "setTrigger",
+    params: {
       trigger: {
         type: "slack",
         binding: {
@@ -119,8 +120,9 @@ function suggestion(overrides: Partial<CopilotSuggestion> = {}): CopilotSuggesti
         },
       },
     },
+    rationale: "Support asks arrive in Slack.",
     ...overrides,
-  };
+  } as CopilotProposal;
 }
 
 function renderDock(overrides: Record<string, unknown> = {}) {
@@ -149,6 +151,16 @@ function lastSocket(): FakeWebSocket {
   return socket;
 }
 
+function sendUserMessage(socket: FakeWebSocket, text = "Help me") {
+  fireEvent.input(q().getByLabelText("Ask copilot"), {
+    target: { value: text },
+  });
+  // happy-dom does not synthesize form submission from a button click.
+  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
+  fireEvent.submit(input.closest("form")!);
+  return JSON.parse(socket.sent.at(-1)!);
+}
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
   window.localStorage.setItem("is.copilot.open", "1");
@@ -170,43 +182,41 @@ test("collapsed pill when closed; opening persists to localStorage", () => {
   expect(FakeWebSocket.instances.length).toBe(1);
 });
 
-test("sends client_hello with the draft on open", () => {
+test("connects to the workspace-scoped copilot socket and sends nothing until asked", () => {
   renderDock();
   const socket = lastSocket();
+  expect(socket.url).toContain("/workspaces/ws-1/copilot");
   act(() => socket.open());
-  const frames = socket.sent.map((raw) => JSON.parse(raw));
-  expect(frames).toEqual([
-    { type: "client_hello", workflowId: "wf-1", draft: definition },
-  ]);
+  expect(socket.sent).toEqual([]);
 });
 
-test("streams assistant deltas into one message; stop sends a stop frame", () => {
+test("user_message carries workflowId + live draft; deltas stream into one message; abort on stop", () => {
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
 
-  fireEvent.input(q().getByLabelText("Ask copilot"), {
-    target: { value: "Help me" },
+  const frame = sendUserMessage(socket);
+  expect(frame).toEqual({
+    type: "user_message",
+    workflowId: "wf-1",
+    draft: definition,
+    message: "Help me",
   });
-  // happy-dom does not synthesize form submission from a button click.
-  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
-  fireEvent.submit(input.closest("form")!);
-  expect(socket.frames().at(-1)?.type).toBe("user_message");
 
   act(() => {
-    socket.message({ type: "assistant_delta", messageId: "m1", text: "Hel" });
-    socket.message({ type: "assistant_delta", messageId: "m1", text: "lo **you**" });
+    socket.message({ type: "delta", text: "Hel" });
+    socket.message({ type: "delta", text: "lo **you**" });
   });
   const thread = q().getByLabelText("Copilot conversation");
   expect(thread.getAttribute("aria-live")).toBe("polite");
   expect(thread.textContent).toContain("Hello");
   expect(thread.textContent).toContain("you");
 
-  // Streaming ⇒ the stop affordance is up; clicking reports stop.
+  // Streaming ⇒ the stop affordance is up; clicking sends an abort frame.
   fireEvent.click(q().getByRole("button", { name: "Stop generating" }));
-  expect(socket.frames().at(-1)).toEqual({ type: "stop" });
+  expect(socket.frames().at(-1)).toEqual({ type: "abort" });
 
-  act(() => socket.message({ type: "assistant_done", messageId: "m1" }));
+  act(() => socket.message({ type: "done", reason: "aborted" }));
   expect(q().queryByRole("button", { name: "Stop generating" })).toBeNull();
 });
 
@@ -219,16 +229,16 @@ test("empty-state example chips send a user_message", () => {
   );
   const frame = JSON.parse(socket.sent.at(-1)!);
   expect(frame.type).toBe("user_message");
-  expect(frame.text).toBe("Set this up to triage Slack mentions");
+  expect(frame.message).toBe("Set this up to triage Slack mentions");
   expect(frame.draft).toEqual(definition);
 });
 
-test("suggestion frame renders a structured card; Apply routes through dispatch and reports accepted", () => {
+test("proposal frame renders a structured card; Apply routes through dispatch and reports accepted", () => {
   const applied = mock(() => {});
   const { dispatch } = renderDock({ onApplied: applied });
   const socket = lastSocket();
   act(() => socket.open());
-  act(() => socket.message({ type: "suggestion", suggestion: suggestion() }));
+  act(() => socket.message({ type: "proposal", proposal: proposal() }));
 
   const card = q().getByTestId("suggestion-card");
   expect(card.textContent).toContain("Set trigger: Slack — #support · @mentions");
@@ -249,9 +259,9 @@ test("suggestion frame renders a structured card; Apply routes through dispatch 
   });
   expect(applied).toHaveBeenCalledWith("trigger");
   expect(JSON.parse(socket.sent.at(-1)!)).toEqual({
-    type: "suggestion_decision",
-    suggestionId: "sug-1",
-    decision: "accepted",
+    type: "mutation_result",
+    proposalId: "prop-1",
+    outcome: "accepted",
   });
   // Card collapses to a ✓ receipt line.
   expect(q().queryByTestId("suggestion-card")).toBeNull();
@@ -264,10 +274,11 @@ test("Dismiss reports rejected without applying", () => {
   act(() => socket.open());
   act(() =>
     socket.message({
-      type: "suggestion",
-      suggestion: suggestion({
-        id: "sug-2",
-        mutation: { kind: "addContext", contextKind: "connection", id: "conn-1" },
+      type: "proposal",
+      proposal: proposal({
+        id: "prop-2",
+        tool: "addContext",
+        params: { kind: "connection", id: CONN_ID },
       }),
     }),
   );
@@ -277,28 +288,26 @@ test("Dismiss reports rejected without applying", () => {
   fireEvent.click(q().getByRole("button", { name: "Dismiss" }));
   expect(dispatch).not.toHaveBeenCalled();
   expect(JSON.parse(socket.sent.at(-1)!)).toEqual({
-    type: "suggestion_decision",
-    suggestionId: "sug-2",
-    decision: "rejected",
+    type: "mutation_result",
+    proposalId: "prop-2",
+    outcome: "rejected",
   });
   expect(q().getByTestId("suggestion-receipt").textContent).toContain(
     "Dismissed",
   );
 });
 
-test("setInstructions suggestion renders an inline diff", () => {
+test("setInstructions proposal renders an inline diff", () => {
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
   act(() =>
     socket.message({
-      type: "suggestion",
-      suggestion: suggestion({
-        id: "sug-3",
-        mutation: {
-          kind: "setInstructions",
-          markdown: "New line\nShared line",
-        },
+      type: "proposal",
+      proposal: proposal({
+        id: "prop-3",
+        tool: "setInstructions",
+        params: { markdown: "New line\nShared line" },
       }),
     }),
   );
@@ -316,10 +325,11 @@ test("suggestion card is keyboard-operable (Enter applies)", () => {
   act(() => socket.open());
   act(() =>
     socket.message({
-      type: "suggestion",
-      suggestion: suggestion({
-        id: "sug-4",
-        mutation: { kind: "setAgent", agentPresetId: PRESET_ID },
+      type: "proposal",
+      proposal: proposal({
+        id: "prop-4",
+        tool: "setAgent",
+        params: { agentPresetId: PRESET_ID },
       }),
     }),
   );
@@ -329,15 +339,23 @@ test("suggestion card is keyboard-operable (Enter applies)", () => {
   expect(dispatch).toHaveBeenCalledWith({ type: "setAgentPreset", id: PRESET_ID });
 });
 
-test("copilot_error frames render as alerts", () => {
+test("error frames render as alerts and end the generating state", () => {
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
-  act(() => socket.message({ type: "copilot_error", message: "Model unavailable" }));
+  sendUserMessage(socket);
+  act(() =>
+    socket.message({
+      type: "error",
+      code: "llm_error",
+      message: "Model unavailable",
+    }),
+  );
   expect(q().getByRole("alert").textContent).toBe("Model unavailable");
+  expect(q().queryByRole("button", { name: "Stop generating" })).toBeNull();
 });
 
-test("reconnects after a drop and re-sends the draft hello", async () => {
+test("reconnects after a drop; the new socket can carry the next user_message", async () => {
   renderDock();
   const first = lastSocket();
   act(() => first.open());
@@ -351,10 +369,11 @@ test("reconnects after a drop and re-sends the draft hello", async () => {
   expect(FakeWebSocket.instances.length).toBe(2);
   const second = lastSocket();
   act(() => second.open());
-  expect(JSON.parse(second.sent[0]!)).toEqual({
-    type: "client_hello",
+  const frame = sendUserMessage(second, "Still here?");
+  expect(frame).toMatchObject({
+    type: "user_message",
     workflowId: "wf-1",
-    draft: definition,
+    message: "Still here?",
   });
 });
 
@@ -367,5 +386,3 @@ test("unmount tears the socket down without reconnecting", async () => {
   await new Promise((resolve) => setTimeout(resolve, 25));
   expect(FakeWebSocket.instances.length).toBe(1);
 });
-
-

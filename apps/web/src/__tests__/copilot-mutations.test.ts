@@ -1,13 +1,17 @@
 /**
- * Copilot mutation → builder-action mapping and card descriptions. Every
- * mutation kind must land on the SAME reducer path manual edits use.
+ * Copilot proposal → builder-action mapping and card descriptions. Every
+ * proposal tool must land on the SAME reducer paths manual edits use.
  */
 import { describe, expect, test } from "bun:test";
-import type { WorkflowDefinition } from "@invisible-string/shared";
+import type { CopilotProposal, WorkflowDefinition } from "@invisible-string/shared";
 
 import { builderReducer, initBuilderState } from "../lib/builder/model";
 import type { ContextResources } from "../lib/builder/resources";
-import { describeMutation, mutationToAction } from "../lib/copilot/mutations";
+import {
+  describeProposal,
+  pillarOfProposal,
+  proposalToActions,
+} from "../lib/copilot/mutations";
 
 const PRESET_ID = "a1111111-1111-4111-8111-111111111111";
 const OTHER_PRESET_ID = "a2222222-2222-4222-8222-222222222222";
@@ -33,16 +37,24 @@ const agentPresets = [
   { id: OTHER_PRESET_ID, name: "Support Agent" },
 ] as never[];
 
-describe("mutationToAction", () => {
+function proposal<T extends CopilotProposal["tool"]>(
+  tool: T,
+  params: Extract<CopilotProposal, { tool: T }>["params"],
+): CopilotProposal {
+  return { id: "p-1", tool, params, rationale: "" } as CopilotProposal;
+}
+
+describe("proposalToActions", () => {
   test("setTrigger replaces the whole trigger through the reducer", () => {
-    const action = mutationToAction({
-      kind: "setTrigger",
-      trigger: {
-        type: "slack",
-        binding: { mentionOnly: true, includeDirectMessages: false },
-      },
-    });
-    const next = builderReducer(initBuilderState(definition), action);
+    const [action] = proposalToActions(
+      proposal("setTrigger", {
+        trigger: {
+          type: "slack",
+          binding: { mentionOnly: true, includeDirectMessages: false },
+        },
+      }),
+    );
+    const next = builderReducer(initBuilderState(definition), action!);
     expect(next.definition.trigger.type).toBe("slack");
     // Draft-preserving: previous manual trigger survives in triggerDrafts.
     expect(next.triggerDrafts.manual).toEqual({ type: "manual" });
@@ -50,50 +62,73 @@ describe("mutationToAction", () => {
 
   test("addContext maps by kind", () => {
     expect(
-      mutationToAction({ kind: "addContext", contextKind: "connection", id: "c" }),
-    ).toEqual({ type: "addConnection", id: "c" });
+      proposalToActions(proposal("addContext", { kind: "connection", id: "c" })),
+    ).toEqual([{ type: "addConnection", id: "c" }]);
     expect(
-      mutationToAction({ kind: "addContext", contextKind: "skill", id: "s" }),
-    ).toEqual({ type: "addSkill", id: "s" });
+      proposalToActions(proposal("addContext", { kind: "skill", id: "s" })),
+    ).toEqual([{ type: "addSkill", id: "s" }]);
   });
 
   test("removeContext maps by kind", () => {
     expect(
-      mutationToAction({
-        kind: "removeContext",
-        contextKind: "connection",
-        id: "conn-1",
-      }),
-    ).toEqual({ type: "removeConnection", id: "conn-1" });
+      proposalToActions(
+        proposal("removeContext", { kind: "connection", id: "conn-1" }),
+      ),
+    ).toEqual([{ type: "removeConnection", id: "conn-1" }]);
     expect(
-      mutationToAction({ kind: "removeContext", contextKind: "skill", id: "s" }),
-    ).toEqual({ type: "removeSkill", id: "s" });
+      proposalToActions(proposal("removeContext", { kind: "skill", id: "s" })),
+    ).toEqual([{ type: "removeSkill", id: "s" }]);
   });
 
-  test("setAgent / setModelPreset / setInstructions map onto existing actions", () => {
-    expect(mutationToAction({ kind: "setAgent", agentPresetId: "x" })).toEqual({
-      type: "setAgentPreset",
-      id: "x",
-    });
-    expect(mutationToAction({ kind: "setModelPreset", preset: "quick" })).toEqual({
-      type: "setModelPreset",
-      preset: "quick",
-    });
-    expect(mutationToAction({ kind: "setModelPreset", preset: null })).toEqual({
-      type: "setModelPreset",
-      preset: undefined,
-    });
+  test("setAgent fans out to one action per provided field", () => {
+    expect(proposalToActions(proposal("setAgent", { agentPresetId: "x" }))).toEqual([
+      { type: "setAgentPreset", id: "x" },
+    ]);
     expect(
-      mutationToAction({ kind: "setInstructions", markdown: "New" }),
-    ).toEqual({ type: "setInstructions", markdown: "New" });
+      proposalToActions(
+        proposal("setAgent", {
+          agentPresetId: "x",
+          reasoning: "high",
+          modelId: "anthropic/claude-sonnet-5",
+        }),
+      ),
+    ).toEqual([
+      { type: "setAgentPreset", id: "x" },
+      { type: "setReasoning", reasoning: "high" },
+      { type: "setModelId", modelId: "anthropic/claude-sonnet-5" },
+    ]);
+  });
+
+  test("setModelPreset / setInstructions map onto existing actions", () => {
+    expect(proposalToActions(proposal("setModelPreset", { slug: "quick" }))).toEqual([
+      { type: "setModelPreset", preset: "quick" },
+    ]);
+    expect(
+      proposalToActions(proposal("setInstructions", { markdown: "New" })),
+    ).toEqual([{ type: "setInstructions", markdown: "New" }]);
+  });
+
+  test("pillarOfProposal routes every tool to its pillar", () => {
+    expect(pillarOfProposal(proposal("setTrigger", { trigger: { type: "manual" } }))).toBe(
+      "trigger",
+    );
+    expect(
+      pillarOfProposal(proposal("addContext", { kind: "skill", id: "s" })),
+    ).toBe("context");
+    expect(pillarOfProposal(proposal("setAgent", { reasoning: "low" }))).toBe("agent");
+    expect(pillarOfProposal(proposal("setModelPreset", { slug: "quick" }))).toBe(
+      "agent",
+    );
+    expect(
+      pillarOfProposal(proposal("setInstructions", { markdown: "x" })),
+    ).toBe("instructions");
   });
 });
 
-describe("describeMutation", () => {
+describe("describeProposal", () => {
   test("setTrigger names the new trigger and shows before→after", () => {
-    const d = describeMutation(
-      {
-        kind: "setTrigger",
+    const d = describeProposal(
+      proposal("setTrigger", {
         trigger: {
           type: "slack",
           binding: {
@@ -102,7 +137,7 @@ describe("describeMutation", () => {
             channelId: "support",
           },
         },
-      },
+      }),
       definition,
       resources,
       agentPresets,
@@ -115,8 +150,8 @@ describe("describeMutation", () => {
   });
 
   test("addContext resolves the resource name", () => {
-    const d = describeMutation(
-      { kind: "addContext", contextKind: "skill", id: "skill-1" },
+    const d = describeProposal(
+      proposal("addContext", { kind: "skill", id: "skill-1" }),
       definition,
       resources,
       agentPresets,
@@ -127,8 +162,8 @@ describe("describeMutation", () => {
   });
 
   test("removeContext shows the shrinking count", () => {
-    const d = describeMutation(
-      { kind: "removeContext", contextKind: "connection", id: "conn-1" },
+    const d = describeProposal(
+      proposal("removeContext", { kind: "connection", id: "conn-1" }),
       definition,
       resources,
       agentPresets,
@@ -138,21 +173,22 @@ describe("describeMutation", () => {
     expect(d.after).toContain("0 sources");
   });
 
-  test("setAgent resolves the preset name", () => {
-    const d = describeMutation(
-      { kind: "setAgent", agentPresetId: OTHER_PRESET_ID },
+  test("setAgent resolves the preset name and includes extra fields", () => {
+    const d = describeProposal(
+      proposal("setAgent", { agentPresetId: OTHER_PRESET_ID, reasoning: "high" }),
       definition,
       resources,
       agentPresets,
       [],
     );
-    expect(d.title).toBe("Set agent: Support Agent");
-    expect(d.before).toBe("General");
+    expect(d.title).toContain("Set agent: Support Agent");
+    expect(d.title).toContain("reasoning high");
+    expect(d.before).toContain("General");
   });
 
   test("setInstructions defers preview to the diff view", () => {
-    const d = describeMutation(
-      { kind: "setInstructions", markdown: "New" },
+    const d = describeProposal(
+      proposal("setInstructions", { markdown: "New" }),
       definition,
       resources,
       agentPresets,

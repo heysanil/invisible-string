@@ -1,7 +1,7 @@
 /**
  * Copilot WS protocol (spec §12, PLAN Phase 4) — typed frames exchanged over
- * `WS /copilot` between the builder's docked copilot rail and the control
- * plane, plus the per-tool mutation param schemas.
+ * `WS /workspaces/:workspaceId/copilot` between the builder's docked copilot
+ * rail and the control plane, plus the per-tool mutation param schemas.
  *
  * Contract highlights:
  * - The copilot NEVER mutates the draft server-side. Every edit is a
@@ -230,3 +230,27 @@ export const copilotServerFrameSchema = z.discriminatedUnion("type", [
     message: z.string(),
   }),
 ]) as z.ZodType<CopilotServerFrame>;
+
+// ── parse helpers ────────────────────────────────────────────────────────────
+
+/** Parse a raw WS payload into a server frame (null on any invalid frame). */
+export function parseCopilotServerFrame(raw: unknown): CopilotServerFrame | null {
+  if (typeof raw !== "string") return null;
+  try {
+    const result = copilotServerFrameSchema.safeParse(JSON.parse(raw));
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse a raw WS payload into a client frame (null on any invalid frame). */
+export function parseCopilotClientFrame(raw: unknown): CopilotClientFrame | null {
+  if (typeof raw !== "string") return null;
+  try {
+    const result = copilotClientFrameSchema.safeParse(JSON.parse(raw));
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
+}

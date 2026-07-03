@@ -33,8 +33,6 @@ export interface CopilotSocketOptions {
   workflowId: string;
   onFrame: (frame: CopilotServerFrame) => void;
   onStatus?: (status: CopilotSocketStatus) => void;
-  /** Called on every (re)open so the owner can re-send its context hello. */
-  onOpen?: () => void;
   createWebSocket?: WebSocketFactory;
   /** Base backoff in ms (doubles per attempt, capped). Tests shrink this. */
   backoffBaseMs?: number;
@@ -91,7 +89,6 @@ export class CopilotSocket {
       if (this.disposed || this.ws !== ws) return;
       this.attempts = 0;
       this.setStatus("open");
-      this.options.onOpen?.();
     });
     ws.addEventListener("message", (event: MessageEvent) => {
       if (this.disposed || this.ws !== ws) return;

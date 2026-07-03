@@ -6,6 +6,8 @@ import {
   copilotMutationParamSchemas,
   copilotProposalSchema,
   copilotServerFrameSchema,
+  parseCopilotClientFrame,
+  parseCopilotServerFrame,
 } from "./copilot";
 
 const UUID = "11111111-2222-4333-8444-555555555555";
@@ -182,5 +184,34 @@ describe("copilot frames", () => {
       copilotServerFrameSchema.safeParse({ type: "error", code: "nope", message: "" })
         .success,
     ).toBe(false);
+  });
+});
+
+describe("parse helpers", () => {
+  test("parseCopilotServerFrame round-trips valid frames and nulls invalid ones", () => {
+    expect(
+      parseCopilotServerFrame(JSON.stringify({ type: "delta", text: "hi" })),
+    ).toEqual({ type: "delta", text: "hi" });
+    expect(parseCopilotServerFrame(JSON.stringify({ type: "nope" }))).toBeNull();
+    expect(parseCopilotServerFrame("not json")).toBeNull();
+    expect(parseCopilotServerFrame(42)).toBeNull();
+  });
+
+  test("parseCopilotClientFrame round-trips valid frames and nulls invalid ones", () => {
+    expect(
+      parseCopilotClientFrame(
+        JSON.stringify({
+          type: "mutation_result",
+          proposalId: "p1",
+          outcome: "accepted",
+        }),
+      ),
+    ).toEqual({ type: "mutation_result", proposalId: "p1", outcome: "accepted" });
+    expect(parseCopilotClientFrame(JSON.stringify({ type: "abort" }))).toEqual({
+      type: "abort",
+    });
+    expect(
+      parseCopilotClientFrame(JSON.stringify({ type: "user_message" })),
+    ).toBeNull();
   });
 });

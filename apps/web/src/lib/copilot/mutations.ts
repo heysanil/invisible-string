@@ -1,15 +1,17 @@
 /**
- * Copilot mutation presentation + application.
+ * Copilot proposal presentation + application.
  *
- * `mutationToAction` maps a typed copilot mutation onto the EXISTING builder
- * reducer action (single writer — the same path manual edits take, so
- * autosave / dirty state / dry-run all just work). `describeMutation` turns
- * a mutation + the CURRENT definition into the card's title, rationale
- * context, affected pillar, and a compact before→after preview.
+ * `proposalToActions` maps a typed copilot proposal (shared protocol:
+ * `{id, tool, params, rationale}`) onto the EXISTING builder reducer actions
+ * (single writer — the same path manual edits take, so autosave / dirty
+ * state / dry-run all just work). A `setAgent` proposal may touch several
+ * agent fields, hence the array. `describeProposal` turns a proposal + the
+ * CURRENT definition into the card's title, affected pillar, and a compact
+ * before→after preview.
  */
 import type {
   AgentPresetDto,
-  CopilotMutation,
+  CopilotProposal,
   ModelPresetDto,
   WorkflowDefinition,
 } from "@invisible-string/shared";
@@ -18,25 +20,57 @@ import type { BuilderAction, Pillar } from "../builder/model";
 import type { ContextResources } from "../builder/resources";
 import { agentSummary, triggerSummary } from "../builder/summary";
 
-/** Map a copilot mutation to the builder reducer action that applies it. */
-export function mutationToAction(mutation: CopilotMutation): BuilderAction {
-  switch (mutation.kind) {
+/** The pillar a proposal's mutation lands on (rail flash + card icon). */
+export function pillarOfProposal(proposal: CopilotProposal): Pillar {
+  switch (proposal.tool) {
     case "setTrigger":
-      return { type: "setTrigger", trigger: mutation.trigger };
+      return "trigger";
     case "addContext":
-      return mutation.contextKind === "connection"
-        ? { type: "addConnection", id: mutation.id }
-        : { type: "addSkill", id: mutation.id };
     case "removeContext":
-      return mutation.contextKind === "connection"
-        ? { type: "removeConnection", id: mutation.id }
-        : { type: "removeSkill", id: mutation.id };
+      return "context";
     case "setAgent":
-      return { type: "setAgentPreset", id: mutation.agentPresetId };
     case "setModelPreset":
-      return { type: "setModelPreset", preset: mutation.preset ?? undefined };
+      return "agent";
     case "setInstructions":
-      return { type: "setInstructions", markdown: mutation.markdown };
+      return "instructions";
+  }
+}
+
+/** Map a copilot proposal to the builder reducer actions that apply it. */
+export function proposalToActions(proposal: CopilotProposal): BuilderAction[] {
+  switch (proposal.tool) {
+    case "setTrigger":
+      return [{ type: "setTrigger", trigger: proposal.params.trigger }];
+    case "addContext":
+      return [
+        proposal.params.kind === "connection"
+          ? { type: "addConnection", id: proposal.params.id }
+          : { type: "addSkill", id: proposal.params.id },
+      ];
+    case "removeContext":
+      return [
+        proposal.params.kind === "connection"
+          ? { type: "removeConnection", id: proposal.params.id }
+          : { type: "removeSkill", id: proposal.params.id },
+      ];
+    case "setAgent": {
+      const { agentPresetId, reasoning, modelId } = proposal.params;
+      const actions: BuilderAction[] = [];
+      if (agentPresetId !== undefined) {
+        actions.push({ type: "setAgentPreset", id: agentPresetId });
+      }
+      if (reasoning !== undefined) {
+        actions.push({ type: "setReasoning", reasoning });
+      }
+      if (modelId !== undefined) {
+        actions.push({ type: "setModelId", modelId });
+      }
+      return actions;
+    }
+    case "setModelPreset":
+      return [{ type: "setModelPreset", preset: proposal.params.slug }];
+    case "setInstructions":
+      return [{ type: "setInstructions", markdown: proposal.params.markdown }];
   }
 }
 
@@ -49,25 +83,28 @@ export interface MutationDescription {
 }
 
 function contextName(
-  mutation: Extract<CopilotMutation, { kind: "addContext" | "removeContext" }>,
+  params: { kind: "connection" | "skill"; id: string },
   resources: ContextResources,
 ): string {
-  if (mutation.contextKind === "connection") {
-    return resources.connectionById.get(mutation.id)?.name ?? mutation.id;
+  if (params.kind === "connection") {
+    return resources.connectionById.get(params.id)?.name ?? params.id;
   }
-  return resources.skillById.get(mutation.id)?.name ?? mutation.id;
+  return resources.skillById.get(params.id)?.name ?? params.id;
 }
 
-export function describeMutation(
-  mutation: CopilotMutation,
+export function describeProposal(
+  proposal: CopilotProposal,
   definition: WorkflowDefinition,
   resources: ContextResources,
   agentPresets: readonly AgentPresetDto[],
   modelPresets: readonly ModelPresetDto[],
 ): MutationDescription {
-  switch (mutation.kind) {
+  switch (proposal.tool) {
     case "setTrigger": {
-      const next = triggerSummary({ ...definition, trigger: mutation.trigger });
+      const next = triggerSummary({
+        ...definition,
+        trigger: proposal.params.trigger,
+      });
       const current = triggerSummary(definition);
       return {
         pillar: "trigger",
@@ -77,52 +114,63 @@ export function describeMutation(
       };
     }
     case "addContext": {
-      const name = contextName(mutation, resources);
+      const name = contextName(proposal.params, resources);
       const count =
         definition.context.mcpConnectionIds.length +
         definition.context.skillIds.length;
       return {
         pillar: "context",
-        title: `Add ${mutation.contextKind}: ${name}`,
+        title: `Add ${proposal.params.kind}: ${name}`,
         before: `${count} source${count === 1 ? "" : "s"}`,
         after: `${count + 1} sources — + ${name}`,
       };
     }
     case "removeContext": {
-      const name = contextName(mutation, resources);
+      const name = contextName(proposal.params, resources);
       const count =
         definition.context.mcpConnectionIds.length +
         definition.context.skillIds.length;
       return {
         pillar: "context",
-        title: `Remove ${mutation.contextKind}: ${name}`,
+        title: `Remove ${proposal.params.kind}: ${name}`,
         before: `${count} source${count === 1 ? "" : "s"}`,
         after: `${Math.max(0, count - 1)} sources — − ${name}`,
       };
     }
     case "setAgent": {
-      const nextName =
-        agentPresets.find((p) => p.id === mutation.agentPresetId)?.name ??
-        mutation.agentPresetId;
+      const { agentPresetId, reasoning, modelId } = proposal.params;
       const current = agentSummary(definition, agentPresets, modelPresets);
+      const parts: string[] = [];
+      const afterParts: string[] = [];
+      if (agentPresetId !== undefined) {
+        const nextName =
+          agentPresets.find((p) => p.id === agentPresetId)?.name ??
+          agentPresetId;
+        parts.push(`Set agent: ${nextName}`);
+        afterParts.push(nextName);
+      }
+      if (reasoning !== undefined) {
+        parts.push(`reasoning ${reasoning}`);
+        afterParts.push(`reasoning ${reasoning}`);
+      }
+      if (modelId !== undefined) {
+        parts.push(`model ${modelId}`);
+        afterParts.push(modelId);
+      }
       return {
         pillar: "agent",
-        title: `Set agent: ${nextName}`,
-        before: current.presetName,
-        after: nextName,
+        title: parts.join(" · ") || "Update agent",
+        before: `${current.presetName} · ${current.modelChain} · reasoning ${current.reasoning}`,
+        after: afterParts.join(" · ") || null,
       };
     }
     case "setModelPreset": {
       const current = agentSummary(definition, agentPresets, modelPresets);
-      const nextLabel = mutation.preset ?? "preset default";
       return {
         pillar: "agent",
-        title:
-          mutation.preset === null
-            ? "Clear model preset override"
-            : `Set model preset: ${mutation.preset}`,
+        title: `Set model preset: ${proposal.params.slug}`,
         before: current.modelChain,
-        after: nextLabel,
+        after: proposal.params.slug,
       };
     }
     case "setInstructions": {

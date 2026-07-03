@@ -80,7 +80,10 @@ const fakeWorkspaceDeps: WorkspaceDeps = {
 };
 
 interface TestServer {
+  /** Socket URL for ORG (the common case). */
   url: string;
+  /** Socket URL addressing a specific workspace path segment. */
+  urlFor(org: string): string;
   transport: ReturnType<typeof createScriptedTransport>;
   stop(): void;
 }
@@ -106,7 +109,8 @@ function startServer(
   const app = new Elysia().use(copilotPlugin(deps)).listen(0);
   const port = app.server!.port;
   const server: TestServer = {
-    url: `ws://localhost:${port}/copilot`,
+    url: `ws://localhost:${port}/workspaces/${ORG}/copilot`,
+    urlFor: (org) => `ws://localhost:${port}/workspaces/${org}/copilot`,
     transport,
     stop: () => void app.stop(true),
   };
@@ -210,9 +214,15 @@ describe("copilot ws auth + scoping", () => {
     expect(await client.opened).toBe(false);
   });
 
+  test("path workspace differing from the active workspace is rejected at upgrade (IDOR)", async () => {
+    const server = startServer([]);
+    const client = new Client(server.urlFor(OTHER_ORG), `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(false);
+  });
+
   test("workflow outside the active workspace → workflow_not_found", async () => {
     const server = startServer([{ text: "hi" }]);
-    const client = new Client(server.url, `user=alice;org=${OTHER_ORG}`);
+    const client = new Client(server.urlFor(OTHER_ORG), `user=alice;org=${OTHER_ORG}`);
     expect(await client.opened).toBe(true);
     client.send(userMessage());
     const error = await client.waitFor((f) => f.type === "error");
@@ -510,7 +520,7 @@ describe("copilot session cap", () => {
     await second.closed;
 
     // A different workspace is unaffected.
-    const other = new Client(server.url, `user=carol;org=${OTHER_ORG}`);
+    const other = new Client(server.urlFor(OTHER_ORG), `user=carol;org=${OTHER_ORG}`);
     expect(await other.opened).toBe(true);
 
     // Closing the first frees the slot.

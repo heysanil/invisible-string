@@ -9,14 +9,13 @@ import { ChevronRight, RefreshCw, Send, Sparkles, Square } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type {
   AgentPresetDto,
-  CopilotMutation,
   ModelPresetDto,
   WorkflowDefinition,
 } from "@invisible-string/shared";
 
 import type { BuilderAction, Pillar } from "../../lib/builder/model";
 import type { ContextResources } from "../../lib/builder/resources";
-import { mutationToAction } from "../../lib/copilot/mutations";
+import { pillarOfProposal, proposalToActions } from "../../lib/copilot/mutations";
 import type { WebSocketFactory } from "../../lib/copilot/socket";
 import { useCopilot } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
@@ -61,21 +60,6 @@ function readStoredOpen(): boolean {
   }
 }
 
-function pillarOf(mutation: CopilotMutation): Pillar {
-  switch (mutation.kind) {
-    case "setTrigger":
-      return "trigger";
-    case "addContext":
-    case "removeContext":
-      return "context";
-    case "setAgent":
-    case "setModelPreset":
-      return "agent";
-    case "setInstructions":
-      return "instructions";
-  }
-}
-
 export function CopilotDock(props: CopilotDockProps) {
   const {
     workspaceId,
@@ -113,9 +97,9 @@ export function CopilotDock(props: CopilotDockProps) {
     workflowId,
     enabled: open,
     getDraft: () => definitionRef.current,
-    applyMutation: (mutation) => {
-      dispatch(mutationToAction(mutation));
-      onApplied?.(pillarOf(mutation));
+    applyProposal: (proposal) => {
+      for (const action of proposalToActions(proposal)) dispatch(action);
+      onApplied?.(pillarOfProposal(proposal));
     },
     ...(createWebSocket ? { createWebSocket } : {}),
     ...(backoffBaseMs !== undefined ? { backoffBaseMs } : {}),
@@ -232,7 +216,7 @@ export function CopilotDock(props: CopilotDockProps) {
               return (
                 <SuggestionCard
                   key={item.id}
-                  suggestion={item.suggestion}
+                  proposal={item.proposal}
                   status={item.status}
                   definition={definition}
                   resources={resources}

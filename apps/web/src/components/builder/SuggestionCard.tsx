@@ -7,16 +7,20 @@
  */
 import { ArrowRight, Bot, Check, FileText, Plug, X, Zap } from "lucide-react";
 import type { ComponentType } from "react";
-import type { CopilotSuggestion, WorkflowDefinition } from "@invisible-string/shared";
+import type {
+  AgentPresetDto,
+  CopilotProposal,
+  ModelPresetDto,
+  WorkflowDefinition,
+} from "@invisible-string/shared";
 
 import type { Pillar } from "../../lib/builder/model";
 import {
-  describeMutation,
+  describeProposal,
   type MutationDescription,
 } from "../../lib/copilot/mutations";
 import type { SuggestionStatus } from "../../lib/copilot/useCopilot";
 import type { ContextResources } from "../../lib/builder/resources";
-import type { AgentPresetDto, ModelPresetDto } from "@invisible-string/shared";
 import { cn } from "../../lib/cn";
 import { DiffView } from "./DiffView";
 
@@ -28,7 +32,7 @@ const PILLAR_ICONS: Record<Pillar, ComponentType<{ size?: number }>> = {
 };
 
 export interface SuggestionCardProps {
-  suggestion: CopilotSuggestion;
+  proposal: CopilotProposal;
   status: SuggestionStatus;
   definition: WorkflowDefinition;
   resources: ContextResources;
@@ -40,7 +44,7 @@ export interface SuggestionCardProps {
 
 export function SuggestionCard(props: SuggestionCardProps) {
   const {
-    suggestion,
+    proposal,
     status,
     definition,
     resources,
@@ -49,8 +53,8 @@ export function SuggestionCard(props: SuggestionCardProps) {
     onApply,
     onDismiss,
   } = props;
-  const description = describeMutation(
-    suggestion.mutation,
+  const description = describeProposal(
+    proposal,
     definition,
     resources,
     agentPresets,
@@ -104,16 +108,16 @@ export function SuggestionCard(props: SuggestionCardProps) {
           <p className="text-[13px] font-semibold leading-snug text-ink">
             {description.title}
           </p>
-          {suggestion.rationale ? (
+          {proposal.rationale ? (
             <p className="mt-0.5 text-[12px] leading-snug text-ink-3">
-              {suggestion.rationale}
+              {proposal.rationale}
             </p>
           ) : null}
         </div>
       </div>
 
       <SuggestionPreview
-        suggestion={suggestion}
+        proposal={proposal}
         description={description}
         definition={definition}
       />
@@ -139,19 +143,19 @@ export function SuggestionCard(props: SuggestionCardProps) {
 }
 
 function SuggestionPreview({
-  suggestion,
+  proposal,
   description,
   definition,
 }: {
-  suggestion: CopilotSuggestion;
+  proposal: CopilotProposal;
   description: MutationDescription;
   definition: WorkflowDefinition;
 }) {
-  if (suggestion.mutation.kind === "setInstructions") {
+  if (proposal.tool === "setInstructions") {
     return (
       <DiffView
         before={definition.instructions.markdown}
-        after={suggestion.mutation.markdown}
+        after={proposal.params.markdown}
       />
     );
   }

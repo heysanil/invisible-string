@@ -1,5 +1,6 @@
 /**
- * `WS /copilot` — the builder copilot socket (spec §12, PLAN Phase 4).
+ * `WS /workspaces/:workspaceId/copilot` — the builder copilot socket
+ * (spec §12, PLAN Phase 4).
  *
  * - Authenticated at UPGRADE via the Better Auth session cookie the SPA
  *   already sends (beforeHandle rejects 401/403 before the handshake
@@ -85,10 +86,18 @@ export function copilotPlugin(deps: CopilotDeps) {
   const liveByWorkspace = new Map<string, number>();
   const states = new Map<string, SocketState>();
 
-  return new Elysia({ name: "copilot" }).ws("/copilot", {
+  return new Elysia({ name: "copilot" }).ws("/workspaces/:workspaceId/copilot", {
     // Reject unauthenticated / workspace-less callers BEFORE the upgrade.
-    beforeHandle: async ({ request, status }) => {
-      const result = await resolveWorkspace(deps.workspaceDeps, request.headers);
+    // The :workspaceId path segment follows the product-route convention and
+    // is IDOR-checked against the caller's ACTIVE organization (same rule as
+    // every /workspaces/:workspaceId/... REST route).
+    beforeHandle: async ({ request, params, status }) => {
+      const result = await resolveWorkspace(
+        deps.workspaceDeps,
+        request.headers,
+        undefined,
+        (params as { workspaceId?: string }).workspaceId,
+      );
       if (!result.ok) return status(result.status, { error: result.message });
       authorized.set(request, result.workspace);
       return undefined;

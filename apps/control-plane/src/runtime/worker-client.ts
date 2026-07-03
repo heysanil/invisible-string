@@ -57,6 +57,14 @@ export interface EveContinueResult {
   continuationToken: string | null;
 }
 
+/**
+ * A normalized TriggerEvent envelope POSTed to a compiled agent's custom
+ * trigger channel. Structurally the platform's `TriggerEvent` (see
+ * packages/shared) — kept as an index signature here so the client stays
+ * decoupled from the shared type while carrying the full envelope.
+ */
+export type TriggerEventPayload = Record<string, unknown>;
+
 export interface WorkerClient {
   ensureAgent(
     workerAddress: string,
@@ -68,6 +76,20 @@ export interface WorkerClient {
     contentHash: string,
     jwt: string,
     message: string,
+  ): Promise<EveSessionCreated>;
+  /**
+   * POST a TriggerEvent to a compiled agent's custom trigger channel at the
+   * locked route `/eve/v1/platform/<trigger>` (form/webhook/slack). The
+   * channel calls send() and returns `{ ok, sessionId, continuationToken }`.
+   * For threaded/continuation triggers the envelope carries a
+   * `continuationToken` the channel passes to send() (same eve session).
+   */
+  postTriggerEvent(
+    workerAddress: string,
+    contentHash: string,
+    jwt: string,
+    triggerType: string,
+    triggerEvent: TriggerEventPayload,
   ): Promise<EveSessionCreated>;
   continueEveSession(
     workerAddress: string,
@@ -177,6 +199,41 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
       const json = (await res.json()) as Partial<EveSessionCreated>;
       if (!json.sessionId || !json.continuationToken) {
         throw new Error("eve session create returned no sessionId/continuationToken");
+      }
+      return { sessionId: json.sessionId, continuationToken: json.continuationToken };
+    },
+
+    async postTriggerEvent(workerAddress, contentHash, jwt, triggerType, triggerEvent) {
+      const res = await doFetch(
+        `${agentProxyBase(workerAddress, contentHash)}/eve/v1/platform/${triggerType}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${jwt}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(triggerEvent),
+          signal: AbortSignal.timeout(timeoutMs),
+        },
+      );
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`trigger channel dispatch failed: ${await readError(res)}`);
+      }
+      const json = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        sessionId?: string;
+        continuationToken?: string;
+        error?: string;
+      };
+      if (json.ok === false) {
+        throw new Error(
+          `trigger channel rejected the event: ${json.error ?? "unknown error"}`,
+        );
+      }
+      if (!json.sessionId || !json.continuationToken) {
+        throw new Error(
+          "trigger channel returned no sessionId/continuationToken",
+        );
       }
       return { sessionId: json.sessionId, continuationToken: json.continuationToken };
     },

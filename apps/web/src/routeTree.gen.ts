@@ -24,6 +24,7 @@ import { Route as AppWorkflowsWorkflowIdRouteImport } from './routes/_app.workfl
 import { Route as AppSettingsWorkspaceRouteImport } from './routes/_app.settings.workspace'
 import { Route as AppSettingsModelsRouteImport } from './routes/_app.settings.models'
 import { Route as AppSettingsMembersRouteImport } from './routes/_app.settings.members'
+import { Route as AppSettingsIntegrationsRouteImport } from './routes/_app.settings.integrations'
 import { Route as AppSettingsAllowlistRouteImport } from './routes/_app.settings.allowlist'
 import { Route as AppSettingsAgentsRouteImport } from './routes/_app.settings.agents'
 import { Route as AppContextSkillsSkillIdRouteImport } from './routes/_app.context.skills.$skillId'
@@ -102,6 +103,11 @@ const AppSettingsMembersRoute = AppSettingsMembersRouteImport.update({
   path: '/members',
   getParentRoute: () => AppSettingsRoute,
 } as any)
+const AppSettingsIntegrationsRoute = AppSettingsIntegrationsRouteImport.update({
+  id: '/integrations',
+  path: '/integrations',
+  getParentRoute: () => AppSettingsRoute,
+} as any)
 const AppSettingsAllowlistRoute = AppSettingsAllowlistRouteImport.update({
   id: '/allowlist',
   path: '/allowlist',
@@ -128,6 +134,7 @@ export interface FileRoutesByFullPath {
   '/workflows': typeof AppWorkflowsRouteWithChildren
   '/settings/agents': typeof AppSettingsAgentsRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
@@ -144,6 +151,7 @@ export interface FileRoutesByTo {
   '/chat': typeof AppChatRoute
   '/settings/agents': typeof AppSettingsAgentsRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
@@ -165,6 +173,7 @@ export interface FileRoutesById {
   '/_app/workflows': typeof AppWorkflowsRouteWithChildren
   '/_app/settings/agents': typeof AppSettingsAgentsRoute
   '/_app/settings/allowlist': typeof AppSettingsAllowlistRoute
+  '/_app/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/_app/settings/members': typeof AppSettingsMembersRoute
   '/_app/settings/models': typeof AppSettingsModelsRoute
   '/_app/settings/workspace': typeof AppSettingsWorkspaceRoute
@@ -186,6 +195,7 @@ export interface FileRouteTypes {
     | '/workflows'
     | '/settings/agents'
     | '/settings/allowlist'
+    | '/settings/integrations'
     | '/settings/members'
     | '/settings/models'
     | '/settings/workspace'
@@ -202,6 +212,7 @@ export interface FileRouteTypes {
     | '/chat'
     | '/settings/agents'
     | '/settings/allowlist'
+    | '/settings/integrations'
     | '/settings/members'
     | '/settings/models'
     | '/settings/workspace'
@@ -222,6 +233,7 @@ export interface FileRouteTypes {
     | '/_app/workflows'
     | '/_app/settings/agents'
     | '/_app/settings/allowlist'
+    | '/_app/settings/integrations'
     | '/_app/settings/members'
     | '/_app/settings/models'
     | '/_app/settings/workspace'
@@ -346,6 +358,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsMembersRouteImport
       parentRoute: typeof AppSettingsRoute
     }
+    '/_app/settings/integrations': {
+      id: '/_app/settings/integrations'
+      path: '/integrations'
+      fullPath: '/settings/integrations'
+      preLoaderRoute: typeof AppSettingsIntegrationsRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
     '/_app/settings/allowlist': {
       id: '/_app/settings/allowlist'
       path: '/allowlist'
@@ -387,6 +406,7 @@ const AppContextRouteWithChildren = AppContextRoute._addFileChildren(
 interface AppSettingsRouteChildren {
   AppSettingsAgentsRoute: typeof AppSettingsAgentsRoute
   AppSettingsAllowlistRoute: typeof AppSettingsAllowlistRoute
+  AppSettingsIntegrationsRoute: typeof AppSettingsIntegrationsRoute
   AppSettingsMembersRoute: typeof AppSettingsMembersRoute
   AppSettingsModelsRoute: typeof AppSettingsModelsRoute
   AppSettingsWorkspaceRoute: typeof AppSettingsWorkspaceRoute
@@ -396,6 +416,7 @@ interface AppSettingsRouteChildren {
 const AppSettingsRouteChildren: AppSettingsRouteChildren = {
   AppSettingsAgentsRoute: AppSettingsAgentsRoute,
   AppSettingsAllowlistRoute: AppSettingsAllowlistRoute,
+  AppSettingsIntegrationsRoute: AppSettingsIntegrationsRoute,
   AppSettingsMembersRoute: AppSettingsMembersRoute,
   AppSettingsModelsRoute: AppSettingsModelsRoute,
   AppSettingsWorkspaceRoute: AppSettingsWorkspaceRoute,

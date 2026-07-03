@@ -26,11 +26,13 @@ import { schema } from "@invisible-string/db";
 import {
   createSessionRequestSchema,
   postMessageRequestSchema,
+  runCancelRequestSchema,
   runInputRequestSchema,
   type AgentSessionDto,
   type BuildStatusResponse,
   type EveInputResponse,
   type PublishWorkflowResponse,
+  type RunCancelResponse,
   type RunDto,
   type TriggerEvent,
   type WorkflowDefinition,
@@ -182,7 +184,7 @@ function compileServiceDeps(deps: RuntimeDeps): CompileServiceDeps {
 
 // ── DTO mapping ─────────────────────────────────────────────────────────────
 
-function sessionDto(row: SessionRow): AgentSessionDto {
+export function sessionDto(row: SessionRow): AgentSessionDto {
   return {
     id: row.id,
     workflowId: row.workflowId,
@@ -195,7 +197,7 @@ function sessionDto(row: SessionRow): AgentSessionDto {
   };
 }
 
-function runDto(row: RunRow): RunDto {
+export function runDto(row: RunRow): RunDto {
   return {
     id: row.id,
     agentSessionId: row.agentSessionId,
@@ -223,7 +225,7 @@ function parseBody<T>(schemaLike: { safeParse(v: unknown): { success: boolean; d
  * Provider that was COMPILED into a version. Stored on the row at publish;
  * legacy rows re-resolve from the immutable config snapshot.
  */
-async function providerForVersion(
+export async function providerForVersion(
   db: Db,
   organizationId: string,
   version: VersionRow,
@@ -258,12 +260,18 @@ export async function requireReadyVersion(
   return { version, definition, artifactKey: build.artifactKey };
 }
 
-/** ensure-agent on the picked worker with the version's full env. */
+/**
+ * ensure-agent on the picked worker with the version's full env. `extraEnv`
+ * lets a caller inject additional non-secret-or-decrypted vars (e.g. the Slack
+ * team bot token `SLACK_BOT_TOKEN` for a slack-triggered version) that ride
+ * the same spawn-time-only env channel as provider keys and MCP tokens.
+ */
 export async function ensureAgentOnWorker(
   deps: RuntimeDeps,
   worker: { id: string; address: string },
   ready: ReadyVersion,
   organizationId: string,
+  extraEnv?: Record<string, string>,
 ): Promise<void> {
   const hash = ready.version.contentHash;
   const provider = await providerForVersion(
@@ -277,13 +285,16 @@ export async function ensureAgentOnWorker(
     deps.masterKey,
     ready.definition.context.mcpConnectionIds,
   );
-  const env = buildAgentEnv({
-    runtime: deps.runtime,
-    worldUrl: worldUrlFor(deps.runtime.worldDatabaseUrl, worldNameForHash(hash)),
-    contentHash: hash,
-    provider,
-    mcpEnv,
-  });
+  const env = {
+    ...buildAgentEnv({
+      runtime: deps.runtime,
+      worldUrl: worldUrlFor(deps.runtime.worldDatabaseUrl, worldNameForHash(hash)),
+      contentHash: hash,
+      provider,
+      mcpEnv,
+    }),
+    ...(extraEnv ?? {}),
+  };
   try {
     await deps.workerClient.ensureAgent(worker.address, hash, {
       artifactUrl: deps.artifacts.presignGetUrl(ready.artifactKey),
@@ -332,7 +343,7 @@ export function startTail(
  * a control-plane failure mid-dispatch leaves an auditable, cap-counted
  * record instead of an invisible orphaned eve session (202-async window).
  */
-async function failDispatch(
+export async function failDispatch(
   deps: RuntimeDeps,
   runId: string,
   error: unknown,
@@ -352,7 +363,7 @@ async function failDispatch(
 }
 
 /** Count the session's queued/running runs (session-serialization guard). */
-async function countDispatchingRuns(
+export async function countDispatchingRuns(
   db: DbClient,
   agentSessionId: string,
 ): Promise<number> {
@@ -871,6 +882,57 @@ export function runtimePlugin(deps: RuntimeDeps) {
           lastEventId,
           heartbeatMs: runtime.sseHeartbeatMs,
         });
+      },
+      { requireWorkspace: true },
+    )
+
+    // ── run cancel ─────────────────────────────────────────────────────────
+    //
+    // Abort an in-flight run: stop the tailer and mark the run `canceled`
+    // (freeing its concurrency slot). Idempotent — cancelling an
+    // already-terminal run returns its current state. Best-effort re: eve's
+    // turn: eve exposes no session-cancel HTTP route (runs/tailer.ts header),
+    // so the platform stops streaming and records the cancellation while eve's
+    // own turn parks/caps out server-side.
+    .post(
+      "/runs/:runId/cancel",
+      async ({ workspace, params, body }): Promise<RunCancelResponse> => {
+        const input = parseBody(runCancelRequestSchema, body ?? {}) ?? {};
+        const { run } = await loadRunOwned(db, workspace.organizationId, params.runId);
+        const reason = input.reason ?? "canceled by user";
+
+        // Idempotent: a run that already reached a terminal status is returned
+        // as-is (no error) so a double-tap / retry is harmless.
+        if (
+          run.status === "succeeded" ||
+          run.status === "failed" ||
+          run.status === "canceled"
+        ) {
+          return { run: runDto(run) };
+        }
+
+        // A live tail (running run) is aborted and marked canceled by the
+        // tailer; a parked (`waiting`) or not-yet-tailed (`queued`) run has no
+        // live tail — mark it canceled directly.
+        const hadTail = await deps.tailers.cancelRun(run.id, reason);
+        if (!hadTail) {
+          await deps.runStore.markRun(run.id, {
+            status: "canceled",
+            error: reason,
+            completedAt: new Date(),
+          });
+          deps.bus.publish(run.id, {
+            kind: "status",
+            frame: { runId: run.id, status: "canceled", error: reason },
+          });
+        }
+
+        const updated = await db
+          .select()
+          .from(schema.runs)
+          .where(eq(schema.runs.id, run.id))
+          .limit(1);
+        return { run: runDto(updated[0] ?? run) };
       },
       { requireWorkspace: true },
     );

@@ -13,3 +13,4 @@ export * from "./skills";
 export * from "./models";
 export * from "./agent-presets";
 export * from "./members";
+export * from "./integrations";

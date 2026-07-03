@@ -207,6 +207,64 @@ export const errors = {
       "session already has an active run — wait for it to finish before sending another message",
     ),
 
+  // ── Phase-3 dispatch / trigger ingress / integrations ─────────────────────
+  /**
+   * Dispatch-time allowlist re-validation (spec §7 / design correction): a
+   * published version's compiled model was on the allowlist at publish but has
+   * since been removed/disabled. The run is FAILED with this message (not
+   * executed) — see runtime/dispatch.ts.
+   */
+  modelDisallowedAtDispatch: (modelId: string) =>
+    new RuntimeApiError(
+      422,
+      "model_disallowed_at_dispatch",
+      `model "${modelId}" is no longer on this workspace's allowlist — the run was not executed; re-allowlist the model or republish the workflow`,
+      { modelId },
+    ),
+  triggerNotFound: () =>
+    new RuntimeApiError(404, "trigger_not_found", "no trigger matches this token"),
+  triggerDisabled: () =>
+    new RuntimeApiError(403, "trigger_disabled", "this trigger is disabled"),
+  triggerTypeMismatch: (expected: string, actual: string) =>
+    new RuntimeApiError(
+      409,
+      "trigger_type_mismatch",
+      `this trigger is of type "${actual}", not "${expected}"`,
+      { expected, actual },
+    ),
+  triggerPayloadTooLarge: (maxBytes: number) =>
+    new RuntimeApiError(
+      413,
+      "payload_too_large",
+      `request body exceeds the ${maxBytes}-byte ingress cap`,
+      { maxBytes },
+    ),
+  rateLimited: (retryAfterSeconds: number) =>
+    new RuntimeApiError(429, "rate_limited", "too many requests — slow down", {
+      retryAfterSeconds,
+    }),
+  formValidationFailed: (reason: string) =>
+    new RuntimeApiError(422, "form_validation_failed", reason),
+  integrationNotConfigured: (type: string) =>
+    new RuntimeApiError(
+      503,
+      "integration_not_configured",
+      `the ${type} integration is not configured on this deployment`,
+    ),
+  integrationNotFound: () =>
+    new RuntimeApiError(404, "integration_not_found", "integration not found in this workspace"),
+  integrationInUse: (workflowNames: string[]) =>
+    new RuntimeApiError(
+      409,
+      "integration_in_use",
+      `integration is referenced by ${workflowNames.length} workflow trigger(s): ${workflowNames.join(", ")}`,
+      { workflows: workflowNames },
+    ),
+  slackOAuthFailed: (detail: string) =>
+    new RuntimeApiError(502, "slack_oauth_failed", `Slack OAuth failed: ${detail}`),
+  slackStateInvalid: () =>
+    new RuntimeApiError(400, "slack_state_invalid", "OAuth state is missing, expired, or invalid"),
+
   workspaceRunCapExceeded: (cap: number) =>
     new RuntimeApiError(
       429,

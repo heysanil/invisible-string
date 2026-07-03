@@ -8,7 +8,9 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  runCancelResponseSchema,
   runInputResponseSchema,
+  type RunCancelRequest,
   type RunInputRequest,
 } from "@invisible-string/shared";
 
@@ -21,6 +23,28 @@ export function usePostRunInput(workspaceId: string) {
     mutationFn: (variables: { runId: string; input: RunInputRequest }) =>
       api.post(`/runs/${variables.runId}/input`, runInputResponseSchema, {
         body: variables.input,
+      }),
+    onSuccess: async (data) => {
+      await Promise.all([
+        invalidateSession(queryClient, data.run.agentSessionId),
+        invalidateSessionLists(queryClient, workspaceId),
+      ]);
+    },
+  });
+}
+
+/**
+ * Cancel an in-flight run (`POST /runs/:id/cancel`). The server stops the
+ * tailer and marks the run `canceled` (idempotent for already-terminal runs);
+ * best-effort re: eve's turn (it exposes no cancel route, so the turn parks /
+ * caps out server-side).
+ */
+export function useCancelRun(workspaceId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (variables: { runId: string; reason?: string }) =>
+      api.post(`/runs/${variables.runId}/cancel`, runCancelResponseSchema, {
+        body: variables.reason ? ({ reason: variables.reason } satisfies RunCancelRequest) : {},
       }),
     onSuccess: async (data) => {
       await Promise.all([

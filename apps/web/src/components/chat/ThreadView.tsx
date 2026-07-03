@@ -19,6 +19,10 @@ export interface ThreadViewProps {
   runs: readonly RunView[];
   isChatOrigin: boolean;
   onRespond: (runId: string, response: RunInputRequest) => void;
+  /** Cancel an in-flight run (stable identity). */
+  onCancel?: (runId: string) => void;
+  /** The run whose cancel is in flight (disables its button). */
+  cancelingRunId?: string | null;
   pendingInput?: {
     runId: string;
     requestId: string;
@@ -38,6 +42,8 @@ export function ThreadView({
   runs,
   isChatOrigin,
   onRespond,
+  onCancel,
+  cancelingRunId,
   pendingInput,
   inputError,
   onSend,
@@ -122,6 +128,8 @@ export function ThreadView({
                     run={run}
                     isChatOrigin={isChatOrigin}
                     onRespond={onRespond}
+                    onCancel={onCancel}
+                    canceling={cancelingRunId === run.runId}
                     pendingInput={
                       pendingInput?.runId === run.runId ? pendingInput : null
                     }

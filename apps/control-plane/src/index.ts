@@ -47,6 +47,11 @@ import {
   type WorkerClient,
 } from "./runtime/worker-client";
 import { mintDispatchToken } from "@invisible-string/shared";
+import { loadIntegrationsConfig } from "./integrations/config";
+import { FixedWindowRateLimiter } from "./integrations/rate-limit";
+import { integrationsPlugin, type IntegrationDeps } from "./integrations/routes";
+import { createSlackClient, type SlackClient } from "./integrations/slack-client";
+import { SlackEventDedup } from "./integrations/slack-verify";
 import {
   createWorkspaceDeps,
   workspacePlugin,
@@ -60,6 +65,8 @@ export interface AppStack {
   dbHandle: DbHandle;
   /** Present when the runtime API is configured (see runtime/config.ts). */
   runtime: RuntimeDeps | null;
+  /** Present when the runtime API is configured (triggers/integrations). */
+  integrations: IntegrationDeps | null;
   close(): Promise<void>;
 }
 
@@ -72,6 +79,8 @@ export interface RuntimeOverrides {
   workerClient?: WorkerClient;
   /** MCP registry proxy client (stubbed in tests). */
   registry?: RegistryClient;
+  /** Slack Web API client (stubbed against a fake Slack server in tests). */
+  slackClient?: SlackClient;
 }
 
 /** Assemble the Elysia app from already-constructed pieces (testable). */
@@ -81,6 +90,7 @@ export function buildApp(opts: {
   workspaceDeps: WorkspaceDeps;
   resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
+  integrationDeps?: IntegrationDeps | null;
 }) {
   const { config, auth, workspaceDeps, resourceDeps } = opts;
   const app = new Elysia()
@@ -115,7 +125,47 @@ export function buildApp(opts: {
   if (opts.runtimeDeps) {
     app.use(runtimePlugin(opts.runtimeDeps));
   }
+  if (opts.integrationDeps) {
+    app.use(integrationsPlugin(opts.integrationDeps));
+  }
   return app;
+}
+
+/**
+ * Construct the trigger-ingress + integrations dependency graph. Null when the
+ * runtime is unconfigured (ingress dispatch needs workers + artifacts). The
+ * Slack app itself stays optional (see loadIntegrationsConfig) — webhook/form
+ * ingress works without it.
+ */
+export function createIntegrationDeps(opts: {
+  env: Record<string, string | undefined>;
+  runtimeDeps: RuntimeDeps | null;
+  slackClient?: SlackClient;
+}): IntegrationDeps | null {
+  const { env, runtimeDeps } = opts;
+  if (!runtimeDeps) return null;
+  const config = loadIntegrationsConfig(env, runtimeDeps.runtime.platformJwtSecret);
+  const perMinute = (name: string, fallback: number): number => {
+    const raw = env[name]?.trim();
+    const parsed = raw ? Number(raw) : NaN;
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  return {
+    runtime: runtimeDeps,
+    config,
+    slackClient:
+      opts.slackClient ??
+      createSlackClient({ apiBaseUrl: config.slack?.apiBaseUrl }),
+    tokenRateLimiter: new FixedWindowRateLimiter({
+      limit: perMinute("TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN", 60),
+      windowMs: 60_000,
+    }),
+    ipRateLimiter: new FixedWindowRateLimiter({
+      limit: perMinute("TRIGGER_RATE_LIMIT_PER_IP_PER_MIN", 120),
+      windowMs: 60_000,
+    }),
+    slackDedup: new SlackEventDedup(),
+  };
 }
 
 /** Construct the runtime dependency graph (null when unconfigured). */
@@ -207,6 +257,11 @@ export function createAppStack(
     workspaceDeps,
     overrides: runtimeOverrides,
   });
+  const integrationDeps = createIntegrationDeps({
+    env,
+    runtimeDeps,
+    slackClient: runtimeOverrides?.slackClient,
+  });
   const resourceDeps: ResourceDeps = {
     db: dbHandle.db,
     workspaceDeps,
@@ -219,13 +274,21 @@ export function createAppStack(
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
   };
-  const app = buildApp({ config, auth, workspaceDeps, resourceDeps, runtimeDeps });
+  const app = buildApp({
+    config,
+    auth,
+    workspaceDeps,
+    resourceDeps,
+    runtimeDeps,
+    integrationDeps,
+  });
   return {
     app,
     auth,
     config,
     dbHandle,
     runtime: runtimeDeps,
+    integrations: integrationDeps,
     close: async () => {
       await runtimeDeps?.tailers.stopAll();
       await dbHandle.close();

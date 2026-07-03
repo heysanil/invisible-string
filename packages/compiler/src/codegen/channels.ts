@@ -162,6 +162,11 @@ import { routeAuth } from "eve/channels/auth";
 
 import { platformAuth } from "../lib/platform-auth.js";
 import {
+  postSlackReply,
+  replyTargetFrom,
+  type SlackReplyTarget,
+} from "../lib/slack.js";
+import {
   buildTriggerMessage,
   parseTriggerEvent,
 } from "../lib/trigger-event.js";
@@ -169,71 +174,13 @@ import {
 /** {{trigger.*}} markers used by this workflow's instructions (compile-time). */
 const TRIGGER_REFS: readonly string[] = ${tsStringArray(triggerRefPaths)};
 
-/** Where the terminal reply goes: captured from the inbound event's data. */
-interface SlackReplyTarget {
-  channel: string | null;
-  threadTs: string | null;
-}
-
-function replyTargetFrom(data: Record<string, unknown>): SlackReplyTarget {
-  const channel = typeof data.channel === "string" ? data.channel : null;
-  const threadTs =
-    typeof data.thread_ts === "string"
-      ? data.thread_ts
-      : typeof data.ts === "string"
-        ? data.ts
-        : null;
-  return { channel, threadTs };
-}
-
-/** Outbound delivery for real: Slack Web API chat.postMessage. */
-async function postSlackReply(
-  target: SlackReplyTarget,
-  text: string,
-): Promise<void> {
-  const token = process.env.SLACK_BOT_TOKEN;
-  if (token === undefined || token.length === 0) {
-    console.error("[slack] SLACK_BOT_TOKEN is not set; dropping outbound reply");
-    return;
-  }
-  if (target.channel === null) {
-    console.error("[slack] no reply channel recorded; dropping outbound reply");
-    return;
-  }
-  try {
-    const response = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        authorization: \`Bearer \${token}\`,
-      },
-      body: JSON.stringify({
-        channel: target.channel,
-        text,
-        ...(target.threadTs !== null ? { thread_ts: target.threadTs } : {}),
-      }),
-    });
-    const result = (await response.json().catch(() => null)) as {
-      ok?: boolean;
-      error?: string;
-    } | null;
-    if (result === null || result.ok !== true) {
-      console.error(
-        \`[slack] chat.postMessage failed: \${result?.error ?? \`HTTP \${response.status}\`}\`,
-      );
-    }
-  } catch (error) {
-    console.error("[slack] chat.postMessage failed", error);
-  }
-}
-
 /**
  * slack trigger channel. eve's built-in Slack channel is Vercel-coupled
  * (PLAN correction 3), so the platform dispatches normalized TriggerEvents
- * here and outbound replies use the Slack Web API directly with platform
- * credentials from env. Threaded replies continue the same session via the
- * dispatcher's continuationToken passthrough (thread_ts mapping lives in the
- * control plane).
+ * here and outbound replies use the Slack Web API directly (agent/lib/slack.ts)
+ * with the team bot token the dispatcher injects as SLACK_BOT_TOKEN. Threaded
+ * replies continue the same session via the dispatcher's continuationToken
+ * passthrough (thread_ts ↔ session mapping lives in the control plane).
  */
 export default defineChannel({
   state: { channel: null, threadTs: null } as SlackReplyTarget,

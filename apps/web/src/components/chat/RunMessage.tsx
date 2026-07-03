@@ -4,7 +4,7 @@
  * (markdown), inline HITL approval cards, and a failure banner.
  */
 import { memo, useCallback } from "react";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, X } from "lucide-react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
@@ -20,6 +20,10 @@ export interface RunMessageProps {
   isChatOrigin: boolean;
   /** Stable across renders so memoized rows bail out (runId is passed back). */
   onRespond: (runId: string, response: RunInputRequest) => void;
+  /** Cancel an in-flight run (queued/running/waiting). Stable identity. */
+  onCancel?: (runId: string) => void;
+  /** True while this run's cancel request is in flight (disables the button). */
+  canceling?: boolean;
   /** requestId → the response being submitted (optimistic). */
   pendingInput?: { requestId: string; optionId?: string; text?: string } | null;
   inputError?: string | null;
@@ -29,14 +33,22 @@ function RunMessageImpl({
   run,
   isChatOrigin,
   onRespond,
+  onCancel,
+  canceling,
   pendingInput,
   inputError,
 }: RunMessageProps) {
   const showReply = run.reply !== null;
   const isActive = run.status === "queued" || run.status === "running";
+  // A parked (waiting) run can also be cancelled — it holds a slot until answered.
+  const cancelable = isActive || run.status === "waiting";
   const handleRespond = useCallback(
     (response: RunInputRequest) => onRespond(run.runId, response),
     [onRespond, run.runId],
+  );
+  const handleCancel = useCallback(
+    () => onCancel?.(run.runId),
+    [onCancel, run.runId],
   );
   return (
     <div className="flex flex-col gap-1.5">
@@ -98,6 +110,23 @@ function RunMessageImpl({
         {run.block === null && !showReply && run.pendingInputs.length === 0 && run.error === null &&
         isActive ? (
           <p className="py-1 text-[12.5px] text-ink-4">Thinking…</p>
+        ) : null}
+
+        {onCancel && cancelable ? (
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={canceling}
+              className={cn(
+                "lift inline-flex items-center gap-1.5 rounded-capsule border border-black/10 bg-white/60 px-2.5 py-1 text-[12px] font-medium text-ink-2",
+                "hover:border-err/40 hover:text-err disabled:pointer-events-none disabled:opacity-50",
+              )}
+            >
+              <X size={12} aria-hidden="true" />
+              {canceling ? "Cancelling…" : "Cancel run"}
+            </button>
+          </div>
         ) : null}
       </div>
     </div>

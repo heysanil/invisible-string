@@ -116,3 +116,51 @@ jobs:
       - name: Compose down
         if: always()
         run: docker compose down -v
+
+  e2e:
+    # Phase-2 acceptance: a real browser drives the built SPA against the FULL
+    # compose stack (the e2e global-setup brings compose up itself under its
+    # own project name p2e2e) through builder → publish (real eve build) → chat
+    # → HITL round-trip. Slow on a cold npm cache — generous timeout.
+    name: Phase-2 E2E (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: node@24
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - name: Cache npm cache (eve agent installs)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
+          restore-keys: npm-eve-${{ runner.os }}-
+
+      - name: Run Phase-2 E2E
+        working-directory: e2e
+        run: bunx playwright test --project=acceptance
+
+      - name: Upload Playwright traces + report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            e2e/.artifacts/
+            e2e/playwright-report/
+            e2e/.runtime/*.log
+          retention-days: 7

@@ -250,6 +250,24 @@ type _PublishLockstep = [
 const _publishLockstep: _PublishLockstep = [true, true];
 void _publishLockstep;
 
+// ── GET /workspaces/:workspaceId/workflows/:wfId/versions/:versionId/build ──
+
+/**
+ * Build status of a workflow version. The builder polls this after an async
+ * publish (a fresh build answers "building" and progresses in the background)
+ * so the rail can flip from "Building…" to the ready/error chip.
+ */
+export interface BuildStatusResponse {
+  status: BuildStatus;
+  /** `eve build`/compiler error log when status is "failed". */
+  error: string | null;
+}
+
+export const buildStatusResponseSchema = z.object({
+  status: buildStatusSchema,
+  error: z.string().nullable(),
+});
+
 // ── POST /workspaces/:workspaceId/workflows/:wfId/versions/dry-run-compile ──
 
 /**

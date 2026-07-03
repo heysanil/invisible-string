@@ -38,8 +38,19 @@ import {
 } from "./publish-machine";
 import type { ReferenceSources } from "./references";
 import type { ContextResources } from "./resources";
-import { useDryRunCompile, usePublishWorkflow, useUpdateWorkflow } from "../queries/workflows";
+import {
+  fetchBuildStatus,
+  useDryRunCompile,
+  usePublishWorkflow,
+  useUpdateWorkflow,
+} from "../queries/workflows";
 import { ApiError } from "../api-client";
+
+/** Poll cadence + ceiling for the post-publish build-status watch. */
+const BUILD_POLL_INTERVAL_MS = 1500;
+const BUILD_POLL_MAX_ATTEMPTS = 1000; // ~25 min ceiling; a fresh eve build is minutes
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const AUTOSAVE_DELAY_MS = 700;
 
@@ -216,7 +227,35 @@ export function useBuilderController(
       await flush();
       const response = await publishWorkflow.mutateAsync(workflow.id);
       publishDispatch({ type: "received", response });
-      return response;
+
+      // A fresh build answers "building"/"pending" and finishes in the
+      // background — poll the version's build status until it is terminal so
+      // the rail flips from "Building…" to the ready/error chip.
+      let current = response;
+      let attempts = 0;
+      while (
+        (current.buildStatus === "building" || current.buildStatus === "pending") &&
+        attempts < BUILD_POLL_MAX_ATTEMPTS
+      ) {
+        attempts += 1;
+        await sleep(BUILD_POLL_INTERVAL_MS);
+        try {
+          const status = await fetchBuildStatus(
+            workspaceId,
+            workflow.id,
+            response.versionId,
+          );
+          current = {
+            ...response,
+            buildStatus: status.status,
+            buildError: status.error,
+          };
+          publishDispatch({ type: "received", response: current });
+        } catch {
+          // Transient poll failure — keep waiting for the build to settle.
+        }
+      }
+      return current;
     } catch (error) {
       const message =
         error instanceof ApiError
@@ -225,7 +264,7 @@ export function useBuilderController(
       publishDispatch({ type: "failed", message });
       return null;
     }
-  }, [flush, publishWorkflow, workflow.id]);
+  }, [flush, publishWorkflow, workflow.id, workspaceId]);
 
   const resetPublish = useCallback(() => {
     publishDispatch({ type: "reset" });

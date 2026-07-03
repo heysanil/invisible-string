@@ -5,7 +5,8 @@
   "workspaces": [
     "apps/*",
     "packages/*",
-    "tests/*"
+    "tests/*",
+    "e2e"
   ],
   "scripts": {
     "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' --filter='./tests/*' typecheck",

@@ -28,6 +28,7 @@ import {
   postMessageRequestSchema,
   runInputRequestSchema,
   type AgentSessionDto,
+  type BuildStatusResponse,
   type EveInputResponse,
   type PublishWorkflowResponse,
   type RunDto,
@@ -473,6 +474,36 @@ export function runtimePlugin(deps: RuntimeDeps) {
           buildStatus,
           cached,
           buildError,
+        };
+      },
+      { requireWorkspace: true },
+    )
+
+    // ── build status (builder polls this after an async publish) ───────────
+    .get(
+      "/workspaces/:workspaceId/workflows/:wfId/versions/:versionId/build",
+      async ({ workspace, params }): Promise<BuildStatusResponse> => {
+        const workflow = await loadWorkflowOwned(
+          db,
+          workspace.organizationId,
+          params.wfId,
+        );
+        const rows = await db
+          .select()
+          .from(schema.workflowVersions)
+          .where(
+            and(
+              eq(schema.workflowVersions.id, params.versionId),
+              eq(schema.workflowVersions.workflowId, workflow.id),
+            ),
+          )
+          .limit(1);
+        const version = rows[0];
+        if (!version) throw errors.notFound("workflow version");
+        const build = await deps.buildStore.get(version.contentHash);
+        return {
+          status: build?.status ?? version.buildStatus,
+          error: build?.errorLog ?? null,
         };
       },
       { requireWorkspace: true },

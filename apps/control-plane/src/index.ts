@@ -190,7 +190,9 @@ export function createAppStack(
     compile: runtimeOverrides?.compile ?? compileWorkflow,
     // Skill attachments live in the same object store as build artifacts.
     artifacts: runtimeDeps?.artifacts,
-    registry: runtimeOverrides?.registry ?? createRegistryClient(),
+    registry:
+      runtimeOverrides?.registry ??
+      createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
   };
   const app = buildApp({ config, auth, workspaceDeps, resourceDeps, runtimeDeps });
   return {

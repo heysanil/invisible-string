@@ -12,6 +12,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import {
+  buildStatusResponseSchema,
   createWorkflowResponseSchema,
   deleteResourceResponseSchema,
   dryRunCompileResponseSchema,
@@ -19,6 +20,7 @@ import {
   listWorkflowsResponseSchema,
   publishWorkflowResponseSchema,
   updateWorkflowResponseSchema,
+  type BuildStatusResponse,
   type CreateWorkflowRequest,
   type GetWorkflowResponse,
   type UpdateWorkflowRequest,
@@ -43,6 +45,20 @@ export function fetchWorkflow(
   return api.get(
     `${basePath(workspaceId)}/${workflowId}`,
     getWorkflowResponseSchema,
+    { signal },
+  );
+}
+
+/** One-shot build-status poll for a version (builder polls after publish). */
+export function fetchBuildStatus(
+  workspaceId: string,
+  workflowId: string,
+  versionId: string,
+  signal?: AbortSignal,
+): Promise<BuildStatusResponse> {
+  return api.get(
+    `${basePath(workspaceId)}/${workflowId}/versions/${versionId}/build`,
+    buildStatusResponseSchema,
     { signal },
   );
 }

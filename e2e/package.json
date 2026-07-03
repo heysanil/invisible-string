@@ -1,0 +1,22 @@
+{
+  "name": "@invisible-string/e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:acceptance": "playwright test workflow-form",
+    "report": "playwright show-report",
+    "install:browser": "playwright install chromium",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.1",
+    "@invisible-string/db": "workspace:*",
+    "@invisible-string/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^26.1.0",
+    "typescript": "^6.0.3",
+    "zod": "^3.23.8"
+  }
+}

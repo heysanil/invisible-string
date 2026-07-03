@@ -23,6 +23,8 @@ import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { organization } from "better-auth/plugins";
 
+import { seedWorkspace } from "@invisible-string/db";
+
 import { authSchema } from "./auth-schema";
 import type { Config } from "./config";
 import type { Db } from "./db";
@@ -67,6 +69,14 @@ export function createAuth(config: Config, db: Db) {
     plugins: [
       organization({
         creatorRole: "owner",
+        // A new workspace must arrive with the locked defaults (model presets,
+        // allowlist, agent presets) so the builder is usable immediately — the
+        // seed is idempotent and never clobbers later admin edits.
+        organizationHooks: {
+          afterCreateOrganization: async ({ organization: org }) => {
+            await seedWorkspace(db, org.id);
+          },
+        },
       }),
       sso({
         domainVerification: { enabled: true },

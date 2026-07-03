@@ -173,6 +173,13 @@ export interface CreateRegistryClientOptions {
   fetchImpl?: typeof fetch;
   ttlMs?: number;
   now?: () => number;
+  /**
+   * Override the registry host (MCP_REGISTRY_BASE_URL). LOCAL DEV/CI ONLY — an
+   * operator-controlled test seam that points the proxy at a local stub (same
+   * shape as OPENROUTER_BASE_URL). Never set in production: the SSRF
+   * containment above assumes the single hardcoded host.
+   */
+  baseUrl?: string;
 }
 
 export function createRegistryClient(
@@ -181,6 +188,7 @@ export function createRegistryClient(
   const doFetch = options.fetchImpl ?? fetch;
   const ttlMs = options.ttlMs ?? CACHE_TTL_MS;
   const now = options.now ?? Date.now;
+  const host = (options.baseUrl?.trim() || REGISTRY_HOST).replace(/\/+$/, "");
   const cache = new Map<string, CacheEntry>();
 
   async function getJson(url: string): Promise<Json> {
@@ -210,7 +218,7 @@ export function createRegistryClient(
       const cached = cache.get(key);
       if (cached && cached.expires > now()) return cached.servers;
 
-      const url = `${REGISTRY_HOST}${SEARCH_PATH}?search=${encodeURIComponent(query)}&version=latest`;
+      const url = `${host}${SEARCH_PATH}?search=${encodeURIComponent(query)}&version=latest`;
       const body = await getJson(url);
       const servers = asArray(body.servers)
         .map((entry) => {
@@ -225,7 +233,7 @@ export function createRegistryClient(
     async getServer(name, version = "latest") {
       // Path-segment-encode BOTH the reverse-DNS name and version; still the
       // fixed host, never a user URL.
-      const url = `${REGISTRY_HOST}${SEARCH_PATH}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
+      const url = `${host}${SEARCH_PATH}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
       let body: Json;
       try {
         body = await getJson(url);

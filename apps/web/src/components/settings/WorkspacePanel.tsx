@@ -2,9 +2,10 @@
  * Workspace settings: rename the workspace (owners/admins) + a danger-zone
  * placeholder. Rename goes through Better Auth's organization update.
  */
+import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
-import { authClient } from "../../lib/auth-client";
+import { authClient, signOut } from "../../lib/auth-client";
 import { Button } from "../ui/Button";
 import { Input } from "../ui/Input";
 import { useToast } from "../ui/Toast";
@@ -22,8 +23,10 @@ export function WorkspacePanel({
   canManage,
 }: WorkspacePanelProps) {
   const { toast } = useToast();
+  const navigate = useNavigate();
   const [name, setName] = useState(workspaceName);
   const [saving, setSaving] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Reflect an updated name arriving from elsewhere while not mid-edit.
@@ -57,6 +60,17 @@ export function WorkspacePanel({
     }
   }
 
+  async function handleSignOut() {
+    setSigningOut(true);
+    try {
+      await signOut();
+      await navigate({ to: "/login" });
+    } catch {
+      toast({ variant: "error", message: "Could not sign out. Try again." });
+      setSigningOut(false);
+    }
+  }
+
   return (
     <SettingsSection title="Workspace" description="Name and workspace-level controls.">
       <div className="flex flex-col gap-6">
@@ -82,6 +96,23 @@ export function WorkspacePanel({
               Only owners and admins can rename the workspace.
             </p>
           )}
+        </div>
+
+        <div className="flex items-center justify-between gap-4 rounded-card-lg border border-black/[0.07] bg-white/45 p-4">
+          <div className="flex min-w-0 flex-col">
+            <p className="text-[13px] font-semibold text-ink">Account</p>
+            <p className="text-[12.5px] leading-relaxed text-ink-3">
+              Sign out of this browser session.
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            loading={signingOut}
+            onClick={() => void handleSignOut()}
+          >
+            Sign out
+          </Button>
         </div>
 
         <div className="flex flex-col gap-2 rounded-card-lg border border-err/20 bg-err/[0.04] p-4">

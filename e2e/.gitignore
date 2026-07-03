@@ -1,0 +1,6 @@
+# Playwright + harness runtime output
+.runtime/
+.artifacts/
+playwright-report/
+test-results/
+node_modules/

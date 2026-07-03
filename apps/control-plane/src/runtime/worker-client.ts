@@ -82,6 +82,13 @@ export function agentProxyBase(workerAddress: string, contentHash: string): stri
 
 export interface CreateWorkerClientOptions {
   workerSharedSecret: string;
+  /**
+   * Allow secret-bearing calls to http:// worker addresses
+   * (ALLOW_INSECURE_WORKER_TRANSPORT=1 — local dev/CI only). The ensure-agent
+   * payload carries the agent's full env map; plaintext transport exposes it
+   * on any observable network segment.
+   */
+  allowInsecureWorkerTransport?: boolean;
   /** Per-request timeout for non-streaming calls (default 60s — ensure-agent
    *  may pull + boot the agent synchronously in v1). */
   requestTimeoutMs?: number;
@@ -91,14 +98,25 @@ export interface CreateWorkerClientOptions {
 export function createWorkerClient(options: CreateWorkerClientOptions): WorkerClient {
   const doFetch = options.fetchImpl ?? fetch;
   const timeoutMs = options.requestTimeoutMs ?? 60_000;
+  const allowInsecureHttp = options.allowInsecureWorkerTransport === true;
 
   async function readError(res: Response): Promise<string> {
     const text = await res.text().catch(() => "");
     return `${res.status} ${text.slice(0, 500)}`;
   }
 
+  function assertSecureTransport(workerAddress: string): void {
+    if (allowInsecureHttp) return;
+    if (!workerAddress.startsWith("http://")) return;
+    throw new Error(
+      `refusing to send agent secrets to plaintext worker address ${workerAddress} — ` +
+        "use https:// (or ALLOW_INSECURE_WORKER_TRANSPORT=1 for local dev only)",
+    );
+  }
+
   return {
     async ensureAgent(workerAddress, contentHash, request) {
+      assertSecureTransport(workerAddress);
       const res = await doFetch(
         `${workerAddress.replace(/\/+$/, "")}/internal/agents/ensure`,
         {

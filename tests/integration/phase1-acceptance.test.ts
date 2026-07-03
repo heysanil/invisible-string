@@ -403,7 +403,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
     baseUrl = `http://localhost:${controlPort}`;
     stack = createAppStack({
       DATABASE_URL: productDatabaseUrl,
-      BETTER_AUTH_SECRET: "p1a-better-auth-secret",
+      BETTER_AUTH_SECRET: "p1a-better-auth-secret-0123456789",
       BETTER_AUTH_URL: baseUrl,
       ENCRYPTION_MASTER_KEY: MASTER_KEY_B64,
       WORLD_DATABASE_URL: worldDatabaseUrl,
@@ -419,6 +419,8 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       OPENROUTER_API_KEY: "p1a-dummy-openrouter-key",
       OPENROUTER_BASE_URL: "http://127.0.0.1:9/v1",
       EVE_MOCK_AUTHORED_MODELS: "1",
+      // The in-test worker serves plain http on localhost.
+      ALLOW_INSECURE_WORKER_TRANSPORT: "1",
       AGENT_BUILD_ROOT: AGENT_ROOT,
       NPM_CACHE_DIR,
       SSE_HEARTBEAT_MS: "500",

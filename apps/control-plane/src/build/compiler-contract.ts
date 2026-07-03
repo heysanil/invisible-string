@@ -16,6 +16,12 @@ import type { ResolvedModel } from "../runtime/model-resolution";
 export interface CompileConnection {
   id: string;
   name: string;
+  /**
+   * Model-facing summary from the registry entry / custom-install form —
+   * connection_search routes on it. Null falls back to a name-derived
+   * placeholder in the adapter.
+   */
+  description: string | null;
   /** MCP server URL. */
   url: string | null;
   /**

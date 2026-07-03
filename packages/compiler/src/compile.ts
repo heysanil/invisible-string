@@ -125,6 +125,15 @@ function validateJoin<T extends { id: string; slug: string }>(
   }
 }
 
+/**
+ * Query-parameter names that look like credentials. Connection URLs are
+ * emitted as LITERALS in generated files — a token smuggled through the URL
+ * would violate the "secrets never in generated files" rule via the side
+ * door, so such URLs are rejected at compile (fail closed; steer these
+ * servers to the bearer/header env-var auth path).
+ */
+const CREDENTIAL_QUERY_PARAM = /^(api[-_]?key|apikey|token|access[-_]?token|auth|authorization|bearer|secret|password|key|sig|signature)$/i;
+
 function validateConnection(connection: ResolvedMcpConnection): void {
   if (connection.url.trim().length === 0) {
     throw new CompileError(
@@ -132,6 +141,32 @@ function validateConnection(connection: ResolvedMcpConnection): void {
       `connection "${connection.slug}" has an empty url`,
       { slug: connection.slug },
     );
+  }
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(connection.url);
+  } catch {
+    throw new CompileError(
+      "INVALID_DEPS",
+      `connection "${connection.slug}" url is not a valid URL`,
+      { slug: connection.slug },
+    );
+  }
+  if (parsedUrl.username !== "" || parsedUrl.password !== "") {
+    throw new CompileError(
+      "INVALID_DEPS",
+      `connection "${connection.slug}" url embeds userinfo credentials — URLs are emitted as literals in generated files; use bearer-token or header env-var auth instead`,
+      { slug: connection.slug },
+    );
+  }
+  for (const param of parsedUrl.searchParams.keys()) {
+    if (CREDENTIAL_QUERY_PARAM.test(param)) {
+      throw new CompileError(
+        "INVALID_DEPS",
+        `connection "${connection.slug}" url carries a credential-looking query parameter "${param}" — URLs are emitted as literals in generated files; use bearer-token or header env-var auth instead`,
+        { slug: connection.slug, param },
+      );
+    }
   }
   if (connection.description.trim().length === 0) {
     throw new CompileError(
@@ -297,12 +332,17 @@ export function compile(
     def.agent.reasoning ?? deps.agentPreset.defaultReasoning;
   const dev = deps.options?.dev === true;
 
+  // The hash is a pure function of the INPUTS (never of the emitted bytes),
+  // so it can be computed up front and baked into the generated code — the
+  // platform-auth JWT audience is bound to this version's hash.
+  const hash = computeWorkflowHash(def, deps);
+
   const files = new Map<string, string>();
   files.set("package.json", emitPackageJson(sortedDeps));
   files.set("tsconfig.json", emitTsconfig());
   files.set("agent/agent.ts", emitAgentTs(sortedDeps, reasoning));
   files.set("agent/instructions.md", rendered.markdown);
-  files.set("agent/lib/platform-auth.ts", emitPlatformAuthLib(dev));
+  files.set("agent/lib/platform-auth.ts", emitPlatformAuthLib(dev, hash));
   if (connections.some((connection) => connection.auth.kind !== "none")) {
     files.set("agent/lib/env.ts", emitEnvLib());
   }
@@ -340,5 +380,5 @@ export function compile(
 
   // computeWorkflowHash canonicalizes key order AND resolved-entry array
   // order itself, so this matches control-plane pre-computed hashes.
-  return { files, hash: computeWorkflowHash(def, deps) };
+  return { files, hash };
 }

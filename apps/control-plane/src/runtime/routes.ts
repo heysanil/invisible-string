@@ -20,7 +20,7 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, count, eq, inArray } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
 import {
@@ -35,7 +35,7 @@ import {
   type MasterKey,
 } from "@invisible-string/shared";
 
-import type { Db } from "../db";
+import type { Db, DbClient } from "../db";
 import type { ArtifactStore } from "../artifacts";
 import { slugifyName } from "../build/compiler-adapter";
 import type { BuildService, BuildStore } from "../build/service";
@@ -53,10 +53,10 @@ import type { RunStore } from "../runs/store";
 import type { RunTailerManager } from "../runs/tailer";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
 import { buildAgentEnv, decryptMcpEnv, mcpTokenEnvName } from "./agent-env";
-import { assertUnderRunCap } from "./caps";
+import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
 import type { RuntimeConfig } from "./config";
 import { errors, isRuntimeApiError, RuntimeApiError } from "./errors";
-import { mintPlatformJwt } from "./jwt";
+import { agentJwtParams, mintPlatformJwt } from "./jwt";
 import {
   loadModelResolutionData,
   resolveModel,
@@ -230,6 +230,7 @@ async function resolveCompileInputs(
     connections.push({
       id: row.id,
       name: row.name,
+      description: row.description ?? null,
       url: row.url,
       envTokenVar: row.authConfigEncrypted ? mcpTokenEnvName(row.name) : null,
       toolAllow: row.toolAllow ?? null,
@@ -251,6 +252,20 @@ async function resolveCompileInputs(
       ((row.scope === "workspace" && row.organizationId === organizationId) ||
         (row.scope === "user" && row.userId === runAsUserId));
     if (!owned) throw errors.contextResourceNotFound("skill", id);
+    // Attached skill files are a Phase-2 feature; the compiler supports
+    // packaged skills but nothing fetches file CONTENT from the artifact
+    // store yet. Publishing would silently drop the attachments — make the
+    // loss explicit instead (review finding: silent content loss).
+    if (row.files && row.files.length > 0) {
+      throw errors.compileFailed([
+        {
+          path: `skills.${row.name}`,
+          message:
+            `skill "${row.name}" has attached files, which are not yet supported at publish — ` +
+            "publishing would silently drop them (file attachments land in Phase 2)",
+        },
+      ]);
+    }
     skills.push({
       id: row.id,
       name: row.name,
@@ -401,7 +416,7 @@ async function ensureAgentOnWorker(
   }
 }
 
-function startTail(
+export function startTail(
   deps: RuntimeDeps,
   workerAddress: string,
   contentHash: string,
@@ -409,6 +424,10 @@ function startTail(
   runId: string,
   agentSessionId: string,
 ): void {
+  const { secret, audience } = agentJwtParams(
+    deps.runtime.platformJwtSecret,
+    contentHash,
+  );
   deps.tailers.start({
     runId,
     agentSessionId,
@@ -416,13 +435,56 @@ function startTail(
       deps.workerClient.openEventStream(
         workerAddress,
         contentHash,
-        // Minted per (re)connect — short-lived tokens must not expire a resume.
-        await mintPlatformJwt(deps.runtime.platformJwtSecret, { claims: { runId } }),
+        // Minted per (re)connect — short-lived tokens must not expire a
+        // resume. Secret + audience are bound to this version's hash.
+        await mintPlatformJwt(secret, { audience, claims: { runId } }),
         eveSessionId,
         startIndex,
         signal,
       ),
   });
+}
+
+/**
+ * Mark a pre-inserted run (and optionally its brand-new session) failed when
+ * the worker dispatch after it could not complete. The rows stay visible —
+ * a control-plane failure mid-dispatch leaves an auditable, cap-counted
+ * record instead of an invisible orphaned eve session (202-async window).
+ */
+async function failDispatch(
+  deps: RuntimeDeps,
+  runId: string,
+  error: unknown,
+  options: { failSessionId?: string } = {},
+): Promise<never> {
+  const detail = error instanceof Error ? error.message : String(error);
+  await deps.runStore.markRun(runId, {
+    status: "failed",
+    error: `dispatch failed: ${detail}`,
+    completedAt: new Date(),
+  });
+  if (options.failSessionId) {
+    await deps.runStore.markSession(options.failSessionId, "error");
+  }
+  if (isRuntimeApiError(error)) throw error;
+  throw errors.workerDispatchFailed(detail);
+}
+
+/** Count the session's queued/running runs (session-serialization guard). */
+async function countDispatchingRuns(
+  db: DbClient,
+  agentSessionId: string,
+): Promise<number> {
+  const rows = await db
+    .select({ value: count() })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.agentSessionId, agentSessionId),
+        inArray(schema.runs.status, ["queued", "running"]),
+      ),
+    );
+  return rows[0]?.value ?? 0;
 }
 
 // ── the plugin ──────────────────────────────────────────────────────────────
@@ -435,6 +497,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
       workerRegistryPlugin({
         db,
         workerSharedSecret: runtime.workerSharedSecret,
+        allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
       }),
     )
     .use(workspacePlugin(deps.workspaceDeps))
@@ -611,51 +674,13 @@ export function runtimePlugin(deps: RuntimeDeps) {
         );
         if (!workflow.publishedVersionId) throw errors.workflowNotPublished();
         const ready = await requireReadyVersion(deps, workflow.publishedVersionId);
-
-        await assertUnderRunCap(
-          db,
-          workspace.organizationId,
-          runtime.maxConcurrentRunsPerWorkspace,
-        );
         const worker = await selectWorker(db, runtime.workerHeartbeatTtlMs);
-        await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
-
-        const hash = ready.version.contentHash;
-        let created;
-        try {
-          created = await deps.workerClient.createEveSession(
-            worker.address,
-            hash,
-            await mintPlatformJwt(runtime.platformJwtSecret),
-            message,
-          );
-        } catch (error) {
-          throw errors.workerDispatchFailed(
-            error instanceof Error ? error.message : String(error),
-          );
-        }
 
         const principal = {
           workspaceId: workspace.organizationId,
           userId: workspace.userId,
           source: "chat",
         };
-        const sessionRows = await db
-          .insert(schema.agentSessions)
-          .values({
-            organizationId: workspace.organizationId,
-            workflowId: workflow.id,
-            workflowVersionId: ready.version.id,
-            eveSessionId: created.sessionId,
-            continuationToken: created.continuationToken,
-            origin: "chat",
-            principal,
-            affinityWorkerId: worker.id,
-            status: "active",
-          })
-          .returning();
-        const session = sessionRows[0]!;
-
         const triggerEvent: TriggerEvent = {
           workflowId: workflow.id,
           triggerType: "manual",
@@ -663,15 +688,68 @@ export function runtimePlugin(deps: RuntimeDeps) {
           data: {},
           principal,
         };
-        const runRows = await db
-          .insert(schema.runs)
-          .values({
-            agentSessionId: session.id,
-            triggerEvent: triggerEvent as unknown as Record<string, unknown>,
-            status: "queued",
+
+        // Session + run rows land BEFORE the eve dispatch (202-async window:
+        // a crash mid-dispatch leaves a visible failed run, never an
+        // untracked, uncapped eve session), inside one advisory-locked
+        // transaction so the per-workspace cap is atomic under concurrency.
+        const { session, run } = await db.transaction(async (tx) => {
+          await lockWorkspaceRunCap(tx, workspace.organizationId);
+          await assertUnderRunCap(
+            tx,
+            workspace.organizationId,
+            runtime.maxConcurrentRunsPerWorkspace,
+          );
+          const sessionRows = await tx
+            .insert(schema.agentSessions)
+            .values({
+              organizationId: workspace.organizationId,
+              workflowId: workflow.id,
+              workflowVersionId: ready.version.id,
+              eveSessionId: null,
+              continuationToken: null,
+              origin: "chat",
+              principal,
+              affinityWorkerId: worker.id,
+              status: "active",
+            })
+            .returning();
+          const runRows = await tx
+            .insert(schema.runs)
+            .values({
+              agentSessionId: sessionRows[0]!.id,
+              triggerEvent: triggerEvent as unknown as Record<string, unknown>,
+              status: "queued",
+            })
+            .returning();
+          return { session: sessionRows[0]!, run: runRows[0]! };
+        });
+
+        const hash = ready.version.contentHash;
+        const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
+        let created;
+        try {
+          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+          created = await deps.workerClient.createEveSession(
+            worker.address,
+            hash,
+            await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+            message,
+          );
+        } catch (error) {
+          await failDispatch(deps, run.id, error, { failSessionId: session.id });
+          throw error; // unreachable — failDispatch always throws
+        }
+
+        await db
+          .update(schema.agentSessions)
+          .set({
+            eveSessionId: created.sessionId,
+            continuationToken: created.continuationToken,
           })
-          .returning();
-        const run = runRows[0]!;
+          .where(eq(schema.agentSessions.id, session.id));
+        session.eveSessionId = created.sessionId;
+        session.continuationToken = created.continuationToken;
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
 
@@ -699,34 +777,68 @@ export function runtimePlugin(deps: RuntimeDeps) {
         ) {
           throw errors.sessionNotContinuable();
         }
+        const eveSessionId = session.eveSessionId;
+        const continuationToken = session.continuationToken;
         const ready = await requireReadyVersion(deps, session.workflowVersionId);
-
-        await assertUnderRunCap(
-          db,
-          workspace.organizationId,
-          runtime.maxConcurrentRunsPerWorkspace,
-        );
         const worker = await selectWorker(
           db,
           runtime.workerHeartbeatTtlMs,
           session.affinityWorkerId,
         );
-        await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+
+        const triggerEvent: TriggerEvent = {
+          workflowId: session.workflowId,
+          triggerType: "manual",
+          message,
+          data: {},
+          principal: {
+            workspaceId: workspace.organizationId,
+            userId: workspace.userId,
+            source: "chat",
+          },
+          continuationToken,
+        };
+
+        // One advisory-locked transaction: session-serialization guard (two
+        // tails on ONE eve NDJSON stream corrupt run_events and resume
+        // points — refuse with 409 while a run is queued/running), atomic
+        // per-workspace cap, and the run row BEFORE the eve dispatch.
+        const run = await db.transaction(async (tx) => {
+          await lockWorkspaceRunCap(tx, workspace.organizationId);
+          if ((await countDispatchingRuns(tx, session.id)) > 0) {
+            throw errors.sessionBusy();
+          }
+          await assertUnderRunCap(
+            tx,
+            workspace.organizationId,
+            runtime.maxConcurrentRunsPerWorkspace,
+          );
+          const runRows = await tx
+            .insert(schema.runs)
+            .values({
+              agentSessionId: session.id,
+              triggerEvent: triggerEvent as unknown as Record<string, unknown>,
+              status: "queued",
+            })
+            .returning();
+          return runRows[0]!;
+        });
 
         const hash = ready.version.contentHash;
+        const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
         let result;
         try {
+          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
           result = await deps.workerClient.continueEveSession(
             worker.address,
             hash,
-            await mintPlatformJwt(runtime.platformJwtSecret),
-            session.eveSessionId,
-            { continuationToken: session.continuationToken, message },
+            await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+            eveSessionId,
+            { continuationToken, message },
           );
         } catch (error) {
-          throw errors.workerDispatchFailed(
-            error instanceof Error ? error.message : String(error),
-          );
+          await failDispatch(deps, run.id, error);
+          throw error; // unreachable — failDispatch always throws
         }
         if (result.continuationToken) {
           await deps.runStore.updateSessionContinuation(
@@ -739,29 +851,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           .set({ status: "active", affinityWorkerId: worker.id })
           .where(eq(schema.agentSessions.id, session.id));
 
-        const triggerEvent: TriggerEvent = {
-          workflowId: session.workflowId,
-          triggerType: "manual",
-          message,
-          data: {},
-          principal: {
-            workspaceId: workspace.organizationId,
-            userId: workspace.userId,
-            source: "chat",
-          },
-          continuationToken: session.continuationToken,
-        };
-        const runRows = await db
-          .insert(schema.runs)
-          .values({
-            agentSessionId: session.id,
-            triggerEvent: triggerEvent as unknown as Record<string, unknown>,
-            status: "queued",
-          })
-          .returning();
-        const run = runRows[0]!;
-
-        startTail(deps, worker.address, hash, session.eveSessionId, run.id, session.id);
+        startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
 
         set.status = 201;
         return { run: runDto(run) };

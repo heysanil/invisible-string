@@ -73,6 +73,13 @@ database can never see (or re-drive) another version's runs.
   against the server's `max_connections`.
 - Old versions: dropping a retired version's database (`DROP DATABASE …
   WITH (FORCE)`) is the whole cleanup story — no cross-version rows exist.
+  A later republish of the identical config is a build-cache hit, so the
+  build service verifies the world DB still exists on the cached path and
+  falls through to a full rebuild (which re-provisions) when it was dropped.
+- Ownership guard: `ensure()` records the FULL content hash in a
+  `_invisible_string_world_owner` table inside each world DB and fails
+  loudly if an existing database belongs to a different hash — a 12-char
+  truncation collision must never silently share a world.
 - Same-version processes: multiple workers may serve the SAME version
   concurrently against its shared per-version DB; that is homogeneous and
   safe by design (re-enqueue re-drives only that version's runs).

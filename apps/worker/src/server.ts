@@ -5,10 +5,16 @@
  *   header (timing-safe compare): POST /internal/agents/ensure,
  *   POST /internal/drain, GET /internal/status.
  * - `/agents/:hash/*` — reverse proxy to the agent's port with the
- *   `/agents/:hash` prefix stripped. ONLY `/eve/` and
- *   `/.well-known/workflow/` are forwarded (spike proxy contract): the
- *   workflow world delivers run callbacks to `/.well-known/workflow/v1/*` —
- *   forwarding only `/eve/` lets sessions start but stalls runs forever.
+ *   `/agents/:hash` prefix stripped. ONLY `/eve/` is forwarded here: eve's
+ *   channel routes enforce the platform JWT themselves, but the
+ *   `/.well-known/workflow/v1/*` run-callback surface has NO auth of its
+ *   own — exposing it would let any client with network reach forge
+ *   step/flow callbacks into any agent's durable runs (security review).
+ * - `/cb/:token/agents/:hash/*` — the SAME proxy plus `/.well-known/
+ *   workflow/` forwarding, gated by a per-boot callback token that only the
+ *   co-located world queue knows (injected via WORKFLOW_LOCAL_BASE_URL —
+ *   spike proxy contract: callbacks must traverse this ingress or runs
+ *   stall forever, and proxying keeps idle/drain bookkeeping accurate).
  *   Path + query + headers + body pass through verbatim; response bodies
  *   stream unbuffered (NDJSON session streams stay open for minutes).
  * - `/healthz` — unauthenticated worker liveness.
@@ -24,6 +30,12 @@ import { PortPoolExhaustedError, type PortPool } from "./ports";
 
 /** Path prefixes forwarded to agent processes (both are load-bearing). */
 export const FORWARDED_PREFIXES = ["/eve/", "/.well-known/workflow/"] as const;
+
+/** Prefix forwarded on the PUBLIC `/agents/:hash` surface (JWT-enforcing). */
+export const PUBLIC_FORWARDED_PREFIXES = ["/eve/"] as const;
+
+/** eve's un-authenticated internal run-callback surface (token-gated). */
+export const CALLBACK_PREFIX = "/.well-known/workflow/";
 
 const HASH_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
@@ -70,12 +82,15 @@ export function createWorkerServer(options: {
   agents: AgentManager;
   cache: ArtifactCache;
   ports: PortPool;
+  /** Per-boot secret gating `/cb/:token/...` (see agents.ts callbackToken). */
+  callbackToken: string;
   isDraining: () => boolean;
   /** Kicks off the (async) drain; the endpoint returns 202 immediately. */
   requestDrain: () => void;
   log?: (message: string) => void;
 }): WorkerServer {
-  const { config, agents, cache, ports, isDraining, requestDrain } = options;
+  const { config, agents, cache, ports, callbackToken, isDraining, requestDrain } =
+    options;
   const log = options.log ?? (() => {});
 
   const server = Bun.serve({
@@ -89,7 +104,10 @@ export function createWorkerServer(options: {
         return Response.json({ ok: true, draining: isDraining() });
       }
       if (url.pathname.startsWith("/agents/")) {
-        return proxy(request, url);
+        return proxy(request, url.pathname.slice("/agents/".length), url, false);
+      }
+      if (url.pathname.startsWith("/cb/")) {
+        return callbackProxy(request, url);
       }
       if (url.pathname.startsWith("/internal/")) {
         return internal(request, url);
@@ -204,20 +222,53 @@ export function createWorkerServer(options: {
 
   // ── reverse proxy ─────────────────────────────────────────────────────────
 
-  async function proxy(request: Request, url: URL): Promise<Response> {
-    // /agents/<hash>/<rest...> — strip the prefix, forward <rest> verbatim.
-    const withoutBase = url.pathname.slice("/agents/".length);
+  /**
+   * /cb/<token>/agents/<hash>/<rest> — the world queue's run-callback route.
+   * Verifies the per-boot callback token (timing-safe), then proxies with
+   * `/.well-known/workflow/` forwarding enabled.
+   */
+  async function callbackProxy(request: Request, url: URL): Promise<Response> {
+    const withoutBase = url.pathname.slice("/cb/".length);
+    const slash = withoutBase.indexOf("/");
+    const token = slash === -1 ? withoutBase : withoutBase.slice(0, slash);
+    const rest = slash === -1 ? "" : withoutBase.slice(slash);
+    if (token === "" || !secretsEqual(token, callbackToken)) {
+      return errorResponse(401, "invalid_callback_token", "invalid callback token");
+    }
+    if (!rest.startsWith("/agents/")) {
+      return errorResponse(404, "not_found", "expected /cb/:token/agents/:hash/<path>");
+    }
+    return proxy(request, rest.slice("/agents/".length), url, true);
+  }
+
+  async function proxy(
+    request: Request,
+    withoutBase: string,
+    url: URL,
+    allowCallbacks: boolean,
+  ): Promise<Response> {
+    // <hash>/<rest...> — forward <rest> verbatim.
     const slash = withoutBase.indexOf("/");
     const hash = slash === -1 ? withoutBase : withoutBase.slice(0, slash);
     const rest = slash === -1 ? "" : withoutBase.slice(slash);
     if (!HASH_RE.test(hash) || rest === "") {
       return errorResponse(404, "not_found", "expected /agents/:hash/<path>");
     }
-    if (!FORWARDED_PREFIXES.some((prefix) => rest.startsWith(prefix))) {
+    if (!allowCallbacks && rest.startsWith(CALLBACK_PREFIX)) {
+      // eve's run-callback surface has no auth of its own; only the
+      // co-located world queue (via the tokenized /cb/ route) may reach it.
+      return errorResponse(
+        403,
+        "callback_auth_required",
+        `${CALLBACK_PREFIX} is only reachable through the token-authenticated callback route`,
+      );
+    }
+    const forwarded = allowCallbacks ? FORWARDED_PREFIXES : PUBLIC_FORWARDED_PREFIXES;
+    if (!forwarded.some((prefix) => rest.startsWith(prefix))) {
       return errorResponse(
         404,
         "path_not_forwarded",
-        `only ${FORWARDED_PREFIXES.join(" and ")} are forwarded to agents`,
+        `only ${forwarded.join(" and ")} are forwarded to agents`,
       );
     }
     if (isDraining()) {

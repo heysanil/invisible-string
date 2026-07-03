@@ -307,6 +307,39 @@ describe("typed CompileError cases", () => {
     });
   });
 
+  test("INVALID_DEPS: connection URLs may not smuggle credentials (secrets discipline gate)", () => {
+    const withUrl = (url: string): CompileDeps => ({
+      ...base.deps,
+      connections: base.deps.connections.map((connection) => ({
+        ...connection,
+        url,
+      })),
+    });
+    // Userinfo credentials in the URL literal.
+    expectCompileError(
+      "INVALID_DEPS",
+      base.definition,
+      withUrl("https://user:t0ken@mcp.example.com/mcp"),
+    );
+    // Credential-looking query parameters.
+    expectCompileError(
+      "INVALID_DEPS",
+      base.definition,
+      withUrl("https://mcp.example.com/mcp?api_key=abc123"),
+    );
+    expectCompileError(
+      "INVALID_DEPS",
+      base.definition,
+      withUrl("https://mcp.example.com/mcp?access-token=abc123"),
+    );
+    // Not a URL at all.
+    expectCompileError("INVALID_DEPS", base.definition, withUrl("not a url"));
+    // Benign query parameters stay allowed.
+    expect(() =>
+      compile(base.definition, withUrl("https://mcp.example.com/mcp?version=2")),
+    ).not.toThrow();
+  });
+
   test("INVALID_HEADER: bad env var name (secrets discipline gate)", () => {
     expectCompileError("INVALID_HEADER", slackFixture.definition, {
       ...slackFixture.deps,

@@ -360,6 +360,110 @@ describe("tailRun", () => {
     expect(store.events).toHaveLength(2); // partial progress is preserved
   });
 
+  test("leftover events of a previous turn are persisted but never classify the NEW run as terminal", async () => {
+    // A previous run's tail stopped early (wall-clock abort / stream lost);
+    // eve durably finished turn t0 anyway. The follow-up run's startIndex
+    // undercounts, so its first connect drains t0's tail — including a
+    // session.waiting that previously mis-fired as the new run's terminal.
+    const leftovers = [
+      `{"type":"message.completed","data":{"finishReason":"stop","message":"old","sequence":0,"stepIndex":0,"turnId":"t0"}}`,
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const ownTurn = [
+      `{"type":"turn.started","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"message.received","data":{"message":"follow-up","sequence":1,"turnId":"t1"}}`,
+      `{"type":"message.completed","data":{"finishReason":"stop","message":"new","sequence":1,"stepIndex":0,"turnId":"t1"}}`,
+      `{"type":"turn.completed","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const bus = new RunEventBus();
+
+    const handle = tailRun({
+      runId: "run-2",
+      agentSessionId: "sess-1",
+      openStream: async () => ndjsonResponse([...leftovers, ...ownTurn]),
+      store,
+      bus,
+      maxWallClockMs: 5_000,
+    });
+    await handle.done;
+
+    // Had the leftover session.waiting been classified, the tail would have
+    // stopped after 3 events — instead the FULL drain lands on this run and
+    // the terminal is the run's OWN session.waiting.
+    expect(store.events).toHaveLength(leftovers.length + ownTurn.length);
+    expect(store.runStatus).toBe("succeeded");
+    expect(store.sessionStatus).toBe("active");
+  });
+
+  test("a leftover input.requested does not park the NEW run (pending-input resets at its own turn)", async () => {
+    const lines = [
+      // Previous turn's park tail — unanswered input.requested + waiting.
+      `{"type":"input.requested","data":{"requests":[],"sequence":0,"stepIndex":0,"turnId":"t0"}}`,
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+      // The new run's own clean turn.
+      `{"type":"turn.started","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"turn.completed","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const bus = new RunEventBus();
+
+    const handle = tailRun({
+      runId: "run-2",
+      agentSessionId: "sess-1",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus,
+      maxWallClockMs: 5_000,
+    });
+    await handle.done;
+
+    // succeeded, not "waiting": the stale input.requested belonged to t0.
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("an appendEvent failure retries the SAME event on reconnect (no silent loss)", async () => {
+    const lines = await fixtureLines("mocked-turn-events.ndjson");
+    const store = memoryStore();
+    const bus = new RunEventBus();
+    let failedOnce = false;
+    const flakyStore = {
+      ...store,
+      async appendEvent(runId: string, seq: number, event: EveStreamEvent) {
+        if (seq === 4 && !failedOnce) {
+          failedOnce = true;
+          throw new Error("transient postgres error");
+        }
+        return store.appendEvent(runId, seq, event);
+      },
+    };
+    const startIndexes: number[] = [];
+
+    const handle = tailRun({
+      runId: "run-1",
+      agentSessionId: "sess-1",
+      openStream: async (startIndex) => {
+        startIndexes.push(startIndex);
+        return ndjsonResponse(lines.slice(startIndex));
+      },
+      store: flakyStore,
+      bus,
+      maxWallClockMs: 10_000,
+      reconnectDelayMs: 5,
+    });
+    await handle.done;
+
+    // The failed event was re-consumed from the SAME startIndex — every
+    // event persisted exactly once (memory store throws on duplicate seq).
+    expect(startIndexes).toEqual([0, 4]);
+    expect(store.events.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(store.runStatus).toBe("succeeded");
+  });
+
   test("cancel() stops the tail with the given reason", async () => {
     const store = memoryStore();
     const bus = new RunEventBus();

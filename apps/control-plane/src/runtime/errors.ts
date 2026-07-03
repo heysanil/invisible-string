@@ -93,6 +93,12 @@ export const errors = {
       "session_not_continuable",
       "session has no continuation token or is closed",
     ),
+  sessionBusy: () =>
+    new RuntimeApiError(
+      409,
+      "session_busy",
+      "session already has an active run — wait for it to finish before sending another message",
+    ),
 
   workspaceRunCapExceeded: (cap: number) =>
     new RuntimeApiError(

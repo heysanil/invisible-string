@@ -4,6 +4,7 @@
  * Single-worker semantics, but every piece (port pool, LRU cache, drain,
  * heartbeat capacity counts) is multi-agent/multi-worker ready for Phase 3.
  */
+import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 
 import { createAgentManager, type AgentManager } from "./agents";
@@ -18,6 +19,12 @@ export interface Supervisor {
   readonly server: WorkerServer;
   /** Local base URL of this worker's HTTP surface (tests use this). */
   readonly url: string;
+  /**
+   * Per-boot secret gating the `/cb/:token/agents/:hash/.well-known/…`
+   * run-callback route (only the co-located world queue holds it, via
+   * WORKFLOW_LOCAL_BASE_URL). Exposed for tests.
+   */
+  readonly callbackToken: string;
   readonly agents: AgentManager;
   readonly cache: ArtifactCache;
   readonly ports: PortPool;
@@ -40,6 +47,10 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
 
   mkdirSync(config.artifactCacheDir, { recursive: true });
 
+  // Per-boot callback secret: agents get it via WORKFLOW_LOCAL_BASE_URL; the
+  // proxy's /cb/:token route verifies it before forwarding run callbacks.
+  const callbackToken = randomBytes(24).toString("base64url");
+
   const ports = createPortPool(config.agentPortMin, config.agentPortMax);
 
   // Two-phase wiring: the cache's eviction guard needs the agent manager.
@@ -53,7 +64,7 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
     log,
   });
 
-  const agents = createAgentManager({ config, cache, ports, log });
+  const agents = createAgentManager({ config, cache, ports, callbackToken, log });
   agentsRef = agents;
   agents.startIdleReaper();
 
@@ -96,6 +107,7 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
     agents,
     cache,
     ports,
+    callbackToken,
     isDraining: () => draining,
     requestDrain: () => void drain(),
     log,
@@ -105,6 +117,7 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
     config,
     server,
     url: server.url,
+    callbackToken,
     agents,
     cache,
     ports,

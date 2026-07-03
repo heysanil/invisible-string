@@ -183,7 +183,10 @@ function resolveConnection(
     id: connection.id,
     slug,
     url: connection.url,
-    description: `MCP connection "${connection.name}"`,
+    // Real registry/custom descriptions drive connection_search quality;
+    // the placeholder is a last resort for legacy rows without one.
+    description:
+      connection.description?.trim() || `MCP connection "${connection.name}"`,
     auth,
     tools: toolFilterFrom(connection),
     approval: approvalSpecFromPolicy(connection.name, connection.approvalPolicy),

@@ -5,12 +5,14 @@ import {
 } from "eve/channels/auth";
 
 /**
- * Platform route auth: an HS256 JWT signed with the shared
- * PLATFORM_JWT_SECRET, minted by the control-plane dispatcher. Claim
- * constants mirror the platform contract (packages/shared).
+ * Platform route auth: an HS256 JWT signed with this agent's
+ * PLATFORM_JWT_SECRET (a per-version secret derived by the control plane),
+ * minted by the control-plane dispatcher. The audience is bound to THIS
+ * workflow version's hash, so tokens minted for other versions are rejected.
+ * Claim constants mirror the platform contract (packages/shared).
  */
 export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "workflow-agent";
+export const PLATFORM_JWT_AUDIENCE = "workflow-agent:916439994fcdf82bb0425a6f143b5c171e26886f5359ae8706cfe0783f555db4";
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {

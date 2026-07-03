@@ -31,6 +31,21 @@ interface WorkerBody {
   capacity?: Record<string, unknown>;
 }
 
+/**
+ * A registered worker `url` receives ensure-agent payloads carrying the
+ * agent's FULL secret env (provider key, derived JWT secret, decrypted MCP
+ * tokens). Plaintext http is only acceptable for local dev/CI, behind the
+ * explicit ALLOW_INSECURE_WORKER_TRANSPORT=1 opt-in. Per-worker credentials
+ * / mTLS identity land with the Phase-3 worker pool.
+ */
+function workerUrlProblem(url: URL, allowInsecureHttp: boolean): string | null {
+  if (url.protocol === "https:") return null;
+  if (url.protocol === "http:" && allowInsecureHttp) return null;
+  return url.protocol === "http:"
+    ? "worker url must be https:// (secret-bearing dispatches; set ALLOW_INSECURE_WORKER_TRANSPORT=1 for local dev only)"
+    : "worker url must be an http(s) URL";
+}
+
 function secretsEqual(a: string, b: string): boolean {
   const digestA = createHash("sha256").update(a).digest();
   const digestB = createHash("sha256").update(b).digest();
@@ -61,8 +76,25 @@ function parseWorkerBody(raw: unknown, requireUrl: boolean): WorkerBody | null {
   return { id: body.id, url: body.url as string | undefined, capacity };
 }
 
-export function workerRegistryPlugin(deps: { db: Db; workerSharedSecret: string }) {
+export function workerRegistryPlugin(deps: {
+  db: Db;
+  workerSharedSecret: string;
+  /** ALLOW_INSECURE_WORKER_TRANSPORT=1 — local dev/CI only. */
+  allowInsecureWorkerTransport?: boolean;
+}) {
   const { db } = deps;
+  const allowInsecureHttp = deps.allowInsecureWorkerTransport === true;
+
+  function urlProblemFor(parsed: WorkerBody): string | null {
+    if (parsed.url === undefined) return null;
+    let url: URL;
+    try {
+      url = new URL(parsed.url);
+    } catch {
+      return "worker url must be an http(s) URL";
+    }
+    return workerUrlProblem(url, allowInsecureHttp);
+  }
 
   return new Elysia({ name: "worker-registry" })
     .onBeforeHandle(({ request, set }) => {
@@ -78,6 +110,11 @@ export function workerRegistryPlugin(deps: { db: Db; workerSharedSecret: string 
       if (!parsed) {
         set.status = 400;
         return errorBody("invalid_request", "expected {id: uuid, url: http(s) URL, capacity?}");
+      }
+      const urlProblem = urlProblemFor(parsed);
+      if (urlProblem) {
+        set.status = 400;
+        return errorBody("insecure_worker_url", urlProblem);
       }
       await db
         .insert(schema.workers)
@@ -105,6 +142,11 @@ export function workerRegistryPlugin(deps: { db: Db; workerSharedSecret: string 
       if (!parsed) {
         set.status = 400;
         return errorBody("invalid_request", "expected {id: uuid, capacity?}");
+      }
+      const urlProblem = urlProblemFor(parsed);
+      if (urlProblem) {
+        set.status = 400;
+        return errorBody("insecure_worker_url", urlProblem);
       }
       const updated = await db
         .update(schema.workers)

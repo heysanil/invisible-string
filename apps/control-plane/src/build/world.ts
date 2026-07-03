@@ -71,6 +71,73 @@ export interface CreateWorldProvisionerOptions {
 
 const VALID_WORLD_NAME = /^ws_v_[a-z0-9]{12}$/;
 
+/** Ownership marker table inside each world database (collision guard). */
+const WORLD_OWNER_TABLE = "_invisible_string_world_owner";
+
+/**
+ * Does the version's world database exist? Used by the build service's
+ * cache-hit path: a retired-then-republished version whose world DB was
+ * dropped must NOT short-circuit to the cached artifact — the agent would
+ * boot against a nonexistent database (WORLD-ISOLATION cleanup story).
+ */
+export async function worldDatabaseExists(
+  worldDatabaseUrl: string,
+  contentHash: string,
+): Promise<boolean> {
+  const worldName = worldNameForHash(contentHash);
+  const sql = new SQL(worldDatabaseUrl, { max: 1 });
+  try {
+    const rows = (await sql`
+      select 1 as one from pg_database where datname = ${worldName}
+    `) as unknown[];
+    return rows.length > 0;
+  } finally {
+    await sql.close();
+  }
+}
+
+/**
+ * Record/verify which FULL content hash owns this world database.
+ * worldNameForHash truncates to 12 hex chars (48 bits) — a truncation
+ * collision between two versions would silently make them SHARE one world
+ * (re-introducing the cross-version reenqueueActiveRuns bug the
+ * database-per-version contract exists to prevent, REPORT finding 11).
+ * Improbable, but the failure mode is silent and catastrophic — so ensure()
+ * fails LOUDLY instead.
+ */
+async function assertWorldOwnership(worldUrl: string, contentHash: string): Promise<void> {
+  if (!/^[A-Za-z0-9_-]+$/.test(contentHash)) {
+    throw new Error(`content hash contains unexpected characters: "${contentHash}"`);
+  }
+  const sql = new SQL(worldUrl, { max: 1 });
+  try {
+    await sql.unsafe(
+      `create table if not exists "${WORLD_OWNER_TABLE}" (content_hash text primary key)`,
+    );
+    // Insert-if-empty, race-safe: concurrent first-provisioners both insert
+    // their (identical) hash; conflict is ignored, then the row is re-read.
+    await sql.unsafe(
+      `insert into "${WORLD_OWNER_TABLE}" (content_hash)
+       select '${contentHash}'
+       where not exists (select 1 from "${WORLD_OWNER_TABLE}")
+       on conflict do nothing`,
+    );
+    const rows = (await sql.unsafe(
+      `select content_hash from "${WORLD_OWNER_TABLE}" limit 1`,
+    )) as { content_hash: string }[];
+    const owner = rows[0]?.content_hash;
+    if (owner !== contentHash) {
+      throw new Error(
+        `world database ${worldNameForHash(contentHash)} is owned by version ` +
+          `${owner ?? "(unknown)"} but version ${contentHash} resolved the same ` +
+          `truncated name — 12-char world-name collision; refusing to share a world database`,
+      );
+    }
+  } finally {
+    await sql.close();
+  }
+}
+
 export function createWorldProvisioner(
   options: CreateWorldProvisionerOptions,
 ): WorldProvisioner {
@@ -103,6 +170,10 @@ export function createWorldProvisioner(
       } finally {
         await sql.close();
       }
+
+      // An existing pg_database row is NOT proof of ownership — verify the
+      // full hash before touching it (loud failure on truncation collision).
+      await assertWorldOwnership(url, contentHash);
 
       // setupDatabase is idempotent (drizzle migration journal + graphile
       // installSchema), safe to run on every first-build.

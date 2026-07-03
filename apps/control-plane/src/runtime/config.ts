@@ -60,6 +60,21 @@ export interface RuntimeConfig {
   buildRoot: string;
   /** SSE heartbeat comment interval (default 15s; tests shrink it). */
   sseHeartbeatMs: number;
+  /**
+   * Per-agent world-postgres tuning (WORKFLOW_POSTGRES_MAX_POOL_SIZE /
+   * WORKFLOW_POSTGRES_WORKER_CONCURRENCY, defaults 5/5): graphile-worker's
+   * defaults (concurrency 50 vs pool 10) multiply toward the Postgres
+   * server's max_connections at ~20 agents/worker (spike REPORT finding 15).
+   */
+  worldMaxPoolSize: number;
+  worldWorkerConcurrency: number;
+  /**
+   * Allow http:// worker addresses (ALLOW_INSECURE_WORKER_TRANSPORT=1).
+   * LOCAL DEV/CI ONLY: agent env maps (provider keys, JWT secrets, decrypted
+   * MCP tokens) travel to workers over this transport — production must use
+   * https/mTLS, so plaintext registrations are rejected by default.
+   */
+  allowInsecureWorkerTransport: boolean;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -83,8 +98,8 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
   if (worldDatabaseUrl && !/^postgres(ql)?:\/\//.test(worldDatabaseUrl)) {
     problems.push("WORLD_DATABASE_URL must be a postgres:// URL");
   }
-  const platformJwtSecret = requireVar(env, "PLATFORM_JWT_SECRET", problems);
-  const workerSharedSecret = requireVar(env, "WORKER_SHARED_SECRET", problems);
+  const platformJwtSecret = requireSecretVar(env, "PLATFORM_JWT_SECRET", problems);
+  const workerSharedSecret = requireSecretVar(env, "WORKER_SHARED_SECRET", problems);
   const s3Endpoint = requireVar(env, "S3_ENDPOINT", problems);
   const s3AccessKeyId = requireVar(env, "S3_ACCESS_KEY_ID", problems);
   const s3SecretAccessKey = requireVar(env, "S3_SECRET_ACCESS_KEY", problems);
@@ -113,6 +128,18 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     15_000,
     problems,
   );
+  const worldMaxPoolSize = parsePositiveInt(
+    env.WORKFLOW_POSTGRES_MAX_POOL_SIZE,
+    "WORKFLOW_POSTGRES_MAX_POOL_SIZE",
+    5,
+    problems,
+  );
+  const worldWorkerConcurrency = parsePositiveInt(
+    env.WORKFLOW_POSTGRES_WORKER_CONCURRENCY,
+    "WORKFLOW_POSTGRES_WORKER_CONCURRENCY",
+    5,
+    problems,
+  );
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -138,6 +165,10 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",
     sseHeartbeatMs,
+    worldMaxPoolSize,
+    worldWorkerConcurrency,
+    allowInsecureWorkerTransport:
+      env.ALLOW_INSECURE_WORKER_TRANSPORT?.trim() === "1",
   };
 }
 
@@ -160,6 +191,25 @@ function requireVar(env: Env, name: string, problems: string[]): string | undefi
   const value = env[name]?.trim();
   if (!value) {
     problems.push(`${name} is required for the runtime API`);
+    return undefined;
+  }
+  return value;
+}
+
+/** Minimum length for platform-wide HS256/shared secrets (≈32 bytes entropy). */
+const MIN_SECRET_LENGTH = 32;
+
+/**
+ * Like {@link requireVar} but enforces a minimum secret length: these HS256/
+ * shared secrets authorize the whole worker plane — a short secret is
+ * offline-brute-forceable from any captured token.
+ */
+function requireSecretVar(env: Env, name: string, problems: string[]): string | undefined {
+  const value = requireVar(env, name, problems);
+  if (value !== undefined && value.length < MIN_SECRET_LENGTH) {
+    problems.push(
+      `${name} must be at least ${MIN_SECRET_LENGTH} characters — generate with \`openssl rand -base64 32\``,
+    );
     return undefined;
   }
   return value;

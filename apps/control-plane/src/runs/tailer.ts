@@ -21,6 +21,9 @@
  * - session.waiting otherwise → run succeeded (chat sessions always park on
  *   next-user-message after a completed turn)
  * - session.completed → run succeeded, session closed (task-mode)
+ * - LEFTOVER events of a previous, early-stopped turn (drained by a fresh
+ *   run's first connect) are persisted but never classified as terminals —
+ *   see the `sawOwnTurn` gate in the consume loop.
  *
  * WALL-CLOCK CAP (task 6): MAX_RUN_WALL_CLOCK_MS starts when tailing starts;
  * expiry marks the run failed and aborts the tail. Best-effort abort: eve
@@ -213,6 +216,18 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     let seq = await store.countRunEvents(runId);
     let startIndex = await store.countSessionEvents(agentSessionId);
     let pendingInput = false;
+    // TERMINAL GATE: a FRESH run's tail may first drain leftover events of
+    // the session's PREVIOUS turn (early-stopped tail: wall-clock abort,
+    // cancel, reconnect exhaustion, crash — eve durably finishes the turn
+    // anyway and startIndex therefore undercounts). Those leftovers include
+    // the old turn's `turn.completed`/`session.waiting`, which must be
+    // persisted (keeping counts aligned) but NOT classified as THIS run's
+    // terminal — otherwise the new run is instantly marked succeeded before
+    // its own turn emits anything. Terminals only count once this run's own
+    // turn boundary (`turn.started`) has been seen; a resuming tail
+    // (seq > 0) already consumed its own turn.started. `session.failed` is
+    // session-fatal and always classified.
+    let sawOwnTurn = seq > 0;
 
     await store.markRun(runId, {
       status: "running",
@@ -230,17 +245,31 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             throw new Error(`stream returned ${response.status}`);
           }
           for await (const event of ndjsonEvents(response.body)) {
+            // Persist FIRST, count after: if appendEvent throws (transient
+            // Postgres error), the reconnect resumes from the same
+            // startIndex and re-consumes this event instead of silently
+            // skipping it forever.
+            const stored = await store.appendEvent(runId, seq, event);
             consumedThisConnect += 1;
             startIndex += 1;
-            const stored = await store.appendEvent(runId, seq, event);
             bus.publish(runId, {
               kind: "event",
               frame: { runId, seq, event, at: stored.at },
             });
             seq += 1;
+
+            if (event.type === "turn.started") {
+              // This run's own turn boundary: leftover pending-input state
+              // from a drained previous turn is historical, not ours.
+              sawOwnTurn = true;
+              pendingInput = false;
+            }
             pendingInput = nextPendingInputRequest(pendingInput, event);
 
-            const terminal = classifyTerminal(event, pendingInput);
+            const terminal =
+              sawOwnTurn || event.type === "session.failed"
+                ? classifyTerminal(event, pendingInput)
+                : null;
             if (terminal) {
               await finishRun(
                 terminal.runStatus,

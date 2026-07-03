@@ -49,9 +49,11 @@ import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
 import { mcpAuthAadContext } from "./agent-env";
 import {
-  PLATFORM_JWT_AUDIENCE,
+  derivePlatformJwtSecret,
   PLATFORM_JWT_ISSUER,
+  platformJwtAudienceForHash,
 } from "./jwt";
+import { reconcileInterruptedRuns } from "./reconcile";
 import { createAppStack, type AppStack } from "../index";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -117,13 +119,19 @@ class FakeWorker {
     this.server = null;
   }
 
-  private async verifyJwt(req: Request): Promise<boolean> {
+  private async verifyJwt(req: Request, hash: string): Promise<boolean> {
     const token = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
     try {
-      await jwtVerify(token, new TextEncoder().encode(PLATFORM_JWT_SECRET), {
-        issuer: PLATFORM_JWT_ISSUER,
-        audience: PLATFORM_JWT_AUDIENCE,
-      });
+      // Version-bound contract: DERIVED secret + per-hash audience — a token
+      // minted with the platform master or another version's params fails.
+      await jwtVerify(
+        token,
+        new TextEncoder().encode(derivePlatformJwtSecret(PLATFORM_JWT_SECRET, hash)),
+        {
+          issuer: PLATFORM_JWT_ISSUER,
+          audience: platformJwtAudienceForHash(hash),
+        },
+      );
       return true;
     } catch {
       this.jwtFailures += 1;
@@ -225,12 +233,12 @@ class FakeWorker {
     }
 
     // Agent proxy plane: /agents/:hash/eve/v1/...
-    const proxyMatch = path.match(/^\/agents\/[^/]+\/eve\/v1\/(.*)$/);
+    const proxyMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/(.*)$/);
     if (!proxyMatch) return new Response("not found", { status: 404 });
-    if (!(await this.verifyJwt(req))) {
+    if (!(await this.verifyJwt(req, proxyMatch[1]!))) {
       return Response.json({ error: "unauthorized" }, { status: 401 });
     }
-    const sub = proxyMatch[1]!;
+    const sub = proxyMatch[2]!;
 
     if (sub === "session" && req.method === "POST") {
       const body = (await req.json()) as { message: string };
@@ -425,6 +433,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   let versionId: string;
   let sessionId: string;
   let firstRunId: string;
+  let heldSessionId: string;
 
   async function api(
     method: string,
@@ -485,7 +494,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     stack = createAppStack(
       {
         DATABASE_URL: TEST_DATABASE_URL!,
-        BETTER_AUTH_SECRET: "runtime-integration-secret",
+        BETTER_AUTH_SECRET: "runtime-integration-secret-000000",
         BETTER_AUTH_URL: BASE_URL,
         ENCRYPTION_MASTER_KEY: MASTER_KEY_B64,
         WORLD_DATABASE_URL: "postgres://unused:unused@localhost:5432/world",
@@ -497,6 +506,8 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         OPENROUTER_API_KEY: OPENROUTER_KEY,
         OPENROUTER_BASE_URL,
         MAX_CONCURRENT_RUNS_PER_WORKSPACE: "2",
+        // The fake worker fixture serves plain http on localhost.
+        ALLOW_INSECURE_WORKER_TRANSPORT: "1",
         SSE_HEARTBEAT_MS: "50",
         AGENT_BUILD_ROOT: join(tmpdir(), "invisible-string-itest-builds"),
       },
@@ -717,7 +728,13 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       `ws_v_${contentHash.slice(0, 12)}`,
     );
     expect(ensure.env.WORKFLOW_POSTGRES_JOB_PREFIX).toBe(contentHash);
-    expect(ensure.env.PLATFORM_JWT_SECRET).toBe(PLATFORM_JWT_SECRET);
+    // The agent receives the DERIVED per-version secret, never the master.
+    expect(ensure.env.PLATFORM_JWT_SECRET).toBe(
+      derivePlatformJwtSecret(PLATFORM_JWT_SECRET, contentHash),
+    );
+    expect(ensure.env.PLATFORM_JWT_SECRET).not.toBe(PLATFORM_JWT_SECRET);
+    expect(ensure.env.WORKFLOW_POSTGRES_MAX_POOL_SIZE).toBe("5");
+    expect(ensure.env.WORKFLOW_POSTGRES_WORKER_CONCURRENCY).toBe("5");
     expect(ensure.env.OPENROUTER_API_KEY).toBe(OPENROUTER_KEY);
     expect(ensure.env.OPENROUTER_BASE_URL).toBe(OPENROUTER_BASE_URL);
     expect(ensure.env).not.toHaveProperty("ANTHROPIC_API_KEY");
@@ -883,6 +900,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       { cookie: ownerCookie, body: { message: "HOLD one" } },
     );
     expect(first.status).toBe(201);
+    heldSessionId = ((await first.json()) as CreateSessionResponse).session.id;
     const second = await api(
       "POST",
       `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
@@ -914,6 +932,19 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       body: { message: "also too many" },
     });
     expect(followUp.status).toBe(429);
+  });
+
+  test("a second message while a run is still active on the SAME session → 409 session_busy", async () => {
+    // Two tails on one eve NDJSON stream corrupt run_events and resume
+    // points — the message route must serialize runs per session. This
+    // fires BEFORE the cap check (the workspace is also at its cap here).
+    const res = await api("POST", `/sessions/${heldSessionId}/messages`, {
+      cookie: ownerCookie,
+      body: { message: "second message mid-run" },
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("session_busy");
   });
 
   test("no live worker → typed 503 (fresh workspace, stale heartbeats)", async () => {
@@ -998,5 +1029,81 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("workflow_not_published");
+  });
+
+  // ── boot reconciliation ───────────────────────────────────────────────────
+
+  test("boot reconciliation resumes orphaned runs on live workers and fails the rest", async () => {
+    await freshWorkerHeartbeat();
+    const workerRows = await db
+      .select({ id: schema.workers.id })
+      .from(schema.workers)
+      .where(eq(schema.workers.address, fixture.url));
+    const liveWorkerId = workerRows[0]!.id;
+
+    async function orphanSession(eveSessionId: string | null, affinity: string | null) {
+      const rows = await db
+        .insert(schema.agentSessions)
+        .values({
+          organizationId: orgId,
+          workflowId,
+          workflowVersionId: versionId,
+          eveSessionId,
+          continuationToken: eveSessionId ? `ct-${eveSessionId}` : null,
+          origin: "chat",
+          principal: { workspaceId: orgId, source: "chat" },
+          affinityWorkerId: affinity,
+          status: "active",
+        })
+        .returning();
+      return rows[0]!;
+    }
+    async function orphanRun(agentSessionId: string) {
+      const rows = await db
+        .insert(schema.runs)
+        .values({
+          agentSessionId,
+          triggerEvent: {
+            workflowId,
+            triggerType: "manual",
+            message: "orphan",
+            data: {},
+            principal: { workspaceId: orgId, source: "chat" },
+          },
+          status: "running",
+        })
+        .returning();
+      return rows[0]!;
+    }
+
+    // Orphan A: live worker + real eve session → its tail is re-attached and
+    // drains eve's durable stream to a terminal (crash-safe resume).
+    const liveSession = await orphanSession("eve-sess-1", liveWorkerId);
+    const liveRun = await orphanRun(liveSession.id);
+    // Orphan B: nothing to resume from → failed with completedAt so the cap
+    // slot frees and SSE terminates.
+    const deadSession = await orphanSession("eve-gone", null);
+    const deadRun = await orphanRun(deadSession.id);
+
+    // The two live HOLD tails from the caps test are skipped (still owned by
+    // this process's tailer manager) — only true orphans are touched.
+    const outcome = await reconcileInterruptedRuns(stack.runtime!);
+    expect(outcome).toEqual({ resumed: 1, failed: 1 });
+
+    const dead = await db
+      .select({ status: schema.runs.status, completedAt: schema.runs.completedAt, error: schema.runs.error })
+      .from(schema.runs)
+      .where(eq(schema.runs.id, deadRun.id));
+    expect(dead[0]!.status).toBe("failed");
+    expect(dead[0]!.completedAt).not.toBeNull();
+    expect(dead[0]!.error).toContain("control plane restarted");
+
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, liveRun.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "reconciled run to complete from the resumed tail");
   });
 });

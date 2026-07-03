@@ -63,11 +63,46 @@ export class BuildStepError extends Error {
   }
 }
 
-/** Default RunCommand on Bun.spawn. */
+/**
+ * Env allowlist for build subprocesses. Build steps run THIRD-PARTY code
+ * (npm-installed dependency trees, `eve build`, world setup.js) — they must
+ * never inherit the control plane's secrets (ENCRYPTION_MASTER_KEY,
+ * PLATFORM_JWT_SECRET, WORKER_SHARED_SECRET, provider API keys, DB URLs).
+ * Only process-hygiene vars pass through; each step adds exactly what it
+ * needs via options.env (npm_config_cache, NODE_ENV, WORKFLOW_POSTGRES_URL).
+ */
+const STEP_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "SHELL",
+  // mise resolves node@24 through these when customized.
+  "MISE_DATA_DIR",
+  "MISE_CONFIG_DIR",
+  "MISE_CACHE_DIR",
+  "MISE_STATE_DIR",
+] as const;
+
+/** Scrubbed base env + per-step additions (exported for tests). */
+export function buildStepEnv(
+  extra?: Record<string, string>,
+  base: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of STEP_ENV_ALLOWLIST) {
+    const value = base[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
+/** Default RunCommand on Bun.spawn (scrubbed, allowlisted env). */
 export const runCommand: RunCommand = async (cmd, options) => {
   const proc = Bun.spawn(cmd, {
     cwd: options.cwd,
-    env: { ...process.env, ...options.env },
+    env: buildStepEnv(options.env),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -132,7 +167,10 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
     async install(projectDir) {
       await mkdir(npmCacheDir, { recursive: true });
       const result = await run(
-        [...MISE_NODE24, "npm", "install", "--no-audit", "--no-fund"],
+        // --ignore-scripts: third-party lifecycle scripts are arbitrary code
+        // on the build host — the pinned dependency tree works without them
+        // (spike/REPORT.md finding 19: cbor-x falls back to pure JS).
+        [...MISE_NODE24, "npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
         {
           cwd: projectDir,
           env: { npm_config_cache: npmCacheDir },

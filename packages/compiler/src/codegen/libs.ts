@@ -6,10 +6,10 @@
  * control-plane dispatcher (compile-time constants, asserted by compiler
  * tests).
  */
-import { PLATFORM_JWT_AUDIENCE, PLATFORM_JWT_ISSUER } from "../platform";
+import { PLATFORM_JWT_ISSUER, platformJwtAudienceForHash } from "../platform";
 import { tsString } from "./strings";
 
-export function emitPlatformAuthLib(dev: boolean): string {
+export function emitPlatformAuthLib(dev: boolean, versionHash: string): string {
   const localDevImport = dev ? "\n  localDev," : "";
   const chain = dev ? "[platformJwt(), localDev()]" : "[platformJwt()]";
   const devNote = dev
@@ -23,12 +23,14 @@ export function emitPlatformAuthLib(dev: boolean): string {
 } from "eve/channels/auth";
 
 /**
- * Platform route auth: an HS256 JWT signed with the shared
- * PLATFORM_JWT_SECRET, minted by the control-plane dispatcher. Claim
- * constants mirror the platform contract (packages/shared).${devNote}
+ * Platform route auth: an HS256 JWT signed with this agent's
+ * PLATFORM_JWT_SECRET (a per-version secret derived by the control plane),
+ * minted by the control-plane dispatcher. The audience is bound to THIS
+ * workflow version's hash, so tokens minted for other versions are rejected.
+ * Claim constants mirror the platform contract (packages/shared).${devNote}
  */
 export const PLATFORM_JWT_ISSUER = ${tsString(PLATFORM_JWT_ISSUER)};
-export const PLATFORM_JWT_AUDIENCE = ${tsString(PLATFORM_JWT_AUDIENCE)};
+export const PLATFORM_JWT_AUDIENCE = ${tsString(platformJwtAudienceForHash(versionHash))};
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {

@@ -28,15 +28,25 @@ x-worker-secret: <WORKER_SHARED_SECRET>
 ### Agent proxy plane (platform JWT)
 
 ```
-<worker>/agents/<contentHash>/eve/v1/*            → agent's eve routes
-<worker>/agents/<contentHash>/.well-known/workflow/* → run callbacks
+<worker>/agents/<contentHash>/eve/v1/*                      → agent's eve routes
+<worker>/cb/<callbackToken>/agents/<contentHash>/.well-known/workflow/* → run callbacks
 ```
 
-Both prefixes MUST be forwarded (PLAN correction 10). Calls carry
-`authorization: Bearer <HS256 JWT>` minted per call with
-`iss=invisible-string`, `aud=workflow-agent`, exp ≤ 120 s
-(`src/runtime/jwt.ts`); compiled channels verify via eve's `verifyJwtHmac`
-against `PLATFORM_JWT_SECRET`.
+Both prefixes MUST be forwarded (PLAN correction 10), but `.well-known/
+workflow/*` (eve's UNAUTHENTICATED run-callback surface) is only reachable
+through the `/cb/<token>/…` route: the token is a per-boot secret the
+supervisor hands ONLY to its co-located agents via
+`WORKFLOW_LOCAL_BASE_URL`, so external clients cannot forge step/flow
+callbacks (public `/agents/<hash>/.well-known/…` → 403).
+
+Calls onto `/eve/v1/*` carry `authorization: Bearer <HS256 JWT>` minted per
+call with `iss=invisible-string`, exp ≤ 120 s (`src/runtime/jwt.ts`), and a
+VERSION-BOUND contract: audience `workflow-agent:<contentHash>` and signing
+secret `derivePlatformJwtSecret(PLATFORM_JWT_SECRET, contentHash)` — the
+compiler bakes the matching audience into the generated verifier and the
+agent env receives only the derived secret, so a leaked agent env or token
+is useless against any other workflow version. Compiled channels verify via
+eve's `verifyJwtHmac`.
 
 Used today by the control plane:
 
@@ -50,7 +60,8 @@ Used today by the control plane:
 |---|---|
 | `WORKFLOW_POSTGRES_URL` | the version's **dedicated world database** (below) |
 | `WORKFLOW_POSTGRES_JOB_PREFIX` | contentHash — observability ONLY, does not isolate |
-| `PLATFORM_JWT_SECRET` | channel-auth secret |
+| `WORKFLOW_POSTGRES_MAX_POOL_SIZE` / `WORKFLOW_POSTGRES_WORKER_CONCURRENCY` | per-agent connection budget (defaults 5/5 — REPORT finding 15) |
+| `PLATFORM_JWT_SECRET` | channel-auth secret, **derived per version** (`derivePlatformJwtSecret(master, contentHash)`) — never the platform master |
 | `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | exactly ONE, matching the version's resolved provider (`workflow_versions.model_provider`) |
 | `OPENROUTER_BASE_URL` | passthrough when set (test harnesses) |
 | `MCP_<NAME>_TOKEN` | decrypted MCP connection tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time |

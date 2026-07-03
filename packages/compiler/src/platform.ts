@@ -8,6 +8,17 @@ export const PLATFORM_JWT_ISSUER = "invisible-string";
 export const PLATFORM_JWT_AUDIENCE = "workflow-agent";
 
 /**
+ * Version-bound JWT audience: every compiled agent verifies tokens against
+ * `workflow-agent:<its own version hash>`, and the dispatcher mints with the
+ * same value. A token minted for one workflow version is therefore rejected
+ * by every other agent — a leaked agent env cannot be used for cross-tenant
+ * session access (security review: shared-JWT lateral movement).
+ */
+export function platformJwtAudienceForHash(versionHash: string): string {
+  return `${PLATFORM_JWT_AUDIENCE}:${versionHash}`;
+}
+
+/**
  * Locked route convention for compiled trigger channels: custom channel
  * routes mount at the RAW authored path (spike/REPORT.md finding 7), so
  * trigger channels ride the worker proxy's forwarded `/eve/` prefix.

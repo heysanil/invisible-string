@@ -100,9 +100,16 @@ export function createAgentManager(options: {
   >;
   cache: ArtifactCache;
   ports: PortPool;
+  /**
+   * Per-boot secret authorizing `/.well-known/workflow/*` callbacks through
+   * the proxy (server.ts `/cb/<token>/agents/...`). Only the co-located
+   * world queue — which gets it via WORKFLOW_LOCAL_BASE_URL — knows it, so
+   * external clients cannot forge run callbacks (security review).
+   */
+  callbackToken: string;
   log?: (message: string) => void;
 }): AgentManager {
-  const { config, cache, ports } = options;
+  const { config, cache, ports, callbackToken } = options;
   const log = options.log ?? (() => {});
 
   const running = new Map<string, AgentHandle>();
@@ -134,9 +141,11 @@ export function createAgentManager(options: {
       NODE_ENV: "production",
       // Run callbacks (`/.well-known/workflow/v1/*`) must traverse the same
       // ingress as clients (spike/REPORT.md finding 9) — point the workflow
-      // queue at this worker's own proxy base for the agent. Caller env may
-      // override (test harnesses).
-      WORKFLOW_LOCAL_BASE_URL: `${config.publicUrl}/agents/${hash}`,
+      // queue at this worker's own proxy base for the agent, on the
+      // token-authenticated callback route (the public /agents/:hash surface
+      // refuses `.well-known` so external clients cannot forge step/flow
+      // callbacks). Caller env may override (test harnesses).
+      WORKFLOW_LOCAL_BASE_URL: `${config.publicUrl}/cb/${callbackToken}/agents/${hash}`,
     };
     for (const key of ["PATH", "HOME", "LANG", "TMPDIR"]) {
       const value = process.env[key];

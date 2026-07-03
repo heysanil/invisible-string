@@ -94,6 +94,13 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
     "shared secret for /internal/* — generate with `openssl rand -base64 32`",
     problems,
   );
+  if (workerSharedSecret !== undefined && workerSharedSecret.length < 32) {
+    // Guards the ensure-agent surface that receives full secret env maps —
+    // a short secret is offline-brute-forceable.
+    problems.push(
+      "WORKER_SHARED_SECRET must be at least 32 characters — generate with `openssl rand -base64 32`",
+    );
+  }
 
   const workerId = env.WORKER_ID?.trim() || crypto.randomUUID();
 

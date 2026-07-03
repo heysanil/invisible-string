@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
+import { connectionTokenEnvVar } from "@invisible-string/compiler";
+
+import { slugifyName } from "../build/compiler-adapter";
 import { buildAgentEnv, mcpTokenEnvName } from "./agent-env";
 import { RuntimeApiError } from "./errors";
+import { derivePlatformJwtSecret } from "./jwt";
 import type { RuntimeConfig } from "./config";
 
 const RUNTIME: RuntimeConfig = {
@@ -24,6 +28,9 @@ const RUNTIME: RuntimeConfig = {
   npmCacheDir: "/tmp/npm-cache",
   buildRoot: "/var/lib/agents",
   sseHeartbeatMs: 15_000,
+  worldMaxPoolSize: 5,
+  worldWorkerConcurrency: 5,
+  allowInsecureWorkerTransport: false,
 };
 
 const HASH = "abcdef0123456789abcdef0123456789";
@@ -34,6 +41,16 @@ describe("mcpTokenEnvName", () => {
     expect(mcpTokenEnvName("Deep Wiki v2")).toBe("MCP_DEEP_WIKI_V2_TOKEN");
     expect(mcpTokenEnvName("--weird--")).toBe("MCP_WEIRD_TOKEN");
     expect(mcpTokenEnvName("!!!")).toBe("MCP_CONNECTION_TOKEN");
+  });
+
+  test("agrees with the compiler for >64-char names (slug truncation)", () => {
+    // The generated code reads connectionTokenEnvVar(slugifyName(name)); the
+    // dispatcher must inject the SAME var or publish fails with the adapter's
+    // "token env var mismatch" guard.
+    const longName = `Very ${"long ".repeat(20)}connection name`;
+    expect(mcpTokenEnvName(longName)).toBe(
+      connectionTokenEnvVar(slugifyName(longName)),
+    );
   });
 });
 
@@ -50,7 +67,30 @@ describe("buildAgentEnv", () => {
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
     expect(env.WORKFLOW_POSTGRES_URL).toContain("ws_v_abcdef012345");
     expect(env.WORKFLOW_POSTGRES_JOB_PREFIX).toBe(HASH);
-    expect(env.PLATFORM_JWT_SECRET).toBe("jwt-secret");
+    // Per-version DERIVED secret — never the platform master.
+    expect(env.PLATFORM_JWT_SECRET).toBe(derivePlatformJwtSecret("jwt-secret", HASH));
+    expect(env.PLATFORM_JWT_SECRET).not.toBe("jwt-secret");
+    // Postgres connection budget (spike REPORT finding 15).
+    expect(env.WORKFLOW_POSTGRES_MAX_POOL_SIZE).toBe("5");
+    expect(env.WORKFLOW_POSTGRES_WORKER_CONCURRENCY).toBe("5");
+  });
+
+  test("different versions get DIFFERENT derived JWT secrets", () => {
+    const a = buildAgentEnv({
+      runtime: RUNTIME,
+      worldUrl: "postgres://x/a",
+      contentHash: "a".repeat(64),
+      provider: "openrouter",
+      mcpEnv: {},
+    });
+    const b = buildAgentEnv({
+      runtime: RUNTIME,
+      worldUrl: "postgres://x/b",
+      contentHash: "b".repeat(64),
+      provider: "openrouter",
+      mcpEnv: {},
+    });
+    expect(a.PLATFORM_JWT_SECRET).not.toBe(b.PLATFORM_JWT_SECRET);
   });
 
   test("anthropic versions get ANTHROPIC_API_KEY only", () => {

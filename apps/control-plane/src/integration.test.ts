@@ -62,7 +62,7 @@ describe.skipIf(!TEST_DATABASE_URL)(
       await runMigrations(TEST_DATABASE_URL!);
       stack = createAppStack({
         DATABASE_URL: TEST_DATABASE_URL!,
-        BETTER_AUTH_SECRET: "integration-test-secret",
+        BETTER_AUTH_SECRET: "integration-test-secret-0123456789",
         BETTER_AUTH_URL: BASE_URL,
         // Dex runs on localhost (not publicly routable) — its origin must be
         // trusted for OIDC discovery / endpoint validation.

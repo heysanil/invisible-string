@@ -133,6 +133,14 @@ export const mcpConnections = pgTable(
     /** Set when scope = user. */
     userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
+    /**
+     * Model-facing summary of what the server offers. Compiled into the
+     * generated connection + instructions appendix — eve's connection_search
+     * routes on it, so registry installs / custom forms (Phase 2) should
+     * populate it. The compiler falls back to a name-derived placeholder
+     * when absent.
+     */
+    description: text("description"),
     source: mcpSource("source").notNull(),
     /** registry.modelcontextprotocol.io server id (source = registry). */
     registryId: text("registry_id"),

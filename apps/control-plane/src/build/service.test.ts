@@ -106,6 +106,35 @@ describe("BuildService", () => {
     expect(calls).toEqual([]);
   });
 
+  test("cache hit whose world database vanished triggers a full rebuild (re-provisions)", async () => {
+    const store = memoryBuildStore();
+    const artifacts = createMemoryArtifactStore();
+    const key = `artifacts/${HASH}.tar.gz`;
+    await artifacts.put(key, "existing");
+    await store.markSucceeded(HASH, key);
+    const { steps, calls } = fakeSteps();
+    let worldPresent = false;
+    const service = new BuildService({
+      steps,
+      store,
+      artifacts,
+      buildRoot: BUILD_ROOT,
+      worldExists: async () => worldPresent,
+    });
+
+    const rebuilt = await service.ensureBuild(HASH, FILES);
+    expect(rebuilt.cached).toBeFalse();
+    expect(rebuilt.status).toBe("succeeded");
+    expect(calls).toContain(`provisionWorld:${HASH}`);
+
+    // With the world present, the cache short-circuit works as before.
+    worldPresent = true;
+    calls.length = 0;
+    const cached = await service.ensureBuild(HASH, FILES);
+    expect(cached.cached).toBeTrue();
+    expect(calls).toEqual([]);
+  });
+
   test("a succeeded record whose artifact vanished triggers a full rebuild", async () => {
     const store = memoryBuildStore();
     const artifacts = createMemoryArtifactStore();

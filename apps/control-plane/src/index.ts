@@ -31,11 +31,12 @@ import {
   createSetupDatabaseRunner,
   type BuildSteps,
 } from "./build/steps";
-import { createWorldProvisioner } from "./build/world";
+import { createWorldProvisioner, worldDatabaseExists } from "./build/world";
 import { RunEventBus } from "./runs/bus";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
+import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { runtimePlugin, type RuntimeDeps } from "./runtime/routes";
 import {
   createWorkerClient,
@@ -122,10 +123,16 @@ export function createRuntimeDeps(opts: {
     store: buildStore,
     artifacts,
     buildRoot: runtime.buildRoot,
+    worldExists: overrides?.buildSteps
+      ? undefined // faked steps ⇒ no real world server to probe
+      : (hash) => worldDatabaseExists(runtime.worldDatabaseUrl, hash),
   });
   const workerClient =
     overrides?.workerClient ??
-    createWorkerClient({ workerSharedSecret: runtime.workerSharedSecret });
+    createWorkerClient({
+      workerSharedSecret: runtime.workerSharedSecret,
+      allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
+    });
   const runStore = createDrizzleRunStore(db);
   const bus = new RunEventBus();
   const tailers = new RunTailerManager({
@@ -186,4 +193,19 @@ if (import.meta.main) {
   console.log(
     `control-plane listening on :${stack.config.port}${stack.runtime ? " (runtime API enabled)" : " (runtime API disabled — set WORLD_DATABASE_URL/PLATFORM_JWT_SECRET/WORKER_SHARED_SECRET/S3_*)"}`,
   );
+  if (stack.runtime) {
+    // Adopt or fail runs orphaned in queued/running by a previous crash —
+    // they hold cap slots and hang SSE streams forever otherwise.
+    void reconcileInterruptedRuns(stack.runtime)
+      .then(({ resumed, failed }) => {
+        if (resumed > 0 || failed > 0) {
+          console.log(
+            `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s)`,
+          );
+        }
+      })
+      .catch((error) => {
+        console.error("run reconciliation failed:", error);
+      });
+  }
 }

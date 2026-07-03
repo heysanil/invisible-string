@@ -30,8 +30,10 @@ export {
   type WorkerCapacity,
 } from "./registration";
 export {
+  CALLBACK_PREFIX,
   createWorkerServer,
   FORWARDED_PREFIXES,
+  PUBLIC_FORWARDED_PREFIXES,
   type EnsureAgentResponse,
   type WorkerStatusResponse,
 } from "./server";

@@ -104,6 +104,14 @@ export interface BuildServiceDeps {
   artifacts: ArtifactStore;
   /** Canonical build root (see steps.ts path note). */
   buildRoot: string;
+  /**
+   * Does the version's world database still exist? (build/world.ts
+   * worldDatabaseExists). A cache hit whose world DB was dropped (retired
+   * version cleanup) falls through to a full rebuild — which re-provisions
+   * the world — instead of serving an artifact that boots against a
+   * nonexistent database. Optional for tests that don't care.
+   */
+  worldExists?: (contentHash: string) => Promise<boolean>;
 }
 
 export class BuildService {
@@ -147,7 +155,11 @@ export class BuildService {
     if (
       cached?.status === "succeeded" &&
       cached.artifactKey &&
-      (await artifacts.exists(cached.artifactKey))
+      (await artifacts.exists(cached.artifactKey)) &&
+      // A cached artifact is only servable while its world DB exists — a
+      // dropped world (retired-version cleanup) forces a full rebuild, whose
+      // provisionWorld step recreates + bootstraps it.
+      ((await this.deps.worldExists?.(hash)) ?? true)
     ) {
       // Keep version rows in sync (a republish of an identical config may
       // have inserted a fresh 'pending' version row for this hash).

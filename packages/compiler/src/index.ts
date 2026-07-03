@@ -17,6 +17,7 @@ export {
   PLATFORM_JWT_AUDIENCE,
   PLATFORM_JWT_ISSUER,
   PLATFORM_TRIGGER_ROUTE_PREFIX,
+  platformJwtAudienceForHash,
   triggerRoutePath,
 } from "./platform";
 export type {

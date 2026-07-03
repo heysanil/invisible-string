@@ -5,7 +5,7 @@ import { ConfigError, loadConfig } from "./config";
 /** Minimal valid env; WORKER_NODE_BIN avoids filesystem probing in tests. */
 const BASE_ENV = {
   CONTROL_PLANE_URL: "http://control-plane:3000",
-  WORKER_SHARED_SECRET: "test-secret-0123456789",
+  WORKER_SHARED_SECRET: "test-secret-0123456789-0123456789",
   WORKER_NODE_BIN: "/bin/echo",
 };
 
@@ -35,6 +35,17 @@ describe("loadConfig", () => {
       const problems = (err as ConfigError).problems.join("\n");
       expect(problems).toContain("CONTROL_PLANE_URL");
       expect(problems).toContain("WORKER_SHARED_SECRET");
+    }
+  });
+
+  test("rejects a short WORKER_SHARED_SECRET (offline-brute-forceable)", () => {
+    try {
+      loadConfig({ ...BASE_ENV, WORKER_SHARED_SECRET: "short" });
+      expect.unreachable();
+    } catch (err) {
+      expect((err as ConfigError).problems.join("\n")).toContain(
+        "at least 32 characters",
+      );
     }
   });
 

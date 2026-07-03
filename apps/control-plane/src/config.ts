@@ -72,6 +72,12 @@ export function loadConfig(env: Env = process.env): Config {
     "generate with `openssl rand -base64 32`",
     problems,
   );
+  if (betterAuthSecret !== undefined && betterAuthSecret.length < 32) {
+    // Signs every login session — a short secret is offline-brute-forceable.
+    problems.push(
+      "BETTER_AUTH_SECRET must be at least 32 characters — generate with `openssl rand -base64 32`",
+    );
+  }
 
   const betterAuthUrl = env.BETTER_AUTH_URL?.trim() || `http://localhost:${port}`;
   if (!isHttpUrl(betterAuthUrl)) {

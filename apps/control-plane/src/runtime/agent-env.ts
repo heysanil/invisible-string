@@ -11,12 +11,15 @@
  *                                (ws_v_<hash12>; job prefix does NOT isolate —
  *                                design correction #10 / REPORT finding 11)
  * - WORKFLOW_POSTGRES_JOB_PREFIX → version hash, observability/log grouping ONLY
- * - PLATFORM_JWT_SECRET        → channel-auth verification secret
+ * - WORKFLOW_POSTGRES_MAX_POOL_SIZE / _WORKER_CONCURRENCY → connection budget
+ * - PLATFORM_JWT_SECRET        → channel-auth verification secret, DERIVED
+ *                                per version (never the platform master)
  * - exactly ONE provider key   → matching the version's RESOLVED provider
  * - OPENROUTER_BASE_URL        → passthrough when set (test harnesses)
  * - MCP_<CONN>_TOKEN           → decrypted from mcp_connections auth envelopes
  */
 import { inArray } from "drizzle-orm";
+import { connectionTokenEnvVar } from "@invisible-string/compiler";
 import { schema } from "@invisible-string/db";
 import {
   decryptSecret,
@@ -24,23 +27,23 @@ import {
   type MasterKey,
 } from "@invisible-string/shared";
 
+import { slugifyName } from "../build/compiler-adapter";
 import type { Db } from "../db";
 import { errors } from "./errors";
+import { derivePlatformJwtSecret } from "./jwt";
 import type { ModelProvider } from "./model-resolution";
 import type { RuntimeConfig } from "./config";
 
 /**
- * Env var name carrying an MCP connection's token: `MCP_<NAME>_TOKEN` with
- * the connection name upper-snaked (non-alphanumerics collapse to `_`).
- * NOTE(integration): the compiler's emitted `connections/*.ts` must read the
- * SAME name — reconcile with packages/compiler when it lands.
+ * Env var name carrying an MCP connection's token. Derived from the SAME
+ * slug pipeline the compiler uses (`connectionTokenEnvVar(slugifyName(name))`)
+ * so the dispatcher-injected var and the generated code's read can never
+ * drift — a previous independent upper-snake implementation diverged on
+ * >64-char names (slug truncation), permanently failing publish with the
+ * adapter's "token env var mismatch" guard.
  */
 export function mcpTokenEnvName(connectionName: string): string {
-  const slug = connectionName
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return `MCP_${slug || "CONNECTION"}_TOKEN`;
+  return connectionTokenEnvVar(slugifyName(connectionName) || "connection");
 }
 
 /**
@@ -118,7 +121,17 @@ export function buildAgentEnv(input: BuildAgentEnvInput): Record<string, string>
   return {
     WORKFLOW_POSTGRES_URL: input.worldUrl,
     WORKFLOW_POSTGRES_JOB_PREFIX: input.contentHash,
-    PLATFORM_JWT_SECRET: runtime.platformJwtSecret,
+    // Budget the Postgres connection count per agent process — graphile's
+    // defaults (concurrency 50 vs pool 10) multiply badly at ~20
+    // agents/worker (spike/REPORT.md finding 15).
+    WORKFLOW_POSTGRES_MAX_POOL_SIZE: String(runtime.worldMaxPoolSize),
+    WORKFLOW_POSTGRES_WORKER_CONCURRENCY: String(runtime.worldWorkerConcurrency),
+    // PER-VERSION secret (never the platform master): a leaked agent env
+    // cannot mint/verify tokens for any other workflow version.
+    PLATFORM_JWT_SECRET: derivePlatformJwtSecret(
+      runtime.platformJwtSecret,
+      input.contentHash,
+    ),
     // TEST HARNESS ONLY (see runtime/config.ts): eve's built-in mock model.
     ...(runtime.mockAuthoredModels ? { EVE_MOCK_AUTHORED_MODELS: "1" } : {}),
     ...(provider === "openrouter"

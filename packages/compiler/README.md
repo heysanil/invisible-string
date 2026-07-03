@@ -35,7 +35,7 @@ it proved works against `eve@0.19.0`.
 | `tsconfig.json` | strict NodeNext config (mirrors the spike). |
 | `agent/agent.ts` | explicit `model` (never eve's default), optional `reasoning`, `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set** (construction throws keyless — spike friction 4), with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
 | `agent/instructions.md` | agent-preset persona block `---` user instructions with compile-time refs resolved `---` generated "Workspace context" appendix (connection/skill descriptions for `connection_search`/`load_skill` routing). |
-| `agent/lib/platform-auth.ts` | `platformJwt()` AuthFn (`verifyJwtHmac`, HS256, `PLATFORM_JWT_SECRET`, iss `invisible-string` / aud `workflow-agent`) + `localDev()` **only on `options.dev` builds**. |
+| `agent/lib/platform-auth.ts` | `platformJwt()` AuthFn (`verifyJwtHmac`, HS256, `PLATFORM_JWT_SECRET`, iss `invisible-string` / version-bound aud `workflow-agent:<hash>`) + `localDev()` **only on `options.dev` builds**. |
 | `agent/lib/trigger-event.ts` | inlined `TriggerEvent` envelope + parser + `{{trigger.*}}` resolution (generated projects cannot depend on workspace packages; mirrors `packages/shared/src/trigger-event.ts`). Only emitted for form/webhook/slack triggers. |
 | `agent/lib/env.ts` | `requireEnv()` helper (only when a connection needs env credentials). |
 | `agent/channels/eve.ts` | default HTTP channel with platform-JWT route auth and an `onMessage` hook injecting platform context blocks (context is an onMessage **return**, never a `send()` option — PLAN correction 2). |
@@ -87,6 +87,12 @@ UPDATE_GOLDEN=1 bun test packages/compiler/src/golden.test.ts   # then review th
 - minor: new emitted files / optional behavior
 - major: changed generated-code semantics or env contract
 
+The bump is enforced MECHANICALLY: `fixtures/.golden-digest.json` commits a
+sha256 over every fixture's emitted bytes paired with the `COMPILER_VERSION`
+that produced it. A template change without a bump fails
+`golden.test.ts` — and `UPDATE_GOLDEN=1` refuses to rewrite the digest until
+`version.ts` is bumped in the same commit.
+
 ## Runtime env contract (what generated code reads)
 
 Injected by the worker supervisor at spawn — **secrets never appear in
@@ -99,7 +105,7 @@ generated files or artifacts**:
 | `WORKFLOW_POSTGRES_JOB_PREFIX` | world-postgres | Observability/log grouping ONLY — it does **not** isolate (spike finding 11). |
 | `WORKFLOW_LOCAL_BASE_URL` | world-postgres | Point at the worker proxy so `/.well-known/workflow/v1/*` callbacks traverse the same ingress. |
 | `WORKFLOW_POSTGRES_MAX_POOL_SIZE` / `WORKFLOW_POSTGRES_WORKER_CONCURRENCY` | world-postgres | Budget Postgres connections at ~20 agents/worker (spike finding 15). |
-| `PLATFORM_JWT_SECRET` | channels | HS256 shared secret; iss/aud constants exported as `PLATFORM_JWT_ISSUER`/`PLATFORM_JWT_AUDIENCE`. |
+| `PLATFORM_JWT_SECRET` | channels | HS256 secret, DERIVED per version by the control plane (never the platform master). The generated verifier's audience is version-bound: `platformJwtAudienceForHash(hash)` = `workflow-agent:<hash>`; iss exported as `PLATFORM_JWT_ISSUER`. |
 | `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | agent.ts | Exactly one provider key per agent. |
 | `OPENROUTER_BASE_URL` / `ANTHROPIC_BASE_URL` | agent.ts / provider | Optional gateway override (mock-model harness). |
 | `MCP_<SLUG_UPPER>_TOKEN` | connections | Bearer token per bearer-auth connection (`connectionTokenEnvVar(slug)`). |

@@ -5,7 +5,7 @@ import { ConfigError, loadConfig } from "./config";
 
 const validEnv = {
   DATABASE_URL: "postgres://dev:dev@localhost:5432/product",
-  BETTER_AUTH_SECRET: "test-secret",
+  BETTER_AUTH_SECRET: "test-secret-0123456789-0123456789",
 };
 
 describe("loadConfig", () => {
@@ -13,7 +13,7 @@ describe("loadConfig", () => {
     const config = loadConfig(validEnv);
     expect(config.port).toBe(3000);
     expect(config.databaseUrl).toBe(validEnv.DATABASE_URL);
-    expect(config.betterAuthSecret).toBe("test-secret");
+    expect(config.betterAuthSecret).toBe("test-secret-0123456789-0123456789");
     expect(config.betterAuthUrl).toBe("http://localhost:3000");
     expect(config.corsOrigins).toEqual(["http://localhost:5173"]);
     expect(config.trustedOrigins).toEqual([]);
@@ -62,6 +62,12 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...validEnv, PORT: "4000" }).betterAuthUrl).toBe(
       "http://localhost:4000",
     );
+  });
+
+  test("rejects a short BETTER_AUTH_SECRET (offline-brute-forceable)", () => {
+    expect(() =>
+      loadConfig({ ...validEnv, BETTER_AUTH_SECRET: "short" }),
+    ).toThrow(/at least 32 characters/);
   });
 
   test("fails fast when required vars are missing, listing every problem", () => {

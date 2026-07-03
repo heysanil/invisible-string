@@ -8,10 +8,10 @@
  * - Per-run wall-clock cap: enforced by the tailer manager (runs/tailer.ts),
  *   which fails the run and stops tailing when MAX_RUN_WALL_CLOCK_MS elapses.
  */
-import { and, count, eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
-import type { Db } from "../db";
+import type { DbClient } from "../db";
 import { errors } from "./errors";
 
 /** Run statuses that hold a concurrency slot. */
@@ -24,9 +24,24 @@ export function wouldExceedRunCap(activeRunCount: number, cap: number): boolean 
   return activeRunCount + 1 > cap;
 }
 
+/**
+ * Serialize cap decisions per workspace: take the org's transaction-scoped
+ * advisory lock so a concurrent burst of session/message POSTs cannot all
+ * observe the same under-cap count (check-then-act race). MUST be called
+ * inside the same transaction as the subsequent count + run INSERT.
+ */
+export async function lockWorkspaceRunCap(
+  tx: DbClient,
+  organizationId: string,
+): Promise<void> {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtext(${organizationId})::bigint)`,
+  );
+}
+
 /** Count the workspace's active runs (join through agent_sessions ownership). */
 export async function countActiveRuns(
-  db: Db,
+  db: DbClient,
   organizationId: string,
 ): Promise<number> {
   const rows = await db
@@ -45,9 +60,14 @@ export async function countActiveRuns(
   return rows[0]?.value ?? 0;
 }
 
-/** Throws the typed 429 when the workspace is at its concurrent-run cap. */
+/**
+ * Throws the typed 429 when the workspace is at its concurrent-run cap.
+ * Callers on the run-creation paths must hold {@link lockWorkspaceRunCap}
+ * in the same transaction as the run INSERT — otherwise the check is a
+ * bypassable check-then-act race.
+ */
 export async function assertUnderRunCap(
-  db: Db,
+  db: DbClient,
   organizationId: string,
   cap: number,
 ): Promise<void> {

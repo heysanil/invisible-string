@@ -12,6 +12,12 @@ import { schema } from "@invisible-string/db";
 
 export type Db = PostgresJsDatabase<typeof schema> & { $client: postgres.Sql };
 
+/** The transaction client `db.transaction(async (tx) => …)` hands out. */
+export type DbTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+/** Query surface common to the root client and a transaction client. */
+export type DbClient = Db | DbTx;
+
 export interface DbHandle {
   db: Db;
   /** Underlying postgres-js client — call `end()` to close connections. */

@@ -6,7 +6,7 @@ import { createAppStack } from "./index";
 // the endpoints exercised below touch the database.
 const stack = createAppStack({
   DATABASE_URL: "postgres://dev:dev@localhost:5432/unit-test-not-connected",
-  BETTER_AUTH_SECRET: "unit-test-secret",
+  BETTER_AUTH_SECRET: "unit-test-secret-0123456789-0123456789",
   CORS_ORIGIN: "http://localhost:5173",
 });
 const { app } = stack;

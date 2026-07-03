@@ -22,7 +22,7 @@ import {
   type ArtifactServer,
 } from "../test/fixture-agent";
 
-const SECRET = "worker-test-secret-0123456789";
+const SECRET = "worker-test-secret-0123456789-0123456789";
 const NODE_BIN = resolveTestNodeBin();
 
 let scratchDir: string;
@@ -225,9 +225,28 @@ describe("ensure → ready → proxy round-trip", () => {
       expect(echo.headers["x-custom-header"]).toBe("abc");
       expect(echo.body).toBe("hello-body");
 
-      // /.well-known/workflow/ prefix MUST forward (run callbacks stall otherwise).
-      const flow = await fetch(
+      // /.well-known/workflow/ MUST forward for the world queue (run
+      // callbacks stall otherwise) — but ONLY through the token-authenticated
+      // /cb/ route; the public /agents surface refuses it (security review:
+      // eve's callback surface has no auth of its own).
+      const publicFlow = await fetch(
         `${sup.url}/agents/${hash}/.well-known/workflow/v1/flow?run=42`,
+      );
+      expect(publicFlow.status).toBe(403);
+      expect(((await publicFlow.json()) as ApiErrorBody).error.code).toBe(
+        "callback_auth_required",
+      );
+
+      const wrongToken = await fetch(
+        `${sup.url}/cb/not-the-token/agents/${hash}/.well-known/workflow/v1/flow?run=42`,
+      );
+      expect(wrongToken.status).toBe(401);
+      expect(((await wrongToken.json()) as ApiErrorBody).error.code).toBe(
+        "invalid_callback_token",
+      );
+
+      const flow = await fetch(
+        `${sup.url}/cb/${sup.callbackToken}/agents/${hash}/.well-known/workflow/v1/flow?run=42`,
       );
       expect(flow.status).toBe(200);
       const flowEcho = (await flow.json()) as { path: string; query: Record<string, string> };
@@ -305,6 +324,10 @@ describe("agent process env", () => {
         expect(env.FIXTURE_FOO).toBe("bar");
         expect(env.OPENROUTER_API_KEY).toBe("sk-test-not-real");
         expect(env.PORT).toBe(String(ensured.port));
+        // Run callbacks traverse the token-authenticated callback route.
+        expect(env.WORKFLOW_LOCAL_BASE_URL).toBe(
+          `http://worker.test/cb/${sup.callbackToken}/agents/${hash}`,
+        );
         // spike/REPORT.md finding 5: NODE_ENV=test flips eve to mock models.
         expect(env.NODE_ENV).toBe("production");
         expect(env.WORKER_TEST_CANARY).toBeUndefined();

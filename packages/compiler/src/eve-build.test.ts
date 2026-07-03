@@ -1,8 +1,12 @@
 /**
- * Gated slow test (SPIKE_EVE_BUILD=1): proves the emitted templates COMPILE —
- * the form fixture is rendered to a temp dir, dependencies are installed with
- * Node 24 (mise), `tsc --noEmit` passes strict typechecking against the real
- * eve types, and `eve build` produces a servable .output bundle.
+ * Gated slow test (SPIKE_EVE_BUILD=1): proves the emitted templates COMPILE.
+ *
+ * EVERY fixture (manual, form+MCP+skill, slack stateful channel, schedule,
+ * custom approval policy) is rendered to a temp dir, npm-installed with
+ * Node 24 (mise) against a shared npm cache, and strict-typechecked with
+ * `tsc --noEmit` against the real eve types. The form fixture additionally
+ * runs the full `eve build` to a servable .output bundle (representative:
+ * trigger channel + connection + skill + platform auth).
  *
  *   SPIKE_EVE_BUILD=1 bun test packages/compiler/src/eve-build.test.ts
  *
@@ -16,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { compile } from "./compile";
-import { formMcpSkillFixture } from "./test-fixtures";
+import { ALL_FIXTURES, formMcpSkillFixture } from "./test-fixtures";
 
 const GATE = process.env.SPIKE_EVE_BUILD === "1";
 const SKIP_REASON = "requires SPIKE_EVE_BUILD=1 (slow: npm install + eve build)";
@@ -61,46 +65,83 @@ async function run(
   return { exitCode, output: `${stdout}\n${stderr}` };
 }
 
+function renderFixtureTo(dir: string, fixture: (typeof ALL_FIXTURES)[number]): void {
+  const { files } = compile(fixture.definition, fixture.deps);
+  for (const [path, content] of files) {
+    const target = join(dir, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  }
+}
+
 if (!GATE) console.log(`[eve-build] skipped: ${SKIP_REASON}`);
 
 describe.skipIf(!GATE)("eve build (gated)", () => {
+  const root = GATE ? mkdtempSync(join(tmpdir(), "is-compiler-build-")) : "";
+  const nodeBinDir = GATE ? resolve(node24Bin(), "..") : "";
+  const env = {
+    PATH: `${nodeBinDir}:${process.env.PATH ?? ""}`,
+    // Shared npm cache: the first install is cold; the rest are warm.
+    npm_config_cache: process.env.NPM_CACHE_DIR ?? undefined,
+    // bun test exports NODE_ENV=test, which flips eve into mock-model
+    // mode if it leaks into spawned processes (spike/REPORT.md 5).
+    NODE_ENV: "production",
+    // Prove the keyless path: no provider key may be required to build.
+    OPENROUTER_API_KEY: undefined,
+    ANTHROPIC_API_KEY: undefined,
+  };
+
+  // ALL templates (incl. the stateful slack channel and the custom-approval
+  // policy) must typecheck strictly against the real eve@pinned types —
+  // review finding: previously only the form fixture was proven.
+  for (const fixture of ALL_FIXTURES) {
+    test(
+      `${fixture.name}: rendered project installs and typechecks strictly`,
+      async () => {
+        const projectDir = join(root, fixture.name);
+        mkdirSync(projectDir, { recursive: true });
+        renderFixtureTo(projectDir, fixture);
+
+        const install = await run(
+          ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+          projectDir,
+          env,
+          420_000,
+        );
+        expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
+
+        const typecheck = await run(
+          [join(projectDir, "node_modules", ".bin", "tsc"), "--noEmit"],
+          projectDir,
+          env,
+          180_000,
+        );
+        expect(
+          typecheck.exitCode,
+          `tsc --noEmit failed for ${fixture.name}:\n${typecheck.output.slice(-4000)}`,
+        ).toBe(0);
+      },
+      1_200_000,
+    );
+  }
+
   test(
-    "rendered form fixture installs, typechecks strictly, and eve-builds keyless",
+    "form fixture eve-builds keyless to a servable .output bundle",
     async () => {
-      const projectDir = mkdtempSync(join(tmpdir(), "is-compiler-build-"));
-      const { files } = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps);
-      for (const [path, content] of files) {
-        const target = join(projectDir, path);
-        mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, content);
+      const projectDir = join(root, formMcpSkillFixture.name);
+      // Rendered + installed by the typecheck test above (bun runs tests in
+      // declaration order within a file); render defensively if missing.
+      if (!existsSync(join(projectDir, "package.json"))) {
+        mkdirSync(projectDir, { recursive: true });
+        renderFixtureTo(projectDir, formMcpSkillFixture);
+        const install = await run(
+          ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+          projectDir,
+          env,
+          420_000,
+        );
+        expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
       }
-
-      const nodeBinDir = resolve(node24Bin(), "..");
-      const env = {
-        PATH: `${nodeBinDir}:${process.env.PATH ?? ""}`,
-        // bun test exports NODE_ENV=test, which flips eve into mock-model
-        // mode if it leaks into spawned processes (spike/REPORT.md 5).
-        NODE_ENV: "production",
-        // Prove the keyless path: no provider key may be required to build.
-        OPENROUTER_API_KEY: undefined,
-        ANTHROPIC_API_KEY: undefined,
-      };
-
-      const install = await run(
-        ["npm", "install", "--no-audit", "--no-fund"],
-        projectDir,
-        env,
-        420_000,
-      );
-      expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
-
-      const typecheck = await run(
-        [join(projectDir, "node_modules", ".bin", "tsc"), "--noEmit"],
-        projectDir,
-        env,
-        180_000,
-      );
-      expect(typecheck.exitCode, `tsc --noEmit failed:\n${typecheck.output.slice(-4000)}`).toBe(0);
 
       const build = await run(
         [node24Bin(), join(projectDir, "node_modules", "eve", "bin", "eve.js"), "build"],

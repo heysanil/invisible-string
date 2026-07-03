@@ -65,6 +65,43 @@ export async function setFormTriggerWithTwoFields(
   }
 }
 
+/** Select the Webhook trigger type in the Trigger pillar. */
+export async function setWebhookTrigger(page: Page): Promise<void> {
+  await focusPillar(page, "Trigger");
+  await page
+    .getByRole("radiogroup", { name: "Trigger type" })
+    .getByRole("radio", { name: "Webhook" })
+    .click();
+}
+
+/** Select the Slack trigger type in the Trigger pillar. */
+export async function setSlackTrigger(page: Page): Promise<void> {
+  await focusPillar(page, "Trigger");
+  await page
+    .getByRole("radiogroup", { name: "Trigger type" })
+    .getByRole("radio", { name: "Slack" })
+    .click();
+}
+
+/**
+ * Reveal the ingress token ONCE via the live webhook config and return the
+ * plaintext. Asserts the shown-once hash notice. The workflow must already be
+ * a saved webhook/form draft (mint reads the draft trigger type).
+ */
+export async function revealWebhookToken(page: Page): Promise<string> {
+  await focusPillar(page, "Trigger");
+  await page.getByRole("button", { name: /Generate token|Rotate token/ }).click();
+  // The plaintext is shown once with a "we store only a hash" notice.
+  await expect(
+    page.getByText(/store only a hash, so it/i),
+  ).toBeVisible();
+  const tokenCode = page.getByTestId("revealed-token");
+  await expect(tokenCode).toBeVisible();
+  const token = (await tokenCode.textContent())?.trim();
+  if (!token) throw new Error("revealed webhook token was empty");
+  return token;
+}
+
 /** Attach an existing connection or skill via the pillar's Browse picker. */
 export async function attachResource(
   page: Page,

@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "apps/control-plane" },
+    { "path": "apps/web" },
+    { "path": "apps/worker" },
+    { "path": "packages/compiler" },
+    { "path": "packages/db" },
+    { "path": "packages/shared" }
+  ]
+}

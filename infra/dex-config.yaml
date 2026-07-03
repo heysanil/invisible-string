@@ -1,0 +1,24 @@
+# Dex test IdP for local dev + CI (OIDC SSO against Better Auth).
+issuer: http://localhost:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: invisible-string
+    secret: dev-secret
+    name: invisible-string
+    redirectURIs:
+      - http://localhost:3000/api/auth/sso/callback/dex
+
+enablePasswordDB: true
+
+staticPasswords:
+  # password: "password" (bcrypt)
+  - email: test@example.com
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: test
+    userID: 08a8684b-db88-4b73-90a9-3cd1661f5466

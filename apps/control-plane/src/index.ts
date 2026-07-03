@@ -65,6 +65,18 @@ import { FixedWindowRateLimiter } from "./integrations/rate-limit";
 import { integrationsPlugin, type IntegrationDeps } from "./integrations/routes";
 import { createSlackClient, type SlackClient } from "./integrations/slack-client";
 import { SlackEventDedup } from "./integrations/slack-verify";
+import { loadCopilotConfig } from "./copilot/config";
+import {
+  copilotPlugin,
+  createCopilotDeps,
+  type CopilotDeps,
+} from "./copilot/plugin";
+import {
+  createModelTransport,
+  createScriptedTransport,
+  parseFakeScript,
+  type CopilotTransport,
+} from "./copilot/transport";
 import {
   createWorkspaceDeps,
   workspacePlugin,
@@ -98,6 +110,8 @@ export interface RuntimeOverrides {
   slackClient?: SlackClient;
   /** OpenRouter catalog lookup for allowlist validation (stubbed in tests). */
   openRouterModelIds?: OpenRouterModelIds;
+  /** Copilot LLM transport (scripted fake in tests). */
+  copilotTransport?: CopilotTransport;
 }
 
 /** Assemble the Elysia app from already-constructed pieces (testable). */
@@ -108,6 +122,8 @@ export function buildApp(opts: {
   resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
   integrationDeps?: IntegrationDeps | null;
+  /** Copilot WS deps — the `/copilot` socket mounts when present. */
+  copilotDeps?: CopilotDeps | null;
   /** Deep-health probes for `GET /api/health?deep=1` (absent ⇒ shallow only). */
   health?: DeepHealthDeps;
   /** When set, a request-scoped logger threads a per-request correlation id. */
@@ -155,6 +171,9 @@ export function buildApp(opts: {
   }
   if (opts.integrationDeps) {
     app.use(integrationsPlugin(opts.integrationDeps));
+  }
+  if (opts.copilotDeps) {
+    app.use(copilotPlugin(opts.copilotDeps));
   }
   return app;
 }
@@ -348,6 +367,29 @@ export function createAppStack(
     openRouterModelIds:
       runtimeOverrides?.openRouterModelIds ?? createOpenRouterCatalog(),
   };
+  // Copilot socket: mounted whenever a transport is available — a scripted
+  // fake (COPILOT_FAKE_SCRIPT / test override) or the real model path when a
+  // provider key exists. Keyless boots simply do not expose /copilot.
+  const copilotConfig = loadCopilotConfig(env);
+  const copilotTransport: CopilotTransport | null =
+    runtimeOverrides?.copilotTransport ??
+    (copilotConfig.fakeScript
+      ? createScriptedTransport(parseFakeScript(copilotConfig.fakeScript))
+      : (
+            copilotConfig.provider === "anthropic"
+              ? env.ANTHROPIC_API_KEY
+              : env.OPENROUTER_API_KEY
+          )
+        ? createModelTransport(copilotConfig, env)
+        : null);
+  const copilotDeps: CopilotDeps | null = copilotTransport
+    ? createCopilotDeps({
+        db: dbHandle.db,
+        workspaceDeps,
+        config: copilotConfig,
+        transport: copilotTransport,
+      })
+    : null;
   // Deep-health probes: DB always; object store + live-worker count only when
   // the runtime is configured (a Phase-0-style boot degrades to the DB check).
   const health: DeepHealthDeps = {
@@ -376,6 +418,7 @@ export function createAppStack(
     resourceDeps,
     runtimeDeps,
     integrationDeps,
+    copilotDeps,
     health,
     logger,
   });

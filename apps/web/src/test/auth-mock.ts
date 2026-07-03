@@ -13,7 +13,12 @@ export interface MockUser {
 
 export interface MockSessionData {
   user: MockUser;
+  /** Better Auth login session — carries the active organization (= workspace). */
+  session?: { activeOrganizationId?: string | null };
 }
+
+/** Active workspace id the demo session runs in (workspace-scoped screens). */
+export const DEMO_WORKSPACE_ID = "org_demo_1";
 
 export interface MockAuthError {
   message?: string;
@@ -44,7 +49,10 @@ export function resetAuthMock(): void {
 }
 
 export function demoSession(): MockSessionData {
-  return { user: { id: "u1", email: "demo@example.com", name: "Demo" } };
+  return {
+    user: { id: "u1", email: "demo@example.com", name: "Demo" },
+    session: { activeOrganizationId: DEMO_WORKSPACE_ID },
+  };
 }
 
 const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathname;

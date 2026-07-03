@@ -28,12 +28,26 @@ function renderAt(path: string) {
   return { router, view };
 }
 
+// The Workflows section fetches workspace resources on mount; stub fetch so
+// the shell tests stay hermetic (no real network). The merged body satisfies
+// every list schema the index touches (each reads only its own key).
+let realFetch: typeof fetch;
+
 beforeEach(() => {
   resetAuthMock();
   authMockState.session = demoSession();
+  realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ workflows: [], sessions: [], agents: [] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as unknown as typeof fetch;
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  cleanup();
+});
 
 test("shell renders the glass dock with all four sections", async () => {
   const { view } = renderAt("/chat");

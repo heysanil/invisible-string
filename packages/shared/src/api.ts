@@ -1,43 +1,115 @@
 /**
- * Phase-1 API contracts (INITIAL-SPEC.md §10, docs/PLAN.md Phase 1 task 5):
- * publish, create session, post message, and the run/run_event shapes served
- * over SSE. Single source of truth imported by apps/control-plane and
- * (later) apps/web — neither side re-declares these.
+ * API contracts (INITIAL-SPEC.md §10, docs/PLAN.md Phases 1–2): publish,
+ * sessions, messages, run SSE frames, plus the full Phase-2 resource surface
+ * (workflows CRUD, sessions list, run input, MCP connections + registry,
+ * skills + attachments, model presets/allowlist, agent presets, members).
+ * Single source of truth imported by apps/control-plane and apps/web —
+ * neither side re-declares these.
  *
  * Conventions:
- * - Request bodies get zod schemas (both sides validate); responses are
- *   plain DTO interfaces.
+ * - Request bodies get zod schemas (both sides validate). Responses ALSO get
+ *   zod schemas so the web client can parse them — the hand-written DTO
+ *   interfaces from Phase 1 are kept (doc comments + open unions) with
+ *   compile-time lockstep guards against their schemas.
  * - All timestamps are ISO-8601 strings (DB `timestamptz` serialized).
- * - Status string unions mirror packages/db pgEnums — keep in lockstep.
+ * - Status/enum schemas mirror packages/db pgEnums — keep in lockstep.
  * - `agent_sessions` (chat/eve sessions) are distinct from Better Auth login
  *   sessions everywhere, including these DTO names.
+ * - SECRETS DISCIPLINE: credential WRITE shapes exist ({@link mcpAuthWriteSchema});
+ *   the server encrypts and NEVER echoes secrets back — read DTOs carry a
+ *   `hasCredentials` boolean only.
  */
 import { z } from "zod";
 
 import type { EveStreamEvent } from "./eve-events";
-import type { TriggerEvent } from "./trigger-event";
+import { triggerEventSchema, type TriggerEvent } from "./trigger-event";
+import {
+  modelPresetSlugSchema,
+  reasoningEffortSchema,
+  workflowDefinitionSchema,
+  type WorkflowDefinition,
+} from "./workflow-definition";
+
+/** ISO-8601 timestamp (kept lenient on read; the DB serializer owns format). */
+const isoTimestamp = z.string().min(1);
+
+/** Product-row id (uuid). Requests validate strictly; DTO reads stay uuid too. */
+const productId = z.uuid();
+
+/** Better Auth ids (user/org/member) are opaque text, not uuids. */
+const authId = z.string().min(1);
 
 // ── Shared status unions (mirror packages/db pgEnums) ──────────────────────
 
 /** Mirrors pgEnum `build_status`. */
-export type BuildStatus = "pending" | "building" | "succeeded" | "failed";
+export const buildStatusSchema = z.enum([
+  "pending",
+  "building",
+  "succeeded",
+  "failed",
+]);
+export type BuildStatus = z.infer<typeof buildStatusSchema>;
 
 /** Mirrors pgEnum `run_status`. `waiting` = parked on HITL input. */
-export type RunStatus =
-  | "queued"
-  | "running"
-  | "waiting"
-  | "succeeded"
-  | "failed"
-  | "canceled";
+export const runStatusSchema = z.enum([
+  "queued",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+  "canceled",
+]);
+export type RunStatus = z.infer<typeof runStatusSchema>;
 
 /** Mirrors pgEnum `agent_session_status`. */
-export type AgentSessionStatus = "active" | "waiting" | "closed" | "error";
+export const agentSessionStatusSchema = z.enum([
+  "active",
+  "waiting",
+  "closed",
+  "error",
+]);
+export type AgentSessionStatus = z.infer<typeof agentSessionStatusSchema>;
 
 /** Mirrors pgEnum `session_origin`. */
-export type SessionOrigin = "chat" | "slack" | "webhook" | "form" | "schedule";
+export const sessionOriginSchema = z.enum([
+  "chat",
+  "slack",
+  "webhook",
+  "form",
+  "schedule",
+]);
+export type SessionOrigin = z.infer<typeof sessionOriginSchema>;
+
+/** Mirrors pgEnum `resource_scope` (MCP connections + skills). */
+export const resourceScopeSchema = z.enum(["workspace", "user"]);
+export type ResourceScope = z.infer<typeof resourceScopeSchema>;
+
+/** Mirrors pgEnum `mcp_source`. */
+export const mcpSourceSchema = z.enum(["registry", "custom"]);
+export type McpSource = z.infer<typeof mcpSourceSchema>;
+
+/** Mirrors pgEnum `model_provider`. */
+export const modelProviderSchema = z.enum(["anthropic", "openrouter"]);
+export type ModelProvider = z.infer<typeof modelProviderSchema>;
+
+/**
+ * Better Auth organization roles. `member.role` is open text upstream, so
+ * DTOs read `string` — these are the roles the UI understands.
+ */
+export const WORKSPACE_ROLES = ["owner", "admin", "member"] as const;
+export type KnownWorkspaceRole = (typeof WORKSPACE_ROLES)[number];
 
 // ── Error envelope ──────────────────────────────────────────────────────────
+
+export const apiErrorInfoSchema = z.object({
+  /** Stable machine-readable slug (e.g. "session_busy", "draft_invalid"). */
+  code: z.string().min(1),
+  message: z.string(),
+  details: z.unknown().optional(),
+});
+export type ApiErrorInfo = z.infer<typeof apiErrorInfoSchema>;
+
+export const apiErrorBodySchema = z.object({ error: apiErrorInfoSchema });
 
 /** Uniform non-2xx body. `code` is a stable machine-readable slug. */
 export interface ApiErrorBody {
@@ -47,6 +119,22 @@ export interface ApiErrorBody {
     details?: unknown;
   };
 }
+
+type _ErrorBodyLockstep = [
+  z.infer<typeof apiErrorBodySchema> extends ApiErrorBody ? true : never,
+  ApiErrorBody extends z.infer<typeof apiErrorBodySchema> ? true : never,
+];
+const _errorBodyLockstep: _ErrorBodyLockstep = [true, true];
+void _errorBodyLockstep;
+
+/** Uniform delete/archive acknowledgement. */
+export const deleteResourceResponseSchema = z.object({
+  id: z.string().min(1),
+  deleted: z.literal(true),
+});
+export type DeleteResourceResponse = z.infer<
+  typeof deleteResourceResponseSchema
+>;
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
@@ -72,6 +160,24 @@ export interface AgentSessionDto {
   updatedAt: string;
 }
 
+export const agentSessionDtoSchema = z.object({
+  id: productId,
+  workflowId: productId,
+  workflowVersionId: productId,
+  origin: sessionOriginSchema,
+  status: agentSessionStatusSchema,
+  eveSessionId: z.string().nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+
+type _SessionDtoLockstep = [
+  z.infer<typeof agentSessionDtoSchema> extends AgentSessionDto ? true : never,
+  AgentSessionDto extends z.infer<typeof agentSessionDtoSchema> ? true : never,
+];
+const _sessionDtoLockstep: _SessionDtoLockstep = [true, true];
+void _sessionDtoLockstep;
+
 /** One run = one inbound message/trigger event within a session. */
 export interface RunDto {
   id: string;
@@ -86,7 +192,26 @@ export interface RunDto {
   createdAt: string;
 }
 
-// ── POST /workflows/:id/publish ─────────────────────────────────────────────
+export const runDtoSchema = z.object({
+  id: productId,
+  agentSessionId: productId,
+  status: runStatusSchema,
+  triggerEvent: triggerEventSchema,
+  eveRunId: z.string().nullable(),
+  error: z.string().nullable(),
+  startedAt: isoTimestamp.nullable(),
+  completedAt: isoTimestamp.nullable(),
+  createdAt: isoTimestamp,
+});
+
+type _RunDtoLockstep = [
+  z.infer<typeof runDtoSchema> extends RunDto ? true : never,
+  RunDto extends z.infer<typeof runDtoSchema> ? true : never,
+];
+const _runDtoLockstep: _RunDtoLockstep = [true, true];
+void _runDtoLockstep;
+
+// ── POST /workspaces/:workspaceId/workflows/:wfId/publish ───────────────────
 
 /**
  * Publish: snapshot the draft into an immutable `workflow_versions` row,
@@ -105,7 +230,40 @@ export interface PublishWorkflowResponse {
   buildError: string | null;
 }
 
-// ── POST /workflows/:id/sessions ────────────────────────────────────────────
+export const publishWorkflowResponseSchema = z.object({
+  workflowId: productId,
+  versionId: productId,
+  contentHash: z.string().min(1),
+  buildStatus: buildStatusSchema,
+  cached: z.boolean(),
+  buildError: z.string().nullable(),
+});
+
+type _PublishLockstep = [
+  z.infer<typeof publishWorkflowResponseSchema> extends PublishWorkflowResponse
+    ? true
+    : never,
+  PublishWorkflowResponse extends z.infer<typeof publishWorkflowResponseSchema>
+    ? true
+    : never,
+];
+const _publishLockstep: _PublishLockstep = [true, true];
+void _publishLockstep;
+
+// ── POST /workspaces/:workspaceId/workflows/:wfId/versions/dry-run-compile ──
+
+/**
+ * Dry-run compile of the CURRENT draft (no rows written). Compile problems
+ * are the PAYLOAD of a dry run (`ok: false`), not a failed request — the
+ * builder renders them inline next to the pillar cards.
+ */
+export const dryRunCompileResponseSchema = z.discriminatedUnion("ok", [
+  z.object({ ok: z.literal(true), contentHash: z.string().min(1) }),
+  z.object({ ok: z.literal(false), error: apiErrorInfoSchema }),
+]);
+export type DryRunCompileResponse = z.infer<typeof dryRunCompileResponseSchema>;
+
+// ── POST /workspaces/:workspaceId/workflows/:wfId/sessions ──────────────────
 
 /** Start a chat/manual session against the workflow's published version. */
 export const createSessionRequestSchema = z.object({
@@ -121,9 +279,19 @@ export interface CreateSessionResponse {
   run: RunDto;
 }
 
+export const createSessionResponseSchema = z.object({
+  session: agentSessionDtoSchema,
+  run: runDtoSchema,
+});
+
 // ── POST /sessions/:id/messages ─────────────────────────────────────────────
 
-/** Follow-up message → continues the same eve session (new run). */
+/**
+ * Follow-up message → continues the same eve session (new run). One run at a
+ * time per session: while a run is queued/running the server answers 409
+ * `session_busy` — the UI must surface this gracefully (disable composer /
+ * offer retry), never crash.
+ */
 export const postMessageRequestSchema = z.object({
   message: z.string().min(1),
 });
@@ -134,6 +302,8 @@ export interface PostMessageResponse {
   run: RunDto;
 }
 
+export const postMessageResponseSchema = z.object({ run: runDtoSchema });
+
 // ── GET /sessions/:id ───────────────────────────────────────────────────────
 
 /** Session detail: the thread rendered as its sequence of runs. */
@@ -142,6 +312,11 @@ export interface GetSessionResponse {
   /** Ordered by createdAt ascending. */
   runs: RunDto[];
 }
+
+export const getSessionResponseSchema = z.object({
+  session: agentSessionDtoSchema,
+  runs: z.array(runDtoSchema),
+});
 
 // ── GET /runs/:id/stream (SSE) ──────────────────────────────────────────────
 //
@@ -155,8 +330,9 @@ export interface GetSessionResponse {
 //   event: run_status         run lifecycle transition (incl. terminal)
 //   data: <RunStatusFrame JSON>
 //
-// Resume: reconnect with `Last-Event-ID: <seq>`; the server replays only
-// run_events with seq > Last-Event-ID (mirrors eve's own `?startIndex=`
+// Resume: reconnect with `Last-Event-ID: <seq>` (or `?lastEventId=<seq>` for
+// native EventSource clients that cannot set headers); the server replays
+// only run_events with seq > Last-Event-ID (mirrors eve's own `?startIndex=`
 // NDJSON resume upstream).
 
 export const RUN_STREAM_EVENT_NAMES = ["run_event", "run_status"] as const;
@@ -180,3 +356,677 @@ export interface RunStatusFrame {
   /** Set when status is "failed". */
   error?: string | null;
 }
+
+/**
+ * No further SSE frames arrive for a run in this status — the server closes
+ * the stream after sending it. NOTE `waiting` IS stream-terminal: a parked
+ * run emits nothing further until `POST /runs/:id/input` resumes it, after
+ * which clients re-open the stream (replay via Last-Event-ID is seamless).
+ */
+export function isRunStreamTerminalStatus(status: RunStatus): boolean {
+  return status !== "queued" && status !== "running";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 2 — resource CRUD surface
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Workflows CRUD ──────────────────────────────────────────────────────────
+//
+//   GET    /workspaces/:workspaceId/workflows                → ListWorkflowsResponse
+//   POST   /workspaces/:workspaceId/workflows                → CreateWorkflowResponse (201)
+//   GET    /workspaces/:workspaceId/workflows/:wfId          → GetWorkflowResponse
+//   PATCH  /workspaces/:workspaceId/workflows/:wfId          → UpdateWorkflowResponse
+//   DELETE /workspaces/:workspaceId/workflows/:wfId          → DeleteResourceResponse
+//
+// Deleting a workflow cascades to versions/sessions/runs (DB FKs) — the UI
+// confirms destructive intent before calling.
+
+const workflowNameSchema = z.string().trim().min(1).max(200);
+
+/** List-item projection (no draft payload). */
+export const workflowSummaryDtoSchema = z.object({
+  id: productId,
+  name: workflowNameSchema,
+  /** Credentials owner (spec §2) — must remain a workspace member. */
+  runAsUserId: authId,
+  publishedVersionId: productId.nullable(),
+  /**
+   * `draft.trigger.type` surfaced for list chips; null while the draft has
+   * no shape-valid trigger yet.
+   */
+  triggerType: z.string().nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type WorkflowSummaryDto = z.infer<typeof workflowSummaryDtoSchema>;
+
+/**
+ * Full workflow row. `draft` is served AS STORED (jsonb, draft-lenient —
+ * legacy rows may predate the WorkflowDefinition schema); use
+ * {@link parseWorkflowDraft} to get a shape-guarded definition.
+ */
+export const workflowDtoSchema = workflowSummaryDtoSchema.extend({
+  draft: z.record(z.string(), z.unknown()),
+});
+export type WorkflowDto = z.infer<typeof workflowDtoSchema>;
+
+/** Shape-guarded view of a stored draft; null when empty or shape-invalid. */
+export function parseWorkflowDraft(draft: unknown): WorkflowDefinition | null {
+  const parsed = workflowDefinitionSchema.safeParse(draft);
+  return parsed.success ? parsed.data : null;
+}
+
+export const createWorkflowRequestSchema = z.object({
+  name: workflowNameSchema,
+  /** Full four-pillar draft; omitted = empty draft the builder fills in. */
+  draft: workflowDefinitionSchema.optional(),
+  /** Defaults to the creator. */
+  runAsUserId: authId.optional(),
+});
+export type CreateWorkflowRequest = z.infer<typeof createWorkflowRequestSchema>;
+
+export const updateWorkflowRequestSchema = z
+  .object({
+    name: workflowNameSchema.optional(),
+    runAsUserId: authId.optional(),
+    /** Full replacement draft (the builder always writes whole definitions). */
+    draft: workflowDefinitionSchema.optional(),
+  })
+  .refine(
+    (patch) =>
+      patch.name !== undefined ||
+      patch.runAsUserId !== undefined ||
+      patch.draft !== undefined,
+    { message: "update at least one of name, runAsUserId, draft" },
+  );
+export type UpdateWorkflowRequest = z.infer<typeof updateWorkflowRequestSchema>;
+
+export const listWorkflowsResponseSchema = z.object({
+  workflows: z.array(workflowSummaryDtoSchema),
+});
+export type ListWorkflowsResponse = z.infer<typeof listWorkflowsResponseSchema>;
+
+export const getWorkflowResponseSchema = z.object({
+  workflow: workflowDtoSchema,
+});
+export type GetWorkflowResponse = z.infer<typeof getWorkflowResponseSchema>;
+
+export const createWorkflowResponseSchema = getWorkflowResponseSchema;
+export type CreateWorkflowResponse = GetWorkflowResponse;
+
+export const updateWorkflowResponseSchema = getWorkflowResponseSchema;
+export type UpdateWorkflowResponse = GetWorkflowResponse;
+
+// ── Sessions list ───────────────────────────────────────────────────────────
+//
+//   GET /workspaces/:workspaceId/sessions?workflowId=&status= → ListSessionsResponse
+//
+// Ordered by lastActivityAt descending (the chat list).
+
+export const listSessionsQuerySchema = z.object({
+  /** Restrict to one workflow (the workflow's session history panel). */
+  workflowId: productId.optional(),
+  status: agentSessionStatusSchema.optional(),
+});
+export type ListSessionsQuery = z.infer<typeof listSessionsQuerySchema>;
+
+/** Session list item: DTO + the fields the chat list renders. */
+export const agentSessionSummaryDtoSchema = agentSessionDtoSchema.extend({
+  workflowName: z.string(),
+  /** Status of the most recent run; null before the first run lands. */
+  lastRunStatus: runStatusSchema.nullable(),
+  /** Max of session/run updatedAt — the list's sort key. */
+  lastActivityAt: isoTimestamp,
+});
+export type AgentSessionSummaryDto = z.infer<
+  typeof agentSessionSummaryDtoSchema
+>;
+
+export const listSessionsResponseSchema = z.object({
+  sessions: z.array(agentSessionSummaryDtoSchema),
+});
+export type ListSessionsResponse = z.infer<typeof listSessionsResponseSchema>;
+
+// ── POST /runs/:id/input — HITL response ────────────────────────────────────
+//
+// Answers an `input.requested` frame (approval card / question). Forwarded to
+// eve as `inputResponses: [{requestId, optionId? , text?}]`; the parked run
+// resumes and the client re-opens the SSE stream.
+
+export const runInputRequestSchema = z
+  .object({
+    /** EveInputRequest.requestId from the input.requested frame. */
+    requestId: z.string().min(1),
+    /** Chosen option id (e.g. "approve" / "deny"). */
+    optionId: z.string().min(1).optional(),
+    /** Freeform answer (input requests with allowFreeform). */
+    text: z.string().min(1).optional(),
+  })
+  .refine((input) => (input.optionId === undefined) !== (input.text === undefined), {
+    message: "provide exactly one of optionId or text",
+  });
+export type RunInputRequest = z.infer<typeof runInputRequestSchema>;
+
+export const runInputResponseSchema = z.object({ run: runDtoSchema });
+export type RunInputResponse = z.infer<typeof runInputResponseSchema>;
+
+// ── MCP connections (CONTEXT pillar) ────────────────────────────────────────
+//
+// BOTH scopes (spec §9 — "Both workspace- and user-level required"):
+//   workspace: /workspaces/:workspaceId/mcp-connections[...]
+//   user:      /me/mcp-connections[...]
+//
+//   GET    <base>                 → ListMcpConnectionsResponse
+//   POST   <base>                 → GetMcpConnectionResponse (201; custom URL)
+//   POST   <base>/install         → GetMcpConnectionResponse (201; from registry)
+//   GET    <base>/:id             → GetMcpConnectionResponse
+//   PATCH  <base>/:id             → GetMcpConnectionResponse
+//   DELETE <base>/:id             → DeleteResourceResponse
+
+/**
+ * Per-tool approval decision, exactly as stored on
+ * `mcp_connections.approval_policy` and consumed by the compiler adapter:
+ * "never" = auto-allow, "once" = ask once per session, "always" = always ask.
+ */
+export const mcpApprovalDecisionSchema = z.enum(["never", "once", "always"]);
+export type McpApprovalDecision = z.infer<typeof mcpApprovalDecisionSchema>;
+
+/**
+ * Approval policy compiled into eve's tool-approval config. Stored shape:
+ * `{ default, tools?: { <bare tool name>: decision } }`.
+ */
+export const mcpApprovalPolicySchema = z.object({
+  default: mcpApprovalDecisionSchema.default("never"),
+  tools: z
+    .record(z.string().min(1), mcpApprovalDecisionSchema)
+    .optional(),
+});
+export type McpApprovalPolicy = z.infer<typeof mcpApprovalPolicySchema>;
+
+/**
+ * Credential WRITE shape. The server encrypts values (AES-256-GCM envelope,
+ * AAD-bound to the row) and NEVER echoes them back — read DTOs carry
+ * {@link McpConnectionDto.hasCredentials} only.
+ *
+ * - none    → clears any stored credentials
+ * - bearer  → `values.token` becomes the connection's bearer token
+ * - headers → `values` = header name → header VALUE (each stored encrypted)
+ */
+export const mcpAuthWriteSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("none") }),
+  z.object({
+    type: z.literal("bearer"),
+    values: z.object({ token: z.string().min(1) }),
+  }),
+  z.object({
+    type: z.literal("headers"),
+    values: z
+      .record(z.string().min(1), z.string().min(1))
+      .refine((headers) => Object.keys(headers).length > 0, {
+        message: "provide at least one header",
+      }),
+  }),
+]);
+export type McpAuthWrite = z.infer<typeof mcpAuthWriteSchema>;
+
+const mcpConnectionNameSchema = z.string().trim().min(1).max(120);
+const httpUrlSchema = z
+  .url()
+  .refine((value) => /^https?:\/\//i.test(value), {
+    message: "must be an http(s) URL",
+  });
+const toolNameListSchema = z.array(z.string().min(1)).min(1);
+
+/** Exactly one of allow/block may be set (compiler contract). */
+function refineToolFilter<
+  T extends { toolAllow?: string[] | null; toolBlock?: string[] | null },
+>(value: T): boolean {
+  return !(
+    value.toolAllow != null &&
+    value.toolAllow.length > 0 &&
+    value.toolBlock != null &&
+    value.toolBlock.length > 0
+  );
+}
+const TOOL_FILTER_MESSAGE = "set toolAllow or toolBlock, not both";
+
+export const mcpConnectionDtoSchema = z.object({
+  id: productId,
+  scope: resourceScopeSchema,
+  name: z.string().min(1),
+  /** Model-facing summary — eve's connection_search routes on it. */
+  description: z.string().nullable(),
+  source: mcpSourceSchema,
+  /** registry.modelcontextprotocol.io server name (source = registry). */
+  registryId: z.string().nullable(),
+  url: z.string().nullable(),
+  toolAllow: z.array(z.string()).nullable(),
+  toolBlock: z.array(z.string()).nullable(),
+  approvalPolicy: mcpApprovalPolicySchema.nullable(),
+  enabled: z.boolean(),
+  /** True when encrypted credentials are stored. Secrets are never echoed. */
+  hasCredentials: z.boolean(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type McpConnectionDto = z.infer<typeof mcpConnectionDtoSchema>;
+
+/** Create a CUSTOM-URL connection (registry installs use .../install). */
+export const createMcpConnectionRequestSchema = z
+  .object({
+    name: mcpConnectionNameSchema,
+    description: z.string().max(2000).optional(),
+    url: httpUrlSchema,
+    auth: mcpAuthWriteSchema.optional(),
+    toolAllow: toolNameListSchema.optional(),
+    toolBlock: toolNameListSchema.optional(),
+    approvalPolicy: mcpApprovalPolicySchema.optional(),
+    enabled: z.boolean().optional(),
+  })
+  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
+export type CreateMcpConnectionRequest = z.infer<
+  typeof createMcpConnectionRequestSchema
+>;
+
+/**
+ * Partial update. `auth` semantics: omitted = keep stored credentials;
+ * `{type:"none"}` = clear; bearer/headers = replace. Explicit nulls clear
+ * the nullable fields.
+ */
+export const updateMcpConnectionRequestSchema = z
+  .object({
+    name: mcpConnectionNameSchema.optional(),
+    description: z.string().max(2000).nullable().optional(),
+    url: httpUrlSchema.optional(),
+    auth: mcpAuthWriteSchema.optional(),
+    toolAllow: toolNameListSchema.nullable().optional(),
+    toolBlock: toolNameListSchema.nullable().optional(),
+    approvalPolicy: mcpApprovalPolicySchema.nullable().optional(),
+    enabled: z.boolean().optional(),
+  })
+  .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
+    message: "update at least one field",
+  })
+  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
+export type UpdateMcpConnectionRequest = z.infer<
+  typeof updateMcpConnectionRequestSchema
+>;
+
+export const listMcpConnectionsResponseSchema = z.object({
+  connections: z.array(mcpConnectionDtoSchema),
+});
+export type ListMcpConnectionsResponse = z.infer<
+  typeof listMcpConnectionsResponseSchema
+>;
+
+export const getMcpConnectionResponseSchema = z.object({
+  connection: mcpConnectionDtoSchema,
+});
+export type GetMcpConnectionResponse = z.infer<
+  typeof getMcpConnectionResponseSchema
+>;
+
+// ── MCP registry proxy ──────────────────────────────────────────────────────
+//
+//   GET /mcp-registry/search?q= → RegistrySearchResponse
+//
+// The control plane proxies registry.modelcontextprotocol.io
+// (`GET /v0.1/servers?search=&version=latest`, active/latest filtered) and
+// TRIMS each server to this DTO — the UI never talks to the registry
+// directly and never sees fields we don't render.
+
+/**
+ * One env-var/header the server declares it needs. Secret-flagged
+ * declarations render as password prompts in the install flow; values are
+ * sent via {@link mcpAuthWriteSchema} and encrypted server-side.
+ */
+export const registryEnvVarDeclarationSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  isRequired: z.boolean().default(false),
+  isSecret: z.boolean().default(false),
+  /** Registry format hint, e.g. "string" | "number" | "boolean" | "filepath". */
+  format: z.string().optional(),
+  default: z.string().optional(),
+});
+export type RegistryEnvVarDeclaration = z.infer<
+  typeof registryEnvVarDeclarationSchema
+>;
+
+/** One hosted transport of a registry server. */
+export const registryRemoteSchema = z.object({
+  /** e.g. "streamable-http" | "sse" — open (registry adds transports). */
+  type: z.string().min(1),
+  url: httpUrlSchema,
+  /** Headers the remote requires (install flow prompts for secret ones). */
+  headers: z.array(registryEnvVarDeclarationSchema).optional(),
+});
+export type RegistryRemote = z.infer<typeof registryRemoteSchema>;
+
+export const registryIconSchema = z.object({
+  src: httpUrlSchema,
+  mimeType: z.string().optional(),
+  sizes: z.string().optional(),
+  theme: z.enum(["light", "dark"]).optional(),
+});
+export type RegistryIcon = z.infer<typeof registryIconSchema>;
+
+/** Trimmed registry server DTO (proxy output). */
+export const registryServerSummarySchema = z.object({
+  /** Registry id, reverse-DNS style (e.g. "io.github.owner/server"). */
+  name: z.string().min(1),
+  /** Human display name when the registry provides one. */
+  title: z.string().optional(),
+  description: z.string().default(""),
+  version: z.string().min(1),
+  /** Only remote-capable servers are installable — may be empty. */
+  remotes: z.array(registryRemoteSchema).default([]),
+  /** Package-level env-var declarations (secret prompts at install). */
+  envVarDeclarations: z.array(registryEnvVarDeclarationSchema).default([]),
+  icons: z.array(registryIconSchema).optional(),
+});
+export type RegistryServerSummary = z.infer<typeof registryServerSummarySchema>;
+
+export const registrySearchQuerySchema = z.object({
+  q: z.string().trim().min(1).max(200),
+});
+export type RegistrySearchQuery = z.infer<typeof registrySearchQuerySchema>;
+
+export const registrySearchResponseSchema = z.object({
+  servers: z.array(registryServerSummarySchema),
+});
+export type RegistrySearchResponse = z.infer<
+  typeof registrySearchResponseSchema
+>;
+
+/**
+ * Install a registry server as an MCP connection
+ * (`POST <mcp-connections base>/install`, both scopes). The UI picks one of
+ * the server's `remotes[].url`; secret values collected from the
+ * declarations travel in `auth` and are encrypted server-side.
+ */
+export const installMcpConnectionRequestSchema = z
+  .object({
+    /** RegistryServerSummary.name. */
+    registryName: z.string().min(1),
+    /** Registry version installed; server resolves "latest" when omitted. */
+    version: z.string().min(1).optional(),
+    /** The chosen remotes[].url. */
+    remoteUrl: httpUrlSchema,
+    /** Display name override; defaults to the server's title/name. */
+    name: mcpConnectionNameSchema.optional(),
+    description: z.string().max(2000).optional(),
+    auth: mcpAuthWriteSchema.optional(),
+    toolAllow: toolNameListSchema.optional(),
+    toolBlock: toolNameListSchema.optional(),
+    approvalPolicy: mcpApprovalPolicySchema.optional(),
+  })
+  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
+export type InstallMcpConnectionRequest = z.infer<
+  typeof installMcpConnectionRequestSchema
+>;
+
+// ── Skills (CONTEXT pillar) ─────────────────────────────────────────────────
+//
+// Scoped like MCP connections:
+//   workspace: /workspaces/:workspaceId/skills[...]
+//   user:      /me/skills[...]
+//
+//   GET    <base>                    → ListSkillsResponse
+//   POST   <base>                    → GetSkillResponse (201)
+//   GET    <base>/:id                → GetSkillResponse
+//   PATCH  <base>/:id                → GetSkillResponse
+//   DELETE <base>/:id                → DeleteResourceResponse
+//   POST   <base>/:id/files          → GetSkillResponse (multipart, below)
+//   DELETE <base>/:id/files/:name    → GetSkillResponse
+//
+// ATTACHMENT UPLOAD (decision: direct multipart, not presigned — files are
+// small, capped, and flow through the control plane's authz):
+// `POST <base>/:id/files` with `multipart/form-data`; the file part is named
+// {@link SKILL_FILE_FORM_FIELD}. Decoded size ≤ {@link SKILL_FILE_MAX_BYTES}
+// (413 `skill_file_too_large` otherwise). Re-uploading an existing file name
+// replaces it. Responses return the updated skill.
+
+export const SKILL_FILE_FORM_FIELD = "file";
+export const SKILL_FILE_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB
+export const SKILL_CONTENT_MAX_CHARS = 262_144; // 256 KiB of markdown
+
+export const skillFileDtoSchema = z.object({
+  /** Original filename (unique per skill; re-upload replaces). */
+  name: z.string().min(1),
+  /** Object-store key (server-managed; opaque to clients). */
+  key: z.string().min(1),
+  mediaType: z.string().min(1),
+});
+export type SkillFileDto = z.infer<typeof skillFileDtoSchema>;
+
+export const skillDtoSchema = z.object({
+  id: productId,
+  scope: resourceScopeSchema,
+  name: z.string().min(1),
+  /** Routing hint eve advertises to the model. */
+  description: z.string().nullable(),
+  /** SKILL.md markdown body. */
+  content: z.string(),
+  /** Normalized to [] (DB stores null for "no files"). */
+  files: z.array(skillFileDtoSchema),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type SkillDto = z.infer<typeof skillDtoSchema>;
+
+const skillNameSchema = z.string().trim().min(1).max(120);
+
+export const createSkillRequestSchema = z.object({
+  name: skillNameSchema,
+  description: z.string().max(2000).optional(),
+  /** May be empty while drafting; publish requires non-empty content. */
+  content: z.string().max(SKILL_CONTENT_MAX_CHARS),
+});
+export type CreateSkillRequest = z.infer<typeof createSkillRequestSchema>;
+
+export const updateSkillRequestSchema = z
+  .object({
+    name: skillNameSchema.optional(),
+    description: z.string().max(2000).nullable().optional(),
+    content: z.string().max(SKILL_CONTENT_MAX_CHARS).optional(),
+  })
+  .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
+    message: "update at least one field",
+  });
+export type UpdateSkillRequest = z.infer<typeof updateSkillRequestSchema>;
+
+export const listSkillsResponseSchema = z.object({
+  skills: z.array(skillDtoSchema),
+});
+export type ListSkillsResponse = z.infer<typeof listSkillsResponseSchema>;
+
+export const getSkillResponseSchema = z.object({ skill: skillDtoSchema });
+export type GetSkillResponse = z.infer<typeof getSkillResponseSchema>;
+
+// ── Model presets ───────────────────────────────────────────────────────────
+//
+//   GET /workspaces/:workspaceId/model-presets        → ListModelPresetsResponse
+//   PUT /workspaces/:workspaceId/model-presets/:slug  → GetModelPresetResponse
+//
+// The three slugs are seeded per workspace and fixed — presets are re-pointed
+// (PUT), never created or deleted.
+
+export const modelPresetDtoSchema = z.object({
+  id: productId,
+  slug: modelPresetSlugSchema,
+  provider: modelProviderSchema,
+  modelId: z.string().min(1),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type ModelPresetDto = z.infer<typeof modelPresetDtoSchema>;
+
+export const updateModelPresetRequestSchema = z.object({
+  provider: modelProviderSchema,
+  /** Must be on the workspace allowlist (422 `model_not_allowlisted`). */
+  modelId: z.string().min(1),
+});
+export type UpdateModelPresetRequest = z.infer<
+  typeof updateModelPresetRequestSchema
+>;
+
+export const listModelPresetsResponseSchema = z.object({
+  presets: z.array(modelPresetDtoSchema),
+});
+export type ListModelPresetsResponse = z.infer<
+  typeof listModelPresetsResponseSchema
+>;
+
+export const getModelPresetResponseSchema = z.object({
+  preset: modelPresetDtoSchema,
+});
+export type GetModelPresetResponse = z.infer<
+  typeof getModelPresetResponseSchema
+>;
+
+// ── Model allowlist ─────────────────────────────────────────────────────────
+//
+//   GET    /workspaces/:workspaceId/model-allowlist      → ListModelAllowlistResponse
+//   POST   /workspaces/:workspaceId/model-allowlist      → GetModelAllowlistEntryResponse (201)
+//   PATCH  /workspaces/:workspaceId/model-allowlist/:id  → GetModelAllowlistEntryResponse (toggle)
+//   DELETE /workspaces/:workspaceId/model-allowlist/:id  → DeleteResourceResponse
+
+export const modelAllowlistEntryDtoSchema = z.object({
+  id: productId,
+  provider: modelProviderSchema,
+  modelId: z.string().min(1),
+  enabled: z.boolean(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type ModelAllowlistEntryDto = z.infer<
+  typeof modelAllowlistEntryDtoSchema
+>;
+
+export const addModelAllowlistEntryRequestSchema = z.object({
+  provider: modelProviderSchema,
+  modelId: z.string().trim().min(1).max(200),
+  enabled: z.boolean().default(true),
+});
+export type AddModelAllowlistEntryRequest = z.infer<
+  typeof addModelAllowlistEntryRequestSchema
+>;
+
+export const updateModelAllowlistEntryRequestSchema = z.object({
+  enabled: z.boolean(),
+});
+export type UpdateModelAllowlistEntryRequest = z.infer<
+  typeof updateModelAllowlistEntryRequestSchema
+>;
+
+export const listModelAllowlistResponseSchema = z.object({
+  entries: z.array(modelAllowlistEntryDtoSchema),
+});
+export type ListModelAllowlistResponse = z.infer<
+  typeof listModelAllowlistResponseSchema
+>;
+
+export const getModelAllowlistEntryResponseSchema = z.object({
+  entry: modelAllowlistEntryDtoSchema,
+});
+export type GetModelAllowlistEntryResponse = z.infer<
+  typeof getModelAllowlistEntryResponseSchema
+>;
+
+// ── Agent presets (AGENT pillar) ────────────────────────────────────────────
+//
+//   GET    /workspaces/:workspaceId/agents      → ListAgentPresetsResponse
+//   POST   /workspaces/:workspaceId/agents      → GetAgentPresetResponse (201)
+//   GET    /workspaces/:workspaceId/agents/:id  → GetAgentPresetResponse
+//   PATCH  /workspaces/:workspaceId/agents/:id  → GetAgentPresetResponse
+//   DELETE /workspaces/:workspaceId/agents/:id  → DeleteResourceResponse
+//
+// Deleting a preset referenced by workflow drafts makes those drafts fail
+// publish with `agent_preset_not_found` — the UI warns before deleting.
+
+export const agentPresetDtoSchema = z.object({
+  id: productId,
+  name: z.string().min(1),
+  description: z.string().nullable(),
+  /** Persona block prepended to compiled instructions.md. */
+  basePrompt: z.string().min(1),
+  reasoningEffort: reasoningEffortSchema,
+  /** Workspace model preset this agent resolves through. */
+  modelPreset: modelPresetSlugSchema,
+  /** Specific-model override (wins over modelPreset; allowlist-checked). */
+  modelId: z.string().nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type AgentPresetDto = z.infer<typeof agentPresetDtoSchema>;
+
+const agentPresetNameSchema = z.string().trim().min(1).max(120);
+
+export const createAgentPresetRequestSchema = z.object({
+  name: agentPresetNameSchema,
+  description: z.string().max(2000).optional(),
+  basePrompt: z.string().min(1).max(50_000),
+  reasoningEffort: reasoningEffortSchema.default("medium"),
+  modelPreset: modelPresetSlugSchema.default("balanced"),
+  modelId: z.string().min(1).optional(),
+});
+export type CreateAgentPresetRequest = z.infer<
+  typeof createAgentPresetRequestSchema
+>;
+
+export const updateAgentPresetRequestSchema = z
+  .object({
+    name: agentPresetNameSchema.optional(),
+    description: z.string().max(2000).nullable().optional(),
+    basePrompt: z.string().min(1).max(50_000).optional(),
+    reasoningEffort: reasoningEffortSchema.optional(),
+    modelPreset: modelPresetSlugSchema.optional(),
+    /** null clears the specific-model override. */
+    modelId: z.string().min(1).nullable().optional(),
+  })
+  .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
+    message: "update at least one field",
+  });
+export type UpdateAgentPresetRequest = z.infer<
+  typeof updateAgentPresetRequestSchema
+>;
+
+export const listAgentPresetsResponseSchema = z.object({
+  agents: z.array(agentPresetDtoSchema),
+});
+export type ListAgentPresetsResponse = z.infer<
+  typeof listAgentPresetsResponseSchema
+>;
+
+export const getAgentPresetResponseSchema = z.object({
+  agent: agentPresetDtoSchema,
+});
+export type GetAgentPresetResponse = z.infer<typeof getAgentPresetResponseSchema>;
+
+// ── Workspace members ───────────────────────────────────────────────────────
+//
+//   GET /workspaces/:workspaceId/members → ListWorkspaceMembersResponse
+//
+// Read-only list (settings → members; run-as pickers). Invitation/role
+// mutations go through Better Auth's organization endpoints, not this API.
+
+export const workspaceMemberDtoSchema = z.object({
+  /** Better Auth member row id. */
+  id: authId,
+  userId: authId,
+  name: z.string().nullable(),
+  email: z.string().min(1),
+  /** Better Auth role — see {@link WORKSPACE_ROLES} for the known set. */
+  role: z.string().min(1),
+  createdAt: isoTimestamp,
+});
+export type WorkspaceMemberDto = z.infer<typeof workspaceMemberDtoSchema>;
+
+export const listWorkspaceMembersResponseSchema = z.object({
+  members: z.array(workspaceMemberDtoSchema),
+});
+export type ListWorkspaceMembersResponse = z.infer<
+  typeof listWorkspaceMembersResponseSchema
+>;

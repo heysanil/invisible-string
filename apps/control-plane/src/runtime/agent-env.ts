@@ -119,6 +119,8 @@ export function buildAgentEnv(input: BuildAgentEnvInput): Record<string, string>
     WORKFLOW_POSTGRES_URL: input.worldUrl,
     WORKFLOW_POSTGRES_JOB_PREFIX: input.contentHash,
     PLATFORM_JWT_SECRET: runtime.platformJwtSecret,
+    // TEST HARNESS ONLY (see runtime/config.ts): eve's built-in mock model.
+    ...(runtime.mockAuthoredModels ? { EVE_MOCK_AUTHORED_MODELS: "1" } : {}),
     ...(provider === "openrouter"
       ? {
           OPENROUTER_API_KEY: providerKey,

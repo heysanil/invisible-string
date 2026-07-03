@@ -6,10 +6,9 @@
  * workspace-scoping macro → Phase-1 runtime API (publish/build, sessions,
  * runs, SSE) when the runtime env is configured (see runtime/config.ts).
  *
- * NOTE(integration): the workflow compiler is injected. Until
- * packages/compiler lands its real `compile`, the default is
- * `compilerNotIntegrated` (typed compile error) — wire the adapter here at
- * the Integrate stage (see build/compiler-contract.ts).
+ * The workflow compiler is injected (tests use stubs); the production
+ * default is `compileWorkflow` — the adapter over @invisible-string/compiler
+ * (build/compiler-adapter.ts).
  */
 import { cors } from "@elysiajs/cors";
 import { Elysia } from "elysia";
@@ -21,10 +20,8 @@ import {
   createArtifactStore,
   type ArtifactStore,
 } from "./artifacts";
-import {
-  compilerNotIntegrated,
-  type CompileWorkflowFn,
-} from "./build/compiler-contract";
+import { compileWorkflow } from "./build/compiler-adapter";
+import { type CompileWorkflowFn } from "./build/compiler-contract";
 import {
   BuildService,
   createDrizzleBuildStore,
@@ -145,7 +142,7 @@ export function createRuntimeDeps(opts: {
     artifacts,
     buildService,
     buildStore,
-    compile: overrides?.compile ?? compilerNotIntegrated,
+    compile: overrides?.compile ?? compileWorkflow,
     workerClient,
     runStore,
     bus,

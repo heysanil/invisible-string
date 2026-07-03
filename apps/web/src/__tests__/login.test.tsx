@@ -1,4 +1,4 @@
-import "../test/setup";
+import { ensureDomForThisFile } from "../test/setup";
 import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -16,6 +16,8 @@ import {
 } from "@tanstack/react-router";
 
 import { authMockState, demoSession, resetAuthMock } from "../test/auth-mock";
+
+ensureDomForThisFile();
 
 // Dynamic import AFTER ../test/auth-mock has registered mock.module, so the
 // route modules resolve the mocked auth client instead of the real one.

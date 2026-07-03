@@ -95,7 +95,7 @@ generated files or artifacts**:
 | Var | Read by | Notes |
 |---|---|---|
 | `PORT` | eve | `eve start` listen port. |
-| `WORKFLOW_POSTGRES_URL` | world-postgres | **Must point at this workflow version's DEDICATED world DATABASE** (`world_v_<hash12>`) — see `WORLD-ISOLATION.md`. Read as-is; the generated project does no URL surgery. |
+| `WORKFLOW_POSTGRES_URL` | world-postgres | **Must point at this workflow version's DEDICATED world DATABASE** (`ws_v_<hash12>`) — see `WORLD-ISOLATION.md`. Read as-is; the generated project does no URL surgery. |
 | `WORKFLOW_POSTGRES_JOB_PREFIX` | world-postgres | Observability/log grouping ONLY — it does **not** isolate (spike finding 11). |
 | `WORKFLOW_LOCAL_BASE_URL` | world-postgres | Point at the worker proxy so `/.well-known/workflow/v1/*` callbacks traverse the same ingress. |
 | `WORKFLOW_POSTGRES_MAX_POOL_SIZE` / `WORKFLOW_POSTGRES_WORKER_CONCURRENCY` | world-postgres | Budget Postgres connections at ~20 agents/worker (spike finding 15). |

@@ -16,6 +16,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, mkdirSync, readFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
 
 import { agentEntrypoint, type ArtifactCache } from "./cache";
@@ -95,6 +96,7 @@ export function createAgentManager(options: {
     | "agentReadyTimeoutMs"
     | "agentStopTimeoutMs"
     | "nodeBin"
+    | "publicUrl"
   >;
   cache: ArtifactCache;
   ports: PortPool;
@@ -124,10 +126,18 @@ export function createAgentManager(options: {
 
   /** Caller env + PORT on a minimal base — nothing else inherited. */
   function agentEnv(
+    hash: string,
     callerEnv: Record<string, string> | undefined,
     port: number,
   ): Record<string, string> {
-    const env: Record<string, string> = { NODE_ENV: "production" };
+    const env: Record<string, string> = {
+      NODE_ENV: "production",
+      // Run callbacks (`/.well-known/workflow/v1/*`) must traverse the same
+      // ingress as clients (spike/REPORT.md finding 9) — point the workflow
+      // queue at this worker's own proxy base for the agent. Caller env may
+      // override (test harnesses).
+      WORKFLOW_LOCAL_BASE_URL: `${config.publicUrl}/agents/${hash}`,
+    };
     for (const key of ["PATH", "HOME", "LANG", "TMPDIR"]) {
       const value = process.env[key];
       if (value !== undefined) env[key] = value;
@@ -180,18 +190,48 @@ export function createAgentManager(options: {
     }
   }
 
+  /** Can we actually bind this port right now? (wildcard, like the agent). */
+  function portIsFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const probe = createServer();
+      probe.unref();
+      probe.once("error", () => resolve(false));
+      probe.listen({ port, exclusive: true }, () => {
+        probe.close(() => resolve(true));
+      });
+    });
+  }
+
+  /**
+   * Allocate a port that is REALLY free. A pool port held by a foreign
+   * process (e.g. an agent orphaned by a SIGKILLed supervisor) must never be
+   * handed to a new agent: the spawn would fail to bind while the readiness
+   * health-check happily answers from the stale listener — a silent
+   * mis-route to the wrong agent. Busy ports stay allocated (burned) for
+   * this supervisor's lifetime so they are never retried.
+   */
+  async function allocatePort(): Promise<number> {
+    for (;;) {
+      const port = ports.allocate(); // throws PortPoolExhaustedError
+      if (await portIsFree(port)) return port;
+      log(
+        `port ${port} is unexpectedly in use (stale listener?) — burning it and trying the next`,
+      );
+    }
+  }
+
   async function bootAgent(input: EnsureAgentInput): Promise<EnsureAgentResult> {
     const hash = input.versionHash;
     const dir = await cache.ensure(hash, input.artifactUrl);
     const entry = agentEntrypoint(dir);
-    const port = ports.allocate();
+    const port = await allocatePort();
     const logPath = join(logsDir, `${hash}-${Date.now()}.log`);
 
     try {
       const child = spawn(config.nodeBin, [entry], {
         cwd: dir,
         detached: true,
-        env: agentEnv(input.env, port),
+        env: agentEnv(hash, input.env, port),
         stdio: ["ignore", "pipe", "pipe"],
       });
       const logStream = createWriteStream(logPath, { flags: "a" });

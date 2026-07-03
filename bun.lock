@@ -14,6 +14,7 @@
       "dependencies": {
         "@better-auth/sso": "^1.6.23",
         "@elysiajs/cors": "^1.4.2",
+        "@invisible-string/compiler": "workspace:*",
         "@invisible-string/db": "workspace:*",
         "@invisible-string/shared": "workspace:*",
         "better-auth": "^1.6.23",
@@ -83,6 +84,19 @@
       "name": "@invisible-string/shared",
       "dependencies": {
         "zod": "^4.4.3",
+      },
+      "devDependencies": {
+        "typescript": "^6.0.3",
+      },
+    },
+    "tests/integration": {
+      "name": "@invisible-string/integration-tests",
+      "dependencies": {
+        "@invisible-string/control-plane": "workspace:*",
+        "@invisible-string/db": "workspace:*",
+        "@invisible-string/shared": "workspace:*",
+        "@invisible-string/worker": "workspace:*",
+        "drizzle-orm": "^0.45.2",
       },
       "devDependencies": {
         "typescript": "^6.0.3",
@@ -221,6 +235,8 @@
     "@invisible-string/control-plane": ["@invisible-string/control-plane@workspace:apps/control-plane"],
 
     "@invisible-string/db": ["@invisible-string/db@workspace:packages/db"],
+
+    "@invisible-string/integration-tests": ["@invisible-string/integration-tests@workspace:tests/integration"],
 
     "@invisible-string/shared": ["@invisible-string/shared@workspace:packages/shared"],
 

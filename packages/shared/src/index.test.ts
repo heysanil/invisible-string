@@ -1,8 +1,7 @@
 import { expect, test } from "bun:test";
 
-import { placeholderSchema } from "./index";
+import { SHARED_PACKAGE } from "./index";
 
-test("placeholder schema parses", () => {
-  expect(placeholderSchema.safeParse({ ok: true }).success).toBe(true);
-  expect(placeholderSchema.safeParse({ ok: false }).success).toBe(false);
+test("shared package exports its name", () => {
+  expect(SHARED_PACKAGE).toBe("@invisible-string/shared");
 });

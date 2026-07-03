@@ -4,10 +4,11 @@
   "type": "module",
   "workspaces": [
     "apps/*",
-    "packages/*"
+    "packages/*",
+    "tests/*"
   ],
   "scripts": {
-    "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' typecheck",
+    "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' --filter='./tests/*' typecheck",
     "test": "bun test",
     "dev": "bun run --filter='./apps/*' dev"
   },

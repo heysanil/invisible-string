@@ -1,14 +1,12 @@
 /**
  * Compile contract between the control plane and packages/compiler.
  *
- * NOTE(integration): packages/compiler is being built in parallel and is
- * still a placeholder in this tree. This file defines the injectable
- * interface the build/publish paths consume; at the Integrate stage, wire
- * `createAppStack`'s `compile` override (see index.ts) to an adapter over the
- * real `compile(WorkflowDefinition, versions)` export and delete
- * `compilerNotIntegrated`. The control plane resolves preset→model and
- * validates the allowlist BEFORE calling compile (typed errors surface to
- * the API), so the compiler receives an already-resolved model.
+ * This file defines the injectable interface the build/publish paths consume
+ * (tests inject stubs); the production implementation is the adapter over
+ * @invisible-string/compiler in `compiler-adapter.ts`. The control plane
+ * resolves preset→model and validates the allowlist BEFORE calling compile
+ * (typed errors surface to the API), so the compiler receives an
+ * already-resolved model.
  */
 import type { WorkflowDefinition } from "@invisible-string/shared";
 
@@ -45,6 +43,14 @@ export interface CompileRequest {
   model: ResolvedModel;
   connections: CompileConnection[];
   skills: CompileSkill[];
+  /**
+   * Human-readable identity baked into the generated project (package name,
+   * instructions header). Lowercase kebab-case — the routes slugify the
+   * organization slug / workflow name before compiling. Participates in the
+   * content hash (renaming a workflow re-keys its artifact).
+   */
+  workspaceSlug: string;
+  workflowSlug: string;
 }
 
 export interface CompileResult {
@@ -74,16 +80,3 @@ export class WorkflowCompileError extends Error {
 }
 
 export type CompileWorkflowFn = (request: CompileRequest) => CompileResult;
-
-/**
- * Boot-time placeholder until the real compiler is wired (Integrate stage).
- * Fails as a structured compile error so the API surface stays typed.
- */
-export const compilerNotIntegrated: CompileWorkflowFn = () => {
-  throw new WorkflowCompileError([
-    {
-      message:
-        "compiler not integrated — wire @invisible-string/compiler's compile() into createAppStack",
-    },
-  ]);
-};

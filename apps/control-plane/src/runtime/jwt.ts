@@ -8,9 +8,14 @@
  * persisted, never logged.
  */
 import { SignJWT } from "jose";
+import {
+  PLATFORM_JWT_AUDIENCE,
+  PLATFORM_JWT_ISSUER,
+} from "@invisible-string/compiler";
 
-export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "workflow-agent";
+// Re-exported from the compiler (generated channels verify these exact
+// values) so the minting and verifying sides can never drift.
+export { PLATFORM_JWT_AUDIENCE, PLATFORM_JWT_ISSUER };
 export const PLATFORM_JWT_DEFAULT_TTL_SECONDS = 120;
 
 export interface MintPlatformJwtOptions {

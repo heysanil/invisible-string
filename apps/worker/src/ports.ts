@@ -1,8 +1,9 @@
 /**
  * Agent port pool — the supervisor owns an inclusive port range and hands one
- * port to each running agent process. The pool assumes exclusive ownership of
- * the range on this host (a stale listener surfaces as an agent boot failure
- * with EADDRINUSE in the crash log, not as a silent mis-route).
+ * port to each running agent process. The pool tracks OUR allocations only;
+ * the agent manager additionally bind-probes each allocated port before
+ * spawning (agents.ts allocatePort) so a stale foreign listener burns the
+ * port instead of silently answering the new agent's health checks.
  */
 
 export class PortPoolExhaustedError extends Error {

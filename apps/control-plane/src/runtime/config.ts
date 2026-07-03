@@ -35,6 +35,13 @@ export interface RuntimeConfig {
   anthropicApiKey?: string;
   /** Passed through to agents when set (test harnesses point it at a mock). */
   openrouterBaseUrl?: string;
+  /**
+   * TEST HARNESS ONLY: propagate `EVE_MOCK_AUTHORED_MODELS=1` to agent
+   * processes — eve then serves turns with its built-in mock model (honors
+   * "Reply with exactly: X"; spike/REPORT.md finding 5). Never set in
+   * production: turns would "succeed" without ever calling a real model.
+   */
+  mockAuthoredModels: boolean;
   /** Per-run wall-clock cap (MAX_RUN_WALL_CLOCK_MS, default 10 minutes). */
   maxRunWallClockMs: number;
   /** Per-workspace concurrent-run cap (MAX_CONCURRENT_RUNS_PER_WORKSPACE, default 5). */
@@ -123,6 +130,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     openrouterApiKey: env.OPENROUTER_API_KEY?.trim() || undefined,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || undefined,
     openrouterBaseUrl: env.OPENROUTER_BASE_URL?.trim() || undefined,
+    mockAuthoredModels: env.EVE_MOCK_AUTHORED_MODELS?.trim() === "1",
     maxRunWallClockMs,
     maxConcurrentRunsPerWorkspace,
     workerHeartbeatTtlMs,

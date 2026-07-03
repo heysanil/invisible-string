@@ -1,19 +1,22 @@
 # Runtime ⇄ worker / compiler contract (Phase 1)
 
-Written by the control-plane runtime build (apps/control-plane). The worker
-supervisor and compiler were built in parallel — reconcile against this at the
-Integrate stage. Code anchors are marked `NOTE(integration)` in source.
+Reconciled at the Integrate stage — this document describes what the code
+actually does on BOTH sides (apps/control-plane ⇄ apps/worker ⇄
+packages/compiler). The end-to-end proof is
+`tests/integration/phase1-acceptance.test.ts`.
 
 ## Worker HTTP surface the control plane calls
 
 ### Internal plane (shared secret)
 
 ```
-POST <worker>/internal/agents/<contentHash>/ensure
-authorization: Bearer <WORKER_SHARED_SECRET>
-{ "artifactUrl": "<presigned GET url of artifacts/<hash>.tar.gz>",
+POST <worker>/internal/agents/ensure
+x-worker-secret: <WORKER_SHARED_SECRET>
+{ "versionHash": "<contentHash>",
+  "artifactUrl": "<presigned GET url of artifacts/<hash>.tar.gz>",
   "env": { ...full agent process env, secrets included... } }
-→ 200 once the agent for <contentHash> is running & healthy (idempotent)
+→ 200 {hash, port, url, startedAt, reused} once the agent is running &
+  healthy (idempotent)
 ```
 
 - `env` is spawn-time-only material. The supervisor must never write it to
@@ -50,10 +53,15 @@ Used today by the control plane:
 | `PLATFORM_JWT_SECRET` | channel-auth secret |
 | `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | exactly ONE, matching the version's resolved provider (`workflow_versions.model_provider`) |
 | `OPENROUTER_BASE_URL` | passthrough when set (test harnesses) |
-| `MCP_<NAME>_TOKEN` | decrypted MCP connection tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`) — compiler-emitted `connections/*.ts` must read the same names |
+| `MCP_<NAME>_TOKEN` | decrypted MCP connection tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time |
+| `EVE_MOCK_AUTHORED_MODELS` | TEST HARNESS ONLY passthrough (set on the control plane → forwarded per agent); eve serves turns with its built-in mock model |
 
-The supervisor adds `PORT` and `WORKFLOW_LOCAL_BASE_URL` (its own proxy
-address for `<worker>/agents/<hash>`) itself.
+The supervisor adds `PORT`, `NODE_ENV=production` (REPORT finding 5) and
+`WORKFLOW_LOCAL_BASE_URL=${publicUrl}/agents/<hash>` (its own proxy base —
+REPORT finding 9; caller env may override) itself, plus the ambient
+PATH/HOME/LANG/TMPDIR. Worker registration:
+`POST /internal/workers/{register,heartbeat,deregister}` on the control
+plane, `x-worker-secret`-guarded (`src/runtime/workers.ts`).
 
 ## World isolation (design correction #10)
 
@@ -66,9 +74,9 @@ Why a database and not a `search_path` schema: `@workflow/world-postgres`
 queries are schema-qualified and `search_path` cannot redirect them — a
 per-version schema would LOOK isolated while every version still shared
 `workflow.*` (the exact cross-agent re-enqueue bug from REPORT finding 11).
-If packages/compiler's WORLD-ISOLATION.md lands with a different mechanism,
-reconcile in `src/build/world.ts` (naming + provisioning are the only touch
-points).
+`packages/compiler/WORLD-ISOLATION.md` documents the same contract (both
+built to it independently; reconciled at Integrate — `ws_v_<hash12>`
+everywhere) and its gated test proves both halves live.
 
 ## Artifacts
 
@@ -87,10 +95,11 @@ points).
 
 The control plane resolves preset→model and validates the model allowlist
 BEFORE compiling (typed 422s), then calls an injected
-`compile({definition, model, connections, skills}) → {files, hash,
-compilerVersion, eveVersion}` (`src/build/compiler-contract.ts`). Until the
-real compiler is wired in `createAppStack` (src/index.ts), the default
-placeholder fails publish with a typed `compile_failed` error.
+`compile({definition, model, connections, skills, workspaceSlug,
+workflowSlug}) → {files, hash, compilerVersion, eveVersion}`
+(`src/build/compiler-contract.ts`). The production implementation is
+`src/build/compiler-adapter.ts` over `@invisible-string/compiler` (wired as
+the default in `createAppStack`); tests inject stubs.
 
 ## Control-plane runtime env
 

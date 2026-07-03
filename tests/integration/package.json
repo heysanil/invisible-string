@@ -1,0 +1,19 @@
+{
+  "name": "@invisible-string/integration-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@invisible-string/control-plane": "workspace:*",
+    "@invisible-string/db": "workspace:*",
+    "@invisible-string/shared": "workspace:*",
+    "@invisible-string/worker": "workspace:*",
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}

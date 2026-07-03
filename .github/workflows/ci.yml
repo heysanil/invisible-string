@@ -22,7 +22,91 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      # Unit tests only for now. DB-gated tests skip when TEST_DATABASE_URL
-      # is unset; the compose integration job (Phase 0 task 4+) provides it.
+      # DB-gated tests skip when TEST_DATABASE_URL is unset; the integration
+      # and acceptance jobs below provide it.
       - name: Test
         run: bun test
+
+  integration:
+    name: Gated integration tests (compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: node@24
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Cache npm cache (eve agent installs)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
+          restore-keys: npm-eve-${{ runner.os }}-
+
+      - name: Compose up (postgres, minio, dex)
+        run: docker compose up -d --wait postgres minio dex && docker compose up -d minio-init && docker compose wait minio-init
+
+      # The world-isolation proof and the spike suites need the spike
+      # project's pinned @workflow/world-postgres install.
+      - name: Install spike agent project (mise node 24)
+        run: mise exec node@24 -- npm ci
+        working-directory: spike/agent-project
+
+      - name: Gated tests (apps + packages + spike)
+        env:
+          TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
+        run: bun test apps packages spike
+
+      - name: Compose down
+        if: always()
+        run: docker compose down -v
+
+  acceptance:
+    # Full compiler→build→run spine: real compile, mise-node24 npm install,
+    # eve build, tarball → MinIO, real worker + agent, mock-model turns.
+    # Slow on a cold npm cache — generous timeout.
+    name: Phase-1 acceptance (eve build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: node@24
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Cache npm cache (eve agent installs)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
+          restore-keys: npm-eve-${{ runner.os }}-
+
+      - name: Compose up (postgres, minio, dex)
+        run: docker compose up -d --wait postgres minio dex && docker compose up -d minio-init && docker compose wait minio-init
+
+      - name: Phase-1 acceptance
+        env:
+          TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
+          PHASE1_AGENT_ROOT: /tmp/invisible-string-p1-agents
+        run: bun test tests/integration/phase1-acceptance.test.ts
+
+      - name: Compose down
+        if: always()
+        run: docker compose down -v

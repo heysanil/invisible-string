@@ -2,7 +2,7 @@
 
 **Contract: ONE WORLD POSTGRES *DATABASE* PER WORKFLOW VERSION.**
 The generated project reads `WORKFLOW_POSTGRES_URL` **as-is**; the control
-plane provisions a dedicated database `world_v_<hash12>` (first 12 hex chars
+plane provisions a dedicated database `ws_v_<hash12>` (first 12 hex chars
 of the workflow-version hash) on the world Postgres server, runs the
 world-postgres bootstrap against it once, and passes a URL whose *database
 name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is set for
@@ -55,12 +55,15 @@ unit Postgres actually enforces and the only input world-postgres accepts.
 
 The **gated test proves the fix** (part 2): two databases on one server are
 bootstrapped; an active (`running`) row planted in A is invisible to B's
-`workflow_runs` — a booting agent pointed at its own `world_v_<hash12>`
+`workflow_runs` — a booting agent pointed at its own `ws_v_<hash12>`
 database can never see (or re-drive) another version's runs.
 
 ## Operational notes for the supervisor / build service (Phase-1/3 consumers)
 
-- Provision: `CREATE DATABASE "world_v_<hash12>"` (idempotent check first),
+- Naming + provisioning are implemented control-plane-side in
+  `apps/control-plane/src/build/world.ts` (`worldNameForHash` →
+  `ws_v_<first 12 hash chars>`); this document is the contract it satisfies.
+- Provision: `CREATE DATABASE "ws_v_<hash12>"` (idempotent check first),
   then `node_modules/@workflow/world-postgres/bin/setup.js` with
   `WORKFLOW_POSTGRES_URL` pointing at it (runs drizzle migrations + the
   graphile-worker bootstrap; safe to re-run).

@@ -205,14 +205,22 @@ class FakeWorker {
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // Internal plane: ensure-agent (shared secret).
-    const ensureMatch = path.match(/^\/internal\/agents\/([^/]+)\/ensure$/);
-    if (ensureMatch && req.method === "POST") {
-      if (req.headers.get("authorization") !== `Bearer ${WORKER_SHARED_SECRET}`) {
+    // Internal plane: ensure-agent (shared secret; the real worker contract —
+    // POST /internal/agents/ensure + x-worker-secret + {versionHash,...}).
+    if (path === "/internal/agents/ensure" && req.method === "POST") {
+      if (req.headers.get("x-worker-secret") !== WORKER_SHARED_SECRET) {
         return Response.json({ error: "bad shared secret" }, { status: 401 });
       }
-      const body = (await req.json()) as { artifactUrl: string; env: Record<string, string> };
-      this.ensureCalls.push({ hash: ensureMatch[1]!, ...body });
+      const body = (await req.json()) as {
+        versionHash: string;
+        artifactUrl: string;
+        env: Record<string, string>;
+      };
+      this.ensureCalls.push({
+        hash: body.versionHash,
+        artifactUrl: body.artifactUrl,
+        env: body.env,
+      });
       return Response.json({ ok: true });
     }
 

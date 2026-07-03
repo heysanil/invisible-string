@@ -1,5 +1,3 @@
-import { z } from "zod";
-
 /**
  * Shared contracts package — single source of truth for:
  * - `TriggerEvent` (the normalized trigger envelope, spec §8)
@@ -15,11 +13,3 @@ export * from "./trigger-event";
 export * from "./workflow-definition";
 
 export const SHARED_PACKAGE = "@invisible-string/shared";
-
-/** @deprecated Phase-0 scaffold; remove once packages/compiler stops importing it. */
-export const placeholderSchema = z.object({
-  ok: z.literal(true),
-});
-
-/** @deprecated Phase-0 scaffold; remove once packages/compiler stops importing it. */
-export type Placeholder = z.infer<typeof placeholderSchema>;

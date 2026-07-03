@@ -2,12 +2,12 @@
  * HTTP client for worker-hosted agents.
  *
  * Two planes:
- * - INTERNAL (shared-secret): `POST <worker>/internal/agents/:hash/ensure`
- *   asks the supervisor to have the agent for `hash` running (pull+extract
- *   artifact, spawn `eve start`, wait healthy). Idempotent.
- *   NOTE(integration): this request/response contract is defined here and
- *   must be reconciled with apps/worker's supervisor when it lands — the
- *   worker builder runs in parallel. Shape: { artifactUrl, env } → 200.
+ * - INTERNAL (shared-secret): `POST <worker>/internal/agents/ensure` with
+ *   `{versionHash, artifactUrl, env}` and the `x-worker-secret` header asks
+ *   the supervisor to have the agent for `versionHash` running (pull+extract
+ *   artifact, spawn the agent server, wait healthy). Idempotent. This is the
+ *   contract apps/worker/src/server.ts actually serves (reconciled at the
+ *   Integrate stage; see docs/runtime-worker-contract.md).
  * - AGENT PROXY (platform JWT): `<worker>/agents/:hash/eve/v1/...` forwards
  *   to the agent's eve channel routes (the worker proxy forwards BOTH /eve/
  *   and /.well-known/workflow/ under /agents/:hash/).
@@ -100,14 +100,14 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
   return {
     async ensureAgent(workerAddress, contentHash, request) {
       const res = await doFetch(
-        `${workerAddress.replace(/\/+$/, "")}/internal/agents/${contentHash}/ensure`,
+        `${workerAddress.replace(/\/+$/, "")}/internal/agents/ensure`,
         {
           method: "POST",
           headers: {
-            authorization: `Bearer ${options.workerSharedSecret}`,
+            "x-worker-secret": options.workerSharedSecret,
             "content-type": "application/json",
           },
-          body: JSON.stringify(request),
+          body: JSON.stringify({ versionHash: contentHash, ...request }),
           signal: AbortSignal.timeout(timeoutMs),
         },
       );

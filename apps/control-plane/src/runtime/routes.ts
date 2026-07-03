@@ -37,6 +37,7 @@ import {
 
 import type { Db } from "../db";
 import type { ArtifactStore } from "../artifacts";
+import { slugifyName } from "../build/compiler-adapter";
 import type { BuildService, BuildStore } from "../build/service";
 import {
   WorkflowCompileError,
@@ -64,6 +65,7 @@ import {
 } from "./model-resolution";
 import { selectWorker } from "./scheduler";
 import type { WorkerClient } from "./worker-client";
+import { workerRegistryPlugin } from "./workers";
 
 export interface RuntimeDeps {
   db: Db;
@@ -181,6 +183,8 @@ interface CompileInputs {
   model: ResolvedModel;
   connections: CompileConnection[];
   skills: CompileSkill[];
+  /** Slugified organization slug — baked into the generated project. */
+  workspaceSlug: string;
 }
 
 /**
@@ -201,6 +205,13 @@ async function resolveCompileInputs(
     definition.agent.agentPresetId,
   );
   const model = resolveModel(definition.agent, data);
+
+  const orgRows = await db
+    .select({ slug: schema.organization.slug })
+    .from(schema.organization)
+    .where(eq(schema.organization.id, organizationId))
+    .limit(1);
+  const workspaceSlug = slugifyName(orgRows[0]?.slug ?? "") || "workspace";
 
   const connections: CompileConnection[] = [];
   for (const id of definition.context.mcpConnectionIds) {
@@ -248,13 +259,14 @@ async function resolveCompileInputs(
     });
   }
 
-  return { model, connections, skills };
+  return { model, connections, skills, workspaceSlug };
 }
 
 function compileOrThrow(
   compile: CompileWorkflowFn,
   definition: WorkflowDefinition,
   inputs: CompileInputs,
+  workflowName: string,
 ): CompileResult {
   try {
     return compile({
@@ -262,6 +274,8 @@ function compileOrThrow(
       model: inputs.model,
       connections: inputs.connections,
       skills: inputs.skills,
+      workspaceSlug: inputs.workspaceSlug,
+      workflowSlug: slugifyName(workflowName) || "workflow",
     });
   } catch (error) {
     if (error instanceof WorkflowCompileError) {
@@ -417,6 +431,12 @@ export function runtimePlugin(deps: RuntimeDeps) {
   const { db, runtime } = deps;
 
   return new Elysia({ name: "runtime" })
+    .use(
+      workerRegistryPlugin({
+        db,
+        workerSharedSecret: runtime.workerSharedSecret,
+      }),
+    )
     .use(workspacePlugin(deps.workspaceDeps))
     .onError(({ error, set }) => {
       if (isRuntimeApiError(error)) {
@@ -425,6 +445,42 @@ export function runtimePlugin(deps: RuntimeDeps) {
       }
       return undefined;
     })
+
+    // ── create workflow (minimal REST create; full CRUD lands in Phase 2) ──
+    .post(
+      "/workspaces/:workspaceId/workflows",
+      async ({ workspace, body, set }) => {
+        const raw = body as { name?: unknown; draft?: unknown } | null;
+        if (
+          typeof raw?.name !== "string" ||
+          raw.name.trim() === "" ||
+          typeof raw.draft !== "object" ||
+          raw.draft === null
+        ) {
+          throw new RuntimeApiError(
+            422,
+            "invalid_body",
+            "expected { name: string, draft: object } (draft is stored as-is; it is validated at publish)",
+          );
+        }
+        const rows = await db
+          .insert(schema.workflows)
+          .values({
+            organizationId: workspace.organizationId,
+            name: raw.name.trim(),
+            runAsUserId: workspace.userId,
+            draft: raw.draft as Record<string, unknown>,
+          })
+          .returning({
+            id: schema.workflows.id,
+            name: schema.workflows.name,
+            runAsUserId: schema.workflows.runAsUserId,
+          });
+        set.status = 201;
+        return { workflow: rows[0]! };
+      },
+      { requireWorkspace: true },
+    )
 
     // ── publish ────────────────────────────────────────────────────────────
     .post(
@@ -442,7 +498,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workflow.runAsUserId,
           definition,
         );
-        const compiled = compileOrThrow(deps.compile, definition, inputs);
+        const compiled = compileOrThrow(deps.compile, definition, inputs, workflow.name);
 
         // Idempotent by content hash: an existing version of this workflow
         // with the same hash is re-published, not duplicated.
@@ -529,7 +585,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
             workflow.runAsUserId,
             definition,
           );
-          const compiled = compileOrThrow(deps.compile, definition, inputs);
+          const compiled = compileOrThrow(deps.compile, definition, inputs, workflow.name);
           return { ok: true as const, contentHash: compiled.hash };
         } catch (error) {
           // Compile/validation problems are the PAYLOAD of a dry run, not a

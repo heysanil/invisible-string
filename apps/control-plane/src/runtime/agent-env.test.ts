@@ -17,6 +17,7 @@ const RUNTIME: RuntimeConfig = {
   openrouterApiKey: "or-key",
   anthropicApiKey: "an-key",
   openrouterBaseUrl: undefined,
+  mockAuthoredModels: false,
   maxRunWallClockMs: 600_000,
   maxConcurrentRunsPerWorkspace: 5,
   workerHeartbeatTtlMs: 30_000,

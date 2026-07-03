@@ -1,0 +1,266 @@
+/* ----------------------------------------------------------------------------
+   invisible-string · E1 theme — monochrome ink × liquid glass
+   Design tokens + glass primitives. Source of truth: docs/PLAN.md §E1 tokens.
+---------------------------------------------------------------------------- */
+
+:root {
+  /* Ink scale — the only "chrome" colors in the system */
+  --ink: #111111;
+  --ink-2: #555555;
+  --ink-3: #777777;
+  --ink-4: #999999;
+  --hairline: rgba(0, 0, 0, 0.06);
+  --chip: rgba(0, 0, 0, 0.08);
+
+  /* Semantic color — color is meaning, never decoration */
+  --ok: #16a34a;
+  --warn: #f59e0b;
+  --err: #dc2626;
+
+  /* Wallpaper wash */
+  --wash: linear-gradient(135deg, #eef0f4, #e8eaef, #f0eeea);
+  --blob-1: #d7dbe3;
+  --blob-2: #e3ded4;
+  --blob-3: #cfd4de;
+
+  /* Liquid glass */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-bg-soft: rgba(255, 255, 255, 0.5);
+  --glass-border: rgba(255, 255, 255, 0.7);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --glass-blur: 24px;
+  --surface-solid: #f7f7f7;
+
+  /* Radii */
+  --radius-panel: 20px;
+  --radius-panel-sm: 18px;
+  --radius-card: 12px;
+  --radius-card-lg: 14px;
+  --radius-capsule: 999px;
+
+  /* Motion */
+  --dur: 180ms;
+  --dur-fast: 150ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+  }
+
+  ::selection {
+    background: rgba(17, 17, 17, 0.88);
+    color: #ffffff;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* --- Glass surfaces ----------------------------------------------------- */
+  .glass-panel {
+    position: relative;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--glass-shadow), var(--glass-highlight);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+    backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  }
+
+  .glass-dock {
+    background: var(--glass-bg-soft);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-capsule);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12), var(--glass-highlight);
+    -webkit-backdrop-filter: blur(28px) saturate(140%);
+    backdrop-filter: blur(28px) saturate(140%);
+  }
+
+  .capsule {
+    border-radius: var(--radius-capsule);
+  }
+
+  /* --- Wallpaper wash ------------------------------------------------------ */
+  .wash {
+    position: fixed;
+    inset: 0;
+    z-index: -10;
+    overflow: hidden;
+    pointer-events: none;
+    background: var(--wash);
+  }
+
+  .wash-blob {
+    position: absolute;
+    border-radius: var(--radius-capsule);
+    filter: blur(90px);
+    opacity: 0.8;
+  }
+
+  .wash-blob-1 {
+    width: 55vw;
+    height: 55vw;
+    top: -18vw;
+    left: -14vw;
+    background: radial-gradient(circle at 35% 35%, var(--blob-1) 0%, transparent 70%);
+  }
+
+  .wash-blob-2 {
+    width: 50vw;
+    height: 50vw;
+    right: -12vw;
+    bottom: -16vw;
+    background: radial-gradient(circle at 60% 60%, var(--blob-2) 0%, transparent 70%);
+  }
+
+  .wash-blob-3 {
+    width: 42vw;
+    height: 42vw;
+    top: 30%;
+    left: 52%;
+    background: radial-gradient(circle at 50% 50%, var(--blob-3) 0%, transparent 70%);
+  }
+
+  /* --- Interaction polish --------------------------------------------------- */
+  .lift {
+    transition:
+      transform var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out),
+      background-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out),
+      opacity var(--dur-fast) var(--ease-out);
+  }
+
+  .lift:hover {
+    transform: translateY(-1px);
+  }
+
+  .lift:active {
+    transform: translateY(0);
+  }
+
+  @keyframes panel-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .panel-enter {
+    animation: panel-in 240ms var(--ease-out) both;
+  }
+
+  /* --- Tooltip (ink capsule) ------------------------------------------------ */
+  .tooltip {
+    position: absolute;
+    z-index: 60;
+    left: calc(100% + 12px);
+    top: 50%;
+    transform: translateY(-50%) translateX(-4px);
+    padding: 4px 11px;
+    border-radius: var(--radius-capsule);
+    background: var(--ink);
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition:
+      opacity var(--dur-fast) var(--ease-out),
+      transform var(--dur-fast) var(--ease-out);
+  }
+
+  .tooltip-wrap:hover > .tooltip,
+  .tooltip-wrap:focus-within > .tooltip {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+    transition-delay: 120ms;
+  }
+
+  /* --- Small primitives ------------------------------------------------------ */
+  @keyframes spinner-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .spinner {
+    display: inline-block;
+    border-radius: 50%;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    animation: spinner-spin 0.7s linear infinite;
+  }
+
+  /* Future tool names / @refs — ink on 8% black chips, ui-monospace */
+  .mono-chip {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.85em;
+    background: var(--chip);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 0.1em 0.45em;
+  }
+}
+
+/* --- Resilience fallbacks (unlayered so they always win) ------------------- */
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-panel,
+  .glass-dock {
+    background: var(--surface-solid);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass-panel,
+  .glass-dock {
+    background: var(--surface-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .wash-blob {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

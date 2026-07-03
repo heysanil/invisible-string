@@ -32,6 +32,7 @@ import {
   type EveInputResponse,
   type PublishWorkflowResponse,
   type RunDto,
+  type Logger,
   type TriggerEvent,
   type WorkflowDefinition,
   type MasterKey,
@@ -64,6 +65,11 @@ import {
   resolveModel,
   type ModelProvider,
 } from "./model-resolution";
+import {
+  createDrizzleMetricsReader,
+  metricsPlugin,
+  type MetricsRegistry,
+} from "./metrics";
 import { selectWorker } from "./scheduler";
 import type { WorkerClient } from "./worker-client";
 import { workerRegistryPlugin } from "./workers";
@@ -81,6 +87,10 @@ export interface RuntimeDeps {
   runStore: RunStore;
   bus: RunEventBus;
   tailers: RunTailerManager;
+  /** In-process fleet metrics (GET /internal/metrics). */
+  metrics: MetricsRegistry;
+  /** Structured, redaction-safe logger (correlation ids threaded per call). */
+  logger: Logger;
 }
 
 // ── row loading + ownership ─────────────────────────────────────────────────
@@ -380,6 +390,14 @@ export function runtimePlugin(deps: RuntimeDeps) {
         allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
       }),
     )
+    // GET /internal/metrics — worker-plane-guarded fleet snapshot.
+    .use(
+      metricsPlugin({
+        registry: deps.metrics,
+        reader: createDrizzleMetricsReader(db),
+        workerSharedSecret: runtime.workerSharedSecret,
+      }),
+    )
     .use(workspacePlugin(deps.workspaceDeps))
     .onError(({ error, set }) => {
       if (isRuntimeApiError(error)) {
@@ -455,7 +473,11 @@ export function runtimePlugin(deps: RuntimeDeps) {
           compiled.hash,
           compiled.files,
         );
-        buildPromise.catch(() => {}); // outcome is persisted; never unhandled
+        // Outcome is persisted; never leave the promise unhandled. Feed the
+        // build-cache hit-rate gauge from the resolved outcome (hit vs fresh).
+        buildPromise
+          .then((outcome) => deps.metrics.recordBuildCache(outcome.cached))
+          .catch(() => {});
 
         let buildStatus: PublishWorkflowResponse["buildStatus"] = "building";
         let cached = false;
@@ -538,6 +560,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
       "/workspaces/:workspaceId/workflows/:wfId/sessions",
       async ({ workspace, params, body, set }) => {
         const { message } = parseBody(createSessionRequestSchema, body);
+        deps.metrics.recordTrigger("manual", "received");
         const workflow = await loadWorkflowOwned(
           db,
           workspace.organizationId,
@@ -608,6 +631,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
             message,
           );
         } catch (error) {
+          deps.metrics.recordTrigger("manual", "failed");
           await failDispatch(deps, run.id, error, { failSessionId: session.id });
           throw error; // unreachable — failDispatch always throws
         }
@@ -623,6 +647,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         session.continuationToken = created.continuationToken;
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
+        deps.metrics.recordTrigger("manual", "dispatched");
 
         set.status = 201;
         return { session: sessionDto(session), run: runDto(run) };
@@ -635,6 +660,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
       "/sessions/:sessionId/messages",
       async ({ workspace, params, body, set }) => {
         const { message } = parseBody(postMessageRequestSchema, body);
+        deps.metrics.recordTrigger("manual", "received");
         const session = await loadSessionOwned(
           db,
           workspace.organizationId,
@@ -708,6 +734,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
             { continuationToken, message },
           );
         } catch (error) {
+          deps.metrics.recordTrigger("manual", "failed");
           await failDispatch(deps, run.id, error);
           throw error; // unreachable — failDispatch always throws
         }
@@ -723,6 +750,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           .where(eq(schema.agentSessions.id, session.id));
 
         startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
+        deps.metrics.recordTrigger("manual", "dispatched");
 
         set.status = 201;
         return { run: runDto(run) };

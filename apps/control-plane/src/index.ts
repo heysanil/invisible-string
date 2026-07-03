@@ -11,11 +11,18 @@
  * (build/compiler-adapter.ts).
  */
 import { cors } from "@elysiajs/cors";
+import { eq } from "drizzle-orm";
 import { Elysia } from "elysia";
+import { schema } from "@invisible-string/db";
+import type { Logger } from "@invisible-string/shared";
 
 import { createAuth, type Auth } from "./auth";
 import { loadConfig, type Config } from "./config";
 import { createDb, type DbHandle } from "./db";
+import { healthPlugin, type DeepHealthDeps } from "./health";
+import { createLogger } from "./log";
+import { isWorkerLive } from "./runtime/scheduler";
+import { MetricsRegistry } from "./runtime/metrics";
 import {
   createArtifactStore,
   type ArtifactStore,
@@ -56,6 +63,8 @@ export interface AppStack {
   auth: Auth;
   config: Config;
   dbHandle: DbHandle;
+  /** Process-wide structured logger (redaction-safe). */
+  logger: Logger;
   /** Present when the runtime API is configured (see runtime/config.ts). */
   runtime: RuntimeDeps | null;
   close(): Promise<void>;
@@ -79,6 +88,8 @@ export function buildApp(opts: {
   workspaceDeps: WorkspaceDeps;
   resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
+  /** Deep-health probes for `GET /api/health?deep=1` (absent ⇒ shallow only). */
+  health?: DeepHealthDeps;
 }) {
   const { config, auth, workspaceDeps, resourceDeps } = opts;
   const app = new Elysia()
@@ -106,7 +117,10 @@ export function buildApp(opts: {
     // Better Auth owns everything under its basePath (/api/auth).
     .mount(auth.handler)
     .use(workspacePlugin(workspaceDeps))
-    .get("/api/health", () => ({ ok: true }))
+    // Liveness by default (`{ ok: true }`, no IO). `?deep=1` runs the readiness
+    // probe (DB + object store + a live worker) and answers 503 when any
+    // dependency is degraded, so a load balancer drains this instance.
+    .use(healthPlugin(opts.health))
     // Phase-2 product CRUD (works without the runtime env; skill uploads that
     // need the object store fail cleanly when it is unconfigured).
     .use(resourcesPlugin(resourceDeps));
@@ -122,9 +136,10 @@ export function createRuntimeDeps(opts: {
   config: Config;
   db: DbHandle["db"];
   workspaceDeps: WorkspaceDeps;
+  logger: Logger;
   overrides?: RuntimeOverrides;
 }): RuntimeDeps | null {
-  const { env, config, db, workspaceDeps, overrides } = opts;
+  const { env, config, db, workspaceDeps, logger, overrides } = opts;
   const runtime = overrides?.runtimeConfig ?? tryLoadRuntimeConfig(env);
   if (!runtime) return null;
 
@@ -159,10 +174,19 @@ export function createRuntimeDeps(opts: {
     });
   const runStore = createDrizzleRunStore(db);
   const bus = new RunEventBus();
+  const metrics = new MetricsRegistry();
   const tailers = new RunTailerManager({
     store: runStore,
     bus,
     maxWallClockMs: runtime.maxRunWallClockMs,
+    logger,
+    // Feed the run-duration histogram from every completed run (parked
+    // `waiting` runs are not finished, so they are excluded).
+    onFinish: ({ status, durationMs }) => {
+      if (status === "succeeded" || status === "failed" || status === "canceled") {
+        metrics.recordRunDuration(durationMs);
+      }
+    },
   });
 
   return {
@@ -178,7 +202,27 @@ export function createRuntimeDeps(opts: {
     runStore,
     bus,
     tailers,
+    metrics,
+    logger,
   };
+}
+
+/** Count workers eligible to take work right now (deep-health probe). */
+async function countLiveWorkers(
+  db: DbHandle["db"],
+  heartbeatTtlMs: number,
+  now: Date = new Date(),
+): Promise<number> {
+  const rows = await db
+    .select({
+      id: schema.workers.id,
+      address: schema.workers.address,
+      status: schema.workers.status,
+      lastHeartbeatAt: schema.workers.lastHeartbeatAt,
+    })
+    .from(schema.workers)
+    .where(eq(schema.workers.status, "live"));
+  return rows.filter((row) => isWorkerLive(row, now, heartbeatTtlMs)).length;
 }
 
 /** Construct the full stack from environment configuration. */
@@ -187,6 +231,7 @@ export function createAppStack(
   runtimeOverrides?: RuntimeOverrides,
 ): AppStack {
   const config = loadConfig(env);
+  const logger = createLogger({ env });
   const dbHandle = createDb(config.databaseUrl);
   const auth = createAuth(config, dbHandle.db);
   const workspaceDeps = createWorkspaceDeps(auth, dbHandle.db);
@@ -195,6 +240,7 @@ export function createAppStack(
     config,
     db: dbHandle.db,
     workspaceDeps,
+    logger,
     overrides: runtimeOverrides,
   });
   const resourceDeps: ResourceDeps = {
@@ -209,12 +255,41 @@ export function createAppStack(
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
   };
-  const app = buildApp({ config, auth, workspaceDeps, resourceDeps, runtimeDeps });
+  // Deep-health probes: DB always; object store + live-worker count only when
+  // the runtime is configured (a Phase-0-style boot degrades to the DB check).
+  const health: DeepHealthDeps = {
+    pingDb: async () => {
+      await dbHandle.sql`select 1`;
+    },
+    ...(runtimeDeps
+      ? {
+          pingObjectStore: async () => {
+            // `exists` on a probe key round-trips to the store; a missing key
+            // returns false (reachable = healthy), an unreachable store throws.
+            await runtimeDeps.artifacts.exists("artifacts/__health_probe__");
+          },
+          countLiveWorkers: () =>
+            countLiveWorkers(
+              dbHandle.db,
+              runtimeDeps.runtime.workerHeartbeatTtlMs,
+            ),
+        }
+      : {}),
+  };
+  const app = buildApp({
+    config,
+    auth,
+    workspaceDeps,
+    resourceDeps,
+    runtimeDeps,
+    health,
+  });
   return {
     app,
     auth,
     config,
     dbHandle,
+    logger,
     runtime: runtimeDeps,
     close: async () => {
       await runtimeDeps?.tailers.stopAll();
@@ -225,6 +300,7 @@ export function createAppStack(
 
 if (import.meta.main) {
   const stack = createAppStack();
+  const { logger } = stack;
   // Cap the request body at the transport (Bun.serve) so oversized uploads are
   // refused before buffering — the largest legitimate body is a skill
   // attachment (see resources/plugin.ts SKILL_UPLOAD_MAX_BODY_BYTES).
@@ -232,22 +308,58 @@ if (import.meta.main) {
     port: stack.config.port,
     maxRequestBodySize: 8 * 1024 * 1024,
   });
-  console.log(
-    `control-plane listening on :${stack.config.port}${stack.runtime ? " (runtime API enabled)" : " (runtime API disabled — set WORLD_DATABASE_URL/PLATFORM_JWT_SECRET/WORKER_SHARED_SECRET/S3_*)"}`,
-  );
+  // One structured "ready" line with the resolved config. `fields` is
+  // redaction-safe — every value here is non-secret, and the logger scrubs
+  // anything secret-shaped as a backstop (never the auth/encryption secrets).
+  logger.info("control-plane.ready", {
+    msg: `control-plane listening on :${stack.config.port}`,
+    fields: {
+      port: stack.config.port,
+      runtimeApi: stack.runtime !== null,
+      corsOrigins: stack.config.corsOrigins,
+      requireEmailVerification: stack.config.requireEmailVerification,
+      hstsEnabled: stack.config.hstsEnabled,
+      encryptionConfigured: stack.config.encryptionMasterKey !== undefined,
+    },
+  });
+
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
     // they hold cap slots and hang SSE streams forever otherwise.
     void reconcileInterruptedRuns(stack.runtime)
       .then(({ resumed, failed }) => {
         if (resumed > 0 || failed > 0) {
-          console.log(
-            `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s)`,
-          );
+          logger.info("run.reconciled", {
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s)`,
+            fields: { resumed, failed },
+          });
         }
       })
       .catch((error) => {
-        console.error("run reconciliation failed:", error);
+        logger.error("run.reconcile_failed", { err: error });
       });
   }
+
+  // Graceful shutdown (SIGTERM/SIGINT): stop accepting new connections, drain
+  // live NDJSON tailers, and close the Postgres pool (stack.close). Idempotent.
+  let shuttingDown = false;
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info("control-plane.shutdown", {
+      msg: `${signal} — draining`,
+      fields: { signal },
+    });
+    stack.app.server?.stop();
+    void stack
+      .close()
+      .catch((error) => {
+        logger.error("control-plane.shutdown_failed", { err: error });
+      })
+      .finally(() => {
+        process.exit(0);
+      });
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }

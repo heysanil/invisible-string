@@ -122,4 +122,45 @@ the default in `createAppStack`); tests inject stubs.
 `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_BASE_URL`,
 `MAX_RUN_WALL_CLOCK_MS` (default 600000), `MAX_CONCURRENT_RUNS_PER_WORKSPACE`
 (default 5), `WORKER_HEARTBEAT_TTL_MS` (default 30000), `NPM_CACHE_DIR`,
-`AGENT_BUILD_ROOT` (default `/var/lib/agents`), `SSE_HEARTBEAT_MS`.
+`AGENT_BUILD_ROOT` (default `/var/lib/agents`), `SSE_HEARTBEAT_MS`,
+`LOG_LEVEL` (debug|info|warn|error, default info).
+
+## Observability (docs/PLAN.md Phase 3 task 5)
+
+**Structured logs.** Both planes emit one JSON object per line via the shared
+core (`createStructuredLogger`, `packages/shared/src/observability.ts`) wrapped
+by each app's `src/log.ts` sink. Every line carries `at`, `level`, `event`
+(stable `<area>.<verb>` slug), an optional `msg`, the correlation ids it knows
+(`workspaceId`/`workflowId`/`workflowVersionId`/`sessionId`/`runId`/`workerId`),
+and a redaction-safe `fields` object. **Secrets discipline:** the logger runs a
+mandatory redaction pass over `fields` — any secret-shaped key (`*token*`,
+`*secret*`, `*apikey*`, `authorization`, `*credential*`, …) is replaced with
+`[redacted]` at any nesting depth, and URL credentials (`scheme://user:pass@`)
+are stripped from every string value. The worker routes its legacy
+`log(message)` calls through `stringLogAdapter` so all internal lines are JSON.
+Startup emits ONE `*.ready` line with the resolved (non-secret) config.
+
+**Control-plane `GET /internal/metrics`** (guarded by the same timing-safe
+`x-worker-secret` as the rest of `/internal/*`; NEVER public). Body is the
+shared `InternalMetricsResponse`: `queueDepth`, `activeRuns`, `runsByStatus`,
+`activeSessions`, a run-duration histogram (`runDuration`, bucket edges in ms),
+`workers[]` fleet utilization (running/max agents, `utilization` = running/max),
+per-trigger-type `triggers{received,dispatched,failed}`, and
+`buildCache{hits,misses,hitRate}`. In-memory counters (no Prometheus dep; reset
+on restart), fed by the dispatch path (trigger counts), the run tailer
+(durations), and publish (cache hits). `?format=text` (or `Accept: text/plain`)
+returns a minimal Prometheus-style exposition (`is_*` metric names) instead of
+JSON.
+
+**Health.** Control-plane `GET /api/health` → `{ ok: true }` (liveness, no IO);
+`GET /api/health?deep=1` runs a readiness probe over Postgres + object store +
+a live worker and answers **503** with per-check detail when any dependency is
+degraded (skipped checks — runtime unconfigured — never fail the probe). Worker
+`GET /internal/health` (guarded) → `{ ok, ready, draining, runningAgents,
+sandboxCount, at }`: a draining worker is alive (200) but `ready:false`.
+Worker `GET /internal/status` gains a `metrics` block (`runningAgents`,
+`sandboxCount`, `maxAgents`, `activeRequests`, `cacheBytes`, `cacheMaxBytes`).
+
+**Lifecycle.** Both planes handle SIGTERM/SIGINT: the control plane stops
+accepting connections, drains live NDJSON tailers, and closes the Postgres
+pool; the worker drains in-flight proxied requests then deregisters.

@@ -7,9 +7,12 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 
+import type { Logger } from "@invisible-string/shared";
+
 import { createAgentManager, type AgentManager } from "./agents";
 import { createArtifactCache, type ArtifactCache } from "./cache";
 import type { WorkerConfig } from "./config";
+import { createLogger, stringLogAdapter } from "./log";
 import { createPortPool, type PortPool } from "./ports";
 import { createRegistration, type Registration } from "./registration";
 import { createWorkerServer, type WorkerServer } from "./server";
@@ -17,6 +20,8 @@ import { createWorkerServer, type WorkerServer } from "./server";
 export interface Supervisor {
   readonly config: WorkerConfig;
   readonly server: WorkerServer;
+  /** Structured logger bound to this worker's id (lifecycle events). */
+  readonly logger: Logger;
   /** Local base URL of this worker's HTTP surface (tests use this). */
   readonly url: string;
   /**
@@ -40,10 +45,16 @@ export interface Supervisor {
   stop(): Promise<void>;
 }
 
-export function createSupervisor(config: WorkerConfig): Supervisor {
-  const log = (message: string): void => {
-    console.log(`[worker ${config.workerId}] ${message}`);
-  };
+export function createSupervisor(
+  config: WorkerConfig,
+  options: { logger?: Logger } = {},
+): Supervisor {
+  // Bind the worker id to every line; the string adapter upgrades the many
+  // detailed internal log calls (agents/cache/registration/proxy) to
+  // structured JSON without touching each call site. Redaction runs in the
+  // logger core, so a stray secret in a message is scrubbed.
+  const logger = options.logger ?? createLogger({ base: { workerId: config.workerId } });
+  const log = stringLogAdapter(logger);
 
   mkdirSync(config.artifactCacheDir, { recursive: true });
 
@@ -116,6 +127,7 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
   return {
     config,
     server,
+    logger,
     url: server.url,
     callbackToken,
     agents,

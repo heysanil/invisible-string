@@ -156,6 +156,222 @@ export function makeLogEvent(input: MakeLogEventInput): StructuredLogEvent {
   return base;
 }
 
+// ── Redaction (secrets discipline) ───────────────────────────────────────────
+
+/** What a redacted value is replaced with. */
+export const REDACTION_PLACEHOLDER = "[redacted]";
+
+/**
+ * Lower-cased substrings that mark a field KEY as secret-bearing. Matched as a
+ * substring of the lower-cased key, so `apiKey`, `MCP_TOKEN`, `x-worker-secret`
+ * all trip. Kept deliberately specific — `authorization`/`bearer` rather than a
+ * bare `auth` — so legitimate correlation-ish keys (`author`, `oauthProvider`)
+ * are NOT scrubbed. The platform's correlation ids (workspaceId, workflowId,
+ * sessionId, runId, workerId) contain none of these substrings.
+ */
+export const SECRET_FIELD_PATTERNS = [
+  "password",
+  "passwd",
+  "passphrase",
+  "secret",
+  "token", // apiToken, continuationToken, x-worker-token, csrfToken…
+  "apikey",
+  "api_key",
+  "accesskey",
+  "access_key",
+  "privatekey",
+  "private_key",
+  "signingkey",
+  "signing_key",
+  "credential",
+  "authorization",
+  "bearer",
+  "cookie",
+  "session_token",
+  "encryptionkey",
+  "encryption_key",
+  "jwt",
+] as const;
+
+/** True when a field key names a secret (see {@link SECRET_FIELD_PATTERNS}). */
+export function isSecretFieldKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return SECRET_FIELD_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
+ * Strip the `user:pass@` userinfo out of any URL-shaped string value so
+ * connection strings (`postgres://u:p@host/db`, `redis://…`) never leak their
+ * password even when their field key is innocuous (`worldUrl`, `address`).
+ */
+export function redactUrlCredentials(value: string): string {
+  return value.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)([^@/\s]+)@/gi, `$1${REDACTION_PLACEHOLDER}@`);
+}
+
+/**
+ * Deep-copy `fields`, replacing any value under a secret-shaped key (at any
+ * nesting depth) with {@link REDACTION_PLACEHOLDER}, and scrubbing URL
+ * credentials from every surviving string. Pure — never mutates its input.
+ * This is the last line of defense: emitters should not put secrets in
+ * `fields` at all (see module doc), but a redaction pass guarantees it.
+ */
+export function redactLogFields(
+  fields: Record<string, LogFieldValue>,
+): Record<string, LogFieldValue> {
+  const out: Record<string, LogFieldValue> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    out[key] = isSecretFieldKey(key)
+      ? REDACTION_PLACEHOLDER
+      : redactLogValue(value);
+  }
+  return out;
+}
+
+function redactLogValue(value: LogFieldValue): LogFieldValue {
+  if (typeof value === "string") return redactUrlCredentials(value);
+  if (Array.isArray(value)) return value.map(redactLogValue);
+  if (value !== null && typeof value === "object") {
+    const out: { [key: string]: LogFieldValue } = {};
+    for (const [key, nested] of Object.entries(value)) {
+      out[key] = isSecretFieldKey(key)
+        ? REDACTION_PLACEHOLDER
+        : redactLogValue(nested);
+    }
+    return out;
+  }
+  return value;
+}
+
+// ── Structured logger (impl-agnostic core; app sinks in apps/*/src/log.ts) ────
+
+export const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
+/** Where a formed, already-redacted log event goes (stdout writer, buffer…). */
+export type LoggerSink = (event: StructuredLogEvent) => void;
+
+/** Correlation ids + free-form fields a logger can be bound to. */
+export interface LogBindings extends LogCorrelation {
+  fields?: Record<string, LogFieldValue>;
+}
+
+export interface LogOptions extends LogCorrelation {
+  msg?: string;
+  /** Duration of the operation this line reports on (ms). */
+  durationMs?: number;
+  fields?: Record<string, LogFieldValue>;
+  /**
+   * Convenience: fold an error's name + message into `fields` (never its
+   * stack — stacks routinely embed interpolated secrets). Redaction still runs
+   * over the resulting message.
+   */
+  err?: unknown;
+}
+
+export interface Logger {
+  emit(level: LogLevel, event: LogEventName, options?: LogOptions): void;
+  debug(event: LogEventName, options?: LogOptions): void;
+  info(event: LogEventName, options?: LogOptions): void;
+  warn(event: LogEventName, options?: LogOptions): void;
+  error(event: LogEventName, options?: LogOptions): void;
+  /** Derive a logger carrying additional bound ids/fields (base is inherited). */
+  child(bindings: LogBindings): Logger;
+}
+
+export interface CreateLoggerOptions {
+  sink: LoggerSink;
+  base?: LogBindings;
+  /** Lines below this level are dropped (default `info`). */
+  minLevel?: LogLevel;
+  /** Injected clock (tests). */
+  now?: () => Date;
+}
+
+const CORRELATION_KEYS = [
+  "workspaceId",
+  "workflowId",
+  "workflowVersionId",
+  "sessionId",
+  "runId",
+  "workerId",
+] as const;
+
+function pickCorrelation(source: LogCorrelation): LogCorrelation {
+  const out: LogCorrelation = {};
+  for (const key of CORRELATION_KEYS) {
+    const value = source[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * The portable logger core: merges base + per-call correlation ids and fields,
+ * folds in `durationMs`/`err`, runs {@link redactLogFields}, and hands a formed
+ * {@link StructuredLogEvent} to `sink`. No process/IO coupling — apps wrap it
+ * with a stdout JSON sink (each app's `src/log.ts`). Fully unit-testable via a
+ * capturing sink.
+ */
+export function createStructuredLogger(options: CreateLoggerOptions): Logger {
+  const { sink } = options;
+  const minPriority = LOG_LEVEL_PRIORITY[options.minLevel ?? "info"];
+  const now = options.now ?? (() => new Date());
+  const baseCorrelation = pickCorrelation(options.base ?? {});
+  const baseFields = options.base?.fields ?? {};
+
+  function emit(level: LogLevel, event: LogEventName, opts: LogOptions = {}): void {
+    if (LOG_LEVEL_PRIORITY[level] < minPriority) return;
+
+    const mergedFields: Record<string, LogFieldValue> = {
+      ...baseFields,
+      ...(opts.fields ?? {}),
+    };
+    if (opts.durationMs !== undefined) mergedFields.durationMs = opts.durationMs;
+    if (opts.err !== undefined) {
+      const err = opts.err;
+      mergedFields.error = err instanceof Error ? err.message : String(err);
+      if (err instanceof Error && err.name) mergedFields.errorName = err.name;
+    }
+    const redacted = redactLogFields(mergedFields);
+
+    sink(
+      makeLogEvent({
+        ...baseCorrelation,
+        ...pickCorrelation(opts),
+        level,
+        event,
+        msg: opts.msg,
+        fields: redacted,
+        at: now(),
+      }),
+    );
+  }
+
+  return {
+    emit,
+    debug: (event, opts) => emit("debug", event, opts),
+    info: (event, opts) => emit("info", event, opts),
+    warn: (event, opts) => emit("warn", event, opts),
+    error: (event, opts) => emit("error", event, opts),
+    child(bindings: LogBindings): Logger {
+      return createStructuredLogger({
+        sink,
+        minLevel: options.minLevel,
+        now,
+        base: {
+          ...baseCorrelation,
+          ...pickCorrelation(bindings),
+          fields: { ...baseFields, ...(bindings.fields ?? {}) },
+        },
+      });
+    },
+  };
+}
+
 // ── Metrics (GET /internal/metrics) ──────────────────────────────────────────
 
 /**
@@ -255,6 +471,27 @@ export const triggerCountsSchema = z.object({
 });
 export type TriggerCounts = z.infer<typeof triggerCountsSchema>;
 
+/** A zeroed {@link TriggerCounts}. Pure. */
+export function emptyTriggerCounts(): TriggerCounts {
+  return { received: 0, dispatched: 0, failed: 0 };
+}
+
+/** Build-artifact cache effectiveness (hits skip a full `eve build`). */
+export const buildCacheStatsSchema = z.object({
+  hits: z.number().int().nonnegative(),
+  misses: z.number().int().nonnegative(),
+  /** hits / (hits + misses); 0 when nothing has been built yet. */
+  hitRate: z.number().min(0).max(1),
+});
+export type BuildCacheStats = z.infer<typeof buildCacheStatsSchema>;
+
+/** hits / (hits + misses), 0-safe. Pure. */
+export function buildCacheHitRate(hits: number, misses: number): number {
+  const total = hits + misses;
+  if (total <= 0) return 0;
+  return hits / total;
+}
+
 /** Body of `GET /internal/metrics`. */
 export const internalMetricsResponseSchema = z.object({
   /** ISO-8601 time the snapshot was computed. */
@@ -265,10 +502,14 @@ export const internalMetricsResponseSchema = z.object({
   activeRuns: z.number().int().nonnegative(),
   /** Run counts by status (mirrors run_status). */
   runsByStatus: z.record(runStatusSchema, z.number().int().nonnegative()),
+  /** Sessions currently occupying an agent (status active or waiting). */
+  activeSessions: z.number().int().nonnegative(),
   runDuration: runDurationHistogramSchema,
   workers: z.array(workerUtilizationDtoSchema),
   /** Keyed by trigger type ("manual" | "form" | "webhook" | "slack" | …). */
   triggers: z.record(z.string(), triggerCountsSchema),
+  /** Build-artifact cache hit/miss + rate (compile→build reuse). */
+  buildCache: buildCacheStatsSchema,
 });
 export type InternalMetricsResponse = z.infer<
   typeof internalMetricsResponseSchema

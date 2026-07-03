@@ -1,17 +1,68 @@
 /**
- * Worker — placeholder skeleton.
+ * Worker supervisor v1 (docs/PLAN.md Phase 1 task 4).
  *
- * Phase 1 adds the supervisor v1: register/heartbeat, ensure-agent(hash) →
- * pull/extract artifact → `PORT=p eve start`, reverse proxy forwarding BOTH
- * `/eve/` and `/.well-known/workflow/`, and the 15-minute idle reaper.
- * Note: compiled eve agents require Node 24.x; the worker image provides it.
+ * Boot: parse env → start HTTP surface (internal API + agent proxy) →
+ * register with the control plane and heartbeat every 10s.
+ * SIGTERM/SIGINT: drain (stop accepting ensures, finish in-flight proxied
+ * requests, stop agents, deregister) then exit.
  */
-export const WORKER_NAME = "invisible-string-worker";
+export {
+  AgentBootError,
+  createAgentManager,
+  type AgentInfo,
+  type AgentManager,
+  type EnsureAgentInput,
+  type EnsureAgentResult,
+} from "./agents";
+export {
+  agentEntrypoint,
+  ArtifactError,
+  createArtifactCache,
+  type ArtifactCache,
+  type CacheEntry,
+} from "./cache";
+export { ConfigError, loadConfig, type WorkerConfig } from "./config";
+export { createPortPool, PortPoolExhaustedError, type PortPool } from "./ports";
+export {
+  createRegistration,
+  type Registration,
+  type RegisterWorkerBody,
+  type WorkerCapacity,
+} from "./registration";
+export {
+  createWorkerServer,
+  FORWARDED_PREFIXES,
+  type EnsureAgentResponse,
+  type WorkerStatusResponse,
+} from "./server";
+export { createSupervisor, type Supervisor } from "./supervisor";
 
-export function workerPlaceholder(): string {
-  return WORKER_NAME;
-}
+import { loadConfig } from "./config";
+import { createSupervisor } from "./supervisor";
 
 if (import.meta.main) {
-  console.log(`${WORKER_NAME}: supervisor lands in Phase 1`);
+  const config = loadConfig();
+  const supervisor = createSupervisor(config);
+  supervisor.registration.start();
+  console.log(
+    `[worker ${config.workerId}] listening on :${supervisor.server.port} (public ${config.publicUrl}, cache ${config.artifactCacheDir}, agent ports ${config.agentPortMin}-${config.agentPortMax})`,
+  );
+
+  let shuttingDown = false;
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[worker ${config.workerId}] ${signal} — draining`);
+    void supervisor
+      .drain()
+      .catch((err) => {
+        console.error(`[worker ${config.workerId}] drain failed:`, err);
+      })
+      .finally(() => {
+        supervisor.server.stop();
+        process.exit(0);
+      });
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }

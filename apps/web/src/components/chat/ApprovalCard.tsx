@@ -13,6 +13,13 @@ import type { PendingInputView } from "../../lib/chat/run-view";
 import { cn } from "../../lib/cn";
 import { Chip } from "./Chip";
 
+// Satisfies React's controlled-input contract (value without onChange warns).
+// The consumer's update rides onInput, matching the shared Input primitive:
+// React's synthetic onChange never fires for text inputs under happy-dom, and
+// both props ride the same native `input` event in real browsers — so this is
+// deliberate, not a fragile fork. See components/ui/Input.tsx for the rationale.
+function noopChange() {}
+
 export interface ApprovalCardProps {
   input: PendingInputView;
   /** Disabled once the run resumes elsewhere or another card is answering. */
@@ -110,10 +117,10 @@ export function ApprovalCard({
             aria-label="Your response"
             value={text}
             disabled={disabled || isPending}
-            onChange={() => {}}
+            onChange={noopChange}
             onInput={(event) => setText((event.target as HTMLInputElement).value)}
             placeholder="Type a response…"
-            className="h-9 flex-1 rounded-capsule border border-black/10 bg-white/60 px-4 text-sm text-ink placeholder:text-ink-4 focus:border-black/20 disabled:opacity-55"
+            className="h-9 flex-1 rounded-capsule border border-black/10 bg-white/60 px-4 text-sm text-ink outline-none placeholder:text-ink-4 focus-visible:border-black/20 focus-visible:ring-2 focus-visible:ring-ink/20 disabled:opacity-55"
           />
           <button
             type="submit"

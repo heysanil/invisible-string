@@ -82,12 +82,19 @@ test("a completed working block renders collapsed and expands on click", () => {
     active: false,
   };
   const view = render(<WorkingBlock block={block} />);
-  // Collapsed summary present; step hidden until expanded.
+  // Collapsed summary present; the body stays mounted (it animates the fold via
+  // grid-rows) but is hidden from view + assistive tech until expanded.
   expect(view.getByText("Worked for 4s · 1 step")).toBeTruthy();
-  expect(view.queryByText("linear_list")).toBeNull();
+  expect(
+    view.getByText("linear_list").closest("[aria-hidden='true']"),
+  ).not.toBeNull();
 
   fireEvent.click(view.getByRole("button", { expanded: false }));
-  expect(view.getByText("linear_list")).toBeTruthy();
+  // Expanded: aria-hidden clears and the step detail is revealed.
+  expect(view.getByRole("button", { expanded: true })).toBeTruthy();
+  expect(
+    view.getByText("linear_list").closest("[aria-hidden='true']"),
+  ).toBeNull();
   expect(view.getByText("5 issues")).toBeTruthy();
 });
 
@@ -111,7 +118,7 @@ test("a live working block renders expanded with a running summary", () => {
 // (ThreadView is smoke-tested for header + composer above).
 
 test("an approval card round-trips an optionId to onRespond", () => {
-  const onRespond = mock((_response: RunInputRequest) => {});
+  const onRespond = mock((_runId: string, _response: RunInputRequest) => {});
   const run = baseRun({
     status: "waiting",
     pendingInputs: [
@@ -136,11 +143,11 @@ test("an approval card round-trips an optionId to onRespond", () => {
   expect(view.getByText("gmail_send")).toBeTruthy();
   fireEvent.click(view.getByRole("button", { name: "Approve" }));
   expect(onRespond).toHaveBeenCalledTimes(1);
-  expect(onRespond.mock.calls[0]).toEqual([{ requestId: "req1", optionId: "approve" }]);
+  expect(onRespond.mock.calls[0]).toEqual(["run1", { requestId: "req1", optionId: "approve" }]);
 });
 
 test("a free-form input request submits text to onRespond", () => {
-  const onRespond = mock((_response: RunInputRequest) => {});
+  const onRespond = mock((_runId: string, _response: RunInputRequest) => {});
   const run = baseRun({
     status: "waiting",
     pendingInputs: [
@@ -160,7 +167,7 @@ test("a free-form input request submits text to onRespond", () => {
     target: { value: "Launch news" },
   });
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  expect(onRespond.mock.calls[0]).toEqual([{ requestId: "q1", text: "Launch news" }]);
+  expect(onRespond.mock.calls[0]).toEqual(["run1", { requestId: "q1", text: "Launch news" }]);
 });
 
 test("a failed run renders an error banner", () => {

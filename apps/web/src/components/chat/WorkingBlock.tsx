@@ -98,27 +98,38 @@ export function WorkingBlock({ block }: { block: WorkingBlockView }) {
         <span className="text-[12.5px] font-medium text-ink-2">{summary}</span>
       </button>
 
-      {open ? (
-        <div className="border-t border-black/[0.05] px-3 pb-2.5 pt-1.5">
-          {block.reasoning !== null ? (
-            <p className="mb-1 line-clamp-2 text-[12px] italic leading-relaxed text-ink-4">
-              {block.reasoning}
-            </p>
-          ) : null}
-          {block.steps.length > 0 ? (
-            <ul className="flex flex-col">
-              {block.steps.map((step) => (
-                <StepRow key={step.key} step={step} />
-              ))}
-            </ul>
-          ) : null}
-          {block.narration.map((line, index) => (
-            <p key={index} className="mt-1 text-[12px] leading-relaxed text-ink-3">
-              {line}
-            </p>
-          ))}
+      {/* Animate the fold with a grid-rows 0fr↔1fr transition so the block eases
+          closed on completion instead of popping out of the tree. The global
+          prefers-reduced-motion guard zeroes the transition. */}
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows] duration-200 ease-out",
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+        )}
+        aria-hidden={!open}
+      >
+        <div className="overflow-hidden">
+          <div className="border-t border-black/[0.05] px-3 pb-2.5 pt-1.5">
+            {block.reasoning !== null ? (
+              <p className="mb-1 line-clamp-2 text-[12px] italic leading-relaxed text-ink-4">
+                {block.reasoning}
+              </p>
+            ) : null}
+            {block.steps.length > 0 ? (
+              <ul className="flex flex-col">
+                {block.steps.map((step) => (
+                  <StepRow key={step.key} step={step} />
+                ))}
+              </ul>
+            ) : null}
+            {block.narration.map((line, index) => (
+              <p key={index} className="mt-1 text-[12px] leading-relaxed text-ink-3">
+                {line}
+              </p>
+            ))}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }

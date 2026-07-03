@@ -16,6 +16,9 @@
   --ok: #16a34a;
   --warn: #f59e0b;
   --err: #dc2626;
+  /* Legible amber ink for text on a --warn tint (the bright --warn fails
+     contrast as small text). The only sanctioned warn-on-tint text color. */
+  --warn-ink: #b45309;
 
   /* Wallpaper wash */
   --wash: linear-gradient(135deg, #eef0f4, #e8eaef, #f0eeea);
@@ -433,7 +436,7 @@
   /* unresolved refs — amber underline, hover explains (dry-run diagnostics) */
   .cm-ref-unresolved {
     background: rgba(245, 158, 11, 0.1);
-    color: #b45309;
+    color: var(--warn-ink);
     text-decoration: underline wavy var(--warn);
     text-underline-offset: 3px;
     text-decoration-thickness: 1.5px;

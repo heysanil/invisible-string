@@ -48,6 +48,22 @@ async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
   return row;
 }
 
+/**
+ * Reject non-text attachments. The compile path packages every attachment as
+ * TEXT into the generated skill directory (compile-service.ts TextDecodes the
+ * bytes), so a binary file (image/PDF/zip) would be silently UTF-8-mangled and
+ * baked into a broken artifact. Anything with a NUL byte or that fails a strict
+ * UTF-8 decode is refused (415) at upload — where the user can see the error.
+ */
+export function assertTextAttachment(bytes: Uint8Array, name: string): void {
+  if (bytes.includes(0)) throw errors.skillFileNotText(name);
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw errors.skillFileNotText(name);
+  }
+}
+
 /** Reject absolute paths / traversal in an attachment filename. */
 export function assertSafeAttachmentName(name: string): void {
   const normalized = normalize(name);
@@ -156,6 +172,7 @@ export async function uploadSkillFile(
   if (file.bytes.byteLength > SKILL_FILE_MAX_BYTES) {
     throw errors.skillFileTooLarge(SKILL_FILE_MAX_BYTES);
   }
+  assertTextAttachment(file.bytes, file.name);
   if (!deps.artifacts) throw errors.skillFilesUnavailable("(upload)");
 
   const row = await loadOwned(deps.db, scope, skillId);

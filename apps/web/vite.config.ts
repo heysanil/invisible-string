@@ -33,6 +33,21 @@ function stubServerCrypto(): Plugin {
   };
 }
 
+/**
+ * Anti-clickjacking + sniffing headers for the SPA. Emitted by the dev server
+ * and `vite preview`; a production static host must front the built assets with
+ * the same headers (documented in docs/). We deliberately do NOT set a
+ * restrictive `default-src` CSP here — dev HMR needs inline scripts and a
+ * websocket — but `frame-ancestors 'none'` (via X-Frame-Options) is the header
+ * that actually stops the authenticated builder/chat from being framed, and
+ * meta-tag CSP cannot express frame-ancestors.
+ */
+const securityHeaders: Record<string, string> = {
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+
 export default defineConfig({
   plugins: [
     stubServerCrypto(),
@@ -40,4 +55,6 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  server: { headers: securityHeaders },
+  preview: { headers: securityHeaders },
 });

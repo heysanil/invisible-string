@@ -82,6 +82,21 @@ export function buildApp(opts: {
 }) {
   const { config, auth, workspaceDeps, resourceDeps } = opts;
   const app = new Elysia()
+    // Security-response headers on EVERY response (defense-in-depth backstop):
+    // the API is a JSON/SSE surface that should never be framed, sniffed, or
+    // leak a referrer. CSP `default-src 'self'` + `frame-ancestors 'none'`
+    // closes clickjacking of any authenticated surface; HSTS is opt-in (TLS).
+    .onRequest(({ set }) => {
+      set.headers["content-security-policy"] =
+        "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'";
+      set.headers["x-frame-options"] = "DENY";
+      set.headers["x-content-type-options"] = "nosniff";
+      set.headers["referrer-policy"] = "no-referrer";
+      if (config.hstsEnabled) {
+        set.headers["strict-transport-security"] =
+          "max-age=63072000; includeSubDomains";
+      }
+    })
     .use(
       cors({
         origin: config.corsOrigins,
@@ -210,7 +225,13 @@ export function createAppStack(
 
 if (import.meta.main) {
   const stack = createAppStack();
-  stack.app.listen(stack.config.port);
+  // Cap the request body at the transport (Bun.serve) so oversized uploads are
+  // refused before buffering — the largest legitimate body is a skill
+  // attachment (see resources/plugin.ts SKILL_UPLOAD_MAX_BODY_BYTES).
+  stack.app.listen({
+    port: stack.config.port,
+    maxRequestBodySize: 8 * 1024 * 1024,
+  });
   console.log(
     `control-plane listening on :${stack.config.port}${stack.runtime ? " (runtime API enabled)" : " (runtime API disabled — set WORLD_DATABASE_URL/PLATFORM_JWT_SECRET/WORKER_SHARED_SECRET/S3_*)"}`,
   );

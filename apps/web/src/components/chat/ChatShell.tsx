@@ -96,6 +96,9 @@ export function ChatShell({
         <SessionList
           sessions={sessions}
           isLoading={sessionsQuery.isLoading}
+          isError={sessionsQuery.isError}
+          error={sessionsQuery.error}
+          onRetry={() => void sessionsQuery.refetch()}
           activeSessionId={draftWorkflow !== null ? null : activeSessionId}
           onSelect={(id) => {
             setDraftWorkflow(null);

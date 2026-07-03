@@ -17,6 +17,7 @@
   --color-hairline: var(--hairline);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
+  --color-warn-ink: var(--warn-ink);
   --color-err: var(--err);
 
   --radius-panel: var(--radius-panel);

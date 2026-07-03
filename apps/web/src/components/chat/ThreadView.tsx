@@ -121,7 +121,7 @@ export function ThreadView({
                   <RunMessage
                     run={run}
                     isChatOrigin={isChatOrigin}
-                    onRespond={(response) => onRespond(run.runId, response)}
+                    onRespond={onRespond}
                     pendingInput={
                       pendingInput?.runId === run.runId ? pendingInput : null
                     }

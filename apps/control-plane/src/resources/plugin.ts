@@ -10,6 +10,7 @@
  * where noted); user-scoped `/me/...` resources use the `requireAuth` macro.
  */
 import { Elysia } from "elysia";
+import { SKILL_FILE_MAX_BYTES } from "@invisible-string/shared";
 
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { workspacePlugin } from "../workspace";
@@ -55,6 +56,24 @@ import {
   listWorkflows,
   updateWorkflow,
 } from "./workflows";
+
+/**
+ * Transport ceiling for a skill upload body — the per-file cap plus a little
+ * multipart framing overhead. Enforced from the Content-Length header BEFORE
+ * the body is buffered, so an authenticated member cannot force large
+ * allocations by streaming a body far above the 5 MiB attachment limit.
+ */
+const SKILL_UPLOAD_MAX_BODY_BYTES = SKILL_FILE_MAX_BYTES + 1024 * 1024;
+
+/** Reject an oversized upload by Content-Length before reading the body. */
+function assertUploadWithinLimit(request: Request): void {
+  const header = request.headers.get("content-length");
+  if (header === null) return;
+  const length = Number(header);
+  if (Number.isFinite(length) && length > SKILL_UPLOAD_MAX_BODY_BYTES) {
+    throw errors.skillFileTooLarge(SKILL_FILE_MAX_BYTES);
+  }
+}
 
 /** Pull an uploaded file out of a parsed multipart body. */
 async function readUploadedFile(body: unknown): Promise<UploadedFile> {
@@ -273,13 +292,15 @@ export function resourcesPlugin(deps: ResourceDeps) {
       )
       .post(
         "/workspaces/:workspaceId/skills/:id/files",
-        async ({ workspace, params, body }) =>
-          uploadSkillFile(
+        async ({ workspace, params, body, request }) => {
+          assertUploadWithinLimit(request);
+          return uploadSkillFile(
             deps,
             wsScope(workspace.organizationId),
             params.id,
             await readUploadedFile(body),
-          ),
+          );
+        },
         { requireWorkspace: true },
       )
       .delete(
@@ -325,13 +346,15 @@ export function resourcesPlugin(deps: ResourceDeps) {
       )
       .post(
         "/me/skills/:id/files",
-        async ({ authUser, params, body }) =>
-          uploadSkillFile(
+        async ({ authUser, params, body, request }) => {
+          assertUploadWithinLimit(request);
+          return uploadSkillFile(
             deps,
             userScope(authUser.id),
             params.id,
             await readUploadedFile(body),
-          ),
+          );
+        },
         { requireAuth: true },
       )
       .delete(
@@ -393,6 +416,10 @@ export function resourcesPlugin(deps: ResourceDeps) {
         ({ workspace }) => listAgentPresets(deps, workspace.organizationId),
         { requireWorkspace: true },
       )
+      // Agent presets are shared, settings-managed context every workflow
+      // builds on (basePrompt + model override) — mutations are admin-gated,
+      // matching model-presets/allowlist and the spec's "role checks on
+      // settings mutations" (reads stay member-visible for the builder).
       .post(
         "/workspaces/:workspaceId/agents",
         async ({ workspace, body, set }) => {
@@ -400,7 +427,7 @@ export function resourcesPlugin(deps: ResourceDeps) {
           set.status = 201;
           return result;
         },
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .get(
         "/workspaces/:workspaceId/agents/:id",
@@ -411,12 +438,12 @@ export function resourcesPlugin(deps: ResourceDeps) {
         "/workspaces/:workspaceId/agents/:id",
         ({ workspace, params, body }) =>
           updateAgentPreset(deps, workspace.organizationId, params.id, body),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .delete(
         "/workspaces/:workspaceId/agents/:id",
         ({ workspace, params }) => deleteAgentPreset(deps, workspace.organizationId, params.id),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
 
       // ── Members (Better Auth passthrough) ─────────────────────────────────

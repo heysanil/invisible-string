@@ -7,17 +7,23 @@
  * streams (the server replays persisted events on connect). seq is
  * authoritative, so a re-delivered frame after a resume is a no-op.
  */
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { MessageSquare } from "lucide-react";
 
 import type {
+  RunDto,
   RunInputRequest,
   RunStatus,
 } from "@invisible-string/shared";
 
 import { isApiErrorCode } from "../../lib/api-client";
-import { reduceRunView, type RunView } from "../../lib/chat/run-view";
+import {
+  EMPTY_FRAME_STORE,
+  reduceRunView,
+  type FrameStore,
+  type RunView,
+} from "../../lib/chat/run-view";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
 import { titleFromMessage } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
@@ -44,6 +50,14 @@ interface PendingInput {
   requestId: string;
   optionId?: string;
   text?: string;
+}
+
+/** Per-run memo entry: reuse the RunView when its inputs are reference-equal. */
+interface RunViewCacheEntry {
+  run: RunDto;
+  store: FrameStore;
+  status: RunStatus | undefined;
+  view: RunView;
 }
 
 function isActiveStatus(status: RunStatus): boolean {
@@ -76,19 +90,30 @@ export function ThreadContainer({
 
   const streams = useThreadStreams(runRows, { onRunStatus });
 
-  // Fold each run row + its live frames into a view model.
-  const runViews: RunView[] = useMemo(
-    () =>
-      runRows.map((run) => {
-        const live = streams.runs.get(run.id);
-        return reduceRunView(
-          run,
-          live?.store ?? { frames: [], maxSeq: -1 },
-          live?.status ?? undefined,
-        );
-      }),
-    [runRows, streams.runs],
-  );
+  // Fold each run row + its live frames into a view model. A streamed token
+  // grows exactly ONE run's frame store (the others keep their reference), so
+  // we memoize per run: only the run that received a frame gets a fresh
+  // RunView. Combined with a memoized RunMessage this stops every settled row
+  // from re-reducing/repainting on each token of the newest run.
+  const viewCacheRef = useRef(new Map<string, RunViewCacheEntry>());
+  const runViews: RunView[] = useMemo(() => {
+    const nextCache = new Map<string, RunViewCacheEntry>();
+    const views = runRows.map((run) => {
+      const live = streams.runs.get(run.id);
+      const store = live?.store ?? EMPTY_FRAME_STORE;
+      const status = live?.status ?? undefined;
+      const prev = viewCacheRef.current.get(run.id);
+      if (prev && prev.run === run && prev.store === store && prev.status === status) {
+        nextCache.set(run.id, prev);
+        return prev.view;
+      }
+      const view = reduceRunView(run, store, status);
+      nextCache.set(run.id, { run, store, status, view });
+      return view;
+    });
+    viewCacheRef.current = nextCache;
+    return views;
+  }, [runRows, streams.runs]);
 
   const lastRun = runViews[runViews.length - 1];
   const anyActive = runViews.some((run) => isActiveStatus(run.status));
@@ -123,6 +148,12 @@ export function ThreadContainer({
     [postMessage, sessionId],
   );
 
+  // Depend on the STABLE pieces (react-query's bound mutate + the reopen
+  // useCallback), not the freshly-allocated `streams`/`postInput` wrappers, so
+  // `respond` keeps a stable identity across streamed frames — otherwise the
+  // memoized RunMessage rows would see a new onRespond every token and repaint.
+  const postInputMutate = postInput.mutate;
+  const reopenStream = streams.reopen;
   const respond = useCallback(
     (runId: string, response: RunInputRequest) => {
       setInputError(null);
@@ -132,14 +163,14 @@ export function ThreadContainer({
         optionId: response.optionId,
         text: response.text,
       });
-      postInput.mutate(
+      postInputMutate(
         { runId, input: response },
         {
           onSuccess: () => {
             setPendingInput(null);
             // The parked run resumes server-side — re-attach its tail
             // (resumes from the cursor, nothing replays twice).
-            streams.reopen(runId);
+            reopenStream(runId);
           },
           onError: (mutationError) => {
             setInputError(errorMessage(mutationError));
@@ -148,7 +179,7 @@ export function ThreadContainer({
         },
       );
     },
-    [postInput, streams],
+    [postInputMutate, reopenStream],
   );
 
   if (isLoading) {

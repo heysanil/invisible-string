@@ -21,6 +21,11 @@ export interface AttachmentsSidebarProps {
 
 const MAX_MIB = Math.floor(SKILL_FILE_MAX_BYTES / (1024 * 1024));
 
+/** Text-format hint for the file picker (server enforces UTF-8-text with 415). */
+const TEXT_ATTACHMENT_ACCEPT =
+  "text/*,.md,.markdown,.txt,.json,.jsonc,.yaml,.yml,.toml,.csv,.tsv," +
+  ".xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.sh,.rb,.go,.rs,.java,.sql,.env,.ini,.log";
+
 export function AttachmentsSidebar({
   scope,
   skillId,
@@ -96,6 +101,9 @@ export function AttachmentsSidebar({
             ref={inputRef}
             type="file"
             multiple
+            // Reference files are packaged as text into the compiled skill —
+            // hint text formats (the server rejects non-text with 415).
+            accept={TEXT_ATTACHMENT_ACCEPT}
             className="hidden"
             onChange={(event) => {
               void handleFiles(event.currentTarget.files);

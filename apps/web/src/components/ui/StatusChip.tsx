@@ -7,7 +7,7 @@ export type StatusTone = "neutral" | "success" | "warning" | "error" | "ink";
 const TONE: Record<StatusTone, string> = {
   neutral: "bg-black/[0.05] text-ink-2",
   success: "bg-ok/12 text-ok",
-  warning: "bg-warn/15 text-[#b45309]",
+  warning: "bg-warn/15 text-warn-ink",
   error: "bg-err/12 text-err",
   ink: "bg-ink text-white",
 };

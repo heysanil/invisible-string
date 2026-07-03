@@ -32,6 +32,13 @@ export interface Config {
    * `emailVerified` (account linking, domain-based org membership).
    */
   requireEmailVerification: boolean;
+  /**
+   * Emit `Strict-Transport-Security` on every response (SECURITY_HSTS=1).
+   * Default off: only meaningful behind TLS, and enabling it on a plain-http
+   * dev host would pin the browser to https for that origin. Turn on in
+   * production where the control plane is fronted by TLS.
+   */
+  hstsEnabled: boolean;
 }
 
 export class ConfigError extends Error {
@@ -117,6 +124,8 @@ export function loadConfig(env: Env = process.env): Config {
     problems,
   );
 
+  const hstsEnabled = parseBoolean(env.SECURITY_HSTS, "SECURITY_HSTS", problems);
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -128,6 +137,7 @@ export function loadConfig(env: Env = process.env): Config {
     trustedOrigins,
     encryptionMasterKey,
     requireEmailVerification,
+    hstsEnabled,
   };
 }
 

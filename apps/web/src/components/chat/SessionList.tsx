@@ -9,12 +9,14 @@ import { MessageCircle, Plus, Search } from "lucide-react";
 import type { AgentSessionSummaryDto } from "@invisible-string/shared";
 
 import { cn } from "../../lib/cn";
+import { errorMessage } from "../../lib/forms";
 import {
   recencyGroup,
   relativeTime,
   RECENCY_GROUPS,
 } from "../../lib/chat/time";
 import { EmptyState } from "../ui/EmptyState";
+import { ErrorState } from "../ui/ErrorState";
 import { Spinner } from "../ui/Spinner";
 import { Chip } from "./Chip";
 import { livenessOf, StatusDot } from "./StatusDot";
@@ -27,6 +29,10 @@ export interface SessionListItem extends AgentSessionSummaryDto {
 export interface SessionListProps {
   sessions: readonly SessionListItem[];
   isLoading: boolean;
+  /** The sessions query failed — render a retry surface, not "no conversations". */
+  isError?: boolean;
+  error?: unknown;
+  onRetry?: () => void;
   activeSessionId: string | null;
   onSelect: (sessionId: string) => void;
   onNewChat: () => void;
@@ -37,6 +43,9 @@ export interface SessionListProps {
 export function SessionList({
   sessions,
   isLoading,
+  isError = false,
+  error,
+  onRetry,
   activeSessionId,
   onSelect,
   onNewChat,
@@ -103,6 +112,13 @@ export function SessionList({
           <div className="flex h-full items-center justify-center">
             <Spinner size={18} className="text-ink-4" />
           </div>
+        ) : isError ? (
+          <ErrorState
+            compact
+            title="Couldn’t load conversations"
+            message={errorMessage(error, "Check your connection and try again.")}
+            onRetry={onRetry}
+          />
         ) : sessions.length === 0 ? (
           <EmptyState
             icon={MessageCircle}

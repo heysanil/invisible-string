@@ -473,8 +473,16 @@ export type GetWorkflowResponse = z.infer<typeof getWorkflowResponseSchema>;
 export const createWorkflowResponseSchema = getWorkflowResponseSchema;
 export type CreateWorkflowResponse = GetWorkflowResponse;
 
-export const updateWorkflowResponseSchema = getWorkflowResponseSchema;
-export type UpdateWorkflowResponse = GetWorkflowResponse;
+/**
+ * A draft PATCH additionally carries dry-run-compile diagnostics (same payload
+ * as the dry-run endpoint) so the builder gets validation for free without a
+ * second round-trip. Omitted when the draft was not touched or the dry run
+ * could not run (e.g. the object store was briefly down).
+ */
+export const updateWorkflowResponseSchema = getWorkflowResponseSchema.extend({
+  diagnostics: dryRunCompileResponseSchema.optional(),
+});
+export type UpdateWorkflowResponse = z.infer<typeof updateWorkflowResponseSchema>;
 
 // ── Sessions list ───────────────────────────────────────────────────────────
 //

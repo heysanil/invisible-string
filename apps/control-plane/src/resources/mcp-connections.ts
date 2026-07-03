@@ -45,24 +45,35 @@ async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
 
 /**
  * Workflow names (draft OR any published version) that reference this
- * connection id — the delete guard. Ids are globally-unique uuids so no scope
- * filter is needed. jsonb `@>` containment matches the id inside the
+ * connection id — the delete guard. The query is constrained to the SAME
+ * scope as the connection, mirroring how compile-service resolves refs
+ * (workspace connections resolve only against same-org workflows; user
+ * connections only against workflows whose run-as user owns them). This keeps
+ * the guard from ever reading or reporting workflow names outside the owner's
+ * scope. jsonb `@>` containment matches the id inside the
  * `context.mcpConnectionIds` array.
  */
 export async function connectionReferences(
   db: Db,
+  scope: Scope,
   connectionId: string,
 ): Promise<string[]> {
   const idJson = JSON.stringify(connectionId);
+  const scopeCond =
+    scope.kind === "workspace"
+      ? sql`w.organization_id = ${scope.organizationId}`
+      : sql`w.run_as_user_id = ${scope.userId}`;
   const result = await db.execute(sql`
     SELECT DISTINCT w.name AS name
     FROM ${schema.workflows} w
-    WHERE (w.draft -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
+    WHERE ${scopeCond}
+      AND (w.draft -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
     UNION
     SELECT DISTINCT w.name AS name
     FROM ${schema.workflows} w
     JOIN ${schema.workflowVersions} v ON v.workflow_id = w.id
-    WHERE (v.config -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
+    WHERE ${scopeCond}
+      AND (v.config -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
     ORDER BY name
   `);
   const rows = result as unknown as Array<{ name: unknown }>;
@@ -131,6 +142,12 @@ export async function installConnection(
   if (!server) throw errors.registryServerNotFound(input.registryName);
   if (server.remotes.length === 0) {
     throw errors.registryServerNotInstallable(input.registryName);
+  }
+  // The stored URL must be one the registry actually advertises — otherwise a
+  // caller could claim registry provenance while pointing the connection (and
+  // its runtime-injected credentials) at an arbitrary host.
+  if (!server.remotes.some((remote) => remote.url === input.remoteUrl)) {
+    throw errors.registryRemoteMismatch(input.registryName);
   }
   const id = randomUUID();
   const authConfigEncrypted = input.auth
@@ -205,7 +222,7 @@ export async function deleteConnection(
   id: string,
 ): Promise<DeleteResourceResponse> {
   await loadOwned(deps.db, scope, id);
-  const referencing = await connectionReferences(deps.db, id);
+  const referencing = await connectionReferences(deps.db, scope, id);
   if (referencing.length > 0) throw errors.connectionInUse(referencing);
   await deps.db
     .delete(schema.mcpConnections)

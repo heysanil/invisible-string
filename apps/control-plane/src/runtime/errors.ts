@@ -128,6 +128,13 @@ export const errors = {
     ),
   skillFileInvalid: (message: string) =>
     new RuntimeApiError(422, "skill_file_invalid", message),
+  skillFileNotText: (fileName: string) =>
+    new RuntimeApiError(
+      415,
+      "skill_file_not_text",
+      `attachment "${fileName}" is not a UTF-8 text file — skill reference files must be text (compilation would corrupt binary data)`,
+      { fileName },
+    ),
   modelReferencedByPreset: (slugs: string[]) =>
     new RuntimeApiError(
       409,
@@ -154,6 +161,12 @@ export const errors = {
       422,
       "registry_server_not_installable",
       `registry server "${name}" has no remote (streamable-http/sse) endpoint to install`,
+    ),
+  registryRemoteMismatch: (name: string) =>
+    new RuntimeApiError(
+      422,
+      "registry_remote_mismatch",
+      `the requested remote URL is not one advertised by registry server "${name}"`,
     ),
   noPendingInput: () =>
     new RuntimeApiError(

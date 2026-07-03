@@ -134,13 +134,24 @@ export function useBuilderController(
       setSaveStatus("saving");
       const promise = (async () => {
         try {
-          await updateWorkflow.mutateAsync({
+          const result = await updateWorkflow.mutateAsync({
             workflowId: workflow.id,
             patch: { draft: next },
           });
           savedRef.current = next;
           setSaveStatus("saved");
-          await runDryRun();
+          // The PATCH already dry-ran the saved draft — consume its diagnostics
+          // instead of a redundant follow-up call. Fall back to the dedicated
+          // endpoint only when the server omitted them (e.g. object store down).
+          if (result.diagnostics) {
+            setDryRun(
+              result.diagnostics.ok
+                ? emptyDiagnostics()
+                : dryRunDiagnostics(result.diagnostics.error),
+            );
+          } else {
+            await runDryRun();
+          }
         } catch {
           setSaveStatus("error");
         }

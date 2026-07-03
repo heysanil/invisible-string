@@ -11,6 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
+  "dependencies": {
+    "@invisible-string/shared": "workspace:*"
+  },
   "devDependencies": {
     "typescript": "^6.0.3"
   }

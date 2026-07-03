@@ -1,22 +1,11 @@
 /**
- * Apply pending drizzle migrations (idempotent). Used by integration tests
- * and at deploy time. Once `packages/db` ships the product schema + its own
- * migrator, this defers to that package's migrations instead.
+ * Apply pending migrations (idempotent). Defers to the canonical migrator in
+ * `@invisible-string/db` (Better Auth tables + product tables live there).
  */
-import { join } from "node:path";
-import { drizzle } from "drizzle-orm/postgres-js";
-import { migrate } from "drizzle-orm/postgres-js/migrator";
-import postgres from "postgres";
-
-const MIGRATIONS_FOLDER = join(import.meta.dir, "..", "drizzle");
+import { migrateDatabase } from "@invisible-string/db/migrate";
 
 export async function runMigrations(databaseUrl: string): Promise<void> {
-  const sql = postgres(databaseUrl, { max: 1, onnotice: () => {} });
-  try {
-    await migrate(drizzle(sql), { migrationsFolder: MIGRATIONS_FOLDER });
-  } finally {
-    await sql.end({ timeout: 5 });
-  }
+  await migrateDatabase(databaseUrl);
 }
 
 if (import.meta.main) {

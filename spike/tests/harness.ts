@@ -26,8 +26,28 @@ export const PROXY_PORT = 4100;
 export const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}`;
 export const AGENT_URL = `http://127.0.0.1:${AGENT_PORT}`;
 
+/**
+ * World DB resolution: reuse the Postgres server behind TEST_DATABASE_URL
+ * (the compose stack's postgres-init.sh creates both `product` and `world`
+ * DBs) so one stack serves the whole integration suite. Fall back to a
+ * self-managed compose project on :5443 when running the spike standalone.
+ */
+function defaultWorldDbUrl(): string {
+  const testUrl = process.env.TEST_DATABASE_URL;
+  if (testUrl !== undefined) {
+    try {
+      const url = new URL(testUrl);
+      url.pathname = "/world";
+      return url.toString();
+    } catch {
+      // fall through to the standalone default
+    }
+  }
+  return "postgres://dev:dev@localhost:5443/world";
+}
+
 export const WORLD_DB_URL =
-  process.env.SPIKE_WORLD_DATABASE_URL ?? "postgres://dev:dev@localhost:5443/world";
+  process.env.SPIKE_WORLD_DATABASE_URL ?? defaultWorldDbUrl();
 export const PLATFORM_JWT_SECRET = "spike-platform-secret-0000000000000000";
 
 export const DB_GATE_AVAILABLE = process.env.TEST_DATABASE_URL !== undefined;
@@ -123,9 +143,37 @@ export async function queryWorldDb<T>(query: string): Promise<T[]> {
 
 let worldBootstrapped = false;
 let agentBuilt = false;
+let agentDepsInstalled = false;
+
+/**
+ * `npm ci` the spike agent project (exact pins via its committed
+ * package-lock.json) with Node 24 when node_modules is missing — a fresh
+ * checkout has no spike deps. PATH is prefixed with the Node 24 bin dir so
+ * npm and its `#!/usr/bin/env node` shebang both resolve to Node 24.
+ */
+export async function ensureAgentDeps(): Promise<void> {
+  if (agentDepsInstalled) return;
+  if (existsSync(join(AGENT_PROJECT_DIR, "node_modules", "eve", "bin", "eve.js"))) {
+    agentDepsInstalled = true;
+    return;
+  }
+  const nodeBinDir = resolve(node24Bin(), "..");
+  const result = await run(["npm", "ci", "--no-audit", "--no-fund"], {
+    cwd: AGENT_PROJECT_DIR,
+    env: { PATH: `${nodeBinDir}:${process.env.PATH ?? ""}` },
+    timeoutMs: 300_000,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `spike agent-project npm ci failed (${result.exitCode}):\n${result.stdout.slice(-1000)}\n${result.stderr.slice(-2000)}`,
+    );
+  }
+  agentDepsInstalled = true;
+}
 
 export async function bootstrapWorld(): Promise<void> {
   if (worldBootstrapped) return;
+  await ensureAgentDeps();
   const result = await run(
     [node24Bin(), join(AGENT_PROJECT_DIR, "node_modules", "@workflow", "world-postgres", "bin", "setup.js")],
     {

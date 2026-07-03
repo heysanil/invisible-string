@@ -14,11 +14,28 @@ Requires [Bun](https://bun.sh) 1.3+, Docker, and Node 24 (for eve agents;
 `mise install node@24`).
 
 ```sh
-docker compose up -d postgres minio dex   # local stack: Postgres, MinIO, Dex IdP
 bun install
-bun test                                  # unit tests (DB-gated tests skip without TEST_DATABASE_URL)
 bun run typecheck
+bun test                                  # unit lane (DB-gated tests skip without TEST_DATABASE_URL)
 ```
+
+Integration lane (full suite against the local stack):
+
+```sh
+docker compose up -d postgres minio dex   # local stack: Postgres, MinIO, Dex IdP
+
+# apply migrations (Better Auth + product tables live in packages/db)
+DATABASE_URL=postgres://dev:dev@localhost:5432/product bun run --cwd packages/db migrate
+
+# full suite: db + control-plane integration tests and the eve spike suites
+# (the spike reuses the same Postgres server's `world` DB and installs/builds
+# its agent project with Node 24 on first run)
+TEST_DATABASE_URL=postgres://dev:dev@localhost:5432/product bun test
+```
+
+The spike's keyed tests (real model calls) additionally require
+`OPENROUTER_API_KEY` and skip cleanly without it. Tear down with
+`docker compose down`.
 
 Copy `.env.example` to `.env` and fill in secrets before running the apps.
 

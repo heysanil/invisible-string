@@ -1,9 +1,7 @@
 /**
- * Product database client (postgres-js + drizzle).
- *
- * Currently carries the Better Auth-managed tables from `./auth-schema`;
- * when `packages/db` lands the full product schema + migrator, this switches
- * to importing the schema from there (single source of truth).
+ * Product database client (postgres-js + drizzle), typed over the Better
+ * Auth-managed tables re-exported from `@invisible-string/db` via
+ * `./auth-schema` (canonical schema + migrations live in packages/db).
  */
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";

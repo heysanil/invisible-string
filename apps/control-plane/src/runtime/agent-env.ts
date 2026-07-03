@@ -42,28 +42,94 @@ import type { RuntimeConfig } from "./config";
  * >64-char names (slug truncation), permanently failing publish with the
  * adapter's "token env var mismatch" guard.
  */
+export function mcpConnectionSlug(connectionName: string): string {
+  return slugifyName(connectionName) || "connection";
+}
+
 export function mcpTokenEnvName(connectionName: string): string {
-  return connectionTokenEnvVar(slugifyName(connectionName) || "connection");
+  return connectionTokenEnvVar(mcpConnectionSlug(connectionName));
+}
+
+/**
+ * Env var carrying one header value for a header-auth MCP connection —
+ * `MCP_<SLUG>_HEADER_<HEADER>`. The compiler adapter and this dispatcher both
+ * derive it from the SAME (slug, header) so the generated code's read and the
+ * injected value can never drift.
+ */
+export function mcpHeaderEnvName(connectionName: string, header: string): string {
+  const conn = mcpConnectionSlug(connectionName)
+    .toUpperCase()
+    .replaceAll("-", "_");
+  const hdr = header
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `MCP_${conn}_HEADER_${hdr}`;
 }
 
 /**
  * AAD context binding an mcp_connections auth envelope to its row — writers
- * (Phase-2 install flow) must use the same context.
+ * (Phase-2 CRUD/install flow) must use the same context.
  */
 export function mcpAuthAadContext(connectionId: string): string {
   return `mcp_connections:auth_config:${connectionId}`;
 }
 
-/** Decrypted auth-config shape stored (encrypted) on mcp_connections. */
-interface McpAuthConfig {
-  token?: string;
+/**
+ * Decrypted auth-config shape stored (encrypted) on mcp_connections.
+ * - bearer: `{ token }` (legacy) or `{ type: "bearer", token }`
+ * - headers: `{ type: "headers", headers: { <name>: <value> } }`
+ */
+export type McpAuthConfig =
+  | { type?: "bearer"; token: string }
+  | { type: "headers"; headers: Record<string, string> };
+
+/** Decrypt + parse one connection's stored auth config (or null when none). */
+export function decryptMcpAuthConfig(
+  authConfigEncrypted: string | null,
+  masterKey: MasterKey | undefined,
+  connectionId: string,
+): McpAuthConfig | null {
+  if (!authConfigEncrypted) return null;
+  if (!masterKey) throw errors.encryptionKeyMissing();
+  try {
+    const envelope = JSON.parse(authConfigEncrypted) as EncryptedEnvelope;
+    const plaintext = decryptSecret(envelope, masterKey, mcpAuthAadContext(connectionId));
+    return JSON.parse(plaintext) as McpAuthConfig;
+  } catch {
+    throw errors.mcpSecretUnavailable(connectionId);
+  }
 }
 
 /**
- * Decrypt MCP tokens for the given connection ids →
- * `{ MCP_<NAME>_TOKEN: <plaintext> }`. Connections without auth contribute
- * nothing. Decryption failures are typed 500s (never silently dropped —
- * an agent booting without a credential it needs is a worse failure mode).
+ * Non-secret shape of a connection's stored auth, for the compile path (which
+ * must know the auth KIND and header NAMES to wire env-var reads without ever
+ * baking secret VALUES into generated files).
+ */
+export type McpAuthShape =
+  | { kind: "none" }
+  | { kind: "bearer" }
+  | { kind: "headers"; headerNames: string[] };
+
+export function mcpAuthShape(
+  authConfigEncrypted: string | null,
+  masterKey: MasterKey | undefined,
+  connectionId: string,
+): McpAuthShape {
+  const config = decryptMcpAuthConfig(authConfigEncrypted, masterKey, connectionId);
+  if (!config) return { kind: "none" };
+  if (config.type === "headers") {
+    return { kind: "headers", headerNames: Object.keys(config.headers) };
+  }
+  return { kind: "bearer" };
+}
+
+/**
+ * Decrypt MCP secrets for the given connection ids into agent env vars.
+ * Bearer → `{ MCP_<NAME>_TOKEN }`; headers → one `MCP_<NAME>_HEADER_<H>` per
+ * header. Connections without auth contribute nothing. Decryption failures are
+ * typed 500s (never silently dropped — an agent booting without a credential
+ * it needs is a worse failure mode).
  */
 export async function decryptMcpEnv(
   db: Db,
@@ -82,17 +148,15 @@ export async function decryptMcpEnv(
 
   const env: Record<string, string> = {};
   for (const row of rows) {
-    if (!row.authConfigEncrypted) continue;
-    if (!masterKey) throw errors.encryptionKeyMissing();
-    let token: string | undefined;
-    try {
-      const envelope = JSON.parse(row.authConfigEncrypted) as EncryptedEnvelope;
-      const plaintext = decryptSecret(envelope, masterKey, mcpAuthAadContext(row.id));
-      token = (JSON.parse(plaintext) as McpAuthConfig).token;
-    } catch {
-      throw errors.mcpSecretUnavailable(row.id);
+    const config = decryptMcpAuthConfig(row.authConfigEncrypted, masterKey, row.id);
+    if (!config) continue;
+    if (config.type === "headers") {
+      for (const [header, value] of Object.entries(config.headers)) {
+        env[mcpHeaderEnvName(row.name, header)] = value;
+      }
+    } else if (config.token) {
+      env[mcpTokenEnvName(row.name)] = config.token;
     }
-    if (token) env[mcpTokenEnvName(row.name)] = token;
   }
   return env;
 }

@@ -35,6 +35,9 @@ import { createWorldProvisioner, worldDatabaseExists } from "./build/world";
 import { RunEventBus } from "./runs/bus";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
+import { resourcesPlugin } from "./resources/plugin";
+import { createRegistryClient, type RegistryClient } from "./resources/registry";
+import type { ResourceDeps } from "./resources/common";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { runtimePlugin, type RuntimeDeps } from "./runtime/routes";
@@ -65,6 +68,8 @@ export interface RuntimeOverrides {
   buildSteps?: BuildSteps;
   artifacts?: ArtifactStore;
   workerClient?: WorkerClient;
+  /** MCP registry proxy client (stubbed in tests). */
+  registry?: RegistryClient;
 }
 
 /** Assemble the Elysia app from already-constructed pieces (testable). */
@@ -72,9 +77,10 @@ export function buildApp(opts: {
   config: Config;
   auth: Auth;
   workspaceDeps: WorkspaceDeps;
+  resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
 }) {
-  const { config, auth, workspaceDeps } = opts;
+  const { config, auth, workspaceDeps, resourceDeps } = opts;
   const app = new Elysia()
     .use(
       cors({
@@ -85,7 +91,10 @@ export function buildApp(opts: {
     // Better Auth owns everything under its basePath (/api/auth).
     .mount(auth.handler)
     .use(workspacePlugin(workspaceDeps))
-    .get("/api/health", () => ({ ok: true }));
+    .get("/api/health", () => ({ ok: true }))
+    // Phase-2 product CRUD (works without the runtime env; skill uploads that
+    // need the object store fail cleanly when it is unconfigured).
+    .use(resourcesPlugin(resourceDeps));
   if (opts.runtimeDeps) {
     app.use(runtimePlugin(opts.runtimeDeps));
   }
@@ -173,7 +182,17 @@ export function createAppStack(
     workspaceDeps,
     overrides: runtimeOverrides,
   });
-  const app = buildApp({ config, auth, workspaceDeps, runtimeDeps });
+  const resourceDeps: ResourceDeps = {
+    db: dbHandle.db,
+    workspaceDeps,
+    auth,
+    masterKey: config.encryptionMasterKey,
+    compile: runtimeOverrides?.compile ?? compileWorkflow,
+    // Skill attachments live in the same object store as build artifacts.
+    artifacts: runtimeDeps?.artifacts,
+    registry: runtimeOverrides?.registry ?? createRegistryClient(),
+  };
+  const app = buildApp({ config, auth, workspaceDeps, resourceDeps, runtimeDeps });
   return {
     app,
     auth,

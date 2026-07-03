@@ -73,6 +73,100 @@ export const errors = {
     ),
   compileFailed: (issues: unknown) =>
     new RuntimeApiError(422, "compile_failed", "workflow failed to compile", issues),
+  skillFilesUnavailable: (skillName: string) =>
+    new RuntimeApiError(
+      500,
+      "skill_files_unavailable",
+      `skill "${skillName}" has attachments but the object store is not configured — cannot compile`,
+    ),
+  skillFileMissing: (skillName: string, fileName: string) =>
+    new RuntimeApiError(
+      500,
+      "skill_file_missing",
+      `skill "${skillName}" attachment "${fileName}" could not be read from the object store`,
+    ),
+
+  // ── Phase-2 resource errors ───────────────────────────────────────────────
+  notFound: (resource: string) =>
+    new RuntimeApiError(404, `${resource}_not_found`, `${resource.replace(/_/g, " ")} not found in this workspace`),
+  invalidBody: (issues: unknown) =>
+    new RuntimeApiError(422, "invalid_body", "request body failed validation", issues),
+  forbiddenRole: (role: string) =>
+    new RuntimeApiError(403, "forbidden", `requires ${role} role in this workspace`),
+  runAsUserNotMember: (userId: string) =>
+    new RuntimeApiError(
+      422,
+      "run_as_user_not_member",
+      `run-as user ${userId} is not a member of this workspace`,
+    ),
+  toolFilterConflict: () =>
+    new RuntimeApiError(
+      422,
+      "tool_filter_conflict",
+      "set a tool allowlist OR a blocklist on a connection, not both",
+    ),
+  connectionInUse: (workflowNames: string[]) =>
+    new RuntimeApiError(
+      409,
+      "connection_in_use",
+      `connection is referenced by ${workflowNames.length} workflow(s): ${workflowNames.join(", ")}`,
+      { workflows: workflowNames },
+    ),
+  skillFileTooLarge: (maxBytes: number) =>
+    new RuntimeApiError(
+      413,
+      "skill_file_too_large",
+      `attachment exceeds the ${maxBytes}-byte limit`,
+      { maxBytes },
+    ),
+  skillFileLimitExceeded: (max: number) =>
+    new RuntimeApiError(
+      422,
+      "skill_file_limit_exceeded",
+      `a skill may have at most ${max} attachments`,
+      { max },
+    ),
+  skillFileInvalid: (message: string) =>
+    new RuntimeApiError(422, "skill_file_invalid", message),
+  modelReferencedByPreset: (slugs: string[]) =>
+    new RuntimeApiError(
+      409,
+      "model_referenced_by_preset",
+      `model is used by the ${slugs.join(", ")} preset(s) — repoint them before removing it`,
+      { presets: slugs },
+    ),
+  modelAllowlistDuplicate: () =>
+    new RuntimeApiError(
+      409,
+      "model_allowlist_duplicate",
+      "that provider + model is already on the allowlist",
+    ),
+  registryUnavailable: (detail: string) =>
+    new RuntimeApiError(
+      502,
+      "registry_unavailable",
+      `the MCP registry is unavailable: ${detail}`,
+    ),
+  registryServerNotFound: (name: string) =>
+    new RuntimeApiError(404, "registry_server_not_found", `registry server "${name}" not found`),
+  registryServerNotInstallable: (name: string) =>
+    new RuntimeApiError(
+      422,
+      "registry_server_not_installable",
+      `registry server "${name}" has no remote (streamable-http/sse) endpoint to install`,
+    ),
+  noPendingInput: () =>
+    new RuntimeApiError(
+      409,
+      "no_pending_input",
+      "run is not waiting on input — nothing to resolve",
+    ),
+  nameTaken: (resource: string, name: string) =>
+    new RuntimeApiError(
+      409,
+      `${resource}_name_taken`,
+      `a ${resource.replace(/_/g, " ")} named "${name}" already exists in this workspace`,
+    ),
 
   workflowNotPublished: () =>
     new RuntimeApiError(

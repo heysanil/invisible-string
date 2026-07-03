@@ -948,10 +948,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   });
 
   test("no live worker → typed 503 (fresh workspace, stale heartbeats)", async () => {
+    // Stale EVERY worker: selectWorker is global (not workspace-scoped), so a
+    // live row from another suite/run sharing this DB would otherwise be
+    // dispatched to and turn this into a 502.
     await db
       .update(schema.workers)
-      .set({ lastHeartbeatAt: new Date(Date.now() - 120_000) })
-      .where(eq(schema.workers.address, fixture.url));
+      .set({ lastHeartbeatAt: new Date(Date.now() - 120_000) });
 
     // Use a FRESH workspace so the run cap (already saturated above) does
     // not shadow the scheduler error.

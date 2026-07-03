@@ -139,6 +139,46 @@ export const formMcpSkillFixture: CompilerFixture = {
   },
 };
 
+/**
+ * Form trigger + a PACKAGED skill (SKILL.md + a `references/` file) — the
+ * control-plane skill-attachment path in fixture form. Kept OUT of
+ * ALL_FIXTURES (no golden output) and used by the gated eve-build test to
+ * prove a skill-with-file project builds to a servable `.output`.
+ */
+export const skillWithFilesFixture: CompilerFixture = {
+  name: "skill-with-files",
+  definition: {
+    trigger: { type: "manual" },
+    context: {
+      mcpConnectionIds: [],
+      skillIds: ["9c8b7a65-4d3e-4f20-8191-a2b3c4d5e6f7"],
+    },
+    agent: { agentPresetId: SOFTWARE_ENGINEER_PRESET.id },
+    instructions: {
+      markdown: "Follow @skill.release-notes; consult its references/rota.md file.",
+    },
+  },
+  deps: {
+    versions: TEST_VERSIONS,
+    resolvedModel: { provider: "openrouter", modelId: "deepseek/deepseek-v4-flash" },
+    workspaceSlug: "acme",
+    workflowSlug: "packaged-skill",
+    agentPreset: SOFTWARE_ENGINEER_PRESET,
+    connections: [],
+    skills: [
+      {
+        id: "9c8b7a65-4d3e-4f20-8191-a2b3c4d5e6f7",
+        slug: "release-notes",
+        description: "Use when drafting release notes; see references/rota.md.",
+        markdown: "# Release notes\n\nLead with user-facing impact.",
+        files: {
+          "references/rota.md": "# On-call rota\n\n- weekdays: alice\n- weekends: bob\n",
+        },
+      },
+    ],
+  },
+};
+
 /** Slack trigger, anthropic model, headers-auth connection, packaged skill, dev build. */
 export const slackFixture: CompilerFixture = {
   name: "slack",

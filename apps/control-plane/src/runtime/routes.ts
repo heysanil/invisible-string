@@ -26,8 +26,9 @@ import { schema } from "@invisible-string/db";
 import {
   createSessionRequestSchema,
   postMessageRequestSchema,
-  workflowDefinitionSchema,
+  runInputRequestSchema,
   type AgentSessionDto,
+  type EveInputResponse,
   type PublishWorkflowResponse,
   type RunDto,
   type TriggerEvent,
@@ -37,23 +38,23 @@ import {
 
 import type { Db, DbClient } from "../db";
 import type { ArtifactStore } from "../artifacts";
-import { slugifyName } from "../build/compiler-adapter";
 import type { BuildService, BuildStore } from "../build/service";
-import {
-  WorkflowCompileError,
-  type CompileConnection,
-  type CompileResult,
-  type CompileSkill,
-  type CompileWorkflowFn,
-} from "../build/compiler-contract";
+import { type CompileWorkflowFn } from "../build/compiler-contract";
 import { worldNameForHash, worldUrlFor } from "../build/world";
 import { RunEventBus } from "../runs/bus";
 import { createRunSseResponse, parseLastEventId } from "../runs/sse";
 import type { RunStore } from "../runs/store";
 import type { RunTailerManager } from "../runs/tailer";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
-import { buildAgentEnv, decryptMcpEnv, mcpTokenEnvName } from "./agent-env";
+import { buildAgentEnv, decryptMcpEnv } from "./agent-env";
 import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
+import {
+  compileOrThrow,
+  dryRunCompile,
+  parseDefinition,
+  resolveCompileInputs,
+  type CompileServiceDeps,
+} from "./compile-service";
 import type { RuntimeConfig } from "./config";
 import { errors, isRuntimeApiError, RuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
@@ -61,7 +62,6 @@ import {
   loadModelResolutionData,
   resolveModel,
   type ModelProvider,
-  type ResolvedModel,
 } from "./model-resolution";
 import { selectWorker } from "./scheduler";
 import type { WorkerClient } from "./worker-client";
@@ -164,140 +164,19 @@ async function loadVersion(db: Db, versionId: string): Promise<VersionRow> {
   return row;
 }
 
-// ── definition parsing + compile-input resolution ───────────────────────────
+// ── compile-input resolution ────────────────────────────────────────────────
+//
+// parseDefinition / resolveCompileInputs / compileOrThrow live in
+// compile-service.ts (shared with the Phase-2 builder draft validation).
 
-function parseDefinition(raw: unknown): WorkflowDefinition {
-  const parsed = workflowDefinitionSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw errors.draftInvalid(
-      parsed.error.issues.map((issue) => ({
-        path: issue.path.join("."),
-        message: issue.message,
-      })),
-    );
-  }
-  return parsed.data;
-}
-
-interface CompileInputs {
-  model: ResolvedModel;
-  connections: CompileConnection[];
-  skills: CompileSkill[];
-  /** Slugified organization slug — baked into the generated project. */
-  workspaceSlug: string;
-}
-
-/**
- * Resolve the definition's referenced resources. Model resolution +
- * allowlist validation run FIRST so their typed errors surface before any
- * compile work. Context resources must be workspace-scoped rows of this
- * workspace or user-scoped rows of the workflow's run-as user (spec §2).
- */
-async function resolveCompileInputs(
-  db: Db,
-  organizationId: string,
-  runAsUserId: string,
-  definition: WorkflowDefinition,
-): Promise<CompileInputs> {
-  const data = await loadModelResolutionData(
-    db,
-    organizationId,
-    definition.agent.agentPresetId,
-  );
-  const model = resolveModel(definition.agent, data);
-
-  const orgRows = await db
-    .select({ slug: schema.organization.slug })
-    .from(schema.organization)
-    .where(eq(schema.organization.id, organizationId))
-    .limit(1);
-  const workspaceSlug = slugifyName(orgRows[0]?.slug ?? "") || "workspace";
-
-  const connections: CompileConnection[] = [];
-  for (const id of definition.context.mcpConnectionIds) {
-    const rows = await db
-      .select()
-      .from(schema.mcpConnections)
-      .where(eq(schema.mcpConnections.id, id))
-      .limit(1);
-    const row = rows[0];
-    const owned =
-      row &&
-      row.enabled &&
-      ((row.scope === "workspace" && row.organizationId === organizationId) ||
-        (row.scope === "user" && row.userId === runAsUserId));
-    if (!owned) throw errors.contextResourceNotFound("mcp_connection", id);
-    connections.push({
-      id: row.id,
-      name: row.name,
-      description: row.description ?? null,
-      url: row.url,
-      envTokenVar: row.authConfigEncrypted ? mcpTokenEnvName(row.name) : null,
-      toolAllow: row.toolAllow ?? null,
-      toolBlock: row.toolBlock ?? null,
-      approvalPolicy: row.approvalPolicy ?? null,
-    });
-  }
-
-  const skills: CompileSkill[] = [];
-  for (const id of definition.context.skillIds) {
-    const rows = await db
-      .select()
-      .from(schema.skills)
-      .where(eq(schema.skills.id, id))
-      .limit(1);
-    const row = rows[0];
-    const owned =
-      row &&
-      ((row.scope === "workspace" && row.organizationId === organizationId) ||
-        (row.scope === "user" && row.userId === runAsUserId));
-    if (!owned) throw errors.contextResourceNotFound("skill", id);
-    // Attached skill files are a Phase-2 feature; the compiler supports
-    // packaged skills but nothing fetches file CONTENT from the artifact
-    // store yet. Publishing would silently drop the attachments — make the
-    // loss explicit instead (review finding: silent content loss).
-    if (row.files && row.files.length > 0) {
-      throw errors.compileFailed([
-        {
-          path: `skills.${row.name}`,
-          message:
-            `skill "${row.name}" has attached files, which are not yet supported at publish — ` +
-            "publishing would silently drop them (file attachments land in Phase 2)",
-        },
-      ]);
-    }
-    skills.push({
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      content: row.content,
-    });
-  }
-
-  return { model, connections, skills, workspaceSlug };
-}
-
-function compileOrThrow(
-  compile: CompileWorkflowFn,
-  definition: WorkflowDefinition,
-  inputs: CompileInputs,
-  workflowName: string,
-): CompileResult {
-  try {
-    return compile({
-      definition,
-      model: inputs.model,
-      connections: inputs.connections,
-      skills: inputs.skills,
-      workspaceSlug: inputs.workspaceSlug,
-      workflowSlug: slugifyName(workflowName) || "workflow",
-    });
-  } catch (error) {
-    if (error instanceof WorkflowCompileError) {
-      throw errors.compileFailed(error.issues);
-    }
-    throw error;
-  }
+/** The compile-service deps view of a RuntimeDeps (db + secrets + store). */
+function compileServiceDeps(deps: RuntimeDeps): CompileServiceDeps {
+  return {
+    db: deps.db,
+    masterKey: deps.masterKey,
+    artifacts: deps.artifacts,
+    compile: deps.compile,
+  };
 }
 
 // ── DTO mapping ─────────────────────────────────────────────────────────────
@@ -509,41 +388,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
       return undefined;
     })
 
-    // ── create workflow (minimal REST create; full CRUD lands in Phase 2) ──
-    .post(
-      "/workspaces/:workspaceId/workflows",
-      async ({ workspace, body, set }) => {
-        const raw = body as { name?: unknown; draft?: unknown } | null;
-        if (
-          typeof raw?.name !== "string" ||
-          raw.name.trim() === "" ||
-          typeof raw.draft !== "object" ||
-          raw.draft === null
-        ) {
-          throw new RuntimeApiError(
-            422,
-            "invalid_body",
-            "expected { name: string, draft: object } (draft is stored as-is; it is validated at publish)",
-          );
-        }
-        const rows = await db
-          .insert(schema.workflows)
-          .values({
-            organizationId: workspace.organizationId,
-            name: raw.name.trim(),
-            runAsUserId: workspace.userId,
-            draft: raw.draft as Record<string, unknown>,
-          })
-          .returning({
-            id: schema.workflows.id,
-            name: schema.workflows.name,
-            runAsUserId: schema.workflows.runAsUserId,
-          });
-        set.status = 201;
-        return { workflow: rows[0]! };
-      },
-      { requireWorkspace: true },
-    )
+    // Workflows CRUD (list/get/create/update/delete) live in the Phase-2
+    // resources plugin (resources/workflows.ts); the runtime plugin owns the
+    // compile/build/dispatch verbs below.
 
     // ── publish ────────────────────────────────────────────────────────────
     .post(
@@ -556,7 +403,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         );
         const definition = parseDefinition(workflow.draft);
         const inputs = await resolveCompileInputs(
-          db,
+          compileServiceDeps(deps),
           workspace.organizationId,
           workflow.runAsUserId,
           definition,
@@ -640,24 +487,17 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.wfId,
         );
-        try {
-          const definition = parseDefinition(workflow.draft);
-          const inputs = await resolveCompileInputs(
-            db,
-            workspace.organizationId,
-            workflow.runAsUserId,
-            definition,
-          );
-          const compiled = compileOrThrow(deps.compile, definition, inputs, workflow.name);
-          return { ok: true as const, contentHash: compiled.hash };
-        } catch (error) {
-          // Compile/validation problems are the PAYLOAD of a dry run, not a
-          // failed request — the builder renders them inline.
-          if (isRuntimeApiError(error) && error.status === 422) {
-            return { ok: false as const, error: error.toBody().error };
-          }
-          throw error;
-        }
+        // Shape errors, model/allowlist errors, and compile problems are all
+        // the PAYLOAD of a dry run (`ok:false`), not a failed request — the
+        // builder renders them inline. dryRunCompile centralizes that.
+        const definition = parseDefinition(workflow.draft);
+        return dryRunCompile(
+          compileServiceDeps(deps),
+          workspace.organizationId,
+          workflow.runAsUserId,
+          workflow.name,
+          definition,
+        );
       },
       { requireWorkspace: true },
     )
@@ -874,6 +714,101 @@ export function runtimePlugin(deps: RuntimeDeps) {
           .where(eq(schema.runs.agentSessionId, session.id))
           .orderBy(asc(schema.runs.createdAt));
         return { session: sessionDto(session), runs: runRows.map(runDto) };
+      },
+      { requireWorkspace: true },
+    )
+
+    // ── HITL: answer a parked input.requested ────────────────────────────────
+    .post(
+      "/runs/:runId/input",
+      async ({ workspace, params, body }) => {
+        const input = parseBody(runInputRequestSchema, body);
+        const { run, session } = await loadRunOwned(
+          db,
+          workspace.organizationId,
+          params.runId,
+        );
+        if (
+          !session.eveSessionId ||
+          !session.continuationToken ||
+          session.status === "closed" ||
+          session.status === "error"
+        ) {
+          throw errors.sessionNotContinuable();
+        }
+        const eveSessionId = session.eveSessionId;
+        const continuationToken = session.continuationToken;
+        const ready = await requireReadyVersion(deps, session.workflowVersionId);
+        const worker = await selectWorker(
+          db,
+          runtime.workerHeartbeatTtlMs,
+          session.affinityWorkerId,
+        );
+
+        // Only a run parked on input (status `waiting`) is resolvable. Flip it
+        // to queued inside the advisory lock so a double POST cannot
+        // double-dispatch the same answer; the run row is REUSED (no cap
+        // change — a waiting run already holds its slot).
+        const resumed = await db.transaction(async (tx) => {
+          await lockWorkspaceRunCap(tx, workspace.organizationId);
+          const rows = await tx
+            .select({ status: schema.runs.status })
+            .from(schema.runs)
+            .where(eq(schema.runs.id, run.id))
+            .limit(1);
+          if (rows[0]?.status !== "waiting") return false;
+          await tx
+            .update(schema.runs)
+            .set({ status: "queued", error: null })
+            .where(eq(schema.runs.id, run.id));
+          return true;
+        });
+        if (!resumed) throw errors.noPendingInput();
+
+        const hash = ready.version.contentHash;
+        const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
+        const inputResponses: EveInputResponse[] = [
+          {
+            requestId: input.requestId,
+            ...(input.optionId !== undefined ? { optionId: input.optionId } : {}),
+            ...(input.text !== undefined ? { text: input.text } : {}),
+          },
+        ];
+        let result;
+        try {
+          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+          result = await deps.workerClient.continueEveSession(
+            worker.address,
+            hash,
+            await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+            eveSessionId,
+            { continuationToken, inputResponses },
+          );
+        } catch (error) {
+          await failDispatch(deps, run.id, error);
+          throw error; // unreachable — failDispatch always throws
+        }
+        if (result.continuationToken) {
+          await deps.runStore.updateSessionContinuation(
+            session.id,
+            result.continuationToken,
+          );
+        }
+        await db
+          .update(schema.agentSessions)
+          .set({ status: "active", affinityWorkerId: worker.id })
+          .where(eq(schema.agentSessions.id, session.id));
+
+        // Resume tailing the SAME run — its pre-park events stay; new events
+        // append at the next seq (SSE Last-Event-ID resume is seamless).
+        startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
+
+        const updated = await db
+          .select()
+          .from(schema.runs)
+          .where(eq(schema.runs.id, run.id))
+          .limit(1);
+        return { run: runDto(updated[0] ?? run) };
       },
       { requireWorkspace: true },
     )

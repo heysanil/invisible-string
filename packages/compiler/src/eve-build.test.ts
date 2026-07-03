@@ -20,7 +20,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { compile } from "./compile";
-import { ALL_FIXTURES, formMcpSkillFixture } from "./test-fixtures";
+import {
+  ALL_FIXTURES,
+  formMcpSkillFixture,
+  skillWithFilesFixture,
+} from "./test-fixtures";
 
 const GATE = process.env.SPIKE_EVE_BUILD === "1";
 const SKIP_REASON = "requires SPIKE_EVE_BUILD=1 (slow: npm install + eve build)";
@@ -157,6 +161,46 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
       expect(existsSync(manifestPath)).toBe(true);
       const manifest = await Bun.file(manifestPath).text();
       expect(manifest).toContain("/eve/v1/platform/form");
+    },
+    1_200_000,
+  );
+
+  // Proves the control-plane skill-attachment path end product: a workflow
+  // whose skill carries a `references/` file compiles to a PACKAGED skill
+  // directory and eve-builds keyless to a servable .output bundle.
+  test(
+    "skill-with-files fixture packages the attachment and eve-builds keyless",
+    async () => {
+      const projectDir = join(root, skillWithFilesFixture.name);
+      mkdirSync(projectDir, { recursive: true });
+      renderFixtureTo(projectDir, skillWithFilesFixture);
+
+      // The compiler emitted a packaged skill (SKILL.md + the reference file).
+      expect(
+        existsSync(join(projectDir, "agent", "skills", "release-notes", "SKILL.md")),
+      ).toBe(true);
+      expect(
+        existsSync(
+          join(projectDir, "agent", "skills", "release-notes", "references", "rota.md"),
+        ),
+      ).toBe(true);
+
+      const install = await run(
+        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+        projectDir,
+        env,
+        420_000,
+      );
+      expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
+
+      const build = await run(
+        [node24Bin(), join(projectDir, "node_modules", "eve", "bin", "eve.js"), "build"],
+        projectDir,
+        env,
+        420_000,
+      );
+      expect(build.exitCode, `eve build failed:\n${build.output.slice(-4000)}`).toBe(0);
+      expect(existsSync(join(projectDir, ".output", "server", "index.mjs"))).toBe(true);
     },
     1_200_000,
   );

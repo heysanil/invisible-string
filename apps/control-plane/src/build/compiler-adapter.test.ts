@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
+import { compile, RUNTIME_VERSIONS, type CompileDeps } from "@invisible-string/compiler";
 import type { WorkflowDefinition } from "@invisible-string/shared";
 
 import { compileWorkflow } from "./compiler-adapter";
 import type { CompileConnection, CompileRequest } from "./compiler-contract";
+import { BUILD_ENV_EPOCH } from "./steps";
 
 function baseRequest(connection: CompileConnection): CompileRequest {
   const definition: WorkflowDefinition = {
@@ -72,5 +74,75 @@ describe("compileWorkflow — MCP auth wiring", () => {
     expect(file!).toContain('"X-Api-Key": requireEnv("MCP_DOCS_API_HEADER_X_API_KEY")');
     // No secret value is ever present in generated code.
     expect(file!).not.toContain("Bearer");
+  });
+});
+
+describe("compileWorkflow — build-env epoch in the content hash", () => {
+  const connection: CompileConnection = {
+    id: "7d3f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6",
+    name: "Linear",
+    description: "Issues",
+    url: "https://mcp.linear.app/mcp",
+    envTokenVar: "MCP_LINEAR_TOKEN",
+    authHeaders: null,
+    toolAllow: null,
+    toolBlock: null,
+    approvalPolicy: null,
+  };
+
+  function rawDeps(request: CompileRequest): Omit<CompileDeps, "buildEnvEpoch"> {
+    return {
+      versions: RUNTIME_VERSIONS,
+      resolvedModel: {
+        provider: request.model.provider,
+        modelId: request.model.modelId,
+      },
+      workspaceSlug: request.workspaceSlug,
+      workflowSlug: request.workflowSlug,
+      agentPreset: {
+        id: request.definition.agent.agentPresetId,
+        name: request.model.agentName,
+        persona: request.model.basePrompt,
+        defaultReasoning: request.model.reasoning,
+      },
+      connections: [
+        {
+          id: connection.id,
+          slug: "linear",
+          url: connection.url!,
+          description: connection.description!,
+          auth: { kind: "bearerToken" },
+          tools: undefined,
+          approval: { mode: "never" },
+        },
+      ],
+      skills: [],
+    };
+  }
+
+  test("BUILD_ENV_EPOCH re-keys the content hash (regression: the eve-build routing placeholder changed artifact bytes without changing the hash — poisoned artifacts kept cache-hitting)", () => {
+    const request = baseRequest(connection);
+    const adapted = compileWorkflow(request);
+    const withoutEpoch = compile(request.definition, rawDeps(request));
+    const withEpoch = compile(request.definition, {
+      ...rawDeps(request),
+      buildEnvEpoch: BUILD_ENV_EPOCH,
+    });
+    expect(adapted.hash).not.toBe(withoutEpoch.hash);
+    expect(adapted.hash).toBe(withEpoch.hash);
+    const bumped = compile(request.definition, {
+      ...rawDeps(request),
+      buildEnvEpoch: BUILD_ENV_EPOCH + 1,
+    });
+    expect(bumped.hash).not.toBe(adapted.hash);
+    // Still a well-formed sha256 hex (worldNameForHash / artifact keys rely on it).
+    expect(adapted.hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("the baked platform-JWT audience is bound to the SAME hash the control plane keys by (an outward hash the compiled agent doesn't know would 401 every platform token)", () => {
+    const adapted = compileWorkflow(baseRequest(connection));
+    const authLib = adapted.files.get("agent/lib/platform-auth.ts");
+    expect(authLib).toBeDefined();
+    expect(authLib!).toContain(adapted.hash);
   });
 });

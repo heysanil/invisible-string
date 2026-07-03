@@ -31,6 +31,7 @@ import {
   type ToolFilterSpec,
 } from "@invisible-string/compiler";
 
+import { BUILD_ENV_EPOCH } from "./steps";
 import {
   WorkflowCompileError,
   type CompileConnection,
@@ -223,6 +224,11 @@ export const compileWorkflow: CompileWorkflowFn = (
   try {
     const compiled = compile(request.definition, {
       versions: RUNTIME_VERSIONS,
+      // Build-env changes that alter artifact BYTES for the same compiled
+      // files (e.g. the eve-build routing placeholder) must re-key cached
+      // artifacts. Passed INTO compile() so the baked platform-JWT audience
+      // stays bound to the same hash the control plane mints against.
+      buildEnvEpoch: BUILD_ENV_EPOCH,
       resolvedModel: {
         provider: request.model.provider,
         modelId: request.model.modelId,

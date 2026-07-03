@@ -190,6 +190,14 @@ Event inventory frozen in `packages/shared/src/eve-events.ts` (14 types live-obs
     at build) + emit `modelContextWindowTokens`, or pass the (or any) key to
     `eve build`, or override routing at runtime. Decide before first real
     keyed deployment.
+    **RESOLVED in the product (2026-07-03)**: the eve-build step now sets a
+    public placeholder OPENROUTER_API_KEY (steps.ts — bakes external routing;
+    placeholder never reaches the artifact), the compiler emits
+    `modelContextWindowTokens` verbatim (codegen/agent.ts, COMPILER_VERSION
+    2.2.0), and a BUILD_ENV_EPOCH (steps.ts) participates in the content hash
+    via the compiler adapter so build-env changes like this one can never
+    cache-hit stale (gateway-routed) artifacts again. Verified end-to-end by
+    tests/integration/keyed-acceptance.test.ts under a real key.
 
 ## How to run
 

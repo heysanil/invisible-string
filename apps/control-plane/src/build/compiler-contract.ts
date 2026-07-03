@@ -75,7 +75,11 @@ export interface CompileRequest {
 export interface CompileResult {
   /** Relative path → file content of the emitted eve project. */
   files: ReadonlyMap<string, string>;
-  /** Content hash covering config + compiler version + eve version. */
+  /**
+   * Content hash covering config + compiler version + eve version + the
+   * build-environment epoch (build/steps.ts BUILD_ENV_EPOCH — build-step
+   * changes that alter artifact bytes must re-key cached artifacts).
+   */
   hash: string;
   compilerVersion: string;
   eveVersion: string;

@@ -53,6 +53,33 @@ export interface BuildSteps {
   packageArtifact(projectDir: string, contentHash: string): Promise<Uint8Array>;
 }
 
+/**
+ * Build-environment epoch — participates in the workflow content hash
+ * (compiler-adapter.ts passes it as CompileDeps.buildEnvEpoch, so the hash
+ * the compiler bakes into the artifact — e.g. the platform-JWT audience —
+ * and the hash the control plane keys everything by are the same value).
+ *
+ * The compiler's hash covers WHAT gets compiled (definition + resolved deps +
+ * compiler/eve versions) but not HOW this file builds it. `eve build` bakes
+ * environment-dependent state into the artifact — most critically the model
+ * ROUTING in .eve/compile/compiled-agent-manifest.json, which flipped from
+ * `{kind:"gateway"}` (broken: ignores the spawn-time OPENROUTER_API_KEY) to
+ * `{kind:"external",provider:"openrouter"}` when the eve-build step gained
+ * its placeholder key. Without an epoch, that fix would have kept serving
+ * poisoned cached artifacts forever (content hash unchanged, cache hit).
+ *
+ * BUMP THIS whenever a change to the build steps alters artifact BYTES for
+ * the same compiled files (step env, eve invocation flags, tarball layout).
+ * Bumping re-keys every workflow version on its next publish: fresh hash →
+ * fresh build (+ fresh world DB) — the stale artifacts are simply never
+ * referenced again.
+ *
+ * Epoch history:
+ * - 1: introduced alongside the eve-build OPENROUTER_API_KEY routing
+ *      placeholder (invalidates any artifact built keyless before it).
+ */
+export const BUILD_ENV_EPOCH = 1;
+
 export class BuildStepError extends Error {
   override readonly name = "BuildStepError";
   constructor(

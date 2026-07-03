@@ -65,6 +65,10 @@ export function computeWorkflowHash(
   compilerVersion: string = COMPILER_VERSION,
 ): string {
   const canonical = canonicalJson({
+    // Caller-supplied build-environment epoch (CompileDeps.buildEnvEpoch).
+    // `undefined` is dropped by canonicalJson, so callers that don't set it
+    // keep their historical hashes.
+    buildEnv: deps.buildEnvEpoch,
     compilerVersion,
     definition,
     resolved: {

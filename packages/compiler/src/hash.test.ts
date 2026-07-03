@@ -108,6 +108,23 @@ describe("workflow hash properties", () => {
     );
   });
 
+  test("buildEnvEpoch changes the hash; undefined keeps historical hashes (build-env changes must re-key cached artifacts)", () => {
+    const epoch1: CompileDeps = { ...deps, buildEnvEpoch: 1 };
+    const epoch2: CompileDeps = { ...deps, buildEnvEpoch: 2 };
+    expect(computeWorkflowHash(definition, epoch1)).not.toBe(
+      computeWorkflowHash(definition, deps),
+    );
+    expect(computeWorkflowHash(definition, epoch2)).not.toBe(
+      computeWorkflowHash(definition, epoch1),
+    );
+    expect(computeWorkflowHash(definition, epoch1)).toBe(
+      computeWorkflowHash(definition, { ...deps, buildEnvEpoch: 1 }),
+    );
+    expect(computeWorkflowHash(definition, { ...deps, buildEnvEpoch: undefined })).toBe(
+      computeWorkflowHash(definition, deps),
+    );
+  });
+
   test("dev flag changes the hash (dev artifacts never cache-hit prod)", () => {
     const dev: CompileDeps = { ...deps, options: { dev: true } };
     expect(computeWorkflowHash(definition, dev)).not.toBe(

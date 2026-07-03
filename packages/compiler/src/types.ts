@@ -148,6 +148,19 @@ export interface CompileDeps {
   readonly connections: readonly ResolvedMcpConnection[];
   readonly skills: readonly ResolvedSkill[];
   readonly options?: CompileOptions;
+  /**
+   * Caller's build-ENVIRONMENT epoch (the control plane passes
+   * build/steps.ts BUILD_ENV_EPOCH). The compiler hash covers the compile
+   * INPUT; this covers the build steps that turn the emitted files into an
+   * artifact — `eve build` bakes env-dependent state (model routing) into
+   * artifact bytes, so a build-env change must re-key cached artifacts.
+   * Participates in computeWorkflowHash; MUST flow through compile() (not be
+   * appended afterwards) because the emitted platform-auth lib bakes the JWT
+   * audience `agent:<hash>` — an outward hash that differs from the baked
+   * one would 401 every platform-minted token. `undefined` keeps historical
+   * hashes.
+   */
+  readonly buildEnvEpoch?: number;
 }
 
 export interface CompileResult {

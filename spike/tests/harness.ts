@@ -213,6 +213,16 @@ async function resetWorldState(): Promise<void> {
 
 export async function eveBuild(): Promise<void> {
   if (agentBuilt) return;
+  // NOTE (keyed suite): `eve build` must run with the SAME key visibility as
+  // `eve start`. The compiled manifest bakes the model ROUTING at build time:
+  // a keyless build resolves the model to the gateway-id string (routing
+  // {kind:"gateway"}, no module source) and the runtime then calls the
+  // Vercel AI Gateway even if OPENROUTER_API_KEY is present at runtime
+  // (observed empirically: instant step.failed on every turn). With the key
+  // at build time the model is the provider OBJECT (routing
+  // {kind:"external", provider:"openrouter"} + module source) and runtime
+  // turns go to OpenRouter. The catalog-metadata build failure this used to
+  // cause is fixed by modelContextWindowTokens in agent/agent.ts.
   const result = await run(
     [node24Bin(), join(AGENT_PROJECT_DIR, "node_modules", "eve", "bin", "eve.js"), "build"],
     { cwd: AGENT_PROJECT_DIR, timeoutMs: 300_000 },

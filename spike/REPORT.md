@@ -48,8 +48,22 @@ Keyless-mocked (`mocked.test.ts`, `EVE_MOCK_AUTHORED_MODELS=1` — everything re
 - Follow-up via `continuationToken` continues the same durable session (no new `session.started`).
 - `docker()` sandbox executes `bash` and writes `/workspace/proof.txt` (image `ghcr.io/vercel/eve:latest`, 645 MB).
 
-Key-blocked (`keyed.test.ts`, written, skipped with "requires OPENROUTER_API_KEY"):
-- Real-model versions of: full turn, `?startIndex=` resume, approval park + kill + restart + resume, shared-memory follow-up ("codeword" recall — semantic memory can't be proven with the mock), sandbox bash file write.
+Keyed (`keyed.test.ts`, REAL inference on `deepseek/deepseek-v4-flash` via
+OpenRouter — verified green 2026-07-03 with a live key; skips with "requires
+OPENROUTER_API_KEY" otherwise):
+- Full turn completes through the proxy (real model reply, `message.completed`).
+- NDJSON `?startIndex=` resume after disconnect (no replayed head events).
+- **DURABILITY GATE with a real model**: approval-gated `record_note` parks the
+  session; `eve start` SIGKILLed; fresh process (new server PID) resumes via
+  `inputResponses` and the tool's side effect lands on disk from the NEW
+  process.
+- Follow-up via `continuationToken` shares session memory (real "codeword"
+  recall — semantic memory the mock cannot prove).
+- Live MCP: the model calls a `deepwiki__*` tool over the DeepWiki connection
+  (`actions.requested`/`action.result` status `completed`).
+- `docker()` sandbox bash writes `/workspace/proof.txt` under a real model.
+- Prerequisite discovered (finding 20): keyed `eve build` needs the agent-level
+  `modelContextWindowTokens` escape hatch.
 
 Event inventory frozen in `packages/shared/src/eve-events.ts` (14 types live-observed, 13 docs-derived; raw captures in `spike/tests/fixtures/*.ndjson`).
 
@@ -149,6 +163,33 @@ Event inventory frozen in `packages/shared/src/eve-events.ts` (14 types live-obs
 19. **npm blocked postinstall scripts** (`@openrouter/sdk` check-types,
     `cbor-extract` native build) under this environment's allow-scripts
     policy; both packages work without them (cbor-x falls back to pure JS).
+20. **CRITICAL — model ROUTING is baked into the artifact at `eve build`
+    time** (observed empirically under the real key, 2026-07-03). The
+    compiled manifest records `config.model.routing` from whatever
+    `resolveModel()` returned DURING BUILD:
+    - key present at build → provider MODEL OBJECT → `{kind:"external",
+      provider:"openrouter"}` + a `source` module reference; runtime turns go
+      to OpenRouter. But eve derives the gateway id
+      `openrouter/<slug>`, which the AI Gateway model catalog cannot resolve,
+      so the build FAILS ("does not have known AI Gateway context window
+      metadata") unless the agent config sets the documented
+      `modelContextWindowTokens` escape hatch (the spike agent now does:
+      1,000,000, the catalog value for `deepseek/deepseek-v4-flash`).
+    - key absent at build → gateway-id STRING → `{kind:"gateway"}`, no
+      module source; the runtime then calls the Vercel AI Gateway even when
+      OPENROUTER_API_KEY IS present at runtime (every turn fails instantly
+      with `step.failed`). Exporting the key to `eve start` does NOT rescue a
+      keyless build.
+    **Phase-1+ implication (product bug)**: the build service scrubs
+    OPENROUTER_API_KEY (apps/control-plane/src/build/steps.ts allowlist)
+    while the runtime provides it (runtime/agent-env.ts) — so
+    compiler-generated agents are built keyless, bake gateway routing, and
+    can never reach OpenRouter in production. Masked so far because both
+    acceptance suites set EVE_MOCK_AUTHORED_MODELS=1. Fix options: make the
+    generated agent.ts always construct the provider model (placeholder key
+    at build) + emit `modelContextWindowTokens`, or pass the (or any) key to
+    `eve build`, or override routing at runtime. Decide before first real
+    keyed deployment.
 
 ## How to run
 

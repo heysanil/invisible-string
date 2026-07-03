@@ -6,6 +6,7 @@ import { cn } from "../../lib/cn";
 export interface SelectOption {
   value: string;
   label: string;
+  disabled?: boolean;
 }
 
 export interface SelectProps
@@ -13,6 +14,7 @@ export interface SelectProps
   /** Visible field label; pass `srOnlyLabel` to hide it visually. */
   label?: string;
   srOnlyLabel?: boolean;
+  error?: string | null;
   options: readonly SelectOption[];
   /** Leading placeholder rendered as a disabled first option. */
   placeholder?: string;
@@ -22,15 +24,17 @@ export interface SelectProps
 export function Select({
   label,
   srOnlyLabel,
+  error,
   options,
   placeholder,
   className,
   id: idProp,
-  value,
   ...rest
 }: SelectProps) {
   const autoId = useId();
   const id = idProp ?? autoId;
+  const errorId = `${id}-error`;
+
   return (
     <div className="flex flex-col gap-1.5">
       {label ? (
@@ -47,10 +51,12 @@ export function Select({
       <div className="relative">
         <select
           id={id}
-          value={value}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
           className={cn(
-            "h-10 w-full appearance-none rounded-capsule border border-black/10 bg-white/60 pl-4 pr-9 text-sm text-ink",
-            "transition-[border-color,background-color] duration-150 ease-out hover:border-black/15",
+            "h-10 w-full appearance-none rounded-capsule border bg-white/60 pl-4 pr-9 text-sm text-ink",
+            "transition-[border-color,background-color,box-shadow] duration-150 ease-out",
+            error ? "border-err/50" : "border-black/10 hover:border-black/15",
             "focus-visible:outline focus-visible:outline-2 focus-visible:outline-ink",
             className,
           )}
@@ -62,7 +68,7 @@ export function Select({
             </option>
           ) : null}
           {options.map((option) => (
-            <option key={option.value} value={option.value}>
+            <option key={option.value} value={option.value} disabled={option.disabled}>
               {option.label}
             </option>
           ))}
@@ -73,6 +79,11 @@ export function Select({
           className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-ink-4"
         />
       </div>
+      {error ? (
+        <p id={errorId} aria-live="polite" className="px-1 text-xs text-err">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }

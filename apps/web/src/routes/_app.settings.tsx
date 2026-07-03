@@ -1,31 +1,17 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { Settings, UserPlus } from "lucide-react";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 
-import { SectionPage } from "../components/SectionPage";
-import { Button } from "../components/ui/Button";
-import { EmptyState } from "../components/ui/EmptyState";
+import { SettingsNav } from "../components/settings/SettingsNav";
 
-export const Route = createFileRoute("/_app/settings")({
-  component: SettingsPage,
-});
+export const Route = createFileRoute("/_app/settings")({ component: SettingsLayout });
 
-function SettingsPage() {
+/** Settings shell: glass sub-nav + the active section pane. */
+function SettingsLayout() {
   return (
-    <SectionPage
-      title="Settings"
-      listHint="Workspace and account settings will appear here."
-    >
-      <EmptyState
-        icon={Settings}
-        title="Workspace settings"
-        description="Members, model presets, allowlists, and integrations will live here."
-        action={
-          <Button variant="ghost" size="sm">
-            <UserPlus size={14} aria-hidden="true" />
-            Invite teammates
-          </Button>
-        }
-      />
-    </SectionPage>
+    <div className="flex h-full gap-5">
+      <SettingsNav />
+      <div className="min-w-0 flex-1">
+        <Outlet />
+      </div>
+    </div>
   );
 }

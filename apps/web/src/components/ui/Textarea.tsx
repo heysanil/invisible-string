@@ -11,8 +11,12 @@ export interface TextareaProps
   label?: string;
   srOnlyLabel?: boolean;
   error?: string | null;
+  /** Guidance line rendered under the label (e.g. character advice). */
+  hint?: string;
 }
 
+// See ui/Input.tsx: happy-dom never emits React's synthetic change for text
+// controls, so the consumer's onChange rides the native `input` event.
 function noopChange() {}
 
 /**
@@ -24,6 +28,7 @@ export function Textarea({
   label,
   srOnlyLabel,
   error,
+  hint,
   className,
   id: idProp,
   onChange,
@@ -33,11 +38,14 @@ export function Textarea({
   const autoId = useId();
   const id = idProp ?? autoId;
   const errorId = `${id}-error`;
+  const hintId = `${id}-hint`;
 
   const handleInput: TextareaProps["onInput"] = (event) => {
     onInput?.(event);
     onChange?.(event as unknown as ChangeEvent<HTMLTextAreaElement>);
   };
+
+  const describedBy = error ? errorId : hint ? hintId : undefined;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -57,10 +65,10 @@ export function Textarea({
         onChange={noopChange}
         onInput={handleInput}
         aria-invalid={error ? true : undefined}
-        aria-describedby={error ? errorId : undefined}
+        aria-describedby={describedBy}
         className={cn(
-          "w-full rounded-card border bg-white/60 px-4 py-2.5 text-sm text-ink placeholder:text-ink-4",
-          "transition-[border-color,background-color] duration-150 ease-out",
+          "w-full rounded-[16px] border bg-white/60 px-4 py-3 text-sm leading-relaxed text-ink placeholder:text-ink-4",
+          "transition-[border-color,background-color,box-shadow] duration-150 ease-out",
           error ? "border-err/50" : "border-black/10 hover:border-black/15",
           className,
         )}
@@ -69,6 +77,10 @@ export function Textarea({
       {error ? (
         <p id={errorId} aria-live="polite" className="px-1 text-xs text-err">
           {error}
+        </p>
+      ) : hint ? (
+        <p id={hintId} className="px-1 text-xs text-ink-4">
+          {hint}
         </p>
       ) : null}
     </div>

@@ -238,14 +238,14 @@ async function providerForVersion(
   return resolveModel(definition.agent, data).provider;
 }
 
-interface ReadyVersion {
+export interface ReadyVersion {
   version: VersionRow;
   definition: WorkflowDefinition;
   artifactKey: string;
 }
 
 /** The published version must have a succeeded build with its artifact. */
-async function requireReadyVersion(
+export async function requireReadyVersion(
   deps: RuntimeDeps,
   versionId: string,
 ): Promise<ReadyVersion> {
@@ -259,9 +259,9 @@ async function requireReadyVersion(
 }
 
 /** ensure-agent on the picked worker with the version's full env. */
-async function ensureAgentOnWorker(
+export async function ensureAgentOnWorker(
   deps: RuntimeDeps,
-  workerAddress: string,
+  worker: { id: string; address: string },
   ready: ReadyVersion,
   organizationId: string,
 ): Promise<void> {
@@ -285,9 +285,10 @@ async function ensureAgentOnWorker(
     mcpEnv,
   });
   try {
-    await deps.workerClient.ensureAgent(workerAddress, hash, {
+    await deps.workerClient.ensureAgent(worker.address, hash, {
       artifactUrl: deps.artifacts.presignGetUrl(ready.artifactKey),
       env,
+      workerId: worker.id,
     });
   } catch (error) {
     throw errors.workerDispatchFailed(
@@ -378,6 +379,10 @@ export function runtimePlugin(deps: RuntimeDeps) {
         db,
         workerSharedSecret: runtime.workerSharedSecret,
         allowInsecureWorkerTransport: runtime.allowInsecureWorkerTransport,
+        heartbeatIntervalMs: Math.max(
+          1_000,
+          Math.floor(runtime.workerHeartbeatTtlMs / 3),
+        ),
       }),
     )
     .use(workspacePlugin(deps.workspaceDeps))
@@ -545,7 +550,11 @@ export function runtimePlugin(deps: RuntimeDeps) {
         );
         if (!workflow.publishedVersionId) throw errors.workflowNotPublished();
         const ready = await requireReadyVersion(deps, workflow.publishedVersionId);
-        const worker = await selectWorker(db, runtime.workerHeartbeatTtlMs);
+        const { worker } = await selectWorker(db, {
+          heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
+          defaultMaxAgents: runtime.maxAgentsPerWorker,
+          versionHash: ready.version.contentHash,
+        });
 
         const principal = {
           workspaceId: workspace.organizationId,
@@ -600,7 +609,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
         let created;
         try {
-          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+          await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
           created = await deps.workerClient.createEveSession(
             worker.address,
             hash,
@@ -651,11 +660,12 @@ export function runtimePlugin(deps: RuntimeDeps) {
         const eveSessionId = session.eveSessionId;
         const continuationToken = session.continuationToken;
         const ready = await requireReadyVersion(deps, session.workflowVersionId);
-        const worker = await selectWorker(
-          db,
-          runtime.workerHeartbeatTtlMs,
-          session.affinityWorkerId,
-        );
+        const { worker } = await selectWorker(db, {
+          heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
+          defaultMaxAgents: runtime.maxAgentsPerWorker,
+          versionHash: ready.version.contentHash,
+          affinityWorkerId: session.affinityWorkerId,
+        });
 
         const triggerEvent: TriggerEvent = {
           workflowId: session.workflowId,
@@ -699,7 +709,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
         let result;
         try {
-          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+          await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
           result = await deps.workerClient.continueEveSession(
             worker.address,
             hash,
@@ -770,11 +780,12 @@ export function runtimePlugin(deps: RuntimeDeps) {
         const eveSessionId = session.eveSessionId;
         const continuationToken = session.continuationToken;
         const ready = await requireReadyVersion(deps, session.workflowVersionId);
-        const worker = await selectWorker(
-          db,
-          runtime.workerHeartbeatTtlMs,
-          session.affinityWorkerId,
-        );
+        const { worker } = await selectWorker(db, {
+          heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
+          defaultMaxAgents: runtime.maxAgentsPerWorker,
+          versionHash: ready.version.contentHash,
+          affinityWorkerId: session.affinityWorkerId,
+        });
 
         // Only a run parked on input (status `waiting`) is resolvable. Flip it
         // to queued inside the advisory lock so a double POST cannot
@@ -807,7 +818,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         ];
         let result;
         try {
-          await ensureAgentOnWorker(deps, worker.address, ready, workspace.organizationId);
+          await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
           result = await deps.workerClient.continueEveSession(
             worker.address,
             hash,

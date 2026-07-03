@@ -1,24 +1,42 @@
 /**
  * Internal worker-registry endpoints (PLAN §API surface "internal worker
- * endpoints with shared-secret auth") — the control-plane counterpart of
- * apps/worker/src/registration.ts:
+ * endpoints") — the control-plane counterpart of apps/worker/src/registration.ts:
  *
- *   POST /internal/workers/register    {id, url, capacity} → upsert, status live
- *   POST /internal/workers/heartbeat   {id, url, capacity} → refresh; 404 when
- *                                      the row is unknown (worker re-registers)
+ *   POST /internal/workers/register    {id, url, capacity, identity} → upsert,
+ *                                      status live; in `worker-token` mode the
+ *                                      response carries a short-lived
+ *                                      per-worker session token
+ *   POST /internal/workers/heartbeat   {id, url?, capacity?} → refresh; 404 when
+ *                                      the row is unknown (worker re-registers);
+ *                                      rotates the session token when the caller
+ *                                      authenticated with one
  *   POST /internal/workers/deregister  {id} → status dead (drain path)
  *
- * All guarded by the `x-worker-secret` header (timing-safe compare — same
- * scheme as the worker's own /internal/* surface). These rows feed the
- * scheduler (`runtime/scheduler.ts`): a worker is schedulable while status is
- * `live` AND its heartbeat is fresher than WORKER_HEARTBEAT_TTL_MS.
+ * AUTH (docs/PLAN.md Phase 3 task 5 — per-worker identity, deferred from
+ * Phase 1): the first `register` authenticates with the bootstrap
+ * `x-worker-secret` (the ONLY call that must). In `worker-token` mode the
+ * control plane then mints a per-worker HS256 SESSION token (secret derived
+ * from the bootstrap secret + worker id) which the worker re-presents via
+ * `x-worker-token` (+ `x-worker-id`) on heartbeat/deregister — attributable,
+ * and it never resends the bootstrap secret. `shared-secret` mode (Phase-1
+ * default) keeps guarding every call with `x-worker-secret`. Either credential
+ * is accepted on heartbeat/deregister so both modes interoperate.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import { eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
-import type { ApiErrorBody } from "@invisible-string/shared";
+import {
+  mintWorkerSessionToken,
+  verifyWorkerSessionToken,
+  workerIdentityDeclarationSchema,
+  WORKER_BOOTSTRAP_SECRET_HEADER,
+  WORKER_ID_HEADER,
+  WORKER_TOKEN_HEADER,
+  type ApiErrorBody,
+  type WorkerIdentityDeclaration,
+} from "@invisible-string/shared";
 
 import type { Db } from "../db";
 
@@ -29,14 +47,14 @@ interface WorkerBody {
   id: string;
   url?: string;
   capacity?: Record<string, unknown>;
+  identity: WorkerIdentityDeclaration;
 }
 
 /**
  * A registered worker `url` receives ensure-agent payloads carrying the
  * agent's FULL secret env (provider key, derived JWT secret, decrypted MCP
  * tokens). Plaintext http is only acceptable for local dev/CI, behind the
- * explicit ALLOW_INSECURE_WORKER_TRANSPORT=1 opt-in. Per-worker credentials
- * / mTLS identity land with the Phase-3 worker pool.
+ * explicit ALLOW_INSECURE_WORKER_TRANSPORT=1 opt-in.
  */
 function workerUrlProblem(url: URL, allowInsecureHttp: boolean): string | null {
   if (url.protocol === "https:") return null;
@@ -73,7 +91,17 @@ function parseWorkerBody(raw: unknown, requireUrl: boolean): WorkerBody | null {
     typeof body.capacity === "object" && body.capacity !== null && !Array.isArray(body.capacity)
       ? (body.capacity as Record<string, unknown>)
       : undefined;
-  return { id: body.id, url: body.url as string | undefined, capacity };
+  // Additive to the Phase-1 shape: defaults to shared-secret when absent.
+  const identity = workerIdentityDeclarationSchema.safeParse(
+    body.identity ?? { mode: "shared-secret" },
+  );
+  if (!identity.success) return null;
+  return {
+    id: body.id,
+    url: body.url as string | undefined,
+    capacity,
+    identity: identity.data,
+  };
 }
 
 export function workerRegistryPlugin(deps: {
@@ -81,9 +109,12 @@ export function workerRegistryPlugin(deps: {
   workerSharedSecret: string;
   /** ALLOW_INSECURE_WORKER_TRANSPORT=1 — local dev/CI only. */
   allowInsecureWorkerTransport?: boolean;
+  /** Heartbeat cadence advertised to workers (default = ttl/3). */
+  heartbeatIntervalMs?: number;
 }) {
   const { db } = deps;
   const allowInsecureHttp = deps.allowInsecureWorkerTransport === true;
+  const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 10_000;
 
   function urlProblemFor(parsed: WorkerBody): string | null {
     if (parsed.url === undefined) return null;
@@ -96,12 +127,40 @@ export function workerRegistryPlugin(deps: {
     return workerUrlProblem(url, allowInsecureHttp);
   }
 
+  /** Bootstrap secret OR a valid per-worker session token authorizes the call. */
+  function isAuthorized(request: Request): boolean {
+    const bootstrap = request.headers.get(WORKER_BOOTSTRAP_SECRET_HEADER);
+    if (bootstrap !== null && secretsEqual(bootstrap, deps.workerSharedSecret)) {
+      return true;
+    }
+    const token = request.headers.get(WORKER_TOKEN_HEADER);
+    const workerId = request.headers.get(WORKER_ID_HEADER);
+    if (token !== null && workerId !== null && UUID_RE.test(workerId)) {
+      return verifyWorkerSessionToken(deps.workerSharedSecret, workerId, token).ok;
+    }
+    return false;
+  }
+
+  /** Did the caller authenticate with a session token? (→ rotate on ack) */
+  function usedSessionToken(request: Request): string | null {
+    const token = request.headers.get(WORKER_TOKEN_HEADER);
+    const workerId = request.headers.get(WORKER_ID_HEADER);
+    if (token !== null && workerId !== null && UUID_RE.test(workerId)) {
+      if (verifyWorkerSessionToken(deps.workerSharedSecret, workerId, token).ok) {
+        return workerId;
+      }
+    }
+    return null;
+  }
+
   return new Elysia({ name: "worker-registry" })
     .onBeforeHandle(({ request, set }) => {
-      const provided = request.headers.get("x-worker-secret");
-      if (provided === null || !secretsEqual(provided, deps.workerSharedSecret)) {
+      if (!isAuthorized(request)) {
         set.status = 401;
-        return errorBody("unauthorized", "missing or invalid x-worker-secret header");
+        return errorBody(
+          "unauthorized",
+          "missing or invalid worker credential (x-worker-secret or x-worker-token)",
+        );
       }
       return undefined;
     })
@@ -109,7 +168,10 @@ export function workerRegistryPlugin(deps: {
       const parsed = parseWorkerBody(body, true);
       if (!parsed) {
         set.status = 400;
-        return errorBody("invalid_request", "expected {id: uuid, url: http(s) URL, capacity?}");
+        return errorBody(
+          "invalid_request",
+          "expected {id: uuid, url: http(s) URL, capacity?, identity?}",
+        );
       }
       const urlProblem = urlProblemFor(parsed);
       if (urlProblem) {
@@ -135,9 +197,22 @@ export function workerRegistryPlugin(deps: {
             updatedAt: new Date(),
           },
         });
-      return { ok: true };
+
+      // Per-worker identity: mint a fresh session token (rotate on re-register).
+      if (parsed.identity.mode === "worker-token") {
+        const minted = mintWorkerSessionToken(deps.workerSharedSecret, parsed.id);
+        return {
+          ok: true as const,
+          workerId: parsed.id,
+          authMode: "worker-token" as const,
+          workerToken: minted.token,
+          workerTokenExpiresAt: minted.expiresAt,
+          heartbeatIntervalMs,
+        };
+      }
+      return { ok: true as const, workerId: parsed.id, authMode: parsed.identity.mode, heartbeatIntervalMs };
     })
-    .post("/internal/workers/heartbeat", async ({ body, set }) => {
+    .post("/internal/workers/heartbeat", async ({ body, request, set }) => {
       const parsed = parseWorkerBody(body, false);
       if (!parsed) {
         set.status = 400;
@@ -163,7 +238,17 @@ export function workerRegistryPlugin(deps: {
         set.status = 404;
         return errorBody("worker_not_registered", "unknown worker id — re-register");
       }
-      return { ok: true };
+      // Rotate the session token when the caller presented one for this worker.
+      const tokenWorkerId = usedSessionToken(request);
+      if (tokenWorkerId === parsed.id) {
+        const minted = mintWorkerSessionToken(deps.workerSharedSecret, parsed.id);
+        return {
+          ok: true as const,
+          workerToken: minted.token,
+          workerTokenExpiresAt: minted.expiresAt,
+        };
+      }
+      return { ok: true as const };
     })
     .post("/internal/workers/deregister", async ({ body, set }) => {
       const parsed = parseWorkerBody(body, false);
@@ -171,10 +256,12 @@ export function workerRegistryPlugin(deps: {
         set.status = 400;
         return errorBody("invalid_request", "expected {id: uuid}");
       }
+      // Graceful drain → dead. The sweeper (worker-sweeper.ts) then clears the
+      // worker's sessions' affinity and reschedules any interrupted runs.
       await db
         .update(schema.workers)
         .set({ status: "dead", updatedAt: new Date() })
         .where(eq(schema.workers.id, parsed.id));
-      return { ok: true };
+      return { ok: true as const };
     });
 }

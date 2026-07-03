@@ -15,7 +15,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
 import { startTail, type RuntimeDeps } from "./routes";
-import { isWorkerLive } from "./scheduler";
+import { isWorkerLive, toSchedulableWorker } from "./scheduler";
 
 export interface ReconcileOutcome {
   resumed: number;
@@ -57,12 +57,7 @@ export async function reconcileInterruptedRuns(
     const workerLive =
       row.worker !== null &&
       isWorkerLive(
-        {
-          id: row.worker.id,
-          address: row.worker.address,
-          status: row.worker.status,
-          lastHeartbeatAt: row.worker.lastHeartbeatAt,
-        },
+        toSchedulableWorker(row.worker),
         now,
         deps.runtime.workerHeartbeatTtlMs,
       );

@@ -12,6 +12,11 @@ import { createArtifactCache, type ArtifactCache } from "./cache";
 import type { WorkerConfig } from "./config";
 import { createPortPool, type PortPool } from "./ports";
 import { createRegistration, type Registration } from "./registration";
+import {
+  createDockerCliClient,
+  createSandboxReaper,
+  type SandboxReaper,
+} from "./sandbox-reaper";
 import { createWorkerServer, type WorkerServer } from "./server";
 
 export interface Supervisor {
@@ -29,6 +34,8 @@ export interface Supervisor {
   readonly cache: ArtifactCache;
   readonly ports: PortPool;
   readonly registration: Registration;
+  /** Present when SANDBOX_REAPER_ENABLED=1 (needs docker); null otherwise. */
+  readonly sandboxReaper: SandboxReaper | null;
   isDraining(): boolean;
   /**
    * Graceful drain (SIGTERM path): stop accepting ensures and new proxied
@@ -73,9 +80,26 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
     snapshot: () => ({
       runningAgents: agents.list().length,
       activeRequests: agents.totalInflight(),
+      runningHashes: agents.list().map((a) => a.hash),
     }),
     log,
   });
+
+  // Sandbox reaper (design correction 4): eve sandboxes have no idle timeout,
+  // so the worker stops docker containers labelled by eve session that have
+  // been idle past the window. Off by default (needs a docker daemon).
+  const sandboxReaper: SandboxReaper | null = config.sandboxReaperEnabled
+    ? createSandboxReaper({
+        docker: createDockerCliClient({
+          dockerBin: config.dockerBin,
+          labelKey: config.sandboxLabelKey,
+          log,
+        }),
+        idleStopMs: config.sandboxIdleStopMs,
+        log,
+      })
+    : null;
+  sandboxReaper?.start();
 
   let draining = false;
   let drainPromise: Promise<void> | null = null;
@@ -85,6 +109,7 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
       draining = true;
       log("draining: refusing new ensures/requests, waiting for in-flight…");
       agents.stopIdleReaper();
+      sandboxReaper?.stop();
       const deadline = Date.now() + config.drainTimeoutMs;
       while (agents.totalInflight() > 0 && Date.now() < deadline) {
         await Bun.sleep(50);
@@ -122,11 +147,13 @@ export function createSupervisor(config: WorkerConfig): Supervisor {
     cache,
     ports,
     registration,
+    sandboxReaper,
     isDraining: () => draining,
     drain,
     async stop(): Promise<void> {
       draining = true;
       agents.stopIdleReaper();
+      sandboxReaper?.stop();
       registration.stop();
       server.stop();
       await agents.stopAll();

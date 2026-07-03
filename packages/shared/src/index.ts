@@ -17,6 +17,7 @@ export * from "./observability";
 export * from "./trigger-adapters";
 export * from "./trigger-event";
 export * from "./worker-identity";
+export * from "./worker-token-crypto";
 export * from "./workflow-definition";
 
 export const SHARED_PACKAGE = "@invisible-string/shared";

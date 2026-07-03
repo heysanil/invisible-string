@@ -48,6 +48,19 @@ export interface RuntimeConfig {
   maxConcurrentRunsPerWorkspace: number;
   /** A worker is live when its heartbeat is fresher than this (default 30s). */
   workerHeartbeatTtlMs: number;
+  /**
+   * Fallback per-worker agent cap the scheduler enforces for cold placement
+   * when a worker did not report its own `maxAgents` in its heartbeat
+   * (SCHEDULER_MAX_AGENTS_PER_WORKER, default 20 — matches the worker's own
+   * WORKER_MAX_AGENTS default).
+   */
+  maxAgentsPerWorker: number;
+  /**
+   * How often the dead-worker sweeper runs (WORKER_SWEEP_INTERVAL_MS, default
+   * = the heartbeat TTL). Each pass marks stale/draining workers dead, clears
+   * their sessions' affinity, and reschedules interrupted runs elsewhere.
+   */
+  workerSweepIntervalMs: number;
   /** Shared npm cache dir for agent-project installs (NPM_CACHE_DIR). */
   npmCacheDir: string;
   /**
@@ -75,6 +88,15 @@ export interface RuntimeConfig {
    * https/mTLS, so plaintext registrations are rejected by default.
    */
   allowInsecureWorkerTransport: boolean;
+  /**
+   * Worker-plane auth mode (WORKER_AUTH_MODE, default `shared-secret`). In
+   * `worker-token` mode the control plane mints per-worker session tokens at
+   * register (rotated on heartbeat) and per-worker DISPATCH tokens on every
+   * ensure-agent; the bootstrap `WORKER_SHARED_SECRET` then guards only the
+   * initial register. `shared-secret` keeps the Phase-1 single-credential
+   * behaviour (both are accepted so the modes interoperate during rollout).
+   */
+  workerAuthMode: "shared-secret" | "worker-token";
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -122,6 +144,18 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     30_000,
     problems,
   );
+  const maxAgentsPerWorker = parsePositiveInt(
+    env.SCHEDULER_MAX_AGENTS_PER_WORKER,
+    "SCHEDULER_MAX_AGENTS_PER_WORKER",
+    20,
+    problems,
+  );
+  const workerSweepIntervalMs = parsePositiveInt(
+    env.WORKER_SWEEP_INTERVAL_MS,
+    "WORKER_SWEEP_INTERVAL_MS",
+    workerHeartbeatTtlMs,
+    problems,
+  );
   const sseHeartbeatMs = parsePositiveInt(
     env.SSE_HEARTBEAT_MS,
     "SSE_HEARTBEAT_MS",
@@ -161,6 +195,8 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     maxRunWallClockMs,
     maxConcurrentRunsPerWorkspace,
     workerHeartbeatTtlMs,
+    maxAgentsPerWorker,
+    workerSweepIntervalMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",
@@ -169,6 +205,10 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     worldWorkerConcurrency,
     allowInsecureWorkerTransport:
       env.ALLOW_INSECURE_WORKER_TRANSPORT?.trim() === "1",
+    workerAuthMode:
+      env.WORKER_AUTH_MODE?.trim() === "worker-token"
+        ? "worker-token"
+        : "shared-secret",
   };
 }
 

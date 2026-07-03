@@ -9,7 +9,12 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ApiErrorBody } from "@invisible-string/shared";
+import {
+  mintDispatchToken,
+  DISPATCH_TOKEN_HEADER,
+  WORKER_ID_HEADER,
+  type ApiErrorBody,
+} from "@invisible-string/shared";
 
 import type { WorkerConfig } from "./config";
 import type { EnsureAgentResponse, WorkerStatusResponse } from "./server";
@@ -62,6 +67,11 @@ function startSupervisor(overrides: Partial<WorkerConfig> = {}): Supervisor {
     drainTimeoutMs: 5_000,
     heartbeatIntervalMs: 60_000,
     maxAgents: 20,
+    authMode: "shared-secret",
+    sandboxIdleStopMs: 30 * 60_000,
+    dockerBin: "docker",
+    sandboxLabelKey: "eve.session",
+    sandboxReaperEnabled: false,
     nodeBin: NODE_BIN,
     ...overrides,
   };
@@ -178,6 +188,34 @@ describe("internal API auth", () => {
     // /healthz stays unauthenticated (compose liveness probe).
     const health = await fetch(`${sup.url}/healthz`);
     expect(health.status).toBe(200);
+  });
+});
+
+describe("per-worker dispatch-token auth (Phase-3 identity)", () => {
+  test("accepts a valid dispatch token and rejects a foreign / mismatched one", async () => {
+    const sup = startSupervisor();
+    const workerId = sup.config.workerId;
+
+    // A dispatch token minted for THIS worker (audience worker:<id>) is accepted
+    // on the internal plane in addition to the bootstrap secret.
+    const good = mintDispatchToken(SECRET, workerId).token;
+    const ok = await fetch(`${sup.url}/internal/status`, {
+      headers: { [DISPATCH_TOKEN_HEADER]: good, [WORKER_ID_HEADER]: workerId },
+    });
+    expect(ok.status).toBe(200);
+
+    // A token minted for a DIFFERENT worker id is rejected (audience/secret bind).
+    const foreign = mintDispatchToken(SECRET, "some-other-worker").token;
+    const rejForeign = await fetch(`${sup.url}/internal/status`, {
+      headers: { [DISPATCH_TOKEN_HEADER]: foreign, [WORKER_ID_HEADER]: workerId },
+    });
+    expect(rejForeign.status).toBe(401);
+
+    // An x-worker-id that is not this worker is rejected outright.
+    const rejId = await fetch(`${sup.url}/internal/status`, {
+      headers: { [DISPATCH_TOKEN_HEADER]: good, [WORKER_ID_HEADER]: "not-me" },
+    });
+    expect(rejId.status).toBe(401);
   });
 });
 

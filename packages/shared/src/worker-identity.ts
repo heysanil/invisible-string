@@ -117,6 +117,13 @@ export const workerCapacityReportSchema = z.object({
   maxAgents: z.number().int().nonnegative(),
   runningAgents: z.number().int().nonnegative(),
   activeRequests: z.number().int().nonnegative(),
+  /**
+   * Content hashes of the agents currently running on this worker. The
+   * scheduler prefers a worker already warm on the target hash (no artifact
+   * pull + agent boot) — see runtime/scheduler.ts. Optional so a Phase-1
+   * worker that omits it still validates (it is simply never "warm").
+   */
+  runningHashes: z.array(z.string()).optional(),
 });
 export type WorkerCapacityReport = z.infer<typeof workerCapacityReportSchema>;
 

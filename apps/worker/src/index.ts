@@ -30,6 +30,15 @@ export {
   type WorkerCapacity,
 } from "./registration";
 export {
+  createDockerCliClient,
+  createSandboxReaper,
+  selectIdleSandboxes,
+  type DockerClient,
+  type SandboxContainer,
+  type SandboxReaper,
+  type SweepResult,
+} from "./sandbox-reaper";
+export {
   CALLBACK_PREFIX,
   createWorkerServer,
   FORWARDED_PREFIXES,

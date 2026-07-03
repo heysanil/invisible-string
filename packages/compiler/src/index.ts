@@ -1,18 +1,41 @@
-import { SHARED_PACKAGE, placeholderSchema } from "@invisible-string/shared";
-
 /**
- * Compiler package — placeholder.
+ * @invisible-string/compiler — pure workflow → eve-project code generation.
  *
- * Phase 1 adds the pure function
- * `compile(WorkflowDefinition, versions) → { files: Map<path, string>, hash }`
- * emitting the eve project (agent.ts, instructions.md, connections/*,
- * skills/*, channels/*, schedules/*) with the version hash covering pillar
- * config + compiler version + eve version. The runtime version matrix lives
- * in `versions.json` (recorded by the Phase 0 spike).
+ * `compile(definition, deps)` renders a complete, buildable eve agent
+ * project (files map) plus the deterministic workflow-version hash. The
+ * runtime version matrix lives in `versions.json` (recorded by the Phase-0
+ * spike — the ONLY source for eve/ai/provider pins) and is re-exported here
+ * as `RUNTIME_VERSIONS` for the control plane's build service.
  */
-export function compilerPlaceholder(): { dependsOn: string; valid: boolean } {
-  return {
-    dependsOn: SHARED_PACKAGE,
-    valid: placeholderSchema.safeParse({ ok: true }).success,
-  };
-}
+import versionsJson from "../versions.json";
+import type { RuntimeVersions } from "./types";
+
+export { compile } from "./compile";
+export { CompileError, type CompileErrorCode } from "./errors";
+export { canonicalJson, computeWorkflowHash } from "./hash";
+export {
+  PLATFORM_JWT_AUDIENCE,
+  PLATFORM_JWT_ISSUER,
+  PLATFORM_TRIGGER_ROUTE_PREFIX,
+  triggerRoutePath,
+} from "./platform";
+export type {
+  ApprovalRule,
+  ApprovalSpec,
+  CompileDeps,
+  CompileOptions,
+  CompileResult,
+  ConnectionAuthSpec,
+  ModelProvider,
+  ResolvedAgentPreset,
+  ResolvedMcpConnection,
+  ResolvedModel,
+  ResolvedSkill,
+  RuntimeVersions,
+  ToolFilterSpec,
+} from "./types";
+export { COMPILER_VERSION } from "./version";
+export { connectionTokenEnvVar } from "./codegen/strings";
+
+/** The pinned runtime version matrix (contents of versions.json). */
+export const RUNTIME_VERSIONS: RuntimeVersions = versionsJson;

@@ -67,7 +67,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 ## Architecture (one screen)
 
 `apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs) · pillar CRUD · compiler invocation + `eve build` + tarball → MinIO (cache keyed by content hash = pillar config + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) → dispatcher (`TriggerEvent` → compiled channel, version-bound JWT) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop.
-`apps/worker` (stateless, Node 24, docker.sock): supervisor (register/heartbeat/drain, ensure-agent → pull/extract → per-agent `eve start`), streaming reverse proxy, reapers (process idle 15 m, sandbox idle 30 m, artifact LRU 20 GB).
+`apps/worker` (stateless Bun supervisor; boots agents under Node 24; mounted docker.sock): register/heartbeat/drain, ensure-agent → pull/extract → per-agent boot of the compiled entrypoint (`node .output/server/index.mjs` directly — `eve start` is only a CLI wrapper; spike finding 6), streaming reverse proxy, reapers (process idle 15 m, sandbox idle 30 m, artifact LRU 20 GiB).
 `apps/web`: the glass SPA. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
 
 ## Constraints that will bite you (learned empirically — full list in the design spec's "Live-doc corrections" + `spike/REPORT.md`)

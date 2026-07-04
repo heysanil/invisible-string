@@ -129,3 +129,7 @@ infra/             docker-compose init scripts + Dex IdP config
 docs/              Design spec + master plan (+ screenshots/)
 .github/           CI (typecheck + unit tests + web build; gated integration)
 ```
+
+Working in this repo (commands, test lanes, conventions, constraints):
+see **`AGENTS.md`** (`CLAUDE.md` symlinks to it). Keep it — and every doc it
+lists — up to date with your changes.

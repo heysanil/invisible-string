@@ -1,13 +1,39 @@
 # Screenshots
 
-Placeholder for section captures of the web app (`apps/web`). Add one image
-per section as they are recorded:
+Real product captures of the web app (`apps/web`), taken from the live E2E
+stack by `e2e/specs/screenshots.e2e.ts` — never hand-cropped mockups. Each
+shot is a full 1600×1000 window at deviceScaleFactor 2 (3200×2000 retina
+PNGs), light theme, and the spec asserts the photographed state actually
+rendered before capturing it.
 
-- `chat.png` — live thread with a working block + streamed reply
-- `chat-approval.png` — parked run showing the HITL approval card
-- `builder.png` — the pillar rail + a focused editor with `@` autocomplete
-- `context.png` — MCP connections grid + registry browser
-- `settings.png` — model presets / allowlist / members
+| File | What it shows |
+|---|---|
+| `chat.png` | A chat session with a **completed run**: the collapsed working block ("Worked for Ns · N steps"), the streamed assistant reply below it, and the session list on the left with the session's status dot. |
+| `builder.png` | `/workflows/:id` with **all four pillar cards populated** — Form trigger (2 fields), Context (two connections + a skill), Agent (preset + resolved model chain), Instructions ("N lines · N @refs") — and the instructions editor focused in the center with resolved `@notes` / `@trigger.email` reference chips. |
+| `copilot.png` | The builder with the **copilot rail open** mid-conversation: two applied suggestion receipts and one **un-applied** "Write instructions" card showing the inline instructions **diff preview** with its Apply/Dismiss controls, while the pillar rail reflects the already-applied trigger and connection. |
+| `context.png` | `/context` with two MCP connection cards (one custom-URL, one registry-installed) and one authored skill (with an attachment count). |
+| `settings.png` | `/settings` → **Models**: the three model-preset rows (Powerful / Balanced / Quick), each with its provider · model chip and repoint selects. The model **allowlist table** lives on the adjacent `/settings/allowlist` sub-route, visible in the settings nav. |
 
-Capture at a 1440×900 viewport in light theme unless a shot specifically
-demonstrates dark mode. Keep files under ~500 KB (PNG, optimized).
+## Regenerating
+
+The capture spec rides the self-managing Playwright harness (see
+`e2e/README.md` — Docker, `mise`, and an installed Chromium are the only
+prerequisites) and is env-gated so the normal E2E suite never runs it:
+
+```bash
+cd e2e && SCREENSHOTS=1 bunx playwright test screenshots --project=acceptance
+```
+
+That one command brings the full stack up (compose project `p2e2e`), signs up
+a fresh workspace, authors the skill/connections, builds + publishes a
+workflow (real `eve build`), runs it from chat, drives the scripted copilot,
+walks the five routes, and tears everything down. Add `E2E_REUSE=1` to keep
+the stack alive between iterations.
+
+## Keep these current
+
+Per the AGENTS.md documentation directive ("keep all documentation up to
+date" — stale docs are bugs), **any UI change that visibly affects one of
+these surfaces must regenerate the affected screenshots in the same PR** with
+the command above. The spec fails rather than capturing a blank or half-loaded
+pane, so a green run is the freshness check.

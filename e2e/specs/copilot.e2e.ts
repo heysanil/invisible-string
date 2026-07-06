@@ -19,7 +19,7 @@
  * verifiably received the rejection (the scripted fake's closing message
  * echoes the tool-result outcomes it was fed).
  */
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 import { addCustomConnection } from "../support/authoring.ts";
 import {
@@ -37,34 +37,8 @@ import {
   SCAFFOLD_CONNECTION_NAME,
   SCAFFOLD_PROMPT,
 } from "../support/copilot-script.ts";
+import { openCopilotAndSend, railCard } from "../support/copilot.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
-
-/**
- * Open the docked copilot rail and send `message` through its composer.
- * The dock's socket connects lazily on open and drops frames sent before the
- * handshake completes, so the click is retried until the user bubble renders —
- * retries are safe no-ops after a successful send (the composer clears and
- * the send button disables).
- */
-async function openCopilotAndSend(page: Page, message: string): Promise<void> {
-  await page.getByRole("button", { name: "Open Copilot" }).click();
-  const dock = page.getByRole("complementary", { name: "Copilot" });
-  await expect(dock).toBeVisible();
-  await dock.getByRole("textbox", { name: "Ask copilot" }).fill(message);
-  const sendButton = dock.getByRole("button", { name: "Send to copilot" });
-  const userBubble = dock.getByText(message, { exact: true });
-  await expect(async () => {
-    await sendButton.click();
-    await expect(userBubble).toBeVisible({ timeout: 1_000 });
-  }).toPass({ timeout: 20_000 });
-}
-
-/** The pillar rail card (live summary) for a pillar. */
-function railCard(page: Page, pillar: "Trigger" | "Context" | "Instructions") {
-  return page
-    .getByRole("navigation", { name: "Workflow pillars" })
-    .getByRole("button", { name: new RegExp(`^${pillar}`) });
-}
 
 test("copilot scaffolds a runnable workflow from a one-liner", async ({
   page,

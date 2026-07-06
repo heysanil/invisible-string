@@ -159,6 +159,8 @@ working blocks, streamed reply, inline human-in-the-loop approvals. Resumable
 SSE per run with `Last-Event-ID`; one active run per session (`session_busy`
 handled inline). "Edit workflow ↗" deep-links into the builder.
 
+![Chat surface](docs/screenshots/chat.png)
+
 ### 🛠 Workflows — `/workflows`, `/workflows/:id`
 The hybrid builder: a pillar rail (TRIGGER · CONTEXT · AGENT · INSTRUCTIONS)
 with focused editors, `@`-reference autocomplete in the instructions
@@ -166,17 +168,24 @@ with focused editors, `@`-reference autocomplete in the instructions
 onto the pillar cards, and Publish / Run-draft (Run draft publishes then opens
 a new chat via `/chat?workflow=<id>`).
 
+![Workflow builder](docs/screenshots/builder.png)
+
 ### 🔌 Context — `/context`
 MCP connections (workspace + personal), the MCP registry browser + install
 (write-once encrypted secrets), and skills authoring with drag-drop
 attachments — packaged straight into the compiled agent.
+
+![Context section](docs/screenshots/context.png)
 
 ### ⚙️ Settings — `/settings`
 Model presets, provider/model allowlist, agent presets, members (Better Auth
 organization roles), workspace rename, and **Integrations** (connect the
 platform Slack app, per-team bot tokens).
 
-Screenshots of each section live in [`docs/screenshots/`](docs/screenshots/).
+![Settings — model presets](docs/screenshots/settings.png)
+
+All screenshots are captured from the real product by a gated Playwright spec
+— regenerate them with one command (see [`docs/screenshots/`](docs/screenshots/)).
 
 ## Copilot (the builder assistant)
 
@@ -186,6 +195,8 @@ presets, model presets, allowlist) and proposes edits as **typed mutations** —
 `setTrigger`, `addContext`, `removeContext`, `setAgent`, `setModelPreset`,
 `setInstructions` — streamed over `WS /workspaces/:workspaceId/copilot`
 (shared frame protocol in `packages/shared/src/copilot.ts`).
+
+![Builder copilot — suggestion cards with inline diff preview](docs/screenshots/copilot.png)
 
 Every proposal renders as a structured **Apply / Dismiss** card with a preview
 (inline diff for instructions, before→after otherwise). The server **never**

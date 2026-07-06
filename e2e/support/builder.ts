@@ -172,6 +172,25 @@ export async function writeInstructionsWithTriggerRef(
   await expect(editor).toContainText(`@trigger.${opts.triggerField}`);
 }
 
+/**
+ * Append text at the very end of the instructions editor. The caret is first
+ * moved to the document end (select-all → ArrowRight collapses the selection to
+ * its right edge) so this never depends on where the previous edit left it, and
+ * the caller's text can safely lead with a space + blank line to break out of
+ * any `@ref` token before the newline (an open autocomplete would swallow it).
+ */
+export async function appendInstructions(page: Page, text: string): Promise<void> {
+  await focusPillar(page, "Instructions");
+  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+  await expect(editor).toBeVisible();
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("ArrowRight");
+  // Nothing open to eat the newlines we are about to type.
+  await expect(page.locator(".cm-tooltip-autocomplete")).toHaveCount(0);
+  await page.keyboard.type(text);
+}
+
 /** Write plain instructions (no references) — enough to satisfy publish. */
 export async function writePlainInstructions(page: Page, text: string): Promise<void> {
   await focusPillar(page, "Instructions");

@@ -17,6 +17,12 @@ ensureDomForThisFile();
 // route modules resolve the mocked auth client instead of the real one.
 const { routeTree } = await import("../routeTree.gen");
 
+// TEMP DIAGNOSTIC (remove before merge)
+{
+  const mod = (await import("../lib/auth-client")) as { __AUTH_MOCK__?: boolean };
+  console.log("[diag:shell] auth-client mocked =", mod.__AUTH_MOCK__ === true);
+}
+
 // NOTE: RTL's `screen` binds document.body at import time, which is too early
 // under bun's module linking — use render-scoped queries instead.
 function renderAt(path: string) {

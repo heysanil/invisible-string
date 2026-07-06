@@ -164,7 +164,11 @@ const useListOrganizations = () => ({
   refetch: () => {},
 });
 
+// TEMP DIAGNOSTIC (remove before merge)
+console.log("[diag:auth-mock] registering mock for", authClientPath);
+
 mock.module(authClientPath, () => ({
+  __AUTH_MOCK__: true, // TEMP DIAGNOSTIC (remove before merge)
   authClient: { organization: organizationMock },
   useSession: () => ({
     data: authMockState.session,

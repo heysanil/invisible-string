@@ -899,6 +899,11 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
       { cookie: ownerCookie, body: { message: "HOLD one" } },
     );
+    // TEMP DIAGNOSTIC (remove before merge): surface the error envelope when
+    // the create fails — CI sees a 502 here that no local environment does.
+    if (first.status !== 201) {
+      console.log("[diag:cap] first create:", first.status, await first.clone().text());
+    }
     expect(first.status).toBe(201);
     heldSessionId = ((await first.json()) as CreateSessionResponse).session.id;
     const second = await api(

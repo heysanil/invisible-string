@@ -48,7 +48,10 @@ export function generateSecret(): string {
  * Transform .env.example content into a fresh .env: fill each blank
  * generated-secret line (`KEY=`) and append ARTIFACT_CACHE_DIR — the worker's
  * compiled-in default is /var/lib/agents, which macOS dev machines can't
- * write. Returns which keys were filled so the caller can report them.
+ * write — plus ALLOW_INSECURE_WORKER_TRANSPORT=1, since dev workers register
+ * over http://localhost and the template keeps that flag commented out to
+ * stay secure by default. Returns which keys were filled so the caller can
+ * report them.
  */
 export function bootstrapEnvContent(
   exampleContent: string,
@@ -66,7 +69,7 @@ export function bootstrapEnvContent(
     return line;
   });
   const body = lines.join("\n").replace(/\n+$/, "");
-  const content = `${body}\n\n# ── added by \`bun run dev\` bootstrap ────────────────────────────────────────\nARTIFACT_CACHE_DIR=${repoRoot}/.dev/agent-cache\n`;
+  const content = `${body}\n\n# ── added by \`bun run dev\` bootstrap ────────────────────────────────────────\nARTIFACT_CACHE_DIR=${repoRoot}/.dev/agent-cache\n# Dev workers register over http://localhost, not https://.\nALLOW_INSECURE_WORKER_TRANSPORT=1\n`;
   return { content, generated };
 }
 

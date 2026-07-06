@@ -61,6 +61,9 @@ When `.env` is **missing**:
 3. Set `ARTIFACT_CACHE_DIR=.dev/agent-cache` (repo-local, gitignored). The
    worker's compiled-in default is `/var/lib/agents`
    (`apps/worker/src/config.ts`), which is not writable on macOS without sudo.
+   Also append `ALLOW_INSECURE_WORKER_TRANSPORT=1`, since dev workers register
+   with the control plane over `http://localhost`; the flag stays commented
+   out in `.env.example` itself so the template is secure by default.
 4. Print which keys were generated, plus one note that copilot/keyed features
    stay off until `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` is added.
 

@@ -78,6 +78,11 @@ describe("bootstrapEnvContent", () => {
     expect(content).toContain("ARTIFACT_CACHE_DIR=/repo/.dev/agent-cache");
   });
 
+  test("appends ALLOW_INSECURE_WORKER_TRANSPORT=1 for dev workers over http://localhost", () => {
+    const { content } = bootstrapEnvContent(example, "/repo", () => "s");
+    expect(content).toContain("ALLOW_INSECURE_WORKER_TRANSPORT=1");
+  });
+
   test("leaves already-filled secrets alone and does not report them", () => {
     const prefilled = example.replace("ENCRYPTION_MASTER_KEY=", "ENCRYPTION_MASTER_KEY=existing");
     const { content, generated } = bootstrapEnvContent(prefilled, "/repo", () => "gen");
@@ -89,6 +94,11 @@ describe("bootstrapEnvContent", () => {
     const real = await Bun.file(new URL("../../.env.example", import.meta.url)).text();
     const { generated } = bootstrapEnvContent(real, "/repo", () => "s");
     expect(generated).toEqual([...GENERATED_SECRET_KEYS]);
+  });
+
+  test("the real .env.example keeps ALLOW_INSECURE_WORKER_TRANSPORT commented out", async () => {
+    const real = await Bun.file(new URL("../../.env.example", import.meta.url)).text();
+    expect(real).not.toMatch(/^ALLOW_INSECURE_WORKER_TRANSPORT=/m);
   });
 });
 

@@ -14,6 +14,7 @@ spike/.artifacts/
 .env.*
 !.env.example
 .superpowers/
+.dev/
 .idea/
 .vscode/
 *.local

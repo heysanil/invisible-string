@@ -9,7 +9,7 @@
     "e2e"
   ],
   "scripts": {
-    "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' --filter='./tests/*' typecheck",
+    "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' --filter='./tests/*' typecheck && tsc -p scripts",
     "test": "bun test",
     "dev": "bun run --filter='./apps/*' dev"
   },

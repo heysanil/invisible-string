@@ -85,8 +85,9 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
 
   console.log("[e2e:setup] docker compose up (postgres, minio, dex)…");
   compose(["up", "-d", "--wait", "postgres", "minio", "dex"]);
-  compose(["up", "-d", "minio-init"]);
-  compose(["wait", "minio-init"]);
+  // Foreground one-shot: `compose wait` races a fast init container (Compose
+  // ≥ v5 only sees running containers — an exited one-shot is "no containers").
+  compose(["run", "--rm", "minio-init"]);
 
   // node@24 powers the eve build + agent runtime (mise). Warm it (idempotent),
   // then resolve its bin dir so we can pin it on the control-plane + worker

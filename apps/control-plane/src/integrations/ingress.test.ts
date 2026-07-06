@@ -407,10 +407,19 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const agentRows = await db.select({ id: schema.agents.id }).from(schema.agents).where(eq(schema.agents.organizationId, orgId));
     agentPresetId = agentRows[0]!.id;
 
+    // Start from a clean worker registry — workers are GLOBAL (selectWorker is
+    // not workspace-scoped), so stray live rows from another suite/run sharing
+    // this DB would be dispatched to. This suite owns exactly one worker.
+    await db.delete(schema.workers);
     await db.insert(schema.workers).values({ address: worker.url, status: "live", lastHeartbeatAt: new Date() });
   }, 60_000);
 
   afterAll(async () => {
+    // Remove this suite's worker row so it cannot leak into other integration
+    // suites sharing the same test DB — the fixture server stops with this
+    // file, and a live row pointing at a dead address gets picked by a later
+    // suite's scheduler (dispatch then 502s with a connection error).
+    await db?.delete(schema.workers).where(eq(schema.workers.address, worker.url));
     await stack?.close();
     worker.stop();
     slack.stop();

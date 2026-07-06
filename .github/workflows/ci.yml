@@ -59,7 +59,11 @@ jobs:
           restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, minio, dex)
-        run: docker compose up -d --wait postgres minio dex && docker compose up -d minio-init && docker compose wait minio-init
+        # `run --rm` executes the one-shot bucket-init job in the foreground and
+        # propagates its exit code — `compose wait` races a fast init container
+        # (Compose ≥ v5 only sees running containers; an already-exited one-shot
+        # fails with `no containers for project`).
+        run: docker compose up -d --wait postgres minio dex && docker compose run --rm minio-init
 
       # The world-isolation proof and the spike suites need the spike
       # project's pinned @workflow/world-postgres install.
@@ -105,7 +109,11 @@ jobs:
           restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, minio, dex)
-        run: docker compose up -d --wait postgres minio dex && docker compose up -d minio-init && docker compose wait minio-init
+        # `run --rm` executes the one-shot bucket-init job in the foreground and
+        # propagates its exit code — `compose wait` races a fast init container
+        # (Compose ≥ v5 only sees running containers; an already-exited one-shot
+        # fails with `no containers for project`).
+        run: docker compose up -d --wait postgres minio dex && docker compose run --rm minio-init
 
       - name: Phase-1 acceptance
         env:
@@ -196,7 +204,8 @@ jobs:
           restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, minio)
-        run: docker compose up -d --wait postgres minio && docker compose up -d minio-init && docker compose wait minio-init
+        # See the integration job: `run --rm` instead of the racy `compose wait`.
+        run: docker compose up -d --wait postgres minio && docker compose run --rm minio-init
 
       - name: Phase-3 acceptance
         env:

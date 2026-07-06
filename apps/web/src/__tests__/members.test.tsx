@@ -8,7 +8,11 @@ import "../test/auth-mock";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, waitFor } from "@testing-library/react";
 
-import { authMockState, resetAuthMock } from "../test/auth-mock";
+import {
+  authMockState,
+  registerAuthMock,
+  resetAuthMock,
+} from "../test/auth-mock";
 import {
   installFetchMock,
   jsonResponse,
@@ -18,6 +22,9 @@ import {
 import { MembersPanel } from "../components/settings/MembersPanel";
 
 ensureDomForThisFile();
+// Re-register in THIS file: module-mock patches don't survive test-file
+// boundaries when the real module was evaluated first (order-dependent).
+registerAuthMock();
 
 const NOW = "2026-07-03T00:00:00.000Z";
 

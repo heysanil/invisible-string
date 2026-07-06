@@ -141,8 +141,9 @@ async function ensureInfra(): Promise<void> {
   const upCode = await compose("up", "-d", "--wait", ...services);
   if (upCode !== 0) throw new Error(`docker compose up failed (${upCode})`);
   if (!minioUp) {
-    await compose("up", "-d", "minio-init");
-    const initCode = await compose("wait", "minio-init");
+    // Foreground one-shot: `compose wait` races a fast init container (Compose
+    // ≥ v5 only sees running containers — an exited one-shot is "no containers").
+    const initCode = await compose("run", "--rm", "minio-init");
     if (initCode !== 0) throw new Error(`minio-init failed (${initCode})`);
   }
 }

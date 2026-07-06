@@ -136,13 +136,13 @@ async function ensureInfra(): Promise<void> {
   };
   // `--wait` only for long-running services; minio-init is a one-shot job
   // (creates the artifacts bucket, exits 0) which `--wait` misreads as a
-  // failure — run it separately and wait on its exit code.
+  // failure — run it in the foreground instead. (`compose wait` is racy too:
+  // Compose ≥ v5 only sees running containers, so an already-exited one-shot
+  // fails with `no containers for project`.)
   const upCode = await compose("up", "-d", "--wait", ...services);
   if (upCode !== 0) throw new Error(`docker compose up failed (${upCode})`);
   if (!minioUp) {
-    const initUp = await compose("up", "-d", "minio-init");
-    if (initUp !== 0) throw new Error(`docker compose up minio-init failed (${initUp})`);
-    const initCode = await compose("wait", "minio-init");
+    const initCode = await compose("run", "--rm", "minio-init");
     if (initCode !== 0) throw new Error(`minio-init failed (${initCode})`);
   }
 }

@@ -97,6 +97,19 @@ bun test            # unit lane — DB-gated tests skip cleanly without TEST_DAT
 ### Run the full stack
 
 ```sh
+bun run dev
+```
+
+One command: bootstraps `.env` on first run (generates the four platform
+secrets; provider keys stay blank until you add them), starts Postgres, MinIO,
+and Dex and waits for health, applies migrations, then runs the API (:3000),
+worker, and SPA (:5173) with prefixed logs in one terminal. Ctrl-C stops the
+apps and leaves infra running; `bun run dev:down` stops the containers.
+
+<details>
+<summary>Manual, step-by-step equivalent (for debugging individual pieces)</summary>
+
+```sh
 # local infra: Postgres, MinIO, Dex IdP
 docker compose up -d postgres minio dex
 
@@ -114,9 +127,7 @@ bun run --cwd apps/web dev
 bun run --cwd apps/worker dev
 ```
 
-Want to poke at the UI with no backend at all?
-`VITE_FIXTURE_MODE=1 bun run --cwd apps/web dev` renders the chat surface from
-canned fixtures.
+</details>
 
 ### Integration tests
 

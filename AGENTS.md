@@ -46,7 +46,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 - **Bun 1.3+** runs the platform (control-plane, worker, web tooling, all tests). **Node 24 via mise** runs everything eve (`mise install node@24`; harnesses invoke `mise exec node@24 --` themselves). **Docker** for compose + `docker()` sandboxes.
 - `bun install` once at the root (single lockfile). `cp .env.example .env` and fill secrets for running apps (tests provision their own env).
 - Local stack: `docker compose up -d postgres minio dex` (ports overridable: `POSTGRES_PORT`/`MINIO_PORT`/`DEX_PORT`). Test harnesses spin their own compose **projects** (`p1acceptance`, `p2e2e`, `p3acceptance`, `pkeyed`…) on non-default ports — don't reuse those names.
-- Dev servers: `bun run --cwd apps/control-plane dev` (API :3000) + `bun run --cwd apps/web dev` (SPA :5173); worker: `bun run --cwd apps/worker dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`.
+- Dev servers: `bun run dev` at the root does it all — bootstraps `.env` with generated secrets on first run, `docker compose up --wait`, migrations, then API (:3000) + worker + SPA (:5173) with prefixed logs; Ctrl-C stops the apps, `bun run dev:down` stops infra. Individual apps: `bun run --cwd apps/<x> dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`.
 
 ## Test lanes (run the ones your change touches)
 

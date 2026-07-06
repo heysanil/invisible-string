@@ -11,7 +11,8 @@
   "scripts": {
     "typecheck": "bun run --filter='./apps/*' --filter='./packages/*' --filter='./tests/*' typecheck && tsc -p scripts",
     "test": "bun test",
-    "dev": "bun run --filter='./apps/*' dev"
+    "dev": "bun run scripts/dev.ts",
+    "dev:down": "docker compose down"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

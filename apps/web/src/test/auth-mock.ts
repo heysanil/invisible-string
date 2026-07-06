@@ -1,7 +1,8 @@
 /**
- * Shared better-auth client mock. Importing this module replaces
- * `src/lib/auth-client` for every subsequent import; tests drive behavior
- * through the mutable `authMockState`.
+ * Shared better-auth client mock replacing `src/lib/auth-client`; tests drive
+ * behavior through the mutable `authMockState`. Consuming test files must
+ * call `registerAuthMock()` at their own top level — importing this module is
+ * not enough (see the function's doc comment).
  *
  * Covers the organization plugin surface too (active workspace, invites,
  * role changes) so settings/context screens render without a live API.
@@ -164,11 +165,22 @@ const useListOrganizations = () => ({
   refetch: () => {},
 });
 
-// TEMP DIAGNOSTIC (remove before merge)
-console.log("[diag:auth-mock] registering mock for", authClientPath);
+/**
+ * Register the auth-client module mock. Every test file that depends on the
+ * mock MUST call this at its own top level (before dynamically importing
+ * route modules): bun applies `mock.module` differently depending on whether
+ * the real module has already been evaluated — a clean interception persists
+ * across test files, but an exports *patch* (real module already linked by an
+ * earlier file's static imports) is reverted at the file boundary. Relying on
+ * the module-scope call below therefore breaks under orderings where another
+ * file evaluates the real `lib/auth-client` first — which is exactly what
+ * happens on CI runners (test-file discovery order is filesystem-dependent).
+ */
+export function registerAuthMock(): void {
+  mock.module(authClientPath, authMockFactory);
+}
 
-mock.module(authClientPath, () => ({
-  __AUTH_MOCK__: true, // TEMP DIAGNOSTIC (remove before merge)
+const authMockFactory = () => ({
   authClient: { organization: organizationMock },
   useSession: () => ({
     data: authMockState.session,
@@ -191,4 +203,10 @@ mock.module(authClientPath, () => ({
     },
   },
   signOut: async () => ok(),
-}));
+});
+
+// First-import registration: when a mock-consuming file is the first to
+// evaluate this module BEFORE anything linked the real auth-client, this is a
+// clean interception. Files still re-register via registerAuthMock() — see
+// its doc comment for why the import side effect alone is not enough.
+registerAuthMock();

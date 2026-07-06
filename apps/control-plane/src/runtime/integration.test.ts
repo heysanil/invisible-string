@@ -566,6 +566,11 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       .returning({ id: schema.workflows.id });
     workflowId = wfRows[0]!.id;
 
+    // Start from a clean worker registry — workers are GLOBAL (selectWorker is
+    // not workspace-scoped), so a stray live row from another suite sharing
+    // this DB (pointing at a stopped fixture server) would win scheduling for
+    // fresh sessions and fail dispatch with a connection-refused 502.
+    await db.delete(schema.workers);
     await db.insert(schema.workers).values({
       address: fixture.url,
       status: "live",
@@ -574,6 +579,9 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   }, 60_000);
 
   afterAll(async () => {
+    // Remove this suite's worker row so it cannot leak into later suites
+    // sharing the same test DB.
+    await db?.delete(schema.workers).where(eq(schema.workers.address, fixture.url));
     await stack?.close();
     fixture.stop();
   }, 30_000);
@@ -899,10 +907,11 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
       { cookie: ownerCookie, body: { message: "HOLD one" } },
     );
-    // TEMP DIAGNOSTIC (remove before merge): surface the error envelope when
-    // the create fails — CI sees a 502 here that no local environment does.
+    // Surface the error envelope on failure — a bare status mismatch hides
+    // the dispatch error detail (this is how the leaked-worker-row 502 from a
+    // sibling suite was found).
     if (first.status !== 201) {
-      console.log("[diag:cap] first create:", first.status, await first.clone().text());
+      console.log("[cap] first create failed:", first.status, await first.clone().text());
     }
     expect(first.status).toBe(201);
     heldSessionId = ((await first.json()) as CreateSessionResponse).session.id;

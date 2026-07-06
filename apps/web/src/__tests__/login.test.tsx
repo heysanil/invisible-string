@@ -15,27 +15,21 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 
-import { authMockState, demoSession, resetAuthMock } from "../test/auth-mock";
+import {
+  authMockState,
+  demoSession,
+  registerAuthMock,
+  resetAuthMock,
+} from "../test/auth-mock";
 
 ensureDomForThisFile();
+// Re-register in THIS file: module-mock patches don't survive test-file
+// boundaries when the real module was evaluated first (order-dependent).
+registerAuthMock();
 
-// Dynamic import AFTER ../test/auth-mock has registered mock.module, so the
-// route modules resolve the mocked auth client instead of the real one.
+// Dynamic import AFTER the mock is registered, so the route modules resolve
+// the mocked auth client instead of the real one.
 const { routeTree } = await import("../routeTree.gen");
-
-// TEMP DIAGNOSTIC (remove before merge): is the mock actually in effect for
-// this file, and does the mock key match what route modules resolve?
-{
-  const mod = (await import("../lib/auth-client")) as { __AUTH_MOCK__?: boolean };
-  console.log(
-    "[diag:login] auth-client mocked =",
-    mod.__AUTH_MOCK__ === true,
-    "| resolved =",
-    import.meta.resolve("../lib/auth-client"),
-    "| mock key =",
-    new URL("../lib/auth-client.ts", import.meta.url).pathname,
-  );
-}
 
 // NOTE: RTL's `screen` binds document.body at import time, which is too early
 // under bun's module linking — use render-scoped queries instead.

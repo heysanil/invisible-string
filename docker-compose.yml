@@ -46,7 +46,9 @@ services:
       retries: 12
 
   # One-shot init job: creates the "artifacts" bucket (build tarballs +
-  # trigger file payloads). Runs on `docker compose up -d` / `up -d minio-init`.
+  # trigger file payloads). Invoke as `docker compose run --rm minio-init`
+  # (foreground, exit code propagates) — `compose wait` races a fast one-shot
+  # (Compose ≥ v5 only sees running containers).
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:

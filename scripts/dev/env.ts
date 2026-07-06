@@ -46,12 +46,15 @@ export function generateSecret(): string {
 
 /**
  * Transform .env.example content into a fresh .env: fill each blank
- * generated-secret line (`KEY=`) and append ARTIFACT_CACHE_DIR — the worker's
+ * generated-secret line (`KEY=`) and append ARTIFACT_CACHE_DIR plus
+ * AGENT_BUILD_ROOT, set to the same path — the worker's and control plane's
  * compiled-in default is /var/lib/agents, which macOS dev machines can't
- * write — plus ALLOW_INSECURE_WORKER_TRANSPORT=1, since dev workers register
- * over http://localhost and the template keeps that flag commented out to
- * stay secure by default. Returns which keys were filled so the caller can
- * report them.
+ * write, and the two vars must be identical because compiled eve artifacts
+ * bake in absolute paths (the worker extracts to the same path the control
+ * plane built at) — plus ALLOW_INSECURE_WORKER_TRANSPORT=1, since dev workers
+ * register over http://localhost and the template keeps that flag commented
+ * out to stay secure by default. Returns which keys were filled so the
+ * caller can report them.
  */
 export function bootstrapEnvContent(
   exampleContent: string,
@@ -69,7 +72,7 @@ export function bootstrapEnvContent(
     return line;
   });
   const body = lines.join("\n").replace(/\n+$/, "");
-  const content = `${body}\n\n# ── added by \`bun run dev\` bootstrap ────────────────────────────────────────\nARTIFACT_CACHE_DIR=${repoRoot}/.dev/agent-cache\n# Dev workers register over http://localhost, not https://.\nALLOW_INSECURE_WORKER_TRANSPORT=1\n`;
+  const content = `${body}\n\n# ── added by \`bun run dev\` bootstrap ────────────────────────────────────────\n# ARTIFACT_CACHE_DIR (worker extract root) and AGENT_BUILD_ROOT (control-plane\n# build root) must be identical — compiled eve artifacts bake in absolute\n# paths, so a mismatch here breaks agent boot.\nARTIFACT_CACHE_DIR=${repoRoot}/.dev/agent-cache\nAGENT_BUILD_ROOT=${repoRoot}/.dev/agent-cache\n# Dev workers register over http://localhost, not https://.\nALLOW_INSECURE_WORKER_TRANSPORT=1\n`;
   return { content, generated };
 }
 

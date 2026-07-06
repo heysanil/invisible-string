@@ -108,6 +108,9 @@ function pipe(
         sink.write(`${line}\n`);
       }
     }
+    // Flush the decoder's own tail (a child dying mid-multibyte character
+    // leaves bytes buffered inside TextDecoder, not the line prefixer).
+    for (const line of prefixer.push(decoder.decode())) sink.write(`${line}\n`);
     for (const line of prefixer.flush()) sink.write(`${line}\n`);
   })();
 }
@@ -123,7 +126,11 @@ async function shutdown(code: number): Promise<void> {
   for (const { proc } of children) {
     if (proc.exitCode === null) proc.kill("SIGKILL");
   }
-  note("apps stopped — infra still running (`bun run dev:down` stops it)");
+  note(
+    children.length === 0
+      ? "stopped — infra still running (`bun run dev:down` stops it)"
+      : "apps stopped — infra still running (`bun run dev:down` stops it)",
+  );
   process.exit(code);
 }
 

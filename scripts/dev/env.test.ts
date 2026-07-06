@@ -78,6 +78,11 @@ describe("bootstrapEnvContent", () => {
     expect(content).toContain("ARTIFACT_CACHE_DIR=/repo/.dev/agent-cache");
   });
 
+  test("appends AGENT_BUILD_ROOT matching ARTIFACT_CACHE_DIR under the repo root", () => {
+    const { content } = bootstrapEnvContent(example, "/repo", () => "s");
+    expect(content).toContain("AGENT_BUILD_ROOT=/repo/.dev/agent-cache");
+  });
+
   test("appends ALLOW_INSECURE_WORKER_TRANSPORT=1 for dev workers over http://localhost", () => {
     const { content } = bootstrapEnvContent(example, "/repo", () => "s");
     expect(content).toContain("ALLOW_INSECURE_WORKER_TRANSPORT=1");
@@ -98,7 +103,7 @@ describe("bootstrapEnvContent", () => {
 
   test("the real .env.example keeps ALLOW_INSECURE_WORKER_TRANSPORT commented out", async () => {
     const real = await Bun.file(new URL("../../.env.example", import.meta.url)).text();
-    expect(real).not.toMatch(/^ALLOW_INSECURE_WORKER_TRANSPORT=/m);
+    expect(real).not.toMatch(/^\s*ALLOW_INSECURE_WORKER_TRANSPORT=/m);
   });
 });
 

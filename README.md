@@ -118,6 +118,10 @@ DATABASE_URL=postgres://dev:dev@localhost:5432/product bun run --cwd packages/db
 
 # secrets for running the apps (tests provision their own env)
 cp .env.example .env    # then fill in values
+# a hand-built .env also needs the dev-only vars `bun run dev`'s bootstrap
+# would add: uncomment ALLOW_INSECURE_WORKER_TRANSPORT, and set
+# ARTIFACT_CACHE_DIR/AGENT_BUILD_ROOT to the same writable dir (see comments
+# in .env.example)
 
 # terminal 1 — API host (:3000)
 bun run --cwd apps/control-plane dev

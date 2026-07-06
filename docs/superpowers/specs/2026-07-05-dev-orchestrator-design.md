@@ -61,7 +61,11 @@ When `.env` is **missing**:
 3. Set `ARTIFACT_CACHE_DIR=.dev/agent-cache` (repo-local, gitignored). The
    worker's compiled-in default is `/var/lib/agents`
    (`apps/worker/src/config.ts`), which is not writable on macOS without sudo.
-   Also append `ALLOW_INSECURE_WORKER_TRANSPORT=1`, since dev workers register
+   Also set `AGENT_BUILD_ROOT` to the same value: compiled eve artifacts bake
+   in absolute paths (spike/REPORT.md finding 13), so the control plane's
+   build root (`apps/control-plane/src/runtime/config.ts`) and the worker's
+   extract root must be byte-for-byte identical, or agent boot breaks. Also
+   append `ALLOW_INSECURE_WORKER_TRANSPORT=1`, since dev workers register
    with the control plane over `http://localhost`; the flag stays commented
    out in `.env.example` itself so the template is secure by default.
 4. Print which keys were generated, plus one note that copilot/keyed features

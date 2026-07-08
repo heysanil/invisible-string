@@ -67,6 +67,15 @@ export const authMockState = {
   updateOrganizationCalls: [] as Array<Record<string, unknown>>,
   acceptInvitationCalls: [] as Array<Record<string, unknown>>,
   cancelInvitationCalls: [] as Array<Record<string, unknown>>,
+  createOrganizationResult: ok(),
+  getInvitationResult: {
+    data: null,
+    error: { message: "Invitation not found!", status: 400 },
+  } as MockAuthResult,
+  rejectInvitationResult: ok(),
+  createOrganizationCalls: [] as Array<Record<string, unknown>>,
+  getInvitationCalls: [] as Array<Record<string, unknown>>,
+  rejectInvitationCalls: [] as Array<Record<string, unknown>>,
 };
 
 export function resetAuthMock(): void {
@@ -92,6 +101,15 @@ export function resetAuthMock(): void {
   authMockState.updateOrganizationCalls = [];
   authMockState.acceptInvitationCalls = [];
   authMockState.cancelInvitationCalls = [];
+  authMockState.createOrganizationResult = ok();
+  authMockState.getInvitationResult = {
+    data: null,
+    error: { message: "Invitation not found!", status: 400 },
+  };
+  authMockState.rejectInvitationResult = ok();
+  authMockState.createOrganizationCalls = [];
+  authMockState.getInvitationCalls = [];
+  authMockState.rejectInvitationCalls = [];
 }
 
 export function demoSession(): MockSessionData {
@@ -122,11 +140,38 @@ const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathnam
 const organizationMock = {
   setActive: async (args: Record<string, unknown>) => {
     authMockState.setActiveCalls.push(args);
-    const next = authMockState.organizations.find(
-      (org) => org.id === args["organizationId"],
-    );
-    authMockState.activeOrganization = next ?? null;
+    const id = args["organizationId"] as string;
+    const known = authMockState.organizations.find((org) => org.id === id);
+    // Unknown id: mirror the real client — the active-org store refetches
+    // from the server, which knows orgs the (stale) list hook does not,
+    // e.g. right after accepting an invitation.
+    authMockState.activeOrganization =
+      known ??
+      (id
+        ? { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" }
+        : null);
     return ok();
+  },
+  create: async (args: Record<string, unknown>) => {
+    authMockState.createOrganizationCalls.push(args);
+    const result = authMockState.createOrganizationResult;
+    if (!result.error && result.data) {
+      // Mirror the real client: /organization/create fires $listOrg, so
+      // list hooks re-read — append so layout gates flip in tests.
+      authMockState.organizations = [
+        ...authMockState.organizations,
+        result.data as MockOrganization,
+      ];
+    }
+    return result;
+  },
+  getInvitation: async (args: Record<string, unknown>) => {
+    authMockState.getInvitationCalls.push(args);
+    return authMockState.getInvitationResult;
+  },
+  rejectInvitation: async (args: Record<string, unknown>) => {
+    authMockState.rejectInvitationCalls.push(args);
+    return authMockState.rejectInvitationResult;
   },
   inviteMember: async (args: Record<string, unknown>) => {
     authMockState.inviteCalls.push(args);

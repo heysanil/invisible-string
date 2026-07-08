@@ -13,6 +13,7 @@ test("rejects protocol-relative and absolute URLs", () => {
   expect(safeRedirectPath("//evil.example/phish")).toBeUndefined();
   expect(safeRedirectPath("https://evil.example")).toBeUndefined();
   expect(safeRedirectPath("javascript:alert(1)")).toBeUndefined();
+  expect(safeRedirectPath("/\\evil.example/phish")).toBeUndefined();
 });
 
 test("rejects non-strings and relative paths", () => {

@@ -1,6 +1,7 @@
 /**
- * Auth acceptance: signup → land in the shell; logout; login. Exercises the
- * real Better Auth email/password flow end-to-end through the browser.
+ * Auth acceptance: signup → first-run workspace onboarding → shell; logout;
+ * login. Exercises the real Better Auth email/password flow end-to-end
+ * through the browser.
  */
 import { expect, test } from "@playwright/test";
 
@@ -12,7 +13,7 @@ import {
   uniqueAccount,
 } from "../support/flows.ts";
 
-test("signup lands in the app shell, then logout and login round-trip", async ({
+test("signup drives first-run onboarding into the shell, then logout and login round-trip", async ({
   page,
 }) => {
   const account = uniqueAccount("auth");

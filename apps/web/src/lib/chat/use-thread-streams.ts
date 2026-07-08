@@ -78,6 +78,11 @@ export function useThreadStreams(
     (runId: string) => {
       handles.current.get(runId)?.close();
       const streamFn = optionsRef.current.streamFn ?? streamRun;
+      // TEMP DIAG (CI-runner-only test failure) — remove before merge.
+      console.log(
+        "DIAG open()", runId,
+        "| injected streamFn:", optionsRef.current.streamFn !== undefined,
+      );
       const cursor = stores.current.get(runId)?.maxSeq ?? -1;
       const handle = streamFn(
         runId,

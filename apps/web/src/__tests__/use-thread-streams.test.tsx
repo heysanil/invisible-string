@@ -106,6 +106,24 @@ test("DIAG environment probe", async () => {
     "DIAG opens after 150ms:", opens.length,
     "| state entries:", result.current.runs.size,
   );
+  const entry = result.current.runs.get("diag");
+  console.log(
+    "DIAG state entry:",
+    JSON.stringify(
+      entry
+        ? {
+            status: entry.status,
+            error: entry.error,
+            streamError: entry.streamError,
+            frames: entry.store.frames.length,
+          }
+        : null,
+    ),
+  );
+  console.log(
+    "DIAG react version:", (await import("react")).version,
+    "| NODE_ENV:", process.env.NODE_ENV,
+  );
 });
 
 test("frames fold into the run's store; status frames bubble to onRunStatus", async () => {

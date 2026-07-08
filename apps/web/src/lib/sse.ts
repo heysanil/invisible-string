@@ -170,12 +170,16 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+// TEMP DIAG (CI-runner-only test failure) — remove before merge.
+console.log("DIAG sse.ts module evaluated");
+
 /** Subscribe to a run's SSE stream. Returns a handle owning the connection. */
 export function streamRun(
   runId: string,
   handlers: RunStreamHandlers,
   options: RunStreamOptions = {},
 ): RunStreamHandle {
+  console.log("DIAG real streamRun called for run:", runId);
   const abort = new AbortController();
   const initialDelay = options.initialRetryDelayMs ?? 500;
   const maxDelay = options.maxRetryDelayMs ?? 10_000;

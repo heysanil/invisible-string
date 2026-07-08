@@ -1,32 +1,135 @@
-# Disables the bundled postgres + garage — point the platform at managed
-# services instead. Requirements + walkthrough: docs/DEPLOY.md § External data.
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION single-host topology — EXTERNAL DATA SERVICES variant.
+# Standalone (not an override): deploy THIS file alone when Postgres and the
+# S3 store are managed elsewhere. Design: docs/superpowers/specs/
+# 2026-07-07-prod-compose-design.md · operate via docs/DEPLOY.md §7.
 #
-#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.external-data.yml up -d
+# Same app services as docker-compose.prod.yml minus the bundled postgres +
+# garage; DATABASE_URL / WORLD_DATABASE_URL / S3_* point at your managed
+# services instead. Requirements: the Postgres role needs CREATEDB unless the
+# databases are pre-created (per-version `ws_v_*` world DBs are created at
+# publish time); the store must serve SigV4 presigned GETs reachable from the
+# worker.
 #
-# Needs Docker Compose ≥ 2.24 (`!reset`/`!override`). Note: the base file's
-# ${POSTGRES_PASSWORD:?} / ${GARAGE_RPC_SECRET:?} still interpolate — set both
-# to the literal string `unused` in this mode.
-services:
-  postgres:
-    profiles: ["disabled-bundled-data"]
-  garage:
-    profiles: ["disabled-bundled-data"]
+# ⚠️ Keep the shared services in lockstep with docker-compose.prod.yml —
+# CI enforces this (scripts/check-prod-compose-drift.sh).
+# ─────────────────────────────────────────────────────────────────────────────
+name: invisible-string-prod
 
-  migrate:
-    depends_on: !reset {}
-    environment:
-      DATABASE_URL: ${DATABASE_URL:?external-data mode requires DATABASE_URL}
-      # The migrator ensures both databases exist; on managed servers the role
-      # needs CREATEDB unless they are pre-created (docs/DEPLOY.md §7).
-      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?external-data mode requires WORLD_DATABASE_URL}
+services:
+  web:
+    image: ghcr.io/heysanil/invisible-string-web:${IMAGE_TAG:?}
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    networks: [internal, dokploy-network]
+    healthcheck:
+      # 127.0.0.1 (not localhost): busybox resolves localhost to ::1 first, but
+      # the gateway's `listen 80` binds IPv4 only — ::1 would connection-refuse.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
 
   control-plane:
-    depends_on: !override
+    image: ghcr.io/heysanil/invisible-string-control-plane:${IMAGE_TAG:?}
+    restart: unless-stopped
+    depends_on:
       migrate:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: ${DATABASE_URL:?}
-      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?external-data mode requires WORLD_DATABASE_URL}
-      S3_ENDPOINT: ${S3_ENDPOINT:?external-data mode requires S3_ENDPOINT}
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?point at your managed Postgres}
+      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?point at your managed Postgres world DB}
+      S3_ENDPOINT: ${S3_ENDPOINT:?point at your managed S3-compatible store}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?}
       S3_BUCKET: ${S3_BUCKET:-artifacts}
       S3_REGION: ${S3_REGION:-us-east-1}
+      BETTER_AUTH_URL: https://${APP_DOMAIN:?}
+      PUBLIC_APP_URL: https://${APP_DOMAIN:?}
+      CORS_ORIGIN: https://${APP_DOMAIN:?}
+      TRUSTED_ORIGINS: https://${APP_DOMAIN:?}
+      SECURITY_HSTS: "1"
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:?}
+      PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:?}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?}
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:?}
+      WORKER_AUTH_MODE: worker-token
+      WORKER_ALLOWED_IDS: ${WORKER_ID:?}
+      ALLOW_INSECURE_WORKER_TRANSPORT: "1"
+      AGENT_BUILD_ROOT: /var/lib/agents
+      NPM_CACHE_DIR: /var/lib/npm-cache
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - agent-build:/var/lib/agents
+      - npm-cache:/var/lib/npm-cache
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:3000/api/health'); if (!r.ok) process.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  migrate:
+    image: ghcr.io/heysanil/invisible-string-control-plane:${IMAGE_TAG:?}
+    command: ["bun", "apps/control-plane/src/migrate.ts"]
+    restart: "no"
+    environment:
+      # The migrator also creates missing databases (needs CREATEDB unless
+      # they are pre-created) before applying migrations.
+      DATABASE_URL: ${DATABASE_URL:?point at your managed Postgres}
+      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?point at your managed Postgres world DB}
+    networks: [internal]
+
+  worker:
+    image: ghcr.io/heysanil/invisible-string-worker:${IMAGE_TAG:?}
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      WORKER_ID: ${WORKER_ID:?}
+      CONTROL_PLANE_URL: http://control-plane:3000
+      PUBLIC_URL: http://worker:4000
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:?}
+      WORKER_AUTH_MODE: worker-token
+      ARTIFACT_CACHE_DIR: /var/lib/agents
+      SANDBOX_REAPER_ENABLED: "1"
+    volumes:
+      - agent-cache:/var/lib/agents
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:4000/healthz'); if (!r.ok) process.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Optional Cloudflare Tunnel ingress: docker compose --profile cloudflared up.
+  # Map the tunnel's public hostname to http://web:80 in the Cloudflare
+  # dashboard. TUNNEL_TOKEN is required only when the profile is enabled
+  # (cloudflared exits without it) — `:-` keeps profile-off deploys from
+  # demanding the variable.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.6.0
+    profiles: ["cloudflared"]
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARED_TUNNEL_TOKEN:-}
+    depends_on: [web]
+    networks: [internal]
+
+networks:
+  internal: {}
+  dokploy-network:
+    external: true
+
+volumes:
+  agent-build:
+  agent-cache:
+  npm-cache:

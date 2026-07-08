@@ -189,8 +189,10 @@ jobs:
           S3_ENDPOINT=https://s3.example.com
           EOF
           docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml config -q
-          docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml -f docker-compose.prod.external-data.yml config -q
+          docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.external-data.yml config -q
           docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml -f docker-compose.prod.build.yml config -q
+      - name: External-data variant must not drift from the base compose
+        run: ./scripts/check-prod-compose-drift.sh
       - name: Build prod images (validation only, never pushed)
         run: |
           docker build -f infra/docker/control-plane.Dockerfile -t validate-cp .

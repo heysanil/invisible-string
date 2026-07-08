@@ -209,3 +209,11 @@ beyond the structured logs + `/internal/metrics` that already exist.
 - **External-data wart.** Compose interpolates `${POSTGRES_PASSWORD:?}` /
   `${GARAGE_RPC_SECRET:?}` even for profile-disabled services — external-data
   deploys set both to the literal `unused` (documented in DEPLOY.md).
+- **External-data variant became a standalone compose file (2026-07-08).** The
+  original override design (`-f base -f override` with `!reset`) demanded
+  multi-file invocation that one-file hosts (Dokploy paste mode) can't express,
+  plus the `unused`-placeholder wart. `docker-compose.prod.external-data.yml`
+  now mirrors the base's app services minus the bundled data services;
+  `scripts/check-prod-compose-drift.sh` (run by the CI `prod-compose` job)
+  keeps the shared service definitions in lockstep. The `!reset` requirement
+  (Compose ≥ 2.24) is gone; both files need ≥ 2.23.1 for inline `configs`.

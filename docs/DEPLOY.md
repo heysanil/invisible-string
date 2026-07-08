@@ -47,8 +47,8 @@ Images are pulled from GHCR, pinned by `IMAGE_TAG`:
 
 ## 2. Prerequisites
 
-- A Linux host with **Docker** and **Docker Compose ≥ 2.24** (the external-data
-  override uses `!reset`/`!override`, which need 2.24+).
+- A Linux host with **Docker** and **Docker Compose ≥ 2.23.1** (the compose
+  files carry their config files inline via `configs: content:`).
 - A public domain pointed at the host (or at the hoster's proxy).
 - `/var/run/docker.sock` available to the `worker` container — eve session
   sandboxes launch as sibling containers on the host daemon.
@@ -183,24 +183,26 @@ docker compose --env-file /tmp/prod-smoke.env \
 
 ## 7. External / managed data services
 
-`docker-compose.prod.external-data.yml` disables the bundled `postgres` and
-`garage` (via a `disabled-bundled-data` profile) and points the platform at
-managed services instead:
+`docker-compose.prod.external-data.yml` is a **standalone** compose file — the
+same app services as the base file with the bundled `postgres` and `garage`
+removed. Deploy it alone (paste it into Dokploy exactly like the base file, or
+run it directly); do not combine it with `docker-compose.prod.yml`:
 
 ```bash
-docker compose --env-file .env.prod \
-  -f docker-compose.prod.yml -f docker-compose.prod.external-data.yml up -d
+docker compose --env-file .env.prod -f docker-compose.prod.external-data.yml up -d
 ```
+
+CI keeps the two files' shared services in lockstep
+(`scripts/check-prod-compose-drift.sh`) — edit one, mirror the other.
 
 Requirements:
 
-- **Docker Compose ≥ 2.24** (the override uses `!reset`/`!override`).
-- Provide `DATABASE_URL`, `WORLD_DATABASE_URL`, and `S3_ENDPOINT`.
-- The base file still interpolates `${POSTGRES_PASSWORD:?}` and
-  `${GARAGE_RPC_SECRET:?}` even though those services are disabled — set both to
-  the literal string `unused`.
-- The managed Postgres role **must have `CREATEDB`** — the world provisioner
-  creates a per-version `ws_v_*` database for every workflow version.
+- Provide `DATABASE_URL`, `WORLD_DATABASE_URL`, and `S3_ENDPOINT` instead of
+  `POSTGRES_PASSWORD` / `GARAGE_RPC_SECRET` (which this file never references).
+- The managed Postgres role **must have `CREATEDB`** unless the `product` and
+  `world` databases are pre-created — the migrate one-shot creates missing
+  databases, and the world provisioner creates a per-version `ws_v_*` database
+  for every workflow version.
 - The S3 endpoint must support **SigV4 presigned GET** URLs, and those URLs must
   be reachable from the `worker` container (it fetches artifacts by plain
   `fetch`). `S3_BUCKET` (default `artifacts`) and `S3_REGION` (default

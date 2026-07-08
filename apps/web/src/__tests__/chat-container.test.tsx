@@ -15,6 +15,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
+// Link the real module BEFORE mock.module registers (static imports hoist
+// above the call): pins the mock into exports-patch mode, which auto-reverts
+// at this file's boundary. Without it, when this file is the first in the
+// process to touch the specifier (readdir-order dependent — differs per
+// runner), mock.module intercepts process-wide and use-thread-streams.test
+// silently receives the mock.
+import "../lib/chat/use-thread-streams";
 
 ensureDomForThisFile();
 

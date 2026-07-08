@@ -153,6 +153,12 @@ surface, built on the **E1 design system** — monochrome ink × liquid glass,
 color only as meaning (`src/styles/tokens.css` + `src/components/ui`). Four
 sections:
 
+**Onboarding:** a fresh account lands on a first-run screen to name its
+workspace (creation seeds model presets, allowlist, and agent presets via the
+org-creation hook). Teammates join through invite links from Settings →
+Members (`/accept-invitation/:id`) — signed-out recipients round-trip through
+login/signup and land back on the invitation.
+
 ### 💬 Chat — `/chat`
 Start a session with a published workflow and watch its runs stream live:
 working blocks, streamed reply, inline human-in-the-loop approvals. Resumable

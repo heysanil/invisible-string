@@ -2,6 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **EXECUTED 2026-07-07** (commits `653a891`…`6165966`). The committed code is the
+> source of truth; four reviewed deviations from this plan's literal text:
+> 1. Garage needs `--default-access-key --default-bucket` CLI flags in addition to
+>    the `GARAGE_DEFAULT_*` env vars (both compose files carry them).
+> 2. The web gateway proxy regex also includes `/sessions` and `/runs` — the plan's
+>    7-prefix list would have swallowed the chat/run surface (see `infra/nginx/web.conf`).
+> 3. The prod web healthcheck targets `127.0.0.1`, not `localhost` (alpine busybox
+>    resolves localhost to ::1; nginx listens on IPv4 only).
+> 4. `.gitignore` gained `!.env.prod.example` so that template is committable.
+
 **Goal:** Ship a production single-host `docker-compose.prod.yml` (Dokploy-hosted, GHCR images) and migrate the object store from MinIO to Garage across dev, CI, and prod.
 
 **Architecture:** Three new GHCR images (control-plane = Bun + Node 24 + npm; worker = Bun + Node 24 + docker CLI; web = Vite build → nginx SPA-server-plus-API-gateway) composed on a private bridge with postgres + Garage; only `web` joins the hoster's external proxy network. Garage v2.3's `--single-node` + `GARAGE_DEFAULT_*` env vars replace the entire minio-init ceremony.

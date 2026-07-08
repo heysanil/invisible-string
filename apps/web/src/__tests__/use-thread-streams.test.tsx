@@ -68,67 +68,6 @@ function statusFrame(runId: string, status: RunStatus): RunStatusFrame {
   return { runId, status };
 }
 
-// TEMP DIAGNOSTICS (CI-runner-only failure) — remove before merge.
-test("DIAG environment probe", async () => {
-  const { GlobalRegistrator } = await import("@happy-dom/global-registrator");
-  console.log(
-    "DIAG dom-registered:", GlobalRegistrator.isRegistered,
-    "| act-env:", globalThis.IS_REACT_ACT_ENVIRONMENT,
-    "| window:", typeof window,
-    "| document:", typeof document,
-  );
-  await new Promise<void>((resolve) => {
-    const mc = new MessageChannel();
-    const t = setTimeout(() => {
-      console.log("DIAG message-channel: NEVER FIRED (500ms)");
-      resolve();
-    }, 500);
-    mc.port1.onmessage = () => {
-      clearTimeout(t);
-      console.log("DIAG message-channel: fired");
-      resolve();
-    };
-    mc.port2.postMessage(1);
-  });
-  await new Promise<void>((resolve) =>
-    setTimeout(() => {
-      console.log("DIAG setTimeout(0): fired");
-      resolve();
-    }, 0),
-  );
-  const { streamFn, opens } = makeFakeStreamFn();
-  const { result } = renderHook(() =>
-    useThreadStreams([{ id: "diag", status: "running" as RunStatus }], { streamFn }),
-  );
-  console.log("DIAG opens immediately after renderHook:", opens.length);
-  const { act } = await import("@testing-library/react");
-  await act(async () => {});
-  console.log("DIAG opens after explicit act flush:", opens.length);
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  console.log(
-    "DIAG opens after 150ms:", opens.length,
-    "| state entries:", result.current.runs.size,
-  );
-  const entry = result.current.runs.get("diag");
-  console.log(
-    "DIAG state entry:",
-    JSON.stringify(
-      entry
-        ? {
-            status: entry.status,
-            error: entry.error,
-            streamError: entry.streamError,
-            frames: entry.store.frames.length,
-          }
-        : null,
-    ),
-  );
-  console.log(
-    "DIAG react version:", (await import("react")).version,
-    "| NODE_ENV:", process.env.NODE_ENV,
-  );
-});
-
 test("frames fold into the run's store; status frames bubble to onRunStatus", async () => {
   const { streamFn, opens } = makeFakeStreamFn();
   const onRunStatus = mock((_runId: string, _status: RunStatus) => {});

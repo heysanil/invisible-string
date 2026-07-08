@@ -8,20 +8,16 @@
  */
 import { ensureDomForThisFile } from "../test/setup";
 
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
-// Link the real module BEFORE mock.module registers (static imports hoist
-// above the call): pins the mock into exports-patch mode, which auto-reverts
-// at this file's boundary. Without it, when this file is the first in the
-// process to touch the specifier (readdir-order dependent — differs per
-// runner), mock.module intercepts process-wide and use-thread-streams.test
-// silently receives the mock.
-import "../lib/chat/use-thread-streams";
+// The real implementation, bound at THIS file's evaluation, so the module
+// mock below can delegate to it outside this suite (see comment there).
+import * as realThreadStreams from "../lib/chat/use-thread-streams";
 
 ensureDomForThisFile();
 
@@ -66,8 +62,25 @@ const streamsModulePath = new URL(
   import.meta.url,
 ).pathname;
 
+// bun's mock.module can intercept every FUTURE import of this path for the
+// rest of the process (observed on Namespace CI runners, where readdir order
+// runs this file before use-thread-streams.test.tsx first touches the real
+// module — locally the consumer usually binds the real module first and never
+// sees the mock). The registered mock therefore DELEGATES to the real
+// implementation except while this file's own suite is running, so later
+// files get real behavior no matter which module copy their import resolved
+// to. test/auth-mock.ts documents the same ordering trap for the auth client.
+let streamsMockActive = false;
+beforeAll(() => {
+  streamsMockActive = true;
+});
+afterAll(() => {
+  streamsMockActive = false;
+});
+
 mock.module(streamsModulePath, () => ({
-  useThreadStreams: (runs: { id: string }[]) => {
+  useThreadStreams: ((runs, options) => {
+    if (!streamsMockActive) return realThreadStreams.useThreadStreams(runs, options);
     const map = new Map<string, { store: FrameStore; status: RunStatus | null; error: null; streamError: null }>();
     for (const run of runs) {
       const entry = liveStores.get(run.id);
@@ -79,7 +92,7 @@ mock.module(streamsModulePath, () => ({
       });
     }
     return { runs: map, reopen: (runId: string) => reopenCalls.push(runId) };
-  },
+  }) as typeof realThreadStreams.useThreadStreams,
 }));
 
 const { ThreadContainer } = await import("../components/chat/ThreadContainer");

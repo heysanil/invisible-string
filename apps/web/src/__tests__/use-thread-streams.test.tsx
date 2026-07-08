@@ -68,6 +68,46 @@ function statusFrame(runId: string, status: RunStatus): RunStatusFrame {
   return { runId, status };
 }
 
+// TEMP DIAGNOSTICS (CI-runner-only failure) — remove before merge.
+test("DIAG environment probe", async () => {
+  const { GlobalRegistrator } = await import("@happy-dom/global-registrator");
+  console.log(
+    "DIAG dom-registered:", GlobalRegistrator.isRegistered,
+    "| act-env:", globalThis.IS_REACT_ACT_ENVIRONMENT,
+    "| window:", typeof window,
+    "| document:", typeof document,
+  );
+  await new Promise<void>((resolve) => {
+    const mc = new MessageChannel();
+    const t = setTimeout(() => {
+      console.log("DIAG message-channel: NEVER FIRED (500ms)");
+      resolve();
+    }, 500);
+    mc.port1.onmessage = () => {
+      clearTimeout(t);
+      console.log("DIAG message-channel: fired");
+      resolve();
+    };
+    mc.port2.postMessage(1);
+  });
+  await new Promise<void>((resolve) =>
+    setTimeout(() => {
+      console.log("DIAG setTimeout(0): fired");
+      resolve();
+    }, 0),
+  );
+  const { streamFn, opens } = makeFakeStreamFn();
+  const { result } = renderHook(() =>
+    useThreadStreams([{ id: "diag", status: "running" as RunStatus }], { streamFn }),
+  );
+  console.log("DIAG opens immediately after renderHook:", opens.length);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  console.log(
+    "DIAG opens after 150ms:", opens.length,
+    "| state entries:", result.current.runs.size,
+  );
+});
+
 test("frames fold into the run's store; status frames bubble to onRunStatus", async () => {
   const { streamFn, opens } = makeFakeStreamFn();
   const onRunStatus = mock((_runId: string, _status: RunStatus) => {});

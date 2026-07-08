@@ -36,8 +36,13 @@ let tarPlain: string;
 let tarCrash: string;
 let tarPadded: Record<"a" | "b" | "c", string>;
 
-/** Unique agent-port range per supervisor so tests never collide. */
-let portBase = 42_100;
+/**
+ * Unique agent-port range per supervisor so tests never collide. Must stay
+ * BELOW the Linux ephemeral range (32768–60999): outbound sockets on the CI
+ * host can otherwise land on a pool port and the bind check sees it taken
+ * (observed on Namespace runners — the one-port pool test 503'd instantly).
+ */
+let portBase = 25_100;
 function nextPortRange(size: number): { min: number; max: number } {
   const min = portBase;
   portBase += size + 5;

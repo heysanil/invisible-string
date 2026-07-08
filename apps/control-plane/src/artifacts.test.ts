@@ -14,9 +14,10 @@ describe("artifactKeyForHash", () => {
 
 describe("createArtifactStore (Bun S3, offline-verifiable parts)", () => {
   const store = createArtifactStore({
-    endpoint: "http://localhost:9000",
-    accessKeyId: "dev",
-    secretAccessKey: "devdevdev",
+    endpoint: "http://localhost:3900",
+    accessKeyId: "GKdeadbeefdeadbeefdeadbeefdeadbeef",
+    secretAccessKey:
+      "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
     bucket: "artifacts",
   });
 
@@ -25,7 +26,7 @@ describe("createArtifactStore (Bun S3, offline-verifiable parts)", () => {
       expiresInSeconds: 60,
     });
     const parsed = new URL(url);
-    expect(parsed.origin).toBe("http://localhost:9000");
+    expect(parsed.origin).toBe("http://localhost:3900");
     expect(parsed.pathname).toContain("artifacts/abc.tar.gz");
     expect(parsed.searchParams.get("X-Amz-Signature")).toBeTruthy();
     expect(parsed.searchParams.get("X-Amz-Expires")).toBe("60");

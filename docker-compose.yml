@@ -1,8 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # LOCAL DEV / CI ONLY — NOT A PRODUCTION TOPOLOGY.
 #
-# Every credential in this file (Postgres dev/dev, MinIO dev/devdevdev, Dex
-# client secret + static user in infra/dex-config.yaml) is a hardcoded,
+# Every credential in this file (Postgres dev/dev, Garage GK… throwaway key,
+# Dex client secret + static user in infra/dex-config.yaml) is a hardcoded,
 # public, throwaway DEV credential bound to localhost. Do NOT lift this file
 # into any shared, staging, or production environment. The documented
 # production topology (docs/PLAN.md) is defined separately and must source
@@ -28,36 +28,28 @@ services:
       timeout: 3s
       retries: 12
 
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data --console-address ":9001"
+  garage:
+    image: dxflrs/garage:v2.3.0
+    # --single-node auto-initializes the cluster layout; the --default-access-key
+    # + --default-bucket flags idempotently create (on every boot) the access key
+    # and "artifacts" bucket from the GARAGE_DEFAULT_* env vars below (Garage ≥
+    # v2.3). No init one-shot needed (unlike the old minio-init).
+    command: ["/garage", "server", "--single-node", "--default-access-key", "--default-bucket"]
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${GARAGE_PORT:-3900}:3900"
     environment:
-      MINIO_ROOT_USER: dev
-      MINIO_ROOT_PASSWORD: devdevdev
+      GARAGE_RPC_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      GARAGE_DEFAULT_ACCESS_KEY: GKdeadbeefdeadbeefdeadbeefdeadbeef
+      GARAGE_DEFAULT_SECRET_KEY: cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe
+      GARAGE_DEFAULT_BUCKET: artifacts
     volumes:
-      - minio-data:/data
+      - ./infra/garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live"]
+      test: ["CMD", "/garage", "json-api", "GetClusterHealth"]
       interval: 5s
       timeout: 3s
       retries: 12
-
-  # One-shot init job: creates the "artifacts" bucket (build tarballs +
-  # trigger file payloads). Invoke as `docker compose run --rm minio-init`
-  # (foreground, exit code propagates) — `compose wait` races a fast one-shot
-  # (Compose ≥ v5 only sees running containers).
-  minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - mc alias set local http://minio:9000 dev devdevdev && mc mb --ignore-existing local/artifacts
-    restart: "no"
 
   dex:
     image: dexidp/dex:v2.45.1
@@ -81,4 +73,4 @@ services:
 
 volumes:
   postgres-data:
-  minio-data:
+  garage-data:

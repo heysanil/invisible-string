@@ -1,23 +1,23 @@
 /**
  * Object-store client for build artifacts (docs/PLAN.md Phase 1 task 3).
  *
- * S3-compatible (MinIO in the compose stack) via Bun's built-in S3 client.
+ * S3-compatible (Garage in the compose stack) via Bun's built-in S3 client.
  * Artifacts are content-addressed tarballs: `artifacts/<hash>.tar.gz`.
  * Workers download them through short-lived presigned GET URLs — the control
  * plane never streams artifact bytes through itself on the dispatch path.
  *
  * Config comes from env (see `loadRuntimeConfig`): S3_ENDPOINT,
  * S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET (default "artifacts",
- * created by the compose `minio-init` job), optional S3_REGION.
+ * created by the garage service's GARAGE_DEFAULT_* env), optional S3_REGION.
  */
 import { S3Client } from "bun";
 
 export interface ArtifactStoreConfig {
-  /** e.g. http://localhost:9000 (MinIO) — path-style addressing is used. */
+  /** e.g. http://localhost:3900 (Garage) — path-style addressing is used. */
   endpoint: string;
   accessKeyId: string;
   secretAccessKey: string;
-  /** Bucket name (compose stack creates "artifacts"). */
+  /** Bucket name (the garage service auto-creates "artifacts"). */
   bucket: string;
   region?: string;
 }
@@ -53,7 +53,7 @@ export function createArtifactStore(config: ArtifactStoreConfig): ArtifactStore 
     bucket: config.bucket,
     endpoint: config.endpoint,
     region: config.region,
-    // MinIO serves buckets at <endpoint>/<bucket> (path style), not as a
+    // Garage serves buckets at <endpoint>/<bucket> (path style), not as a
     // virtual-host subdomain.
     virtualHostedStyle: false,
   });
@@ -79,7 +79,7 @@ export function createArtifactStore(config: ArtifactStoreConfig): ArtifactStore 
 
 /**
  * In-memory ArtifactStore for tests (unit + the fake-agent integration loop —
- * MinIO is only exercised in the compose integration stage).
+ * Garage is only exercised in the compose integration stage).
  */
 export function createMemoryArtifactStore(
   baseUrl = "http://artifacts.test",

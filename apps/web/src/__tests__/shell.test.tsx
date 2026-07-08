@@ -11,9 +11,9 @@ import {
 
 import {
   authMockState,
-  demoSession,
   registerAuthMock,
   resetAuthMock,
+  signInToDemoWorkspace,
 } from "../test/auth-mock";
 
 ensureDomForThisFile();
@@ -36,18 +36,27 @@ function renderAt(path: string) {
   return { router, view };
 }
 
-// The Workflows section fetches workspace resources on mount; stub fetch so
-// the shell tests stay hermetic (no real network). The merged body satisfies
-// every list schema the index touches (each reads only its own key).
+// Every workspace-scoped section fetches its own resources on mount (a
+// resolved demo workspace clears the zero-org gate, so Workflows/Chat/Context
+// all reach their real queries instead of a "no workspace" gate); stub fetch
+// so the shell tests stay hermetic (no real network). The merged body
+// satisfies every list schema each section touches (each reads only its own
+// key).
 let realFetch: typeof fetch;
 
 beforeEach(() => {
   resetAuthMock();
-  authMockState.session = demoSession();
+  signInToDemoWorkspace();
   realFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
     new Response(
-      JSON.stringify({ workflows: [], sessions: [], agents: [] }),
+      JSON.stringify({
+        workflows: [],
+        sessions: [],
+        agents: [],
+        connections: [],
+        skills: [],
+      }),
       { status: 200, headers: { "content-type": "application/json" } },
     )) as unknown as typeof fetch;
 });
@@ -81,17 +90,16 @@ test("dock navigation switches routes", async () => {
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/workflows");
   });
-  // The demo session has no active organization resolved (the org-plugin
-  // hooks are empty), so every workspace-scoped section shows its gate
-  // rather than firing resource fetches — workflows included.
-  expect(await view.findByText("No active workspace")).toBeTruthy();
+  // The demo session's workspace is resolved, so the Workflows section
+  // renders its real (empty) list rather than the no-workspace gate.
+  expect(await view.findByText("No workflows yet")).toBeTruthy();
 
   const contextLink = view.getByRole("link", { name: "Context" });
   fireEvent.click(contextLink);
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/context");
   });
-  expect(await view.findByText("No workspace yet")).toBeTruthy();
+  expect(await view.findByText("No connections yet")).toBeTruthy();
 });
 
 test("active dock item is marked with aria-current", async () => {

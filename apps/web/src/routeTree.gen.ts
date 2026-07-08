@@ -13,6 +13,7 @@ import { Route as SignupRouteImport } from './routes/signup'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AcceptInvitationInvitationIdRouteImport } from './routes/accept-invitation.$invitationId'
 import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppContextRouteImport } from './routes/_app.context'
@@ -48,6 +49,12 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AcceptInvitationInvitationIdRoute =
+  AcceptInvitationInvitationIdRouteImport.update({
+    id: '/accept-invitation/$invitationId',
+    path: '/accept-invitation/$invitationId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const AppWorkflowsRoute = AppWorkflowsRouteImport.update({
   id: '/workflows',
   path: '/workflows',
@@ -132,6 +139,7 @@ export interface FileRoutesByFullPath {
   '/context': typeof AppContextRouteWithChildren
   '/settings': typeof AppSettingsRouteWithChildren
   '/workflows': typeof AppWorkflowsRouteWithChildren
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
   '/settings/agents': typeof AppSettingsAgentsRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/settings/integrations': typeof AppSettingsIntegrationsRoute
@@ -149,6 +157,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
   '/chat': typeof AppChatRoute
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
   '/settings/agents': typeof AppSettingsAgentsRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/settings/integrations': typeof AppSettingsIntegrationsRoute
@@ -171,6 +180,7 @@ export interface FileRoutesById {
   '/_app/context': typeof AppContextRouteWithChildren
   '/_app/settings': typeof AppSettingsRouteWithChildren
   '/_app/workflows': typeof AppWorkflowsRouteWithChildren
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
   '/_app/settings/agents': typeof AppSettingsAgentsRoute
   '/_app/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/_app/settings/integrations': typeof AppSettingsIntegrationsRoute
@@ -193,6 +203,7 @@ export interface FileRouteTypes {
     | '/context'
     | '/settings'
     | '/workflows'
+    | '/accept-invitation/$invitationId'
     | '/settings/agents'
     | '/settings/allowlist'
     | '/settings/integrations'
@@ -210,6 +221,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/signup'
     | '/chat'
+    | '/accept-invitation/$invitationId'
     | '/settings/agents'
     | '/settings/allowlist'
     | '/settings/integrations'
@@ -231,6 +243,7 @@ export interface FileRouteTypes {
     | '/_app/context'
     | '/_app/settings'
     | '/_app/workflows'
+    | '/accept-invitation/$invitationId'
     | '/_app/settings/agents'
     | '/_app/settings/allowlist'
     | '/_app/settings/integrations'
@@ -249,6 +262,7 @@ export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
   LoginRoute: typeof LoginRoute
   SignupRoute: typeof SignupRoute
+  AcceptInvitationInvitationIdRoute: typeof AcceptInvitationInvitationIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -279,6 +293,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/accept-invitation/$invitationId': {
+      id: '/accept-invitation/$invitationId'
+      path: '/accept-invitation/$invitationId'
+      fullPath: '/accept-invitation/$invitationId'
+      preLoaderRoute: typeof AcceptInvitationInvitationIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_app/workflows': {
@@ -462,6 +483,7 @@ const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
   LoginRoute: LoginRoute,
   SignupRoute: SignupRoute,
+  AcceptInvitationInvitationIdRoute: AcceptInvitationInvitationIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

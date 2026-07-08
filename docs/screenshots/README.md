@@ -8,6 +8,8 @@ rendered before capturing it.
 
 | File | What it shows |
 |---|---|
+| `onboarding.png` | The first-run **"Create your workspace"** glass card over the wash background, name already filled in — plus the invite-link hint ("Have an invite link? Open it to join an existing workspace instead.") and the "Wrong account? Sign out" escape, shown before any workspace exists. |
+| `invite.png` | The invite **confirm panel** at `/accept-invitation/:id`: the workspace name in the "Join <workspace>" heading, the inviter's email as the subtitle, the invited role as a chip ("member"), and the Decline/Accept invitation controls — captured for a pending invite that is never accepted. |
 | `chat.png` | A chat session with a **completed run**: the collapsed working block ("Worked for Ns · N steps"), the streamed assistant reply below it, and the session list on the left with the session's status dot. |
 | `builder.png` | `/workflows/:id` with **all four pillar cards populated** — Form trigger (2 fields), Context (two connections + a skill), Agent (preset + resolved model chain), Instructions ("N lines · N @refs") — and the instructions editor focused in the center with resolved `@notes` / `@trigger.email` reference chips. |
 | `copilot.png` | The builder with the **copilot rail open** mid-conversation: two applied suggestion receipts and one **un-applied** "Write instructions" card showing the inline instructions **diff preview** with its Apply/Dismiss controls, while the pillar rail reflects the already-applied trigger and connection. |
@@ -25,10 +27,11 @@ cd e2e && SCREENSHOTS=1 bunx playwright test screenshots --project=acceptance
 ```
 
 That one command brings the full stack up (compose project `p2e2e`), signs up
-a fresh workspace, authors the skill/connections, builds + publishes a
-workflow (real `eve build`), runs it from chat, drives the scripted copilot,
-walks the five routes, and tears everything down. Add `E2E_REUSE=1` to keep
-the stack alive between iterations.
+a fresh workspace through first-run onboarding, sends and views a pending
+invite from a second browser context, authors the skill/connections, builds +
+publishes a workflow (real `eve build`), runs it from chat, drives the
+scripted copilot, walks the seven routes, and tears everything down. Add
+`E2E_REUSE=1` to keep the stack alive between iterations.
 
 ## Keep these current
 

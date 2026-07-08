@@ -1,4 +1,9 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import {
+  createFileRoute,
+  Link,
+  useNavigate,
+  useRouter,
+} from "@tanstack/react-router";
 import { useState, type FormEvent } from "react";
 
 import { AuthCard } from "../components/auth/AuthCard";
@@ -6,9 +11,15 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { useToast } from "../components/ui/Toast";
 import { signIn } from "../lib/auth-client";
+import { safeRedirectPath } from "../lib/redirect";
 import { isValidEmail } from "../lib/validate";
 
-export const Route = createFileRoute("/login")({ component: LoginPage });
+export const Route = createFileRoute("/login")({
+  validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+    redirect: safeRedirectPath(search["redirect"]),
+  }),
+  component: LoginPage,
+});
 
 interface FieldErrors {
   email?: string;
@@ -26,6 +37,8 @@ function focusFirstError(errors: FieldErrors) {
 
 function LoginPage() {
   const navigate = useNavigate();
+  const router = useRouter();
+  const { redirect } = Route.useSearch();
   const { toast } = useToast();
 
   const [email, setEmail] = useState("");
@@ -64,7 +77,10 @@ function LoginPage() {
     try {
       const { error } = await signIn.email({ email: email.trim(), password });
       if (!error) {
-        await navigate({ to: "/chat" });
+        // `redirect` is pre-validated to a same-app path; history.push keeps
+        // the typed router happy with a runtime-known destination.
+        if (redirect) router.history.push(redirect);
+        else await navigate({ to: "/chat" });
       } else if (!error.status || error.status >= 500) {
         connectionFailed();
       } else {
@@ -122,6 +138,7 @@ function LoginPage() {
         No account yet?{" "}
         <Link
           to="/signup"
+          search={{ redirect }}
           className="font-medium text-ink underline-offset-4 hover:underline"
         >
           Create one

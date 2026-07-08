@@ -33,10 +33,10 @@ const { routeTree } = await import("../routeTree.gen");
 
 // NOTE: RTL's `screen` binds document.body at import time, which is too early
 // under bun's module linking — use render-scoped queries instead.
-function renderLogin() {
+function renderLogin(initialPath = "/login") {
   const router = createRouter({
     routeTree,
-    history: createMemoryHistory({ initialEntries: ["/login"] }),
+    history: createMemoryHistory({ initialEntries: [initialPath] }),
   });
   const view = render(<RouterProvider router={router} />);
   return { router, view };
@@ -103,6 +103,40 @@ test("successful sign-in navigates to /chat", async () => {
   const { router, view } = renderLogin();
   await view.findByText("Welcome back");
   authMockState.session = demoSession(); // the guard sees a session post-login
+  fireEvent.input(view.getByLabelText("Email"), {
+    target: { value: "demo@example.com" },
+  });
+  fireEvent.input(view.getByLabelText("Password"), {
+    target: { value: "secret123" },
+  });
+  submitForm(view);
+  await waitFor(() => {
+    expect(router.state.location.pathname).toBe("/chat");
+  });
+});
+
+test("post-login redirect returns to a validated in-app path", async () => {
+  const { router, view } = renderLogin("/login?redirect=%2Fworkflows");
+  await view.findByText("Welcome back");
+  authMockState.session = demoSession();
+  fireEvent.input(view.getByLabelText("Email"), {
+    target: { value: "demo@example.com" },
+  });
+  fireEvent.input(view.getByLabelText("Password"), {
+    target: { value: "secret123" },
+  });
+  submitForm(view);
+  await waitFor(() => {
+    expect(router.state.location.pathname).toBe("/workflows");
+  });
+});
+
+test("hostile redirect values are ignored in favor of /chat", async () => {
+  const { router, view } = renderLogin(
+    "/login?redirect=%2F%2Fevil.example%2Fphish",
+  );
+  await view.findByText("Welcome back");
+  authMockState.session = demoSession();
   fireEvent.input(view.getByLabelText("Email"), {
     target: { value: "demo@example.com" },
   });

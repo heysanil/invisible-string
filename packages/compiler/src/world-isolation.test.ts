@@ -28,10 +28,9 @@ const WORLD_POSTGRES_DIR =
   join(REPO_ROOT, "spike", "agent-project", "node_modules", "@workflow", "world-postgres");
 const SETUP_BIN = join(WORLD_POSTGRES_DIR, "bin", "setup.js");
 
-const GATE = TEST_DATABASE_URL !== undefined && existsSync(SETUP_BIN);
-const SKIP_REASON =
-  TEST_DATABASE_URL === undefined
-    ? "requires TEST_DATABASE_URL (integration stage provides it)"
+const GATE = Boolean(TEST_DATABASE_URL) && existsSync(SETUP_BIN);
+const SKIP_REASON = !TEST_DATABASE_URL
+  ? "requires TEST_DATABASE_URL (integration stage provides it)"
     : `requires @workflow/world-postgres at ${WORLD_POSTGRES_DIR} (npm ci spike/agent-project, or set WORLD_POSTGRES_PACKAGE_DIR)`;
 
 function nodeBin(): string {

@@ -1,4 +1,9 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import {
+  createFileRoute,
+  Link,
+  useNavigate,
+  useRouter,
+} from "@tanstack/react-router";
 import { useState, type FormEvent } from "react";
 
 import { AuthCard } from "../components/auth/AuthCard";
@@ -6,9 +11,15 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { useToast } from "../components/ui/Toast";
 import { signUp } from "../lib/auth-client";
+import { safeRedirectPath } from "../lib/redirect";
 import { isValidEmail, PASSWORD_MIN_LENGTH } from "../lib/validate";
 
-export const Route = createFileRoute("/signup")({ component: SignupPage });
+export const Route = createFileRoute("/signup")({
+  validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+    redirect: safeRedirectPath(search["redirect"]),
+  }),
+  component: SignupPage,
+});
 
 interface FieldErrors {
   name?: string;
@@ -31,6 +42,8 @@ function focusFirstError(errors: FieldErrors) {
 
 function SignupPage() {
   const navigate = useNavigate();
+  const router = useRouter();
+  const { redirect } = Route.useSearch();
   const { toast } = useToast();
 
   const [name, setName] = useState("");
@@ -77,7 +90,10 @@ function SignupPage() {
         password,
       });
       if (!error) {
-        await navigate({ to: "/chat" });
+        // `redirect` is pre-validated to a same-app path; history.push keeps
+        // the typed router happy with a runtime-known destination.
+        if (redirect) router.history.push(redirect);
+        else await navigate({ to: "/chat" });
       } else if (!error.status || error.status >= 500) {
         connectionFailed();
       } else {
@@ -149,6 +165,7 @@ function SignupPage() {
         Already have an account?{" "}
         <Link
           to="/login"
+          search={{ redirect }}
           className="font-medium text-ink underline-offset-4 hover:underline"
         >
           Sign in

@@ -8,7 +8,7 @@
  */
 import { ensureDomForThisFile } from "../test/setup";
 
-import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -16,8 +16,10 @@ import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
 // The real implementation, bound at THIS file's evaluation, so the module
-// mock below can delegate to it outside this suite (see comment there).
+// mock below can delegate to it when use-thread-streams.test.tsx flips the
+// shared flag (see test/stream-mock-flag.ts for the full story).
 import * as realThreadStreams from "../lib/chat/use-thread-streams";
+import { streamsMockFlag } from "../test/stream-mock-flag";
 
 ensureDomForThisFile();
 
@@ -66,21 +68,12 @@ const streamsModulePath = new URL(
 // rest of the process (observed on Namespace CI runners, where readdir order
 // runs this file before use-thread-streams.test.tsx first touches the real
 // module — locally the consumer usually binds the real module first and never
-// sees the mock). The registered mock therefore DELEGATES to the real
-// implementation except while this file's own suite is running, so later
-// files get real behavior no matter which module copy their import resolved
-// to. test/auth-mock.ts documents the same ordering trap for the auth client.
-let streamsMockActive = false;
-beforeAll(() => {
-  streamsMockActive = true;
-});
-afterAll(() => {
-  streamsMockActive = false;
-});
-
+// sees the mock). The mock stays FAKE by default for order-independence and
+// delegates to the real implementation only while use-thread-streams.test.tsx
+// holds the flag — rationale and hang hazard in test/stream-mock-flag.ts.
 mock.module(streamsModulePath, () => ({
   useThreadStreams: ((runs, options) => {
-    if (!streamsMockActive) return realThreadStreams.useThreadStreams(runs, options);
+    if (!streamsMockFlag.active) return realThreadStreams.useThreadStreams(runs, options);
     const map = new Map<string, { store: FrameStore; status: RunStatus | null; error: null; streamError: null }>();
     for (const run of runs) {
       const entry = liveStores.get(run.id);

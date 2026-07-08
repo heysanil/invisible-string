@@ -11,6 +11,7 @@ permissions:
 jobs:
   images:
     runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 30
     strategy:
       matrix:
         include:

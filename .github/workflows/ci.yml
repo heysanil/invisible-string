@@ -9,6 +9,7 @@ jobs:
   unit:
     name: Typecheck + unit tests
     runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -172,6 +173,7 @@ jobs:
 
   prod-compose:
     runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Compose config lint (bundled · external-data · build)

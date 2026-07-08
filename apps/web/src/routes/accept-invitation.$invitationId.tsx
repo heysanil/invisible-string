@@ -46,7 +46,7 @@ function variantFor(status?: number): "not-found" | "wrong-account" | "connectio
   return "connection";
 }
 
-type SessionProbe = "checking" | "authenticated" | "unauthenticated";
+type SessionProbe = "checking" | "authenticated" | "unauthenticated" | "failed";
 
 function AcceptInvitationPage() {
   const { invitationId } = Route.useParams();
@@ -65,22 +65,29 @@ function AcceptInvitationPage() {
   // screens, and the remount refetch is deferred a macrotask), which bounced
   // fresh invitees straight back to /login. Probe the server directly and
   // gate the redirect on the answer instead of trusting the cached snapshot.
+  // A probe failure (network hiccup, 5xx) is NOT treated as "unauthenticated"
+  // — it renders a retryable connection-error card instead, so a flaky
+  // network doesn't bounce an otherwise signed-in user to /login.
   useEffect(() => {
     let cancelled = false;
     setSessionProbe("checking");
     void authClient
       .getSession()
-      .then(({ data }) => {
+      .then(({ data, error }) => {
         if (cancelled) return;
-        setSessionProbe(data ? "authenticated" : "unauthenticated");
+        if (error && (!error.status || error.status >= 500)) {
+          setSessionProbe("failed");
+        } else {
+          setSessionProbe(data ? "authenticated" : "unauthenticated");
+        }
       })
       .catch(() => {
-        if (!cancelled) setSessionProbe("unauthenticated");
+        if (!cancelled) setSessionProbe("failed");
       });
     return () => {
       cancelled = true;
     };
-  }, [invitationId]);
+  }, [invitationId, attempt]);
 
   useEffect(() => {
     if (sessionProbe !== "authenticated") return;
@@ -90,7 +97,10 @@ function AcceptInvitationPage() {
       .getInvitation({ query: { id: invitationId } })
       .then(({ data, error }) => {
         if (cancelled) return;
-        if (error || !data) {
+        if (error?.status === 401) {
+          // Session expired mid-flow: bounce to re-login, not "invalid invite".
+          setSessionProbe("unauthenticated");
+        } else if (error || !data) {
           setView({ kind: "error", variant: variantFor(error?.status) });
         } else {
           setView({
@@ -115,6 +125,10 @@ function AcceptInvitationPage() {
     );
   }
 
+  if (sessionProbe === "failed") {
+    return <ConnectionErrorCard onRetry={() => setAttempt((n) => n + 1)} />;
+  }
+
   if (sessionProbe === "unauthenticated") {
     return (
       <Navigate
@@ -132,16 +146,29 @@ function AcceptInvitationPage() {
         invitationId,
       });
       if (error) {
-        setView({ kind: "error", variant: variantFor(error.status) });
+        if (error.status === 401) {
+          // Session expired mid-flow: bounce to re-login, not "invalid invite".
+          setSessionProbe("unauthenticated");
+        } else {
+          setView({ kind: "error", variant: variantFor(error.status) });
+        }
         return;
       }
-      await authClient.organization.setActive({
+      const activated = await authClient.organization.setActive({
         organizationId: invitation.organizationId,
       });
-      toast({
-        variant: "success",
-        message: `Joined ${invitation.organizationName}.`,
-      });
+      if (activated.error) {
+        // The membership exists; only switching the active workspace failed.
+        toast({
+          variant: "error",
+          message: `Joined ${invitation.organizationName}, but couldn't switch to it.`,
+        });
+      } else {
+        toast({
+          variant: "success",
+          message: `Joined ${invitation.organizationName}.`,
+        });
+      }
       await navigate({ to: "/chat" });
     } catch {
       setView({ kind: "error", variant: "connection" });
@@ -157,7 +184,12 @@ function AcceptInvitationPage() {
         invitationId,
       });
       if (error) {
-        setView({ kind: "error", variant: variantFor(error.status) });
+        if (error.status === 401) {
+          // Session expired mid-flow: bounce to re-login, not "invalid invite".
+          setSessionProbe("unauthenticated");
+        } else {
+          setView({ kind: "error", variant: variantFor(error.status) });
+        }
         return;
       }
       setView({
@@ -270,16 +302,7 @@ function AcceptInvitationPage() {
     );
   }
 
-  return (
-    <AuthCard
-      title="Can't load this invitation"
-      subtitle="Check your connection, then try again"
-    >
-      <Button className="w-full" onClick={() => setAttempt((n) => n + 1)}>
-        Try again
-      </Button>
-    </AuthCard>
-  );
+  return <ConnectionErrorCard onRetry={() => setAttempt((n) => n + 1)} />;
 }
 
 /** Neutral frame for the pre-content states (session check, loading). */
@@ -306,5 +329,20 @@ function CenteredSpinner({ label }: { label: string }) {
     >
       <Spinner size={18} className="text-ink-4" />
     </div>
+  );
+}
+
+/** Shared by both connection-error sources: the session probe and the
+ * invitation fetch — same designed state whichever request failed. */
+function ConnectionErrorCard({ onRetry }: { onRetry: () => void }) {
+  return (
+    <AuthCard
+      title="Can't load this invitation"
+      subtitle="Check your connection, then try again"
+    >
+      <Button className="w-full" onClick={onRetry}>
+        Try again
+      </Button>
+    </AuthCard>
   );
 }

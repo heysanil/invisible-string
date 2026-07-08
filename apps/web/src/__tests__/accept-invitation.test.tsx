@@ -110,6 +110,24 @@ test("accepting joins, activates the workspace, and lands in the shell", async (
   ).toBeTruthy();
 });
 
+test("a failed workspace switch after accepting is reported honestly", async () => {
+  authMockState.session = demoSession();
+  authMockState.getInvitationResult = { data: INVITATION, error: null };
+  authMockState.setActiveResult = {
+    data: null,
+    error: { message: "boom", status: 500 },
+  };
+  const { router, view } = renderInvite();
+  await view.findByText("Join Acme");
+  fireEvent.click(view.getByRole("button", { name: /accept invitation/i }));
+  expect(
+    await view.findByText("Joined Acme, but couldn't switch to it."),
+  ).toBeTruthy();
+  await waitFor(() => {
+    expect(router.state.location.pathname).toBe("/chat");
+  });
+});
+
 test("declining rejects the invitation and shows the declined state", async () => {
   authMockState.session = demoSession();
   authMockState.getInvitationResult = { data: INVITATION, error: null };

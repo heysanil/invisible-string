@@ -62,6 +62,7 @@ export const authMockState = {
   acceptInvitationResult: ok(),
   listInvitationsResult: { data: [], error: null } as MockAuthResult,
   cancelInvitationResult: ok(),
+  setActiveResult: ok(),
   inviteCalls: [] as Array<Record<string, unknown>>,
   updateMemberRoleCalls: [] as Array<Record<string, unknown>>,
   setActiveCalls: [] as Array<Record<string, unknown>>,
@@ -96,6 +97,7 @@ export function resetAuthMock(): void {
   authMockState.acceptInvitationResult = ok();
   authMockState.listInvitationsResult = { data: [], error: null };
   authMockState.cancelInvitationResult = ok();
+  authMockState.setActiveResult = ok();
   authMockState.inviteCalls = [];
   authMockState.updateMemberRoleCalls = [];
   authMockState.setActiveCalls = [];
@@ -173,6 +175,8 @@ function getOrgStoreVersion(): number {
 const organizationMock = {
   setActive: async (args: Record<string, unknown>) => {
     authMockState.setActiveCalls.push(args);
+    const result = authMockState.setActiveResult;
+    if (result.error) return result;
     const id = args["organizationId"] as string;
     const known = authMockState.organizations.find((org) => org.id === id);
     // Unknown id: mirror the real client — the active-org store refetches
@@ -184,7 +188,7 @@ const organizationMock = {
         ? { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" }
         : null);
     notifyOrgStore();
-    return ok();
+    return result;
   },
   create: async (args: Record<string, unknown>) => {
     authMockState.createOrganizationCalls.push(args);

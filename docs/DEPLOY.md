@@ -225,8 +225,12 @@ profile-off deploys do not need it.
 
 ## 9. Backups
 
-Postgres is the only critical state — Garage artifacts are re-buildable from the
-pillar config (the content-hash cache just re-populates on the next build).
+Postgres is the critical state; Garage artifacts are re-buildable from the
+pillar config — **but back the two up as a pair**: the build cache
+(`workflow_builds`) trusts its `succeeded` rows without re-checking that the
+tarball still exists in the store, so restoring Postgres *without* the matching
+`garage-data` volume strands those builds pointing at missing artifacts (runs
+fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 
 - **Postgres** — run a `pg_dump` on a cron:
 
@@ -237,8 +241,9 @@ pillar config (the content-hash cache just re-populates on the next build).
 
   (Dump `world` too if you want to preserve in-flight run durability across a
   restore; the `product` DB is the one that must survive.)
-- **Garage** — snapshot the `garage-data` volume if you want to skip artifact
-  rebuilds after a restore. It is not required for correctness.
+- **Garage** — snapshot the `garage-data` volume alongside every Postgres
+  backup. If you must restore Postgres without it, clear the stale cache first:
+  `DELETE FROM workflow_builds;` — builds then re-run and re-populate the store.
 
 ---
 

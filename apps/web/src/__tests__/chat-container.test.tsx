@@ -71,9 +71,17 @@ const streamsModulePath = new URL(
 // sees the mock). The mock stays FAKE by default for order-independence and
 // delegates to the real implementation only while use-thread-streams.test.tsx
 // holds the flag — rationale and hang hazard in test/stream-mock-flag.ts.
+//
+// The delegate target MUST be a value captured BEFORE mock.module registers:
+// import bindings are live views, and where mock.module rewrites the real
+// module's bindings in place, delegating through the live binding calls the
+// mock itself — an infinite tail-recursive loop that JSC's proper tail calls
+// keep from ever overflowing the stack, so bun test simply hangs.
+const realUseThreadStreams = realThreadStreams.useThreadStreams;
+
 mock.module(streamsModulePath, () => ({
   useThreadStreams: ((runs, options) => {
-    if (!streamsMockFlag.active) return realThreadStreams.useThreadStreams(runs, options);
+    if (!streamsMockFlag.active) return realUseThreadStreams(runs, options);
     const map = new Map<string, { store: FrameStore; status: RunStatus | null; error: null; streamError: null }>();
     for (const run of runs) {
       const entry = liveStores.get(run.id);

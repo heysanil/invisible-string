@@ -63,6 +63,11 @@ services:
       NPM_CACHE_DIR: /var/lib/npm-cache
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Platform Slack app (optional — docs/SLACK.md). All three or none:
+      # absent, the Slack endpoints answer 503 integration_not_configured.
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
     volumes:
       - agent-build:/var/lib/agents
       - npm-cache:/var/lib/npm-cache

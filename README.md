@@ -188,7 +188,7 @@ attachments — packaged straight into the compiled agent.
 ### ⚙️ Settings — `/settings`
 Model presets, provider/model allowlist, agent presets, members (Better Auth
 organization roles), workspace rename, and **Integrations** (connect the
-platform Slack app, per-team bot tokens).
+platform Slack app, per-team bot tokens — app setup: [`docs/SLACK.md`](docs/SLACK.md)).
 
 ![Settings — model presets](docs/screenshots/settings.png)
 

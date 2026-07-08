@@ -26,6 +26,7 @@ The living documents and what each owns:
 | `.env.example` | **Canonical inventory of every environment variable** — add new vars here with comments |
 | `e2e/README.md` | Playwright harness operation |
 | `docs/DEPLOY.md` | Production deployment: prod compose operation, Dokploy, external data services, backups, upgrades |
+| `docs/SLACK.md` | Platform Slack app: manifest (`infra/slack/manifest.template.json` + drift test), credential wiring, workspace connect, trigger binding |
 
 If you add a subsystem, add its doc and list it here. If a doc contradicts the code, fix whichever is wrong — never leave them divergent.
 

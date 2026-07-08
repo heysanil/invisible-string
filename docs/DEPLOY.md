@@ -78,6 +78,7 @@ a filled copy.**
 | `WORKER_SHARED_SECRET` | Worker ↔ control-plane auth secret | `openssl rand -base64 32` |
 | `WORKER_ID` | Pinned worker identity; registration is allowlisted to it | `uuidgen` |
 | `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | Model provider (at least one) | — |
+| `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_SIGNING_SECRET` | Optional platform Slack app — all three or none ([SLACK.md](SLACK.md)) | — |
 | `CLOUDFLARED_TUNNEL_TOKEN` | Only with `--profile cloudflared` (§5) | — |
 
 The `S3_ACCESS_KEY_ID` **must** be `GK` followed by 32 lowercase hex characters —

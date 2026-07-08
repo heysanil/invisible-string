@@ -101,6 +101,9 @@ test("DIAG environment probe", async () => {
     useThreadStreams([{ id: "diag", status: "running" as RunStatus }], { streamFn }),
   );
   console.log("DIAG opens immediately after renderHook:", opens.length);
+  const { act } = await import("@testing-library/react");
+  await act(async () => {});
+  console.log("DIAG opens after explicit act flush:", opens.length);
   await new Promise((resolve) => setTimeout(resolve, 150));
   console.log(
     "DIAG opens after 150ms:", opens.length,

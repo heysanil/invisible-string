@@ -52,6 +52,11 @@ export function useThreadStreams(
   runs: readonly Pick<RunDto, "id" | "status">[],
   options: UseThreadStreamsOptions = {},
 ): ThreadStreams {
+  // TEMP DIAG (CI-runner-only test failure) — remove before merge.
+  console.log(
+    "DIAG hook render | nRuns:", runs.length,
+    "| hasStreamFn:", options.streamFn !== undefined,
+  );
   const [state, setState] = useState<ReadonlyMap<string, RunLiveState>>(
     () => new Map(),
   );
@@ -62,6 +67,10 @@ export function useThreadStreams(
 
   const updateRun = useCallback(
     (runId: string, patch: (current: RunLiveState) => RunLiveState) => {
+      console.log(
+        "DIAG updateRun", runId, "| caller:",
+        new Error().stack?.split("\n").slice(2, 5).join(" <- ") ?? "?",
+      );
       setState((current) => {
         const existing = current.get(runId) ?? EMPTY_LIVE;
         const updated = patch(existing);
@@ -120,6 +129,10 @@ export function useThreadStreams(
   const runIds = runs.map((run) => run.id).join("\n");
   useEffect(() => {
     const wanted = new Set(runIds === "" ? [] : runIds.split("\n"));
+    console.log(
+      "DIAG effect | wanted:", [...wanted].join(","),
+      "| handles:", handles.current.size,
+    );
     for (const runId of wanted) {
       if (!handles.current.has(runId)) open(runId);
     }

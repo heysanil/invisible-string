@@ -16,6 +16,9 @@ services:
     depends_on: !reset {}
     environment:
       DATABASE_URL: ${DATABASE_URL:?external-data mode requires DATABASE_URL}
+      # The migrator ensures both databases exist; on managed servers the role
+      # needs CREATEDB unless they are pre-created (docs/DEPLOY.md §7).
+      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?external-data mode requires WORLD_DATABASE_URL}
 
   control-plane:
     depends_on: !override

@@ -8,7 +8,12 @@
  */
 export * as schema from "./schema";
 export * from "./client";
-export { MIGRATIONS_FOLDER, migrateDatabase, runMigrations } from "./migrate";
+export {
+  ensureDatabaseExists,
+  MIGRATIONS_FOLDER,
+  migrateDatabase,
+  runMigrations,
+} from "./migrate";
 export {
   DEFAULT_AGENT_PRESETS,
   DEFAULT_MODEL_PRESETS,

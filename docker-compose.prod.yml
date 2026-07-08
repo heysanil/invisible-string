@@ -81,7 +81,10 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # The migrator also creates missing databases (first boot on a volume
+      # whose image-level init never ran; restores) before applying migrations.
       DATABASE_URL: postgres://app:${POSTGRES_PASSWORD:?}@postgres:5432/product
+      WORLD_DATABASE_URL: postgres://app:${POSTGRES_PASSWORD:?}@postgres:5432/world
     networks: [internal]
 
   worker:

@@ -2,7 +2,10 @@
  * Apply pending migrations (idempotent). Defers to the canonical migrator in
  * `@invisible-string/db` (Better Auth tables + product tables live there).
  */
-import { migrateDatabase } from "@invisible-string/db/migrate";
+import {
+  ensureDatabaseExists,
+  migrateDatabase,
+} from "@invisible-string/db/migrate";
 
 export async function runMigrations(databaseUrl: string): Promise<void> {
   await migrateDatabase(databaseUrl);
@@ -15,5 +18,9 @@ if (import.meta.main) {
     process.exit(1);
   }
   await runMigrations(url);
+  // The world maintenance DB carries no migrations of its own — it just has
+  // to exist before the runtime's world provisioner first connects.
+  const worldUrl = process.env.WORLD_DATABASE_URL;
+  if (worldUrl) await ensureDatabaseExists(worldUrl);
   console.log("migrations applied");
 }

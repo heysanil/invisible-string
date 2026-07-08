@@ -292,8 +292,9 @@ Run against the deployed domain after every deploy:
   pre-2026-07-08 compose that bind-mounted `./infra/*` host files. Without a
   repo checkout on the host, Docker creates empty *directories* at those paths:
   Garage reads a directory as its config and crashes; postgres silently skips a
-  directory in `initdb.d`, so the databases are never created. Pull the current
-  compose (config files ride inline now), then **delete the `postgres-data` and
-  `garage-data` volumes before redeploying** — postgres only runs init scripts
-  on an empty data directory, so a volume initialized during the broken deploy
-  stays database-less forever.
+  directory in `initdb.d`, so the databases are never created. Fix: pull the
+  current compose (config files ride inline now) and run images ≥ `v0.1.4` —
+  the `migrate` one-shot creates missing databases itself, so a volume that
+  initialized database-less during the broken deploy heals on the next deploy.
+  (On images ≤ `v0.1.3` the workaround was deleting the `postgres-data` volume
+  so postgres re-ran its init scripts.)

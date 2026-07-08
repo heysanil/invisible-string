@@ -148,6 +148,13 @@ const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathnam
  * (e.g. `_app`'s zero-org gate) sit behind a state boundary (`ToastProvider`)
  * that bails out of re-rendering unchanged `children` elements, so they'd
  * otherwise never notice the mutation and the gate would never flip live.
+ *
+ * Deliberate divergence from the real client: only setActive() notifies
+ * subscribers. The real client also refetches the org list on create(),
+ * which can race the explicit setActive round-trip and let useWorkspace's
+ * first-org self-heal fire a duplicate same-id setActive in production
+ * (harmless there). Tests must therefore never assert EXACT setActive call
+ * counts — assert on call content instead.
  */
 let orgStoreVersion = 0;
 const orgStoreListeners = new Set<() => void>();

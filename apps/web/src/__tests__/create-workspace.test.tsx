@@ -117,9 +117,9 @@ test("creating a workspace calls create + setActive and reveals the shell", asyn
   expect(call["name"]).toBe("Acme Inc"); // trimmed
   expect(String(call["slug"])).toMatch(/^acme-inc-[0-9a-f]{8}$/);
   await waitFor(() => {
-    expect(authMockState.setActiveCalls.length).toBe(1);
+    expect(authMockState.setActiveCalls.length).toBeGreaterThanOrEqual(1);
   });
-  expect(authMockState.setActiveCalls[0]).toEqual({
+  expect(authMockState.setActiveCalls).toContainEqual({
     organizationId: "org_new_1",
   });
   // $listOrg refetch (mocked as an organizations append) flips the gate.

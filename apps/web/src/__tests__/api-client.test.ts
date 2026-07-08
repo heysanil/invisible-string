@@ -147,3 +147,25 @@ describe("api-client", () => {
     expect((error as DOMException).name).toBe("AbortError");
   });
 });
+
+import { resolveApiBaseUrl } from "../lib/api-client";
+
+describe("resolveApiBaseUrl", () => {
+  test("unset keeps the dev default", () => {
+    expect(resolveApiBaseUrl(undefined, "https://app.example.com")).toBe(
+      "http://localhost:3000",
+    );
+  });
+
+  test("empty string resolves to the page origin (same-origin prod builds)", () => {
+    expect(resolveApiBaseUrl("", "https://app.example.com")).toBe(
+      "https://app.example.com",
+    );
+  });
+
+  test("an explicit URL wins", () => {
+    expect(resolveApiBaseUrl("https://api.example.com", "https://app.example.com")).toBe(
+      "https://api.example.com",
+    );
+  });
+});

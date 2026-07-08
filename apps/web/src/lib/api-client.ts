@@ -2,7 +2,8 @@
  * Typed fetch wrapper over the control-plane API (packages/shared/src/api.ts
  * is the contract; this module owns transport only).
  *
- * - Base URL from `VITE_API_URL` (same source as lib/auth-client.ts).
+ * - Base URL from `VITE_API_URL` via {@link resolveApiBaseUrl} (same source
+ *   as lib/auth-client.ts); an empty string resolves to the page origin.
  * - `credentials: "include"` — the API authenticates via the Better Auth
  *   session cookie.
  * - Every response is zod-parsed against the shared schema for its endpoint;
@@ -16,8 +17,21 @@
 import { apiErrorBodySchema } from "@invisible-string/shared";
 import type { z } from "zod";
 
-export const API_BASE_URL: string =
-  import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+/** Empty VITE_API_URL (prod same-origin builds) resolves to the page origin
+ *  so absolute-URL derivations (SSE, copilot WebSocket, Slack install links)
+ *  keep working; unset keeps the localhost dev default. */
+export function resolveApiBaseUrl(
+  raw: string | undefined,
+  pageOrigin: string,
+): string {
+  const base = raw ?? "http://localhost:3000";
+  return base === "" ? pageOrigin : base;
+}
+
+export const API_BASE_URL: string = resolveApiBaseUrl(
+  import.meta.env.VITE_API_URL,
+  typeof window === "undefined" ? "http://localhost:3000" : window.location.origin,
+);
 
 /** Synthetic (non-HTTP) error codes the client itself produces. */
 export const CLIENT_ERROR_CODES = {

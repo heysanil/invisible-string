@@ -2,13 +2,14 @@
  * Reusable UI + auth flows shared across specs. Everything a spec does that
  * isn't the thing-under-test lives here so the specs read as user stories.
  *
- * Workspace note: the product has no in-UI "create your first workspace"
- * onboarding yet (a signed-up user lands in the shell with "No workspace
- * yet"). Creating the org is therefore setup, not the assertion — we drive it
- * through Better Auth's REST endpoints using the browser context's own
- * session cookie (context.request shares the cookie jar), then let the app's
- * self-healing first-org activation take over. The org-creation hook seeds the
- * locked workspace defaults, so the builder is immediately usable.
+ * Workspace note: new users create their first workspace through the
+ * first-run onboarding screen (drive it with `createWorkspaceViaOnboarding`
+ * when onboarding IS the thing under test). For specs where the workspace is
+ * mere setup, `createWorkspace` stays on Better Auth's REST endpoints via the
+ * browser's session cookie — it's faster, and the follow-up full navigation
+ * (`signUpIntoWorkspace`'s goto) refetches the org list so the app leaves the
+ * onboarding gate. The org-creation hook seeds the locked workspace defaults
+ * either way, so the builder is immediately usable.
  */
 import { randomUUID } from "node:crypto";
 import { expect, type Page } from "@playwright/test";
@@ -32,7 +33,8 @@ export function uniqueAccount(prefix: string): Account {
   };
 }
 
-/** Fill and submit the signup form; resolves when the shell (chat) is shown. */
+/** Fill and submit the signup form; a fresh account lands on the first-run
+ * create-workspace screen (URL /chat, shell replaced by onboarding). */
 export async function signUp(page: Page, account: Account): Promise<void> {
   await page.goto("/signup");
   await page.getByLabel("Name").fill(account.name);
@@ -79,6 +81,24 @@ export async function createWorkspace(
   });
   expect(activated.ok, `set-active failed: ${activated.status}`).toBeTruthy();
   return orgId!;
+}
+
+/**
+ * Drive the first-run onboarding screen: name the workspace and wait for the
+ * shell to replace it (the org-list store refetches on create — no reload).
+ */
+export async function createWorkspaceViaOnboarding(
+  page: Page,
+  name: string,
+): Promise<void> {
+  await expect(
+    page.getByRole("heading", { name: "Create your workspace" }),
+  ).toBeVisible();
+  await page.getByLabel("Workspace name").fill(name);
+  await page.getByRole("button", { name: /create workspace/i }).click();
+  await expect(
+    page.getByRole("navigation", { name: "Primary" }),
+  ).toBeVisible();
 }
 
 /** POST JSON to a Better Auth endpoint from the browser (credentialed). */

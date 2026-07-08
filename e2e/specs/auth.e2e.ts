@@ -6,7 +6,7 @@ import { expect, test } from "@playwright/test";
 
 import { API_BASE_URL } from "../config.ts";
 import {
-  createWorkspace,
+  createWorkspaceViaOnboarding,
   login,
   signUp,
   uniqueAccount,
@@ -17,18 +17,20 @@ test("signup lands in the app shell, then logout and login round-trip", async ({
 }) => {
   const account = uniqueAccount("auth");
 
-  // ── signup → shell ────────────────────────────────────────────────────────
+  // ── signup → first-run onboarding → shell ───────────────────────────────
   await signUp(page, account);
   await expect(page).toHaveURL(/\/chat$/);
+  // A fresh account owns no workspace: onboarding replaces the shell.
+  await expect(
+    page.getByRole("heading", { name: "Create your workspace" }),
+  ).toBeVisible();
+  await createWorkspaceViaOnboarding(page, `${account.name} ws`);
   const dock = page.getByRole("navigation", { name: "Primary" });
   await expect(dock).toBeVisible();
   await expect(dock.getByRole("link", { name: "Chat" })).toHaveAttribute(
     "aria-current",
     "page",
   );
-
-  // A workspace is needed to reach the Sign-out control in settings.
-  await createWorkspace(page, `${account.name} ws`);
 
   // ── logout ────────────────────────────────────────────────────────────────
   await page.goto("/settings/workspace");

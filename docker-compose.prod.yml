@@ -117,9 +117,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # Creates the "product" and "world" databases on first boot (same
-      # credential-free script the dev stack uses).
-      - ./infra/postgres-init.sh:/docker-entrypoint-initdb.d/postgres-init.sh:ro
+    configs:
+      # Creates the "product" and "world" databases on first boot (mirrors the
+      # dev stack's infra/postgres-init.sh; inline so no host file is needed).
+      - source: postgres-init
+        target: /docker-entrypoint-initdb.d/postgres-init.sh
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d app"]
@@ -142,8 +144,10 @@ services:
       GARAGE_DEFAULT_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:?}
       GARAGE_DEFAULT_BUCKET: artifacts
     volumes:
-      - ./infra/garage.toml:/etc/garage.toml:ro
       - garage-data:/var/lib/garage
+    configs:
+      - source: garage-toml
+        target: /etc/garage.toml
     networks: [internal]
     healthcheck:
       test: ["CMD", "/garage", "json-api", "GetClusterHealth"]
@@ -165,6 +169,38 @@ services:
       TUNNEL_TOKEN: ${CLOUDFLARED_TUNNEL_TOKEN:-}
     depends_on: [web]
     networks: [internal]
+
+# Inline file payloads (Compose ≥ 2.23.1 `content:`) — the prod compose stays
+# fully standalone, deployable without a repo checkout on the host (e.g. pasted
+# into Dokploy). A bind mount of a missing host path would silently become an
+# empty DIRECTORY at the target ("Is a directory (os error 21)" crash loops).
+configs:
+  # Keep in sync with infra/garage.toml (the dev compose's copy of this file).
+  garage-toml:
+    content: |
+      metadata_dir = "/var/lib/garage/meta"
+      data_dir = "/var/lib/garage/data"
+      db_engine = "sqlite"
+
+      replication_factor = 1
+
+      rpc_bind_addr = "[::]:3901"
+      rpc_public_addr = "127.0.0.1:3901"
+
+      [s3_api]
+      s3_region = "us-east-1"
+      api_bind_addr = "[::]:3900"
+      root_domain = ".s3.garage.localhost"
+
+      [admin]
+      api_bind_addr = "[::]:3903"
+  # $$ escapes compose interpolation → literal $ in the script.
+  postgres-init:
+    content: |
+      #!/bin/sh
+      set -e
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_USER" \
+        -c 'CREATE DATABASE product;' -c 'CREATE DATABASE world;'
 
 networks:
   internal: {}

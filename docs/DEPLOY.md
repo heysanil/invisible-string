@@ -95,7 +95,9 @@ and `S3_ENDPOINT`.
 ### On Dokploy
 
 1. Create a **Compose** service pointing at this repo and set the compose file
-   to `docker-compose.prod.yml`.
+   to `docker-compose.prod.yml` — or paste the file's contents directly; the
+   prod compose is fully standalone (its config files ride inline via
+   `configs: content:`, so no repo checkout is needed on the host).
 2. Paste the variables from `.env.prod.example` into the Dokploy environment UI
    (use the generation commands in §3 for the secrets).
 3. Attach your domain to service **`web`**, container port **80**. Dokploy's
@@ -280,3 +282,18 @@ Run against the deployed domain after every deploy:
    block should stream and complete.
 5. Fire a webhook trigger to confirm ingress:
    `curl -sS -X POST https://<domain>/t/<token> -H 'content-type: application/json' -d '{}'`.
+
+---
+
+## 12. Troubleshooting
+
+- **Garage crash-loops with `Error: IO error: Is a directory (os error 21)`**,
+  or `migrate` fails with `database "product" does not exist` — you deployed a
+  pre-2026-07-08 compose that bind-mounted `./infra/*` host files. Without a
+  repo checkout on the host, Docker creates empty *directories* at those paths:
+  Garage reads a directory as its config and crashes; postgres silently skips a
+  directory in `initdb.d`, so the databases are never created. Pull the current
+  compose (config files ride inline now), then **delete the `postgres-data` and
+  `garage-data` volumes before redeploying** — postgres only runs init scripts
+  on an empty data directory, so a volume initialized during the broken deploy
+  stays database-less forever.

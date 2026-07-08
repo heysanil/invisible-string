@@ -1,7 +1,8 @@
-# Garage (S3-compatible object store) — single-node config shared by the dev
-# and prod compose stacks. The RPC secret comes from the environment
-# (GARAGE_RPC_SECRET): a hardcoded throwaway in docker-compose.yml for dev,
-# an operator-provided secret in docker-compose.prod.yml.
+# Garage (S3-compatible object store) — single-node config for the DEV compose
+# stack. The prod compose embeds its own inline copy (docker-compose.prod.yml
+# `configs.garage-toml`) so it deploys without a repo checkout — keep the two
+# in sync. The RPC secret comes from the environment (GARAGE_RPC_SECRET):
+# a hardcoded throwaway in docker-compose.yml for dev.
 metadata_dir = "/var/lib/garage/meta"
 data_dir = "/var/lib/garage/data"
 db_engine = "sqlite"

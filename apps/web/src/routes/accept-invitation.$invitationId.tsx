@@ -11,7 +11,7 @@ import { Button } from "../components/ui/Button";
 import { Chip } from "../components/ui/Chip";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
-import { authClient, signOut, useSession } from "../lib/auth-client";
+import { authClient, signOut } from "../lib/auth-client";
 
 export const Route = createFileRoute("/accept-invitation/$invitationId")({
   component: AcceptInvitationPage,
@@ -46,9 +46,11 @@ function variantFor(status?: number): "not-found" | "wrong-account" | "connectio
   return "connection";
 }
 
+type SessionProbe = "checking" | "authenticated" | "unauthenticated";
+
 function AcceptInvitationPage() {
   const { invitationId } = Route.useParams();
-  const { data: session, isPending: sessionPending } = useSession();
+  const [sessionProbe, setSessionProbe] = useState<SessionProbe>("checking");
   const navigate = useNavigate();
   const router = useRouter();
   const { toast } = useToast();
@@ -58,8 +60,30 @@ function AcceptInvitationPage() {
   const [signingOut, setSigningOut] = useState(false);
   const [attempt, setAttempt] = useState(0);
 
+  // The shared useSession() atom can hold a stale resolved-null snapshot
+  // right after the login/signup round-trip (no subscriber lives on the auth
+  // screens, and the remount refetch is deferred a macrotask), which bounced
+  // fresh invitees straight back to /login. Probe the server directly and
+  // gate the redirect on the answer instead of trusting the cached snapshot.
   useEffect(() => {
-    if (sessionPending || !session) return;
+    let cancelled = false;
+    setSessionProbe("checking");
+    void authClient
+      .getSession()
+      .then(({ data }) => {
+        if (cancelled) return;
+        setSessionProbe(data ? "authenticated" : "unauthenticated");
+      })
+      .catch(() => {
+        if (!cancelled) setSessionProbe("unauthenticated");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [invitationId]);
+
+  useEffect(() => {
+    if (sessionProbe !== "authenticated") return;
     let cancelled = false;
     setView({ kind: "loading" });
     void authClient.organization
@@ -81,9 +105,9 @@ function AcceptInvitationPage() {
     return () => {
       cancelled = true;
     };
-  }, [sessionPending, session, invitationId, attempt]);
+  }, [sessionProbe, invitationId, attempt]);
 
-  if (sessionPending) {
+  if (sessionProbe === "checking") {
     return (
       <InviteCard subtitle="Checking your session">
         <CenteredSpinner label="Loading invitation" />
@@ -91,7 +115,7 @@ function AcceptInvitationPage() {
     );
   }
 
-  if (!session) {
+  if (sessionProbe === "unauthenticated") {
     return (
       <Navigate
         to="/login"

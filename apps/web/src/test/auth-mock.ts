@@ -273,7 +273,10 @@ export function registerAuthMock(): void {
 }
 
 const authMockFactory = () => ({
-  authClient: { organization: organizationMock },
+  authClient: {
+    getSession: async () => ({ data: authMockState.session, error: null }),
+    organization: organizationMock,
+  },
   useSession: () => ({
     data: authMockState.session,
     isPending: authMockState.pending,

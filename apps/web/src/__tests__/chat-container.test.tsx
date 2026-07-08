@@ -15,6 +15,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
+// The real implementation, bound at THIS file's evaluation, so the module
+// mock below can delegate to it when use-thread-streams.test.tsx flips the
+// shared flag (see test/stream-mock-flag.ts for the full story).
+import * as realThreadStreams from "../lib/chat/use-thread-streams";
+import { streamsMockFlag } from "../test/stream-mock-flag";
 
 ensureDomForThisFile();
 
@@ -59,8 +64,24 @@ const streamsModulePath = new URL(
   import.meta.url,
 ).pathname;
 
+// bun's mock.module can intercept every FUTURE import of this path for the
+// rest of the process (observed on Namespace CI runners, where readdir order
+// runs this file before use-thread-streams.test.tsx first touches the real
+// module — locally the consumer usually binds the real module first and never
+// sees the mock). The mock stays FAKE by default for order-independence and
+// delegates to the real implementation only while use-thread-streams.test.tsx
+// holds the flag — rationale and hang hazard in test/stream-mock-flag.ts.
+//
+// The delegate target MUST be a value captured BEFORE mock.module registers:
+// import bindings are live views, and where mock.module rewrites the real
+// module's bindings in place, delegating through the live binding calls the
+// mock itself — an infinite tail-recursive loop that JSC's proper tail calls
+// keep from ever overflowing the stack, so bun test simply hangs.
+const realUseThreadStreams = realThreadStreams.useThreadStreams;
+
 mock.module(streamsModulePath, () => ({
-  useThreadStreams: (runs: { id: string }[]) => {
+  useThreadStreams: ((runs, options) => {
+    if (!streamsMockFlag.active) return realUseThreadStreams(runs, options);
     const map = new Map<string, { store: FrameStore; status: RunStatus | null; error: null; streamError: null }>();
     for (const run of runs) {
       const entry = liveStores.get(run.id);
@@ -72,7 +93,7 @@ mock.module(streamsModulePath, () => ({
       });
     }
     return { runs: map, reopen: (runId: string) => reopenCalls.push(runId) };
-  },
+  }) as typeof realThreadStreams.useThreadStreams,
 }));
 
 const { ThreadContainer } = await import("../components/chat/ThreadContainer");

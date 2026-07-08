@@ -8,7 +8,8 @@ on:
 jobs:
   unit:
     name: Typecheck + unit tests
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +36,10 @@ jobs:
 
   integration:
     name: Gated integration tests (compose)
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-eve-npm
+      - nscloud-cache-size-20gb
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -51,12 +55,10 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Cache npm cache (eve agent installs)
-        uses: actions/cache@v4
+      - name: Mount Namespace cache volume (eve npm installs)
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: ~/.npm
-          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
-          restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, garage, dex)
         run: docker compose up -d --wait postgres garage dex
@@ -82,7 +84,10 @@ jobs:
     # eve build, tarball → Garage, real worker + agent, mock-model turns.
     # Slow on a cold npm cache — generous timeout.
     name: Phase-1 acceptance (eve build)
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-eve-npm
+      - nscloud-cache-size-20gb
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -98,12 +103,10 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Cache npm cache (eve agent installs)
-        uses: actions/cache@v4
+      - name: Mount Namespace cache volume (eve npm installs)
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: ~/.npm
-          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
-          restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, garage, dex)
         run: docker compose up -d --wait postgres garage dex
@@ -124,7 +127,10 @@ jobs:
     # own project name p2e2e) through builder → publish (real eve build) → chat
     # → HITL round-trip. Slow on a cold npm cache — generous timeout.
     name: Phase-2 E2E (Playwright)
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-eve-npm
+      - nscloud-cache-size-20gb
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -140,16 +146,15 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Mount Namespace cache volume (eve npm installs + Playwright browsers)
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: playwright
+          path: ~/.npm
+
       - name: Install Playwright Chromium
         run: bunx playwright install --with-deps chromium
         working-directory: e2e
-
-      - name: Cache npm cache (eve agent installs)
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
-          restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Run Phase-2 E2E
         working-directory: e2e
@@ -167,7 +172,8 @@ jobs:
           retention-days: 7
 
   prod-compose:
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Compose config lint (bundled · external-data · build)
@@ -206,7 +212,10 @@ jobs:
     # distinct trigger workflows → four eve builds, so it is the slowest lane —
     # a separate job with the longest timeout.
     name: Phase-3 acceptance (multi-worker, failover, slack)
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-eve-npm
+      - nscloud-cache-size-20gb
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -222,12 +231,10 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Cache npm cache (eve agent installs)
-        uses: actions/cache@v4
+      - name: Mount Namespace cache volume (eve npm installs)
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: ~/.npm
-          key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
-          restore-keys: npm-eve-${{ runner.os }}-
 
       - name: Compose up (postgres, garage)
         run: docker compose up -d --wait postgres garage

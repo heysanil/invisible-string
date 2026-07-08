@@ -5,7 +5,7 @@
  */
 import { ensureDomForThisFile } from "../test/setup";
 
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 
 import type {
@@ -19,8 +19,19 @@ import type {
   RunStreamOptions,
 } from "../lib/sse";
 import { useThreadStreams } from "../lib/chat/use-thread-streams";
+import { streamsMockFlag } from "../test/stream-mock-flag";
 
 ensureDomForThisFile();
+// If chat-container.test.tsx ran first, its module mock may still intercept
+// this file's useThreadStreams import (order-dependent — see
+// test/stream-mock-flag.ts). Flip the mock into delegate-to-real mode for
+// this suite; every test injects its streamFn, so no real streams open.
+beforeAll(() => {
+  streamsMockFlag.active = false;
+});
+afterAll(() => {
+  streamsMockFlag.active = true;
+});
 // Drain a macrotask after unmount so React's scheduler flushes its pending
 // work while happy-dom is still registered (cross-file teardown race).
 afterEach(async () => {

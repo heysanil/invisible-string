@@ -1,0 +1,6 @@
+# Namespace (namespace.so) runner labels — actionlint only knows
+# GitHub-hosted labels out of the box.
+self-hosted-runner:
+  labels:
+    - nscloud-*
+    - namespace-profile-*

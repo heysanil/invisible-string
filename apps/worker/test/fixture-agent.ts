@@ -118,7 +118,7 @@ export async function buildFixtureArtifact(options: {
   return tarPath;
 }
 
-/** Serve fixture tarballs over HTTP (models MinIO presigned artifact URLs). */
+/** Serve fixture tarballs over HTTP (models Garage presigned artifact URLs). */
 export interface ArtifactServer {
   urlFor(tarPath: string): string;
   stop(): void;

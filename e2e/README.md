@@ -9,8 +9,8 @@ it all down.
 
 The global setup (in order):
 
-1. `docker compose -p p2e2e up` — postgres, minio, dex (ports offset from the
-   dev `:5432/:9000/:5556` and phase-1 `:5443` stacks, so all three coexist).
+1. `docker compose -p p2e2e up` — postgres, garage, dex (ports offset from the
+   dev `:5432/:3900/:5556` and phase-1 `:5443` stacks, so all three coexist).
 2. Fresh product DB + migrations + demo seed (`scripts/db-setup.ts`, under Bun).
 3. Production `vite build` of the SPA with `VITE_API_URL` baked at the
    control-plane origin.

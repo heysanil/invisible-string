@@ -24,7 +24,7 @@ export interface RuntimeConfig {
   platformJwtSecret: string;
   /** Shared secret for internal worker endpoints (WORKER_SHARED_SECRET). */
   workerSharedSecret: string;
-  /** Object store for build artifacts (S3_* — MinIO in dev/CI). */
+  /** Object store for build artifacts (S3_* — Garage in dev/CI). */
   s3: ArtifactStoreConfig;
   /**
    * Platform-owned provider keys. Exactly ONE is injected per agent — the one

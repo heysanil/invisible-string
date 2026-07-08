@@ -25,6 +25,7 @@ The living documents and what each owns:
 | `packages/compiler/versions.json` | Pinned runtime version matrix + rationale notes |
 | `.env.example` | **Canonical inventory of every environment variable** — add new vars here with comments |
 | `e2e/README.md` | Playwright harness operation |
+| `docs/DEPLOY.md` | Production deployment: prod compose operation, Dokploy, external data services, backups, upgrades |
 
 If you add a subsystem, add its doc and list it here. If a doc contradicts the code, fix whichever is wrong — never leave them divergent.
 
@@ -45,7 +46,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 
 - **Bun 1.3+** runs the platform (control-plane, worker, web tooling, all tests). **Node 24 via mise** runs everything eve (`mise install node@24`; harnesses invoke `mise exec node@24 --` themselves). **Docker** for compose + `docker()` sandboxes.
 - `bun install` once at the root (single lockfile). `cp .env.example .env` and fill secrets for running apps (tests provision their own env).
-- Local stack: `docker compose up -d postgres minio dex` (ports overridable: `POSTGRES_PORT`/`MINIO_PORT`/`DEX_PORT`). Test harnesses spin their own compose **projects** (`p1acceptance`, `p2e2e`, `p3acceptance`, `pkeyed`…) on non-default ports — don't reuse those names.
+- Local stack: `docker compose up -d postgres garage dex` (ports overridable: `POSTGRES_PORT`/`GARAGE_PORT`/`DEX_PORT`). Test harnesses spin their own compose **projects** (`p1acceptance`, `p2e2e`, `p3acceptance`, `pkeyed`…) on non-default ports — don't reuse those names.
 - Dev servers: `bun run dev` at the root does it all — bootstraps `.env` with generated secrets on first run, `docker compose up --wait`, migrations, then API (:3000) + worker + SPA (:5173) with prefixed logs; Ctrl-C stops the apps, `bun run dev:down` stops infra. Individual apps: `bun run --cwd apps/<x> dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`.
 
 ## Test lanes (run the ones your change touches)
@@ -66,7 +67,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 ## Architecture (one screen)
 
-`apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs) · pillar CRUD · compiler invocation + `eve build` + tarball → MinIO (cache keyed by content hash = pillar config + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) → dispatcher (`TriggerEvent` → compiled channel, version-bound JWT) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop.
+`apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs) · pillar CRUD · compiler invocation + `eve build` + tarball → object store (Garage) (cache keyed by content hash = pillar config + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) → dispatcher (`TriggerEvent` → compiled channel, version-bound JWT) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop.
 `apps/worker` (stateless Bun supervisor; boots agents under Node 24; mounted docker.sock): register/heartbeat/drain, ensure-agent → pull/extract → per-agent boot of the compiled entrypoint (`node .output/server/index.mjs` directly — `eve start` is only a CLI wrapper; spike finding 6), streaming reverse proxy, reapers (process idle 15 m, sandbox idle 30 m, artifact LRU 20 GiB).
 `apps/web`: the glass SPA. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
 
@@ -79,6 +80,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 - Compiled trigger channels live at `/eve/v1/platform/<trigger>`; platform JWTs are per-version derived secrets (`HMAC(master, hash)`, audience `workflow-agent:<hash>`).
 - Tests never need a real provider key except the keyed lanes — the mock model rides `EVE_MOCK_AUTHORED_MODELS`; the copilot's scripted fake (`COPILOT_FAKE_SCRIPT`) is dropped in production builds.
 - Version pins are exact (`packages/compiler/versions.json`): eve ↔ `@workflow/world-postgres` beta ↔ `ai@7` ↔ provider majors. Never `@latest` in generated projects; any eve bump must pass the spike suites first.
+- The prod web gateway (`infra/nginx/web.conf`) enumerates the control plane's top-level route prefixes — adding a new prefix requires adding it there (else the SPA fallback swallows it).
 
 ## CI (`.github/workflows/ci.yml`)
 
@@ -86,4 +88,4 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 ## Known residuals (documented, deliberate)
 
-Single-writer-per-hash world constraint (proper world-factory patch tracked) · worker PKI/mTLS attestation (allowlist + single-use dispatch tokens today) · `@openrouter/ai-sdk-provider` pinned to the only `ai@7`-compatible line (alpha) · no mailer (invites surface copyable links; email verification off by default locally) · production deploy documented-not-provisioned. If you resolve one, update this list and the docs that mention it.
+Single-writer-per-hash world constraint (proper world-factory patch tracked; safe in the shipped single-worker prod compose) · worker PKI/mTLS attestation (allowlist + single-use dispatch tokens today) · `@openrouter/ai-sdk-provider` pinned to the only `ai@7`-compatible line (alpha) · no mailer (invites surface copyable links; email verification off by default locally). If you resolve one, update this list and the docs that mention it.

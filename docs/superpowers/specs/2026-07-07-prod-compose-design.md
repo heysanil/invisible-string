@@ -192,3 +192,20 @@ end-to-end, including presigned-GET artifact pulls. No data migration needed
 Multi-host worker fleet (single-writer-per-version-hash is safe here — one
 worker, one host), mailer, worker mTLS/PKI, production observability stack
 beyond the structured logs + `/internal/metrics` that already exist.
+
+## Implementation addenda (2026-07-07)
+
+- **No `garage-init` one-shot.** Garage v2.3 auto-initializes the single-node
+  layout and idempotently (re)creates the access key + `artifacts` bucket from
+  the `GARAGE_DEFAULT_ACCESS_KEY/SECRET_KEY/BUCKET` env on every boot —
+  `garage server --single-node --default-access-key --default-bucket`. The two
+  `--default-*` flags are load-bearing: without them `GARAGE_DEFAULT_*` is
+  ignored and the store 403s "No such key". Verified by the gated live
+  round-trip test (`tests/integration/garage-store.test.ts`). This replaces the
+  spec's earlier `garage-init` + `garage key import` sketch.
+- **No `infra/postgres-init.prod.sh`.** The existing `infra/postgres-init.sh`
+  is credential-free and generic over `$POSTGRES_USER`; the prod compose
+  mounts it unchanged.
+- **External-data wart.** Compose interpolates `${POSTGRES_PASSWORD:?}` /
+  `${GARAGE_RPC_SECRET:?}` even for profile-disabled services — external-data
+  deploys set both to the literal `unused` (documented in DEPLOY.md).

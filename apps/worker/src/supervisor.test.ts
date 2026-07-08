@@ -2,7 +2,7 @@
  * Supervisor integration tests — no real eve, no DB, no provider keys.
  * The "agent" is a fixture tarball built in-test with the exact artifact
  * layout (`.output/server/index.mjs`, launched with PORT env), served over
- * HTTP like a MinIO presigned URL.
+ * HTTP like a Garage presigned URL.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

@@ -15,7 +15,7 @@ This plan is the outcome of a brainstorming pass: live eve/Better Auth/OpenRoute
 | Area | Decision |
 |---|---|
 | Plan scope | Master plan, Phases 0–4 fully detailed (this file) |
-| Environments | Local-first: docker-compose (Postgres, MinIO, Dex IdP, control plane, 2 workers) is the acceptance target; CI on GitHub Actions; production topology documented but not provisioned |
+| Environments | Local-first: docker-compose (Postgres, Garage, Dex IdP, control plane, 2 workers) is the acceptance target; CI on GitHub Actions; production compose provisioned (docker-compose.prod.yml; docs/DEPLOY.md) |
 | Stack (open items) | Drizzle ORM + drizzle-kit · Tailwind v4 + shadcn/ui · TanStack Router + Query · CodeMirror 6 (instructions editor) · Elysia TypeBox validation · bun:test + Playwright · monorepo `apps/{control-plane,worker,web}` + `packages/{compiler,db,shared}` |
 | App shell | **B — workspace rail**: floating glass dock with 💬 Chat · ⚡ Workflows · 🧩 Context · ⚙ Settings, each = list panel + main pane |
 | Builder layout | **A+B hybrid**: left pillar-summary rail (live config cards with ✓/warning states; active card "solidifies"), center focused per-pillar editor, right docked copilot; Run draft/Publish in rail |
@@ -60,7 +60,7 @@ apps/control-plane (Bun+Elysia)          Postgres (product data + Better Auth + 
    ├─ Better Auth (email/pw, OIDC SSO via @better-auth/sso, org plugin)
    ├─ CRUD + authz (workspace scoping, roles)
    ├─ packages/compiler → eve project dir (keyed by version hash)
-   ├─ eve build (once per hash) → tarball → MinIO/S3
+   ├─ eve build (once per hash) → tarball → Garage/S3
    ├─ scheduler (affinity → artifact-warm → any live worker)
    ├─ dispatcher (trigger adapters → TriggerEvent → compiled channel; session ownership)
    └─ event tailer (NDJSON → run_events → SSE, Last-Event-ID resume)
@@ -88,7 +88,7 @@ Per spec §10 verbatim (Better Auth mount, workspace/user MCP + skills CRUD, reg
 
 **Repo/infra tasks**
 1. `git init`; Bun workspaces monorepo scaffold; base tsconfig; `.gitignore` (incl. `.superpowers/`); CI skeleton (GitHub Actions: typecheck, test, compose-up integration job).
-2. `docker-compose.yml`: Postgres (two DBs: `product`, `world`), MinIO, Dex (test IdP with static user), control-plane, worker ×2 (profiles: `dev` minimal / `full`).
+2. `docker-compose.yml`: Postgres (two DBs: `product`, `world`), Garage, Dex (test IdP with static user), control-plane, worker ×2 (profiles: `dev` minimal / `full`).
 3. `packages/db`: Drizzle schema for all tables above + migrations; seed script (workspace, presets, allowlist, agent presets, demo user).
 4. Better Auth in Elysia (`.mount(auth.handler)`): email/pw + org plugin + `@better-auth/sso` OIDC registered against Dex; workspace-scoping middleware (Elysia macro resolving session + active org + role); CI test: sign-up → create org → OIDC SSO login vs Dex.
 5. `apps/web` shell: Vite + React + Tailwind v4 + shadcn/ui + TanStack Router/Query; E1 theme tokens (CSS custom properties + glass utility classes + reduced-transparency fallbacks); glass dock + empty section routes; login/signup pages.
@@ -113,7 +113,7 @@ Per spec §10 verbatim (Better Auth mount, workspace/user MCP + skills CRUD, reg
 
 1. `packages/shared`: `TriggerEvent`, pillar-config Zod/TypeBox schemas, frozen eve event types, API contracts.
 2. `packages/compiler`: pure fn `compile(WorkflowDefinition, versions) → {files: Map<path,string>, hash}`. Emits: `package.json` (pinned)/`tsconfig`/`agent/agent.ts` (preset→provider model resolution; allowlist check → typed error)/`instructions.md` (persona block + instructions; compile-time ref resolution)/`connections/*.ts`/`skills/*`/`channels/eve.ts` (+ per-trigger channels)/`schedules/*`. Golden-file tests per pillar permutation; property test: same config → same hash; hash covers config + compiler version + eve version.
-3. Build service in control plane: render to tmp dir → `bun install` (cached store) → `eve build` → tar `.output` + manifest → MinIO by hash; `workflow_builds` cache (skip on hit); surface build errors to API.
+3. Build service in control plane: render to tmp dir → `bun install` (cached store) → `eve build` → tar `.output` + manifest → Garage by hash; `workflow_builds` cache (skip on hit); surface build errors to API.
 4. `apps/worker` supervisor v1 (single worker): ensure-agent(hash) → pull/extract → spawn `eve start` (port pool) → readiness via `/eve/v1/health`; proxy both prefixes; 15-min idle stop; register/heartbeat.
 5. Control plane runtime API: publish (snapshot+compile+build, idempotent), create session (scheduler stub picks the worker; POST `/eve/v1/session` with platform JWT; persist ids/tokens), follow-up messages, NDJSON tailer → `run_events` → SSE `GET /runs/:id/stream` (Last-Event-ID); session-ownership checks everywhere.
 6. Safety caps v1: per-run wall-clock timer (cancel via abort/turn-limit config), per-workspace concurrent-run gate in dispatcher.

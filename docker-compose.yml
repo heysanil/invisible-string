@@ -33,7 +33,7 @@ services:
     # --single-node auto-initializes the cluster layout; the --default-access-key
     # + --default-bucket flags idempotently create (on every boot) the access key
     # and "artifacts" bucket from the GARAGE_DEFAULT_* env vars below (Garage ≥
-    # v2.3). No init one-shot needed (unlike the old minio-init).
+    # v2.3). No separate bucket-init one-shot container needed.
     command: ["/garage", "server", "--single-node", "--default-access-key", "--default-bucket"]
     ports:
       - "${GARAGE_PORT:-3900}:3900"

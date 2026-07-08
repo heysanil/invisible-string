@@ -55,7 +55,7 @@ flowchart LR
     ingress --> CP
 
     CP["apps/control-plane<br/>Bun + Elysia"]
-    CP -->|"compile → eve build"| MINIO[("MinIO<br/>artifact cache")]
+    CP -->|"compile → eve build"| GARAGE[("Garage<br/>artifact store")]
     CP -->|ensure + dispatch| WK
 
     subgraph pool [" Stateless worker pool "]
@@ -101,7 +101,7 @@ bun run dev
 ```
 
 One command: bootstraps `.env` on first run (generates the four platform
-secrets; provider keys stay blank until you add them), starts Postgres, MinIO,
+secrets; provider keys stay blank until you add them), starts Postgres, Garage,
 and Dex and waits for health, applies migrations, then runs the API (:3000),
 worker, and SPA (:5173) with prefixed logs in one terminal. Ctrl-C stops the
 apps and leaves infra running; `bun run dev:down` stops the containers.
@@ -110,8 +110,8 @@ apps and leaves infra running; `bun run dev:down` stops the containers.
 <summary>Manual, step-by-step equivalent (for debugging individual pieces)</summary>
 
 ```sh
-# local infra: Postgres, MinIO, Dex IdP
-docker compose up -d postgres minio dex
+# local infra: Postgres, Garage, Dex IdP
+docker compose up -d postgres garage dex
 
 # apply migrations (Better Auth + product tables live in packages/db)
 DATABASE_URL=postgres://dev:dev@localhost:5432/product bun run --cwd packages/db migrate
@@ -246,6 +246,14 @@ CI runs typecheck + unit + web build, the gated integration lane (including
 the eve spike), both acceptance suites, and Playwright E2E. Keyed lanes (real
 model calls) are deliberately not in CI.
 
+## Deploy
+
+Production runs as one single-host Docker Compose stack (`docker-compose.prod.yml`)
+— `web` (nginx SPA + same-origin API gateway) fronts `control-plane`, `worker`,
+`postgres`, and `garage` on a private bridge, with GHCR images pinned by
+`IMAGE_TAG`. Full runbook (Dokploy, external/managed data services, Cloudflare
+Tunnel, backups, upgrades, smoke checklist): **[`docs/DEPLOY.md`](docs/DEPLOY.md)**.
+
 ## Repo map
 
 ```
@@ -280,6 +288,7 @@ docs/              Design spec, master plan, runtime contract (+ screenshots/)
 | [`spike/REPORT.md`](spike/REPORT.md) | Empirical eve findings (numbered, cited by later docs) |
 | [`packages/compiler/versions.json`](packages/compiler/versions.json) | Pinned runtime version matrix + rationale |
 | [`.env.example`](.env.example) | Canonical inventory of every environment variable |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | Production deployment guide (prod compose, Dokploy, external data, backups, upgrades) |
 
 ---
 

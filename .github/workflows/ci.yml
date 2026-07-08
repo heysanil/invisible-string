@@ -166,6 +166,37 @@ jobs:
             e2e/.runtime/*.log
           retention-days: 7
 
+  prod-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose config lint (bundled · external-data · build)
+        run: |
+          cat > /tmp/prod-lint.env <<'EOF'
+          APP_DOMAIN=lint.example.com
+          IMAGE_TAG=lint
+          POSTGRES_PASSWORD=lint
+          GARAGE_RPC_SECRET=lint
+          S3_ACCESS_KEY_ID=GKdeadbeefdeadbeefdeadbeefdeadbeef
+          S3_SECRET_ACCESS_KEY=lint
+          ENCRYPTION_MASTER_KEY=lint
+          PLATFORM_JWT_SECRET=lint
+          BETTER_AUTH_SECRET=lint
+          WORKER_SHARED_SECRET=lint
+          WORKER_ID=00000000-0000-0000-0000-000000000000
+          DATABASE_URL=postgres://lint:lint@db.example.com:5432/product
+          WORLD_DATABASE_URL=postgres://lint:lint@db.example.com:5432/world
+          S3_ENDPOINT=https://s3.example.com
+          EOF
+          docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml config -q
+          docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml -f docker-compose.prod.external-data.yml config -q
+          docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml -f docker-compose.prod.build.yml config -q
+      - name: Build prod images (validation only, never pushed)
+        run: |
+          docker build -f infra/docker/control-plane.Dockerfile -t validate-cp .
+          docker build -f infra/docker/worker.Dockerfile -t validate-worker .
+          docker build -f infra/docker/web.Dockerfile -t validate-web .
+
   phase3-acceptance:
     # Phase-3 worker pool: real control plane + TWO real workers + stub MCP +
     # stub Slack + mock-model, proving worker spread, every trigger type, Slack

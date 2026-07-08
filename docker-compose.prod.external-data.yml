@@ -1,0 +1,29 @@
+# Disables the bundled postgres + garage — point the platform at managed
+# services instead. Requirements + walkthrough: docs/DEPLOY.md § External data.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.external-data.yml up -d
+#
+# Needs Docker Compose ≥ 2.24 (`!reset`/`!override`). Note: the base file's
+# ${POSTGRES_PASSWORD:?} / ${GARAGE_RPC_SECRET:?} still interpolate — set both
+# to the literal string `unused` in this mode.
+services:
+  postgres:
+    profiles: ["disabled-bundled-data"]
+  garage:
+    profiles: ["disabled-bundled-data"]
+
+  migrate:
+    depends_on: !reset {}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?external-data mode requires DATABASE_URL}
+
+  control-plane:
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?}
+      WORLD_DATABASE_URL: ${WORLD_DATABASE_URL:?external-data mode requires WORLD_DATABASE_URL}
+      S3_ENDPOINT: ${S3_ENDPOINT:?external-data mode requires S3_ENDPOINT}
+      S3_BUCKET: ${S3_BUCKET:-artifacts}
+      S3_REGION: ${S3_REGION:-us-east-1}

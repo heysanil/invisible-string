@@ -1,0 +1,34 @@
+# Build the prod images from the working tree instead of pulling GHCR tags,
+# publish web on 127.0.0.1:8080, and swap the public URLs to plain-HTTP
+# localhost. LOCAL SMOKE + CI VALIDATION ONLY — never deploy with this file.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    ports:
+      - "127.0.0.1:8080:80"
+  control-plane:
+    build:
+      context: .
+      dockerfile: infra/docker/control-plane.Dockerfile
+    environment:
+      BETTER_AUTH_URL: http://localhost:8080
+      PUBLIC_APP_URL: http://localhost:8080
+      CORS_ORIGIN: http://localhost:8080
+      TRUSTED_ORIGINS: http://localhost:8080
+      SECURITY_HSTS: "0"
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/docker/control-plane.Dockerfile
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+
+networks:
+  # The real deploy attaches to the hoster's proxy network; for local smoke
+  # let compose create it as a plain project network instead.
+  dokploy-network:
+    external: false

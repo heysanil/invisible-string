@@ -7,7 +7,7 @@
  *
  * Proves (same spine as tests/integration/phase1-acceptance.test.ts, but with
  * NO EVE_MOCK_AUTHORED_MODELS and NO dead-port OPENROUTER_BASE_URL override):
- *   1. publish → real compile + eve build → tarball in MinIO (quick preset →
+ *   1. publish → real compile + eve build → tarball in Garage (quick preset →
  *      deepseek/deepseek-v4-flash).
  *   2. create session "ping" → the run streams REAL model tokens
  *      (message.appended deltas over SSE), completes, and the final
@@ -33,7 +33,7 @@
  * Gated on KEYED=1 + OPENROUTER_API_KEY + TEST_DATABASE_URL (+ mise + docker)
  * so CI can never run it accidentally. Infra (unique compose project):
  *
- *   POSTGRES_PORT=5446 MINIO_PORT=9006 docker compose -p pkeyed up -d --wait postgres minio minio-init
+ *   POSTGRES_PORT=5446 GARAGE_PORT=9006 docker compose -p pkeyed up -d --wait postgres garage
  *   KEYED=1 OPENROUTER_API_KEY=... S3_ENDPOINT=http://localhost:9006 \
  *     TEST_DATABASE_URL=postgres://dev:dev@localhost:5446/product \
  *     bun test tests/integration/keyed-acceptance.test.ts
@@ -72,7 +72,7 @@ import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-en
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
-const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:9000";
+const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:3900";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 const PLATFORM_JWT_SECRET = "keyed-platform-jwt-secret-0000000";
 const WORKER_SHARED_SECRET = "keyed-worker-shared-secret-000000";
@@ -118,16 +118,15 @@ async function pgReachable(url: string): Promise<boolean> {
 
 async function ensureInfra(): Promise<void> {
   const pgUp = await pgReachable(TEST_DATABASE_URL!);
-  const minioUp = await tcpReachable(`${S3_ENDPOINT}/minio/health/live`);
-  if (pgUp && minioUp) return;
+  const s3Up = await tcpReachable(S3_ENDPOINT);
+  if (pgUp && s3Up) return;
   const pgPort = new URL(TEST_DATABASE_URL!).port || "5432";
-  const minioPort = new URL(S3_ENDPOINT).port || "9000";
-  const services = [...(pgUp ? [] : ["postgres"]), ...(minioUp ? [] : ["minio"])];
+  const s3Port = new URL(S3_ENDPOINT).port || "3900";
+  const services = [...(pgUp ? [] : ["postgres"]), ...(s3Up ? [] : ["garage"])];
   const composeEnv = {
     ...process.env,
     POSTGRES_PORT: pgPort,
-    MINIO_PORT: minioPort,
-    MINIO_CONSOLE_PORT: String(Number(minioPort) + 1),
+    GARAGE_PORT: s3Port,
   };
   const compose = async (...args: string[]): Promise<number> => {
     const proc = Bun.spawn(["docker", "compose", "-p", "pkeyed", ...args], {
@@ -140,12 +139,6 @@ async function ensureInfra(): Promise<void> {
   };
   const upCode = await compose("up", "-d", "--wait", ...services);
   if (upCode !== 0) throw new Error(`docker compose up failed (${upCode})`);
-  if (!minioUp) {
-    // Foreground one-shot: `compose wait` races a fast init container (Compose
-    // ≥ v5 only sees running containers — an exited one-shot is "no containers").
-    const initCode = await compose("run", "--rm", "minio-init");
-    if (initCode !== 0) throw new Error(`minio-init failed (${initCode})`);
-  }
 }
 
 /** The world SERVER maintenance database (compose init creates it; ensure). */
@@ -392,7 +385,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
   }
 
   /** Publish, wait for the REAL eve build, then delete the build dir so the
-   *  worker must boot from the MinIO tarball. */
+   *  worker must boot from the Garage tarball. */
   async function publishAndBuild(workflowId: string): Promise<PublishWorkflowResponse> {
     const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`);
     expect(res.status).toBe(200);
@@ -475,9 +468,16 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
       PLATFORM_JWT_SECRET,
       WORKER_SHARED_SECRET,
       S3_ENDPOINT,
-      S3_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID ?? "dev",
-      S3_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY ?? "devdevdev",
+      S3_ACCESS_KEY_ID:
+        process.env.S3_ACCESS_KEY_ID ?? "GKdeadbeefdeadbeefdeadbeefdeadbeef",
+      S3_SECRET_ACCESS_KEY:
+        process.env.S3_SECRET_ACCESS_KEY ??
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
       S3_BUCKET: process.env.S3_BUCKET ?? "artifacts",
+      // Garage enforces exact SigV4 region matching (infra/garage.toml
+      // s3_region) — a real S3 provider would tolerate a region mismatch;
+      // Garage does not.
+      S3_REGION: process.env.S3_REGION ?? "us-east-1",
       // THE POINT OF THIS SUITE: the real key, no EVE_MOCK_AUTHORED_MODELS,
       // no OPENROUTER_BASE_URL — agents talk to the real OpenRouter API.
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY!,
@@ -617,7 +617,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
   }, 90_000);
 
   test(
-    "publish (quick preset → deepseek/deepseek-v4-flash) → real eve build → tarball in MinIO",
+    "publish (quick preset → deepseek/deepseek-v4-flash) → real eve build → tarball in Garage",
     async () => {
       const body = await publishAndBuild(pongWorkflowId);
       expect(body.contentHash).toHaveLength(64);

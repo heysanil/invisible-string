@@ -3,7 +3,7 @@
  * every trigger type, HITL, Slack thread continuity, dead-worker failover, and
  * graceful drain, all against the REAL stack: a real control plane, TWO real
  * `apps/worker` processes, real `@invisible-string/compiler` + `eve build`
- * agents booted from MinIO tarballs, and eve's mock-model harness serving the
+ * agents booted from Garage tarballs, and eve's mock-model harness serving the
  * turns (EVE_MOCK_AUTHORED_MODELS — no provider key). External services are
  * stubbed: a local MCP server and a local Slack Web API server. NOTHING between
  * the platform API and a live compiled agent is faked.
@@ -27,12 +27,12 @@
  *      new sessions route to worker B, and A exits 0.
  *
  * Gated on TEST_DATABASE_URL (+ mise + docker). Infra: the docker-compose
- * postgres/minio services, brought up on demand when unreachable. The first run
+ * postgres/garage services, brought up on demand when unreachable. The first run
  * cold-installs the generated agents' npm deps (minutes) — NPM_CACHE_DIR keeps
  * reruns warm. Four distinct trigger workflows compile to four hashes → four
  * `eve build`s; the manual workflow is reused across SPREAD/HITL/FAILOVER/DRAIN.
  *
- *   POSTGRES_PORT=5444 docker compose -p p3acceptance up -d --wait postgres minio minio-init
+ *   POSTGRES_PORT=5444 docker compose -p p3acceptance up -d --wait postgres garage
  *   TEST_DATABASE_URL=postgres://dev:dev@localhost:5444/product bun test tests/integration/phase3-acceptance.test.ts
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -75,7 +75,7 @@ import {
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
-const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:9000";
+const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:3900";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 const PLATFORM_JWT_SECRET = "p3a-platform-jwt-secret-000000000";
 const WORKER_SHARED_SECRET = "p3a-worker-shared-secret-00000000";
@@ -135,16 +135,15 @@ async function pgReachable(url: string): Promise<boolean> {
 
 async function ensureInfra(): Promise<void> {
   const pgUp = await pgReachable(TEST_DATABASE_URL!);
-  const minioUp = await tcpReachable(`${S3_ENDPOINT}/minio/health/live`);
-  if (pgUp && minioUp) return;
+  const s3Up = await tcpReachable(S3_ENDPOINT);
+  if (pgUp && s3Up) return;
   const pgPort = new URL(TEST_DATABASE_URL!).port || "5432";
-  const minioPort = new URL(S3_ENDPOINT).port || "9000";
-  const services = [...(pgUp ? [] : ["postgres"]), ...(minioUp ? [] : ["minio"])];
+  const s3Port = new URL(S3_ENDPOINT).port || "3900";
+  const services = [...(pgUp ? [] : ["postgres"]), ...(s3Up ? [] : ["garage"])];
   const composeEnv = {
     ...process.env,
     POSTGRES_PORT: pgPort,
-    MINIO_PORT: minioPort,
-    MINIO_CONSOLE_PORT: String(Number(minioPort) + 1),
+    GARAGE_PORT: s3Port,
   };
   const compose = async (...args: string[]): Promise<number> => {
     const proc = Bun.spawn(["docker", "compose", "-p", "p3acceptance", ...args], {
@@ -157,12 +156,6 @@ async function ensureInfra(): Promise<void> {
   };
   const upCode = await compose("up", "-d", "--wait", ...services);
   if (upCode !== 0) throw new Error(`docker compose up failed (${upCode})`);
-  if (!minioUp) {
-    // Foreground one-shot: `compose wait` races a fast init container (Compose
-    // ≥ v5 only sees running containers — an exited one-shot is "no containers").
-    const initCode = await compose("run", "--rm", "minio-init");
-    if (initCode !== 0) throw new Error(`minio-init failed (${initCode})`);
-  }
 }
 
 async function ensureWorldDatabase(): Promise<string> {
@@ -545,9 +538,16 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       PLATFORM_JWT_SECRET,
       WORKER_SHARED_SECRET,
       S3_ENDPOINT,
-      S3_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID ?? "dev",
-      S3_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY ?? "devdevdev",
+      S3_ACCESS_KEY_ID:
+        process.env.S3_ACCESS_KEY_ID ?? "GKdeadbeefdeadbeefdeadbeefdeadbeef",
+      S3_SECRET_ACCESS_KEY:
+        process.env.S3_SECRET_ACCESS_KEY ??
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
       S3_BUCKET: process.env.S3_BUCKET ?? "artifacts",
+      // Garage enforces exact SigV4 region matching (infra/garage.toml
+      // s3_region) — a real S3 provider would tolerate a region mismatch;
+      // Garage does not.
+      S3_REGION: process.env.S3_REGION ?? "us-east-1",
       // Mock-model harness (no provider key; a dead base URL fails real calls loudly).
       OPENROUTER_API_KEY: "p3a-dummy-openrouter-key",
       OPENROUTER_BASE_URL: "http://127.0.0.1:9/v1",

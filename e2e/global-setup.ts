@@ -1,7 +1,7 @@
 /**
  * Playwright global setup — stands up the FULL real stack, zero manual steps:
  *
- *   docker compose (postgres · minio · dex, project p2e2e)
+ *   docker compose (postgres · garage · dex, project p2e2e)
  *     → fresh product DB + migrations + demo seed (bun)
  *     → production build of the SPA (VITE_API_URL baked)
  *     → managed processes: stub MCP · control-plane · worker · vite preview
@@ -49,8 +49,7 @@ function composeEnv(): Record<string, string | undefined> {
   return {
     ...process.env,
     POSTGRES_PORT: String(PORTS.postgres),
-    MINIO_PORT: String(PORTS.minio),
-    MINIO_CONSOLE_PORT: String(PORTS.minioConsole),
+    GARAGE_PORT: String(PORTS.garage),
     DEX_PORT: String(PORTS.dex),
   };
 }
@@ -83,11 +82,8 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // Reap any agent left squatting the worker's port pool by a crashed run.
   runQuiet("pkill", ["-9", "-f", `${AGENT_ROOT}/`], REPO_ROOT);
 
-  console.log("[e2e:setup] docker compose up (postgres, minio, dex)…");
-  compose(["up", "-d", "--wait", "postgres", "minio", "dex"]);
-  // Foreground one-shot: `compose wait` races a fast init container (Compose
-  // ≥ v5 only sees running containers — an exited one-shot is "no containers").
-  compose(["run", "--rm", "minio-init"]);
+  console.log("[e2e:setup] docker compose up (postgres, garage, dex)…");
+  compose(["up", "-d", "--wait", "postgres", "garage", "dex"]);
 
   // node@24 powers the eve build + agent runtime (mise). Warm it (idempotent),
   // then resolve its bin dir so we can pin it on the control-plane + worker

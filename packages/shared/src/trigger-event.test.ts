@@ -36,7 +36,7 @@ describe("triggerEventSchema", () => {
         {
           name: "big.bin",
           mediaType: "application/octet-stream",
-          data: new URL("https://minio.local/bucket/big.bin"),
+          data: new URL("https://garage.local/bucket/big.bin"),
         },
       ],
       principal: { workspaceId: "org_123", userId: "user_9", source: "slack:U777" },

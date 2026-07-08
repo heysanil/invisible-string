@@ -58,12 +58,8 @@ jobs:
           key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
           restore-keys: npm-eve-${{ runner.os }}-
 
-      - name: Compose up (postgres, minio, dex)
-        # `run --rm` executes the one-shot bucket-init job in the foreground and
-        # propagates its exit code — `compose wait` races a fast init container
-        # (Compose ≥ v5 only sees running containers; an already-exited one-shot
-        # fails with `no containers for project`).
-        run: docker compose up -d --wait postgres minio dex && docker compose run --rm minio-init
+      - name: Compose up (postgres, garage, dex)
+        run: docker compose up -d --wait postgres garage dex
 
       # The world-isolation proof and the spike suites need the spike
       # project's pinned @workflow/world-postgres install.
@@ -74,6 +70,7 @@ jobs:
       - name: Gated tests (apps + packages + spike)
         env:
           TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
+          TEST_S3_ENDPOINT: http://localhost:3900
         run: bun test apps packages spike
 
       - name: Compose down
@@ -82,7 +79,7 @@ jobs:
 
   acceptance:
     # Full compiler→build→run spine: real compile, mise-node24 npm install,
-    # eve build, tarball → MinIO, real worker + agent, mock-model turns.
+    # eve build, tarball → Garage, real worker + agent, mock-model turns.
     # Slow on a cold npm cache — generous timeout.
     name: Phase-1 acceptance (eve build)
     runs-on: ubuntu-latest
@@ -108,12 +105,8 @@ jobs:
           key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
           restore-keys: npm-eve-${{ runner.os }}-
 
-      - name: Compose up (postgres, minio, dex)
-        # `run --rm` executes the one-shot bucket-init job in the foreground and
-        # propagates its exit code — `compose wait` races a fast init container
-        # (Compose ≥ v5 only sees running containers; an already-exited one-shot
-        # fails with `no containers for project`).
-        run: docker compose up -d --wait postgres minio dex && docker compose run --rm minio-init
+      - name: Compose up (postgres, garage, dex)
+        run: docker compose up -d --wait postgres garage dex
 
       - name: Phase-1 acceptance
         env:
@@ -203,9 +196,8 @@ jobs:
           key: npm-eve-${{ runner.os }}-${{ hashFiles('packages/compiler/versions.json', 'spike/agent-project/package-lock.json') }}
           restore-keys: npm-eve-${{ runner.os }}-
 
-      - name: Compose up (postgres, minio)
-        # See the integration job: `run --rm` instead of the racy `compose wait`.
-        run: docker compose up -d --wait postgres minio && docker compose run --rm minio-init
+      - name: Compose up (postgres, garage)
+        run: docker compose up -d --wait postgres garage
 
       - name: Phase-3 acceptance
         env:

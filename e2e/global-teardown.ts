@@ -39,8 +39,7 @@ export default async function globalTeardown(): Promise<void> {
         env: {
           ...process.env,
           POSTGRES_PORT: String(PORTS.postgres),
-          MINIO_PORT: String(PORTS.minio),
-          MINIO_CONSOLE_PORT: String(PORTS.minioConsole),
+          GARAGE_PORT: String(PORTS.garage),
           DEX_PORT: String(PORTS.dex),
         },
       },

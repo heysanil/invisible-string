@@ -70,9 +70,8 @@ if (!(await node24Available())) {
 
 // ── 3 · infra ───────────────────────────────────────────────────────────────
 const infraStart = Date.now();
-await run(["docker", "compose", "up", "-d", "--wait", "postgres", "minio", "dex"], childEnv);
-await run(["docker", "compose", "run", "--rm", "minio-init"], childEnv);
-note(`infra healthy (postgres, minio, dex) · bucket ok  ${((Date.now() - infraStart) / 1000).toFixed(1)}s`);
+await run(["docker", "compose", "up", "-d", "--wait", "postgres", "garage", "dex"], childEnv);
+note(`infra healthy (postgres, garage, dex) · bucket ok  ${((Date.now() - infraStart) / 1000).toFixed(1)}s`);
 
 // ── 4 · migrate ─────────────────────────────────────────────────────────────
 if (!childEnv.DATABASE_URL) fail(".env is missing DATABASE_URL");

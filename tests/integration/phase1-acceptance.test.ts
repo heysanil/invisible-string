@@ -5,7 +5,7 @@
  *   REST-create workflow (manual trigger, 1 MCP connection → local stub MCP
  *   server, 1 authored skill, balanced preset)
  *   → publish → REAL @invisible-string/compiler compile → mise-node24
- *     npm install → `eve build` → tar.gz → MinIO
+ *     npm install → `eve build` → tar.gz → Garage
  *   → create session with a message (eve's mock-model harness — the spike's
  *     EVE_MOCK_AUTHORED_MODELS pattern; "Reply with exactly: X" fixtures)
  *   → real eve NDJSON events (session/turn/step/message.*) land in
@@ -16,15 +16,15 @@
  *     version hash, the OLD session stays pinned to the old one.
  *
  * Gated on TEST_DATABASE_URL (+ mise + docker). Infra: the docker-compose
- * postgres/minio/dex services — brought up on demand when unreachable:
+ * postgres/garage/dex services — brought up on demand when unreachable:
  *
- *   POSTGRES_PORT=5443 docker compose -p p1acceptance up -d --wait postgres minio minio-init dex
+ *   POSTGRES_PORT=5443 docker compose -p p1acceptance up -d --wait postgres garage dex
  *   TEST_DATABASE_URL=postgres://dev:dev@localhost:5443/product bun test tests/integration/phase1-acceptance.test.ts
  *
  * The first run cold-installs the generated agent's npm deps (minutes);
  * NPM_CACHE_DIR (default ~/.npm) keeps reruns warm. Artifact relocation is
  * proven honestly: the build directory is DELETED after each build, so the
- * worker must pull the tarball from MinIO and boot `.output` alone (eve
+ * worker must pull the tarball from Garage and boot `.output` alone (eve
  * bundles its compiled artifacts into the server bundle; REPORT finding 13's
  * baked appRoot is a fallback path that production never consults).
  */
@@ -57,7 +57,7 @@ import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-en
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
-const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:9000";
+const S3_ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:3900";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 const PLATFORM_JWT_SECRET = "p1a-platform-jwt-secret-000000000";
 const WORKER_SHARED_SECRET = "p1a-worker-shared-secret-00000000";
@@ -102,27 +102,26 @@ async function pgReachable(url: string): Promise<boolean> {
 
 async function ensureInfra(): Promise<void> {
   const pgUp = await pgReachable(TEST_DATABASE_URL!);
-  const minioUp = await tcpReachable(`${S3_ENDPOINT}/minio/health/live`);
-  if (pgUp && minioUp) return;
+  const s3Up = await tcpReachable(S3_ENDPOINT);
+  if (pgUp && s3Up) return;
 
   const pgPort = new URL(TEST_DATABASE_URL!).port || "5432";
-  const minioPort = new URL(S3_ENDPOINT).port || "9000";
-  // Only start what is missing — a postgres/minio already serving the
+  const s3Port = new URL(S3_ENDPOINT).port || "3900";
+  // Only start what is missing — a postgres/garage already serving the
   // configured port (dev compose, spike project, CI service) must not be
   // double-bound by a second compose project.
   const services = [
     ...(pgUp ? [] : ["postgres"]),
-    ...(minioUp ? [] : ["minio"]),
+    ...(s3Up ? [] : ["garage"]),
     "dex",
   ];
   console.log(
-    `[phase1-acceptance] infra not reachable (pg=${pgUp} minio=${minioUp}) — docker compose up ${services.join(" ")} (pg:${pgPort} minio:${minioPort})`,
+    `[phase1-acceptance] infra not reachable (pg=${pgUp} s3=${s3Up}) — docker compose up ${services.join(" ")} (pg:${pgPort} s3:${s3Port})`,
   );
   const composeEnv = {
     ...process.env,
     POSTGRES_PORT: pgPort,
-    MINIO_PORT: minioPort,
-    MINIO_CONSOLE_PORT: String(Number(minioPort) + 1),
+    GARAGE_PORT: s3Port,
     DEX_PORT: process.env.DEX_PORT ?? "5556",
   };
   const compose = async (...args: string[]): Promise<number> => {
@@ -134,17 +133,8 @@ async function ensureInfra(): Promise<void> {
     });
     return proc.exited;
   };
-  // `--wait` only for long-running services; minio-init is a one-shot job
-  // (creates the artifacts bucket, exits 0) which `--wait` misreads as a
-  // failure — run it in the foreground instead. (`compose wait` is racy too:
-  // Compose ≥ v5 only sees running containers, so an already-exited one-shot
-  // fails with `no containers for project`.)
   const upCode = await compose("up", "-d", "--wait", ...services);
   if (upCode !== 0) throw new Error(`docker compose up failed (${upCode})`);
-  if (!minioUp) {
-    const initCode = await compose("run", "--rm", "minio-init");
-    if (initCode !== 0) throw new Error(`minio-init failed (${initCode})`);
-  }
 }
 
 /** The world SERVER maintenance database (compose init creates it; ensure). */
@@ -370,7 +360,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
   }
 
   /** Wait for the (real) build, then delete the build dir so the worker MUST
-   *  pull the tarball from MinIO (proves the artifact path end to end). */
+   *  pull the tarball from Garage (proves the artifact path end to end). */
   async function awaitBuildAndStripDir(contentHash: string): Promise<void> {
     await stack.runtime!.buildService.waitFor(contentHash);
     const record = await until(
@@ -410,9 +400,16 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       PLATFORM_JWT_SECRET,
       WORKER_SHARED_SECRET,
       S3_ENDPOINT,
-      S3_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID ?? "dev",
-      S3_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY ?? "devdevdev",
+      S3_ACCESS_KEY_ID:
+        process.env.S3_ACCESS_KEY_ID ?? "GKdeadbeefdeadbeefdeadbeefdeadbeef",
+      S3_SECRET_ACCESS_KEY:
+        process.env.S3_SECRET_ACCESS_KEY ??
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
       S3_BUCKET: process.env.S3_BUCKET ?? "artifacts",
+      // Garage enforces exact SigV4 region matching (infra/garage.toml
+      // s3_region) — a real S3 provider would tolerate a region mismatch;
+      // Garage does not.
+      S3_REGION: process.env.S3_REGION ?? "us-east-1",
       // Mock-model harness (spike REPORT finding 5): agents serve turns with
       // eve's built-in mock; the provider key is a dummy and the base URL
       // points at a dead port so any REAL model call fails loudly.
@@ -562,7 +559,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
   });
 
   test(
-    "publish → REAL compile + npm install + eve build → tarball in MinIO",
+    "publish → REAL compile + npm install + eve build → tarball in Garage",
     async () => {
       const body = await publish();
       expect(body.contentHash).toHaveLength(64);
@@ -594,7 +591,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
   );
 
   test(
-    "create session → real agent boots from the MinIO tarball → real eve NDJSON events land in run_events",
+    "create session → real agent boots from the Garage tarball → real eve NDJSON events land in run_events",
     async () => {
       const res = await api(
         "POST",

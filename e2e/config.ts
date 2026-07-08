@@ -30,8 +30,7 @@ export const COMPOSE_PROJECT = "p2e2e";
 // ── Ports (offset from dev :5432/:9000/:5556 and p1acceptance :5443) ────────
 export const PORTS = {
   postgres: 5442,
-  minio: 9010,
-  minioConsole: 9011,
+  garage: 3910,
   dex: 5557,
   controlPlane: 4310,
   worker: 4311,
@@ -47,7 +46,7 @@ export const WORKER_URL = `http://localhost:${PORTS.worker}`;
 // Server-side clients (postgres-js, Bun SQL, S3) use 127.0.0.1 explicitly:
 // "localhost" can resolve to ::1 first, which Docker's IPv4 port publishing
 // refuses. Browser-facing URLs stay on localhost (cookie-domain stability).
-export const S3_ENDPOINT = `http://127.0.0.1:${PORTS.minio}`;
+export const S3_ENDPOINT = `http://127.0.0.1:${PORTS.garage}`;
 /** The stub MCP endpoint (bound to 127.0.0.1 so the agent process reaches it). */
 export const STUB_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp`;
 /**
@@ -97,9 +96,13 @@ export function controlPlaneEnv(): Record<string, string> {
     PLATFORM_JWT_SECRET: SECRETS.platformJwt,
     WORKER_SHARED_SECRET: SECRETS.workerShared,
     S3_ENDPOINT,
-    S3_ACCESS_KEY_ID: "dev",
-    S3_SECRET_ACCESS_KEY: "devdevdev",
+    S3_ACCESS_KEY_ID: "GKdeadbeefdeadbeefdeadbeefdeadbeef",
+    S3_SECRET_ACCESS_KEY: "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
     S3_BUCKET: "artifacts",
+    // Garage enforces exact SigV4 region matching (infra/garage.toml
+    // s3_region) — a real S3 provider would tolerate a region mismatch;
+    // Garage does not.
+    S3_REGION: "us-east-1",
     // Redirect the registry proxy at the local stub (never the real registry).
     MCP_REGISTRY_BASE_URL: REGISTRY_STUB_BASE_URL,
     // Mock-model harness: the provider key is a dummy and the base URL points

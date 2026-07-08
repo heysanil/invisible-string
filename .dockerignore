@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+!.env.example
+!.env.prod.example
+.dev
+node_modules
+**/node_modules
+**/dist
+e2e/test-results
+e2e/playwright-report
+spike
+docs
+*.md

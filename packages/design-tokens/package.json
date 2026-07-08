@@ -1,0 +1,6 @@
+{
+  "name": "@invisible-string/design-tokens",
+  "private": true,
+  "exports": { "./tokens.css": "./tokens.css" },
+  "scripts": { "typecheck": "true" }
+}

@@ -150,7 +150,7 @@ The spike's keyed tests (real model calls) additionally require
 
 The SPA (`apps/web`, Vite + React + TanStack Router) is the whole product
 surface, built on the **E1 design system** — monochrome ink × liquid glass,
-color only as meaning (`src/styles/tokens.css` + `src/components/ui`). Four
+color only as meaning (`packages/design-tokens/tokens.css` + `src/components/ui`). Four
 sections:
 
 **Onboarding:** a fresh account lands on a first-run screen to name its

@@ -10,6 +10,7 @@ COPY apps/worker/package.json apps/worker/
 COPY apps/web/package.json apps/web/
 COPY packages/compiler/package.json packages/compiler/
 COPY packages/db/package.json packages/db/
+COPY packages/design-tokens/package.json packages/design-tokens/
 COPY packages/shared/package.json packages/shared/
 COPY tests/integration/package.json tests/integration/
 COPY e2e/package.json e2e/

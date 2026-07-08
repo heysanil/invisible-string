@@ -1,5 +1,5 @@
 @import "tailwindcss";
-@import "./styles/tokens.css";
+@import "@invisible-string/design-tokens/tokens.css";
 
 @theme {
   --font-sans:

@@ -179,6 +179,12 @@ docker compose --env-file /tmp/prod-smoke.env \
   -f docker-compose.prod.yml -f docker-compose.prod.build.yml down -v
 ```
 
+The automated version of this smoke — plus a full workflow publish through the
+gateway, with `eve build` running inside the control-plane container — is
+`tests/integration/prod-compose-smoke.test.ts` (`PROD_SMOKE=1`, compose
+project `psmoke`; CI runs it in the `prod-compose` job). Run it after any
+change to the Dockerfiles, the compose files, or the build steps.
+
 ---
 
 ## 7. External / managed data services

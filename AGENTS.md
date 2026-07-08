@@ -44,7 +44,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 
 ## Toolchain & setup
 
-- **Bun 1.3+** runs the platform (control-plane, worker, web tooling, all tests). **Node 24 via mise** runs everything eve (`mise install node@24`; harnesses invoke `mise exec node@24 --` themselves). **Docker** for compose + `docker()` sandboxes.
+- **Bun 1.3+** runs the platform (control-plane, worker, web tooling, all tests). **Node 24 via mise** runs everything eve on dev machines/CI (`mise install node@24`; the spike/compiler harnesses invoke `mise exec node@24 --` themselves). At RUNTIME the apps never shell out to the mise binary: control-plane build steps and the worker both resolve a Node 24 binary directly (`BUILD_NODE_BIN`/`WORKER_NODE_BIN` override → newest mise install → PATH) — the prod images bake bare node and carry no mise. **Docker** for compose + `docker()` sandboxes.
 - `bun install` once at the root (single lockfile). `cp .env.example .env` and fill secrets for running apps (tests provision their own env).
 - Local stack: `docker compose up -d postgres garage dex` (ports overridable: `POSTGRES_PORT`/`GARAGE_PORT`/`DEX_PORT`). Test harnesses spin their own compose **projects** (`p1acceptance`, `p2e2e`, `p3acceptance`, `pkeyed`…) on non-default ports — don't reuse those names.
 - Dev servers: `bun run dev` at the root does it all — bootstraps `.env` with generated secrets on first run, `docker compose up --wait`, migrations, then API (:3000) + worker + SPA (:5173) with prefixed logs; Ctrl-C stops the apps, `bun run dev:down` stops infra. Individual apps: `bun run --cwd apps/<x> dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`.
@@ -62,6 +62,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 | Keyed (real model, costs cents) | `KEYED=1 OPENROUTER_API_KEY=… TEST_DATABASE_URL=… bun test tests/integration/keyed-acceptance.test.ts` | key from `.openrouter-key` |
 | Copilot real-model smoke | `COPILOT_KEYED=1 OPENROUTER_API_KEY=… bun test apps/control-plane/src/copilot/keyed.test.ts` | key |
 | Browser E2E | `cd e2e && bunx playwright test` | chromium installed; harness self-manages its whole stack |
+| Prod-compose smoke (in-container publish) | `PROD_SMOKE=1 bun test tests/integration/prod-compose-smoke.test.ts` | docker; builds the real images (`-p psmoke`, web on :8080) and publishes through them — the guard against code↔image drift |
 
 E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never collects them. The eve spike (`spike/`) is standalone (not a workspace) — its suites run in the gated lane and are the upgrade gate for eve version bumps.
 
@@ -84,7 +85,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 ## CI (`.github/workflows/ci.yml`)
 
-`unit` (typecheck + `bun test` + web build) · `integration` (compose + gated lane incl. spike) · `acceptance` (phase-1, real eve build) · `phase3-acceptance` (multi-worker) · `e2e` (Playwright). Keyed lanes are deliberately **not** in CI.
+`unit` (typecheck + `bun test` + web build) · `integration` (compose + gated lane incl. spike) · `acceptance` (phase-1, real eve build) · `phase3-acceptance` (multi-worker) · `e2e` (Playwright) · `prod-compose` (compose lint/drift + the prod-compose publish smoke: real images built from the tree, `eve build` runs inside the control-plane container). Keyed lanes are deliberately **not** in CI.
 
 All jobs run on Namespace runners (`nscloud-ubuntu-24.04-amd64-*` labels). The eve npm cache (`~/.npm`) and Playwright browsers persist on a shared Namespace cache volume (tag `eve-npm`, mounted via `nscloud-cache-action` — no `actions/cache` tarball round-trips), and `release.yml` image builds use Namespace's pre-configured remote builders (no `setup-buildx-action`, no gha layer cache — cache lives builder-side).
 

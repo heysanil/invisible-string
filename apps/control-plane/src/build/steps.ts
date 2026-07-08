@@ -2,8 +2,10 @@
  * Real build steps (docs/PLAN.md Phase 1 task 3): compiled files → installed
  * project → `eve build` → tar.gz artifact.
  *
- * eve requires Node 24.x (host Bun stays the control-plane runtime); every
- * node/npm invocation runs through `mise exec node@24 --`. npm installs share
+ * eve requires Node 24.x (host Bun stays the control-plane runtime); node/npm
+ * invocations run against a resolved Node 24 bin dir (resolveNodeBinDir —
+ * BUILD_NODE_BIN → mise installs → PATH; the mise BINARY is never required at
+ * runtime, so the production image ships bare node). npm installs share
  * NPM_CACHE_DIR across builds.
  *
  * PATHS: builds happen under the CANONICAL build root
@@ -21,7 +23,7 @@
  * `node .output/server/index.mjs`, widen this tarball (or npm-install eve on
  * the worker) at the Integrate stage.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, normalize } from "node:path";
 
@@ -43,9 +45,9 @@ export type RunCommand = (
 export interface BuildSteps {
   /** Materialize compiled files into the canonical project dir. */
   writeFiles(projectDir: string, files: ReadonlyMap<string, string>): Promise<void>;
-  /** npm install with the shared cache (mise node@24). */
+  /** npm install with the shared cache (resolved Node 24). */
   install(projectDir: string): Promise<void>;
-  /** npx eve build (mise node@24). */
+  /** npx eve build (resolved Node 24). */
   eveBuild(projectDir: string): Promise<void>;
   /** Provision + bootstrap the version's dedicated world database. */
   provisionWorld(contentHash: string, projectDir: string): Promise<void>;
@@ -105,11 +107,6 @@ const STEP_ENV_ALLOWLIST = [
   "LC_ALL",
   "TMPDIR",
   "SHELL",
-  // mise resolves node@24 through these when customized.
-  "MISE_DATA_DIR",
-  "MISE_CONFIG_DIR",
-  "MISE_CACHE_DIR",
-  "MISE_STATE_DIR",
 ] as const;
 
 /** Scrubbed base env + per-step additions (exported for tests). */
@@ -171,13 +168,57 @@ export interface CreateBuildStepsOptions {
   run?: RunCommand;
   /** World provisioner (index.ts wires build/world.ts's ensure()). */
   provisionWorld: (contentHash: string, projectDir: string) => Promise<void>;
+  /** Node 24 bin dir for npm/npx/node; omit to auto-resolve, null = none found. */
+  nodeBinDir?: string | null;
 }
 
-const MISE_NODE24 = ["mise", "exec", "node@24", "--"];
+/**
+ * Locate the Node 24 bin DIRECTORY for build subprocesses: BUILD_NODE_BIN
+ * override (path to a node binary) → newest mise-installed node 24.x (dev
+ * machines / CI) → `node` on PATH (production image, where PATH node IS
+ * Node 24). Mirrors apps/worker/src/config.ts resolveNodeBin, but yields the
+ * directory: npm/npx live beside node, and their `#!/usr/bin/env node`
+ * shebangs must resolve to the same runtime — steps prepend this dir to the
+ * child PATH instead of shelling out to the mise binary (absent in the
+ * production image).
+ */
+export function resolveNodeBinDir(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const override = env.BUILD_NODE_BIN?.trim();
+  if (override) return dirname(override);
+
+  const installs = join(env.HOME ?? "", ".local/share/mise/installs/node");
+  if (existsSync(installs)) {
+    const newest24 = readdirSync(installs)
+      .filter((entry) => /^24\.\d+\.\d+$/.test(entry))
+      .sort(Bun.semver.order)
+      .at(-1);
+    if (newest24 !== undefined) {
+      const bin = join(installs, newest24, "bin");
+      if (existsSync(join(bin, "node"))) return bin;
+    }
+  }
+
+  const onPath = Bun.which("node", { PATH: env.PATH ?? "" });
+  return onPath === null ? null : dirname(onPath);
+}
+
+/** PATH override putting the resolved Node 24 first; throws with guidance when unresolved. */
+function nodeRuntimeEnv(nodeBinDir: string | null): { PATH: string } {
+  if (nodeBinDir === null) {
+    throw new BuildStepError(
+      "node-runtime",
+      "no Node 24 runtime for build steps — set BUILD_NODE_BIN, `mise install node@24`, or put node 24 on PATH",
+    );
+  }
+  return { PATH: `${nodeBinDir}:${process.env.PATH ?? ""}` };
+}
 
 export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
   const run = options.run ?? runCommand;
   const { npmCacheDir } = options.runtime;
+  const nodeBinDir = options.nodeBinDir === undefined ? resolveNodeBinDir() : options.nodeBinDir;
 
   return {
     async writeFiles(projectDir, files) {
@@ -197,10 +238,10 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
         // --ignore-scripts: third-party lifecycle scripts are arbitrary code
         // on the build host — the pinned dependency tree works without them
         // (spike/REPORT.md finding 19: cbor-x falls back to pure JS).
-        [...MISE_NODE24, "npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
         {
           cwd: projectDir,
-          env: { npm_config_cache: npmCacheDir },
+          env: { npm_config_cache: npmCacheDir, ...nodeRuntimeEnv(nodeBinDir) },
           timeoutMs: 300_000,
         },
       );
@@ -211,7 +252,7 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
       const result = await run(
         // --no-install: eve must come from the project's own pinned deps,
         // never fetched ad hoc from the registry.
-        [...MISE_NODE24, "npx", "--no-install", "eve", "build"],
+        ["npx", "--no-install", "eve", "build"],
         {
           cwd: projectDir,
           // bun test leaks NODE_ENV=test which flips eve into mock-model mode
@@ -237,6 +278,7 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
           env: {
             NODE_ENV: "production",
             OPENROUTER_API_KEY: "eve-build-routing-placeholder",
+            ...nodeRuntimeEnv(nodeBinDir),
           },
           timeoutMs: 300_000,
         },
@@ -286,11 +328,14 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
 }
 
 /** Default world setupDatabase runner: the built project's own pinned bin. */
-export function createSetupDatabaseRunner(run: RunCommand = runCommand) {
+export function createSetupDatabaseRunner(
+  run: RunCommand = runCommand,
+  nodeBinDir: string | null = resolveNodeBinDir(),
+) {
   return async (projectDir: string, worldUrl: string): Promise<void> => {
-    const result = await run([...MISE_NODE24, "node", worldSetupBinPath(projectDir)], {
+    const result = await run(["node", worldSetupBinPath(projectDir)], {
       cwd: projectDir,
-      env: { WORKFLOW_POSTGRES_URL: worldUrl },
+      env: { WORKFLOW_POSTGRES_URL: worldUrl, ...nodeRuntimeEnv(nodeBinDir) },
       timeoutMs: 120_000,
     });
     failIfNonZero("world-setup", result);

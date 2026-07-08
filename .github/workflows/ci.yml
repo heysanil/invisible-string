@@ -172,10 +172,24 @@ jobs:
           retention-days: 7
 
   prod-compose:
+    # Lints the prod compose files, then builds the REAL images from the
+    # working tree and drives a publish through the containerized stack
+    # (tests/integration/prod-compose-smoke.test.ts). The smoke is the drift
+    # guard between host-lane code and the shipped images — host lanes run the
+    # control plane under Bun+mise, so image-only breakage (e.g. build steps
+    # spawning a binary the image doesn't carry) surfaces ONLY here.
     runs-on: nscloud-ubuntu-24.04-amd64-8x16
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
       - name: Compose config lint (bundled · external-data · build)
         run: |
           cat > /tmp/prod-lint.env <<'EOF'
@@ -199,11 +213,14 @@ jobs:
           docker compose --env-file /tmp/prod-lint.env -f docker-compose.prod.yml -f docker-compose.prod.build.yml config -q
       - name: External-data variant must not drift from the base compose
         run: ./scripts/check-prod-compose-drift.sh
-      - name: Build prod images (validation only, never pushed)
-        run: |
-          docker build -f infra/docker/control-plane.Dockerfile -t validate-cp .
-          docker build -f infra/docker/worker.Dockerfile -t validate-worker .
-          docker build -f infra/docker/web.Dockerfile -t validate-web .
+
+      # Builds the three prod images (validation only, never pushed) via the
+      # compose build override, boots the stack, and publishes a workflow
+      # through the gateway — `eve build` runs INSIDE the control-plane image.
+      - name: Prod-compose publish smoke (in-container eve build)
+        env:
+          PROD_SMOKE: "1"
+        run: bun test tests/integration/prod-compose-smoke.test.ts
 
   phase3-acceptance:
     # Phase-3 worker pool: real control plane + TWO real workers + stub MCP +

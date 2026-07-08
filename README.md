@@ -159,6 +159,8 @@ org-creation hook). Teammates join through invite links from Settings →
 Members (`/accept-invitation/:id`) — signed-out recipients round-trip through
 login/signup and land back on the invitation.
 
+![First-run onboarding](docs/screenshots/onboarding.png)
+
 ### 💬 Chat — `/chat`
 Start a session with a published workflow and watch its runs stream live:
 working blocks, streamed reply, inline human-in-the-loop approvals. Resumable

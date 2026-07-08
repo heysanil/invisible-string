@@ -17,12 +17,19 @@
  * control-plane → worker → vite preview, eve mock model, scripted copilot
  * fake — see global-setup.ts): one signup + workspace, the data is built
  * once, then the routes are walked in an order that needs only a single
- * publish (real eve build). Every shot first asserts the state it
- * photographs — the same assertions the acceptance specs use — because a
- * blank pane is a failure, not a deliverable. Captures are full-window at
- * 1600×1000, deviceScaleFactor 2 (crisp retina), with animations
- * force-completed and the caret hidden at shot time.
+ * publish (real eve build). Two shots ride outside that single workspace:
+ * onboarding.png is captured on first-run, before the workspace exists (the
+ * signup that seeds the rest of the run happens through this same screen);
+ * invite.png is captured from a second, unauthenticated browser context that
+ * drives an invited user through login/signup up to — but never past — the
+ * accept-invitation confirm panel, so the pending invite stays inert. Every
+ * shot first asserts the state it photographs — the same assertions the
+ * acceptance specs use — because a blank pane is a failure, not a
+ * deliverable. Captures are full-window at 1600×1000, deviceScaleFactor 2
+ * (crisp retina), with animations force-completed and the caret hidden at
+ * shot time.
  */
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,7 +57,7 @@ import {
   SCAFFOLD_PROMPT,
 } from "../support/copilot-script.ts";
 import { openCopilotAndSend, railCard } from "../support/copilot.ts";
-import { signUpIntoWorkspace } from "../support/flows.ts";
+import { signUp, uniqueAccount } from "../support/flows.ts";
 
 /** docs/screenshots/, resolved from this spec (e2e/specs → repo root). */
 const OUT_DIR = resolve(
@@ -66,6 +73,7 @@ test.skip(
 
 test.use({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 2 });
 
+const WORKSPACE_NAME = "Acme Support";
 const WORKFLOW_NAME = "Support triage workflow";
 const REGISTRY_CONNECTION = "Registry notes";
 const SKILL_NAME = "Brand voice";
@@ -113,9 +121,68 @@ async function shoot(page: Page, file: string): Promise<void> {
   });
 }
 
-test("capture the five product screenshots", async ({ page }) => {
+test("capture the seven product screenshots", async ({ page, browser }) => {
   mkdirSync(OUT_DIR, { recursive: true });
-  await signUpIntoWorkspace(page, "screens");
+
+  // A designed identity for the owner — invite.png's subtitle shows this
+  // email ("… invited you to this workspace"), so it must read like a real
+  // person's address, while the random suffix keeps repeat runs unique.
+  const account = {
+    ...uniqueAccount("screens"),
+    name: "Jordan Lee",
+    email: `jordan-${randomUUID().slice(0, 8)}@acme.dev`,
+  };
+  await signUp(page, account);
+  // ── onboarding.png — first-run create-workspace card over the wash ────────
+  await expect(
+    page.getByRole("heading", { name: "Create your workspace" }),
+  ).toBeVisible();
+  await page.getByLabel("Workspace name").fill(WORKSPACE_NAME);
+  await shoot(page, "onboarding.png");
+  await page.getByRole("button", { name: /create workspace/i }).click();
+  await expect(
+    page.getByRole("navigation", { name: "Primary" }),
+  ).toBeVisible();
+  await page.goto("/workflows");
+
+  // ── invite.png — invite confirm panel, viewed by a not-yet-joined invitee ──
+  const invitee = uniqueAccount("invitee");
+  await page.goto("/settings/members");
+  await page.getByLabel("Email").fill(invitee.email);
+  await page.getByRole("button", { name: /invite/i }).click();
+  const linkText = await page
+    .locator("code", { hasText: "/accept-invitation/" })
+    .textContent();
+  expect(linkText, "invite link not surfaced").toBeTruthy();
+  const invitePath = new URL(linkText!.trim()).pathname;
+
+  const inviteeContext = await browser.newContext({
+    viewport: { width: 1600, height: 1000 },
+    deviceScaleFactor: 2,
+  });
+  const inviteePage = await inviteeContext.newPage();
+  await inviteePage.goto(invitePath);
+  await inviteePage.waitForURL("**/login**");
+
+  // No account yet — the signup hop must preserve the redirect param.
+  await inviteePage.getByRole("link", { name: /create one/i }).click();
+  await inviteePage.getByLabel("Name").fill(invitee.name);
+  await inviteePage.getByLabel("Email").fill(invitee.email);
+  await inviteePage.getByLabel("Password").fill(invitee.password);
+  await inviteePage.getByRole("button", { name: /create account/i }).click();
+
+  // ── back on the invitation, signed in: assert the confirm panel, shoot ─────
+  await inviteePage.waitForURL("**/accept-invitation/**");
+  await expect(
+    inviteePage.getByRole("heading", { name: `Join ${WORKSPACE_NAME}` }),
+  ).toBeVisible();
+  await expect(inviteePage.getByText("member", { exact: true })).toBeVisible();
+  await expect(
+    inviteePage.getByRole("button", { name: /accept invitation/i }),
+  ).toBeEnabled();
+  await shoot(inviteePage, "invite.png");
+  // Never accept — the pending invitation stays inert.
+  await inviteeContext.close();
 
   // ── author the context inventory: one skill + two MCP connections ──────────
   await createSkillWithAttachment(page, {

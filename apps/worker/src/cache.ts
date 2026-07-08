@@ -147,8 +147,25 @@ export function createArtifactCache(options: {
           `artifact download failed for ${hash}: HTTP ${response.status}`,
         );
       }
-      // Stream to disk — never buffer the tarball in memory.
-      await Bun.write(tarPath, response);
+      // Stream to disk — never buffer the tarball in memory. Hand-pumped
+      // rather than `Bun.write(tarPath, response)`: Bun's optimized
+      // Response→file path stalls indefinitely on Linux against Garage's
+      // S3 GET responses (CI ensure-agent hangs; a manual reader drains the
+      // same body at full speed).
+      if (!response.body) {
+        throw new ArtifactError(
+          "artifact_download_failed",
+          `artifact download failed for ${hash}: empty response body`,
+        );
+      }
+      const sink = Bun.file(tarPath).writer();
+      try {
+        for await (const chunk of response.body) {
+          await sink.write(chunk);
+        }
+      } finally {
+        await sink.end();
+      }
 
       mkdirSync(stageDir, { recursive: true });
       const tar = Bun.spawn(["tar", "-xzf", tarPath, "-C", stageDir], {

@@ -1,0 +1,280 @@
+/* ----------------------------------------------------------------------------
+   apps/site — docs shell styles.
+   `.doc-prose` = hand-written E1 typography for rendered MDX (no prose plugin).
+   `.docs-shell` = the docs page width; `.doc-construction` = the placeholder
+   callout. Everything else (sidebar, TOC, pager) is Tailwind in the components.
+   Monochrome ink over glass; color only as meaning.
+---------------------------------------------------------------------------- */
+
+/* Outer width for the docs three-column layout — wider than the landing column
+   so sidebar + content + TOC breathe. */
+.docs-shell {
+  width: 100%;
+  max-width: 88rem;
+  margin-inline: auto;
+  padding-inline: 1.5rem;
+}
+
+/* --- Rendered MDX prose ---------------------------------------------------- */
+
+.doc-prose {
+  color: var(--ink-2);
+  font-size: 15.5px;
+  line-height: 1.72;
+  max-width: 46rem;
+}
+
+/* Anchored headings clear the fixed nav dock when jumped to via the TOC. */
+.doc-prose :is(h1, h2, h3, h4) {
+  scroll-margin-top: 7rem;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  font-weight: 650;
+}
+
+.doc-prose h1 {
+  font-size: clamp(1.9rem, 3.5vw, 2.5rem);
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  font-weight: 680;
+  margin-bottom: 0.6rem;
+}
+
+.doc-prose h2 {
+  font-size: 1.375rem;
+  line-height: 1.25;
+  margin-top: 2.75rem;
+  margin-bottom: 0.85rem;
+  padding-top: 0.35rem;
+}
+
+.doc-prose h3 {
+  font-size: 1.0625rem;
+  line-height: 1.3;
+  margin-top: 1.9rem;
+  margin-bottom: 0.6rem;
+}
+
+.doc-prose h4 {
+  font-size: 0.95rem;
+  margin-top: 1.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.doc-prose p {
+  margin-block: 0.95rem;
+}
+
+.doc-prose > :first-child {
+  margin-top: 0;
+}
+
+/* Lede: the first paragraph after the H1 reads a touch larger and darker. */
+.doc-prose h1 + p {
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+/* Links — hairline underline that inks in on hover (E1 link idiom). */
+.doc-prose a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--hairline);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  transition: text-decoration-color var(--dur-fast) var(--ease-out);
+}
+
+.doc-prose a:hover {
+  text-decoration-color: var(--ink);
+}
+
+.doc-prose strong {
+  color: var(--ink);
+  font-weight: 620;
+}
+
+/* Inline code — mono chip on faint black wash, 6px radius (per spec). */
+.doc-prose :not(pre) > code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.85em;
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 0.12em 0.42em;
+}
+
+/* Code blocks — ink-on-glass panels, SF Mono. */
+.doc-prose pre {
+  margin-block: 1.4rem;
+  padding: 1rem 1.15rem;
+  border-radius: var(--radius-card-lg);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg-soft);
+  box-shadow: var(--glass-highlight);
+  overflow-x: auto;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+}
+
+.doc-prose pre code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: none;
+  padding: 0;
+}
+
+/* Lists — ink dots / hairline rhythm. */
+.doc-prose :is(ul, ol) {
+  margin-block: 1rem;
+  padding-left: 1.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.doc-prose ul {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+
+.doc-prose ul > li {
+  position: relative;
+  padding-left: 1.1rem;
+}
+
+.doc-prose ul > li::before {
+  content: "";
+  position: absolute;
+  left: 0.15rem;
+  top: 0.72em;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--ink-4);
+}
+
+.doc-prose ol {
+  list-style: decimal;
+}
+
+.doc-prose ol > li::marker {
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-prose li > :is(ul, ol) {
+  margin-block: 0.4rem;
+}
+
+/* Hairline rule. */
+.doc-prose hr {
+  margin-block: 2.25rem;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+}
+
+/* Blockquote — hairline ink bar. */
+.doc-prose blockquote {
+  margin-block: 1.4rem;
+  padding-left: 1rem;
+  border-left: 2px solid var(--hairline);
+  color: var(--ink-3);
+}
+
+/* Tables — hairline rules, no fills. */
+.doc-prose table {
+  width: 100%;
+  margin-block: 1.5rem;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.doc-prose :is(th, td) {
+  padding: 0.55rem 0.9rem;
+  text-align: left;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+
+.doc-prose th {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: rgba(0, 0, 0, 0.12);
+}
+
+.doc-prose td {
+  color: var(--ink-2);
+}
+
+.doc-prose tr:last-child td {
+  border-bottom: 0;
+}
+
+/* --- "Under construction" callout ----------------------------------------- */
+
+.doc-construction {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-top: 2.5rem;
+  padding: 1.15rem 1.25rem;
+  border-radius: var(--radius-panel-sm);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg-soft);
+  box-shadow: var(--glass-shadow), var(--glass-highlight);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+}
+
+.doc-construction__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--ink-3);
+}
+
+.doc-construction__body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.doc-construction__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.doc-construction__note {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--ink-3);
+}
+
+/* Glass fallbacks mirror tokens.css (unlayered so they always win). */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .doc-prose pre,
+  .doc-construction {
+    background: var(--surface-solid);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .doc-prose pre,
+  .doc-construction {
+    background: var(--surface-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

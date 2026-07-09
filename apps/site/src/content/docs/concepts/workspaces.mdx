@@ -1,0 +1,27 @@
+---
+title: Workspaces
+section: Concepts
+order: 23
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Workspaces
+
+Every workflow, session, connection, and secret belongs to a **workspace**.
+Multi-tenancy rides on Better Auth organizations, and a fresh account lands on a
+first-run screen to name its workspace — creating it seeds the default model
+presets, the provider/model allowlist, and agent presets.
+
+Membership carries a role — `owner`, `admin`, or `member` — and every route is
+scoped to the active workspace, verifying both membership and row ownership.
+Teammates join through invite links from Settings → Members; a signed-out
+recipient round-trips through login or signup and lands back on the invitation.
+
+## Authentication
+
+Sign-in is email and password or OIDC single sign-on. Because the SPA and API
+are served from the same origin in production, sessions use first-party cookies
+with no CORS.
+
+<UnderConstruction />

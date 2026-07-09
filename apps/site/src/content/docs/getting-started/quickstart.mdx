@@ -1,0 +1,34 @@
+---
+title: Quickstart
+section: Getting started
+order: 11
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Quickstart
+
+Assemble a workflow, publish it, and watch it compile into a running agent —
+end to end in a few minutes.
+
+## Assemble the four pillars
+
+Open the builder and fill in each pillar: pick a trigger, attach context, choose
+a model preset, and write the instructions. Status chips flip to a checkmark as
+each pillar becomes valid, and a debounced dry-run compile surfaces diagnostics
+directly on the pillar cards as you go.
+
+## Publish
+
+Press **Publish**. The platform compiles your configuration, runs the build,
+stores the tarball by content hash, and reports back **Published and built.** —
+your workflow now has a real, version-pinned agent artifact behind it.
+
+## Run it
+
+Fire the workflow from chat or its trigger. The run streams live over resumable
+SSE — working blocks, the streamed reply, inline human-in-the-loop approvals —
+and because durability is Postgres-backed, a worker dying mid-run resumes on any
+live worker instead of losing the run.
+
+<UnderConstruction />

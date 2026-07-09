@@ -1,0 +1,29 @@
+---
+title: Security
+section: Platform
+order: 42
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Security
+
+Secrets never touch git, logs, or model context. Credentials at rest use
+**AES-256-GCM envelope encryption** with the tenant bound into the additional
+authenticated data, so ciphertext from one workspace can't be replayed into
+another. API responses expose only `hasCredentials` booleans — never the values
+— and the structured logger redacts known secret keys.
+
+Every route is workspace-scoped: it resolves the session, the active
+organization, and the caller's role, then verifies row ownership before acting.
+The authorization matrix — outsider, member, and admin-or-owner operations — is
+covered by tests.
+
+## Compiled agents
+
+Model routing is baked in at build time behind a placeholder key, so real
+provider keys never enter the build environment (builds run allowlisted and with
+install scripts ignored). Compiled trigger channels are reached with per-version
+derived JWTs, and workers dispatch with single-use tokens.
+
+<UnderConstruction />

@@ -1,0 +1,52 @@
+---
+title: Overview
+section: Getting started
+order: 10
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Overview
+
+invisible-string is a multi-tenant cloud platform for agent workflows. You
+assemble a workflow from four pillars — **Trigger**, **Context**, **Agent**, and
+**Instructions** — in a chat-centric builder, and every published workflow
+compiles into a real, self-hosted [eve](https://eve.dev) agent that runs on a
+durable, Postgres-backed worker pool.
+
+A workflow isn't orchestration glue. Publishing compiles your pillar
+configuration into a standalone, version-pinned agent artifact — built once,
+cached by content hash, and run on a stateless worker pool where runs survive a
+worker dying mid-flight and resume on any live worker.
+
+## The four pillars
+
+Every workflow is exactly four decisions. Each pillar is a small, focused
+editor, and together they fully describe a runnable agent.
+
+### Trigger
+
+How the workflow fires: from chat, a webhook, a form submission, or a Slack
+event.
+
+### Context
+
+What the agent can reach: MCP connections and authored skills, scoped to the
+workspace and packaged straight into the compiled agent.
+
+### Agent
+
+Which model runs the workflow, chosen from `powerful`, `balanced`, and `quick`
+presets within the workspace's model allowlist.
+
+### Instructions
+
+The natural-language spec the agent follows, with `@`-references into trigger
+data and context (connections and skills).
+
+## Where to go next
+
+Head to the [Quickstart](/docs/getting-started/quickstart) to assemble, publish,
+and run your first workflow end to end.
+
+<UnderConstruction />

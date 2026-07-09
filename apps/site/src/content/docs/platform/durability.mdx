@@ -1,0 +1,27 @@
+---
+title: Durability
+section: Platform
+order: 41
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Durability
+
+Durability is the platform's hardest-won property: **kill a worker mid-run, and
+the run survives.** Because workers are stateless and run state lives in
+Postgres, a crashed run resumes on another live worker instead of being lost or
+corrupted.
+
+Each workflow version gets its own world Postgres database (`ws_v_<hash12>`),
+and a single writer per version is enforced by fencing and scheduler
+reservations — so two workers never write the same version's state at once. The
+control plane's dead-worker sweep detects a lost worker and reroutes its runs.
+
+## Streaming through failure
+
+Runs stream to the browser over resumable SSE, so even a client that reconnects
+across a worker failover replays the events it missed and continues from where
+it left off.
+
+<UnderConstruction />

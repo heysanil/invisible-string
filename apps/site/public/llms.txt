@@ -1,0 +1,16 @@
+# invisible-string
+
+> A multi-tenant cloud platform for agent workflows — assemble, compile, run. Workflows are described in four pillars (trigger · context · agent · instructions) and every published workflow compiles into a real, self-hosted eve agent running on a durable, Postgres-backed worker pool, fired from chat, webhooks, forms, or Slack.
+
+## Docs
+
+- [Overview](/docs/getting-started/overview): what invisible-string is and how the pieces fit
+- [Quickstart](/docs/getting-started/quickstart): run the whole stack locally
+- [The four pillars](/docs/concepts/four-pillars): trigger, context, agent, instructions
+- [Triggers](/docs/building/triggers): chat, webhook, form, Slack, and schedule ingress
+- [Architecture](/docs/platform/architecture): control plane, stateless workers, compiler
+- [Durability](/docs/platform/durability): runs survive worker death and resume anywhere
+
+## Source
+
+- [GitHub](https://github.com/heysanil/invisible-string): repository and issue tracker

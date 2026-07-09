@@ -250,9 +250,12 @@ and the empirically-learned eve gotchas — lives in **[`AGENTS.md`](AGENTS.md)*
 | Phase acceptance suites | see [`AGENTS.md`](AGENTS.md#test-lanes-run-the-ones-your-change-touches) |
 | Browser E2E | `cd e2e && bunx playwright test` |
 
-CI runs typecheck + unit + web build, the gated integration lane (including
-the eve spike), both acceptance suites, and Playwright E2E. Keyed lanes (real
-model calls) are deliberately not in CI.
+CI runs typecheck + unit + web build + site build, the gated integration lane
+(including the eve spike), both acceptance suites, and Playwright E2E. Keyed
+lanes (real model calls) are deliberately not in CI.
+
+The marketing/docs site (`apps/site`) is standalone — no infra needed, run it
+with `bun run --cwd apps/site dev`.
 
 ## Deploy
 
@@ -261,6 +264,9 @@ Production runs as one single-host Docker Compose stack (`docker-compose.prod.ym
 `postgres`, and `garage` on a private bridge, with GHCR images pinned by
 `IMAGE_TAG`. Full runbook (Dokploy, external/managed data services, Cloudflare
 Tunnel, backups, upgrades, smoke checklist): **[`docs/DEPLOY.md`](docs/DEPLOY.md)**.
+
+The marketing/docs site (`apps/site`) deploys separately, to GitHub Pages, via
+`.github/workflows/site.yml` on pushes to `main`.
 
 ## Repo map
 
@@ -274,10 +280,13 @@ apps/
                    Node 24), reverse proxy, idle + sandbox reapers,
                    per-worker token identity
   web/             Vite + React SPA (chat, builder, context, settings)
+  site/            Standalone Vite + React landing + docs site (MDX docs,
+                   E1 tokens), deployed to GitHub Pages — no server
 packages/
   compiler/        Pure WorkflowDefinition -> eve project codegen
   db/              Drizzle schema, migrations, seeds (product DB)
   shared/          TriggerEvent, pillar schemas, eve event types, API contracts
+  design-tokens/   Shared E1 tokens.css consumed by apps/web and apps/site
 spike/             Standalone eve testbed — empirical findings in REPORT.md
 e2e/               Playwright browser harness (self-manages its stack)
 infra/             docker-compose init scripts + Dex IdP config
@@ -297,6 +306,7 @@ docs/              Design spec, master plan, runtime contract (+ screenshots/)
 | [`packages/compiler/versions.json`](packages/compiler/versions.json) | Pinned runtime version matrix + rationale |
 | [`.env.example`](.env.example) | Canonical inventory of every environment variable |
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | Production deployment guide (prod compose, Dokploy, external data, backups, upgrades) |
+| [`apps/site/README.md`](apps/site/README.md) | Marketing/docs site: commands, GitHub Pages deploy, MDX authoring |
 
 ---
 

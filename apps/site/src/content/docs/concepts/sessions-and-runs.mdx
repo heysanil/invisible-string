@@ -1,0 +1,26 @@
+---
+title: Sessions & runs
+section: Concepts
+order: 22
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Sessions & runs
+
+A **session** is a conversation with a published workflow; a **run** is a single
+execution within it. Starting a session pins the compiled agent version it will
+use, and each run streams its progress back to the browser live: working blocks,
+the streamed reply, and any inline human-in-the-loop approvals.
+
+Runs stream over **resumable SSE** — reconnecting with a `Last-Event-ID` replays
+missed events rather than restarting — so a dropped connection never loses run
+history.
+
+## One run per session
+
+A session runs one execution at a time. While a run is active the session is
+busy, and a waiting run (parked on a human approval) counts as busy too — new
+run requests against a busy session are refused rather than interleaved.
+
+<UnderConstruction />

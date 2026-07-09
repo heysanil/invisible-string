@@ -28,6 +28,7 @@ The living documents and what each owns:
 | `e2e/README.md` | Playwright harness operation |
 | `docs/DEPLOY.md` | Production deployment: prod compose operation, Dokploy, external data services, backups, upgrades |
 | `docs/SLACK.md` | Platform Slack app: manifest (`infra/slack/manifest.template.json` + drift test), credential wiring, workspace connect, trigger binding |
+| `apps/site/README.md` | Marketing/docs site: commands, GitHub Pages deploy, MDX authoring, token-extension rules |
 
 If you add a subsystem, add its doc and list it here. If a doc contradicts the code, fix whichever is wrong — never leave them divergent.
 
@@ -39,7 +40,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 2. **Secrets never touch git, logs, or model context.** `.openrouter-key` (local provider key) and `.env` are gitignored — keep them that way. Secrets at rest use AES-256-GCM envelope encryption with AAD tenant binding (`packages/shared/src/crypto.ts`); API responses expose `hasCredentials` booleans, never values. The structured logger redacts known secret keys — use it, not `console.*`, in control-plane/worker hot paths.
 3. **Migrations are additive.** New columns/tables/indexes via `bun run --cwd packages/db generate`; never edit an applied migration. Schema and Better Auth tables live only in `packages/db` (control-plane re-exports).
 4. **Compiler changes have a versioning ritual.** Any edit that changes emitted bytes requires bumping `COMPILER_VERSION` (`packages/compiler/src/version.ts`) — the golden-digest guard (`fixtures/.golden-digest.json`) fails CI otherwise, and `UPDATE_GOLDEN=1` refuses to run without the bump. Build-environment changes that alter artifacts bump `BUILD_ENV_EPOCH` (`apps/control-plane/src/build/steps.ts`), which flows **through** `compile()` into the content hash (the platform-JWT audience bakes the hash — never re-key outside `compile()`).
-5. **The E1 design system is law in `apps/web`.** Monochrome ink × liquid glass: tokens in `packages/design-tokens/tokens.css` (consumed via `@invisible-string/design-tokens/tokens.css`), primitives in `src/components/ui` — extend them, never fork one-off styles. Color only as meaning (`#16a34a` success · `#f59e0b` waiting · `#dc2626` error). Capsule controls, 150–200 ms ease-out, `focus-visible` everywhere, designed empty/loading/error states, `prefers-reduced-motion`/`-transparency` respected. Full tokens: design spec §E1.
+5. **The E1 design system is law in `apps/web` and `apps/site`.** Monochrome ink × liquid glass: tokens in `packages/design-tokens/tokens.css` (consumed via `@invisible-string/design-tokens/tokens.css` by both apps), primitives in `src/components/ui` (or `apps/site`'s local equivalents) — extend them, never fork one-off styles. Color only as meaning (`#16a34a` success · `#f59e0b` waiting · `#dc2626` error). Capsule controls, 150–200 ms ease-out, `focus-visible` everywhere, designed empty/loading/error states, `prefers-reduced-motion`/`-transparency` respected. Full tokens: design spec §E1.
 6. **TypeScript strict everywhere; contracts live in `packages/shared`** (zod schemas mirroring db enums). API DTOs, WS frames, TriggerEvent, eve event types — server and web both import from shared; never let them drift.
 7. **Workspace scoping is mandatory on every route**: resolve the Better Auth session + active organization + role (`requireWorkspace`), verify row ownership (sessions/runs map to workspaces — eve does not enforce this), and test the authz matrix (outsider 403, member vs admin/owner ops).
 8. **Verify before you claim done**: typecheck + the test lanes relevant to your change (below). If you touched runtime/worker/compiler paths, run the acceptance suites.
@@ -49,7 +50,7 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 - **Bun 1.3+** runs the platform (control-plane, worker, web tooling, all tests). **Node 24 via mise** runs everything eve on dev machines/CI (`mise install node@24`; the spike/compiler harnesses invoke `mise exec node@24 --` themselves). At RUNTIME the apps never shell out to the mise binary: control-plane build steps and the worker both resolve a Node 24 binary directly (`BUILD_NODE_BIN`/`WORKER_NODE_BIN` override → newest mise install → PATH) — the prod images bake bare node and carry no mise. **Docker** for compose + `docker()` sandboxes.
 - `bun install` once at the root (single lockfile). `cp .env.example .env` and fill secrets for running apps (tests provision their own env).
 - Local stack: `docker compose up -d postgres garage dex` (ports overridable: `POSTGRES_PORT`/`GARAGE_PORT`/`DEX_PORT`). Test harnesses spin their own compose **projects** (`p1acceptance`, `p2e2e`, `p3acceptance`, `pkeyed`…) on non-default ports — don't reuse those names.
-- Dev servers: `bun run dev` at the root does it all — bootstraps `.env` with generated secrets on first run, `docker compose up --wait`, migrations, then API (:3000) + worker + SPA (:5173) with prefixed logs; Ctrl-C stops the apps, `bun run dev:down` stops infra. Individual apps: `bun run --cwd apps/<x> dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`.
+- Dev servers: `bun run dev` at the root does it all — bootstraps `.env` with generated secrets on first run, `docker compose up --wait`, migrations, then API (:3000) + worker + SPA (:5173) with prefixed logs; Ctrl-C stops the apps, `bun run dev:down` stops infra. Individual apps: `bun run --cwd apps/<x> dev`. Backend-free UI preview: `VITE_FIXTURE_MODE=1`. The marketing/docs site (`apps/site`) is standalone — it needs no infra and is not part of `bun run dev`; run it with `bun run --cwd apps/site dev`.
 
 ## Test lanes (run the ones your change touches)
 
@@ -72,7 +73,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 `apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs) · pillar CRUD · compiler invocation + `eve build` + tarball → object store (Garage) (cache keyed by content hash = pillar config + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) → dispatcher (`TriggerEvent` → compiled channel, version-bound JWT) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop.
 `apps/worker` (stateless Bun supervisor; boots agents under Node 24; mounted docker.sock): register/heartbeat/drain, ensure-agent → pull/extract → per-agent boot of the compiled entrypoint (`node .output/server/index.mjs` directly — `eve start` is only a CLI wrapper; spike finding 6), streaming reverse proxy, reapers (process idle 15 m, sandbox idle 30 m, artifact LRU 20 GiB).
-`apps/web`: the glass SPA. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
+`apps/web`: the glass SPA. `apps/site`: standalone Vite + React static landing + docs SPA (MDX docs, E1 tokens via `packages/design-tokens`), deployed to GitHub Pages — no server, no compose service. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
 
 ## Constraints that will bite you (learned empirically — full list in the design spec's "Live-doc corrections" + `spike/REPORT.md`)
 
@@ -87,9 +88,11 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 ## CI (`.github/workflows/ci.yml`)
 
-`unit` (typecheck + `bun test` + web build) · `integration` (compose + gated lane incl. spike) · `acceptance` (phase-1, real eve build) · `phase3-acceptance` (multi-worker) · `e2e` (Playwright) · `prod-compose` (compose lint/drift + the prod-compose publish smoke: real images built from the tree, `eve build` runs inside the control-plane container). Keyed lanes are deliberately **not** in CI.
+`unit` (typecheck + `bun test` + web build + site build) · `integration` (compose + gated lane incl. spike) · `acceptance` (phase-1, real eve build) · `phase3-acceptance` (multi-worker) · `e2e` (Playwright) · `prod-compose` (compose lint/drift + the prod-compose publish smoke: real images built from the tree, `eve build` runs inside the control-plane container). Keyed lanes are deliberately **not** in CI.
 
 All jobs run on Namespace runners (`nscloud-ubuntu-24.04-amd64-*` labels). The eve npm cache (`~/.npm`) and Playwright browsers persist on a shared Namespace cache volume (tag `eve-npm`, mounted via `nscloud-cache-action` — no `actions/cache` tarball round-trips), and `release.yml` image builds use Namespace's pre-configured remote builders (no `setup-buildx-action`, no gha layer cache — cache lives builder-side).
+
+`.github/workflows/site.yml` is a separate, deliberately non-Namespace workflow (`ubuntu-latest`): on push to `main` touching `apps/site/**` or `packages/design-tokens/**`, it builds the static site (`SITE_BASE`/`VITE_SITE_URL` from `actions/configure-pages`) and deploys it to GitHub Pages via `actions/deploy-pages`. A static marketing/docs build needs no Namespace cache, and this keeps public-site deploys decoupled from the platform's CI runners.
 
 ## Known residuals (documented, deliberate)
 

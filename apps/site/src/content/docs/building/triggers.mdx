@@ -1,0 +1,37 @@
+---
+title: Triggers
+section: Building
+order: 32
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Triggers
+
+A trigger decides how a workflow fires. invisible-string supports four kinds,
+and the compiled agent exposes exactly the channels its trigger needs.
+
+## Chat
+
+The default `manual` trigger. Start a session and drive the workflow
+conversationally from the chat surface.
+
+## Webhook
+
+A per-workflow ingress token accepts an HTTP `POST`; the entire JSON body
+becomes the trigger event's data. Tokens are minted once and shown a single
+time.
+
+## Form
+
+A bound field schema renders a submittable form; the submission is normalised
+into the trigger event's data. Malformed submissions are rejected so the event
+data is always well-formed.
+
+## Slack
+
+Slack events route through the connected platform Slack app. Incoming requests
+are verified by signature within a replay window, and the workspace and workflow
+are resolved from the team id and the trigger's binding.
+
+<UnderConstruction />

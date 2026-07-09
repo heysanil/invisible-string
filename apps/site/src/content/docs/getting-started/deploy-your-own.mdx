@@ -1,0 +1,29 @@
+---
+title: Deploy your own
+section: Getting started
+order: 12
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Deploy your own
+
+invisible-string is self-hostable. The whole platform runs as one single-host
+Docker Compose stack: a `web` service (nginx serving the SPA and reverse-proxying
+the API on the same origin) fronts the control plane, worker, Postgres, and a
+Garage object store on a private bridge.
+
+Only `web` is exposed to the public internet; everything else talks over the
+internal Compose network. Images are pulled from GHCR and pinned by `IMAGE_TAG`,
+and a one-shot `migrate` service applies database migrations before the control
+plane starts. An optional Cloudflare tunnel is profile-gated for hosts without a
+public IP.
+
+## Prerequisites
+
+- A Linux host with Docker and Docker Compose 2.23.1 or newer.
+- `/var/run/docker.sock` available to the worker — eve session sandboxes launch
+  as sibling containers on the host daemon.
+- A domain pointed at the host (or at your reverse proxy).
+
+<UnderConstruction note="The full production runbook — Dokploy, external managed data services, backups, and upgrades — is being ported here from the repo's DEPLOY guide." />

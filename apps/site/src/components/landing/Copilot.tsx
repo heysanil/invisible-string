@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from "motion/react";
+import { motion } from "motion/react";
 import { ArrowRight, Check, Sparkles, Zap } from "lucide-react";
 
 import { cn } from "../../lib/cn";
@@ -43,46 +43,43 @@ export function Copilot() {
               <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-black/[0.05] text-ink-2">
                 <Sparkles size={13} aria-hidden />
               </span>
-              <div className="min-w-0 flex-1">
-                <AnimatePresence mode="wait">
-                  {typing ? (
-                    <motion.div
-                      key="typing"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="stream-caret pt-1 text-[12.5px] text-ink-3"
-                    >
-                      Sure — switching the trigger
-                    </motion.div>
-                  ) : cardVisible ? (
-                    <motion.div
-                      key="card"
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ duration: 0.28, ease: EASE }}
-                    >
-                      {applied ? (
-                        <div className="flex items-center gap-1.5 rounded-card border border-black/[0.06] bg-white/40 px-3 py-1.5 text-[12px] text-ink-3">
-                          <Check size={13} className="shrink-0 text-ok" aria-hidden />
-                          <span>Applied — Set trigger to Slack</span>
-                        </div>
-                      ) : (
-                        <MutationCard applying={applying} />
-                      )}
-                    </motion.div>
-                  ) : (
-                    <motion.div
-                      key="think"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="pt-1 text-[12.5px] text-ink-4"
-                    >
-                      Thinking…
-                    </motion.div>
+              {/* All reply states stacked in one grid cell so the mutation
+                  card (the tallest) reserves the height for the whole loop —
+                  phase swaps are pure opacity, the section never reflows. */}
+              <div className="grid min-w-0 flex-1">
+                <motion.div
+                  animate={{ opacity: typing ? 1 : 0 }}
+                  className={cn(
+                    "col-start-1 row-start-1 h-fit pt-1 text-[12.5px] text-ink-3",
+                    typing && "stream-caret",
                   )}
-                </AnimatePresence>
+                >
+                  Sure — switching the trigger
+                </motion.div>
+                <motion.div
+                  animate={{
+                    opacity: cardVisible && !applied ? 1 : 0,
+                    y: cardVisible ? 0 : 8,
+                  }}
+                  transition={{ duration: 0.28, ease: EASE }}
+                  className="col-start-1 row-start-1"
+                >
+                  <MutationCard applying={applying} />
+                </motion.div>
+                <motion.div
+                  animate={{ opacity: applied ? 1 : 0, y: applied ? 0 : 4 }}
+                  transition={{ duration: 0.28, ease: EASE }}
+                  className="col-start-1 row-start-1 flex h-fit items-center gap-1.5 self-center rounded-card border border-black/[0.06] bg-white/40 px-3 py-1.5 text-[12px] text-ink-3"
+                >
+                  <Check size={13} className="shrink-0 text-ok" aria-hidden />
+                  <span>Applied — Set trigger to Slack</span>
+                </motion.div>
+                <motion.div
+                  animate={{ opacity: typing || cardVisible ? 0 : 1 }}
+                  className="col-start-1 row-start-1 h-fit pt-1 text-[12.5px] text-ink-4"
+                >
+                  Thinking…
+                </motion.div>
               </div>
             </div>
 

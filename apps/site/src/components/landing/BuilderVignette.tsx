@@ -120,53 +120,43 @@ export function BuilderVignette() {
           A GitHub issue came in — triage it.
         </div>
 
-        <div className="min-h-[92px]">
-          <AnimatePresence mode="wait">
-            {streaming ? (
-              <motion.div
-                key="streaming"
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.24, ease: EASE }}
-                className="max-w-[90%] rounded-card rounded-bl-sm border border-black/[0.06] bg-white/60 px-3 py-2 text-[12.5px] text-ink-2"
-              >
-                <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-ink-3">
-                  <span aria-hidden className="dot-pulse size-1.5 rounded-full bg-ok" />
-                  Working
-                </div>
-                <span className="stream-caret">
-                  Read the issue, searched the repo, drafted a reply
-                </span>
-              </motion.div>
-            ) : worked ? (
-              <motion.div
-                key="worked"
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.28, ease: EASE }}
-                className="flex flex-col gap-2"
-              >
-                <div className="inline-flex w-fit items-center gap-1.5 rounded-capsule border border-black/[0.06] bg-white/55 px-2.5 py-1 text-[11.5px] text-ink-3">
-                  <Check size={12} className="text-ok" aria-hidden />
-                  Worked for 6s · 4 steps
-                </div>
-                <div className="max-w-[90%] rounded-card rounded-bl-sm border border-black/[0.06] bg-white/60 px-3 py-2 text-[12.5px] leading-snug text-ink-2">
-                  Replied in-thread and labelled the issue{" "}
-                  <span className="mono-chip">needs-repro</span>.
-                </div>
-              </motion.div>
-            ) : (
-              <motion.div
-                key="idle"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="flex h-full items-center px-1 text-[12px] text-ink-4"
-              >
-                Describing the workflow…
-              </motion.div>
-            )}
-          </AnimatePresence>
+        {/* All three states stacked in one grid cell: the tallest ("worked")
+            reserves the region's height permanently, so phase swaps are pure
+            opacity — the panel (and the page below it) never moves. */}
+        <div className="grid">
+          <motion.div
+            animate={{ opacity: streaming ? 1 : 0, y: streaming ? 0 : 6 }}
+            transition={{ duration: 0.24, ease: EASE }}
+            className="col-start-1 row-start-1 h-fit max-w-[90%] rounded-card rounded-bl-sm border border-black/[0.06] bg-white/60 px-3 py-2 text-[12.5px] text-ink-2"
+          >
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-ink-3">
+              <span aria-hidden className="dot-pulse size-1.5 rounded-full bg-ok" />
+              Working
+            </div>
+            <span className={cn(streaming && "stream-caret")}>
+              Read the issue, searched the repo, drafted a reply
+            </span>
+          </motion.div>
+          <motion.div
+            animate={{ opacity: worked ? 1 : 0, y: worked ? 0 : 6 }}
+            transition={{ duration: 0.28, ease: EASE }}
+            className="col-start-1 row-start-1 flex flex-col gap-2"
+          >
+            <div className="inline-flex w-fit items-center gap-1.5 rounded-capsule border border-black/[0.06] bg-white/55 px-2.5 py-1 text-[11.5px] text-ink-3">
+              <Check size={12} className="text-ok" aria-hidden />
+              Worked for 6s · 4 steps
+            </div>
+            <div className="max-w-[90%] rounded-card rounded-bl-sm border border-black/[0.06] bg-white/60 px-3 py-2 text-[12.5px] leading-snug text-ink-2">
+              Replied in-thread and labelled the issue{" "}
+              <span className="mono-chip">needs-repro</span>.
+            </div>
+          </motion.div>
+          <motion.div
+            animate={{ opacity: streaming || worked ? 0 : 1 }}
+            className="col-start-1 row-start-1 flex items-start px-1 pt-1 text-[12px] text-ink-4"
+          >
+            Describing the workflow…
+          </motion.div>
         </div>
       </div>
     </div>
@@ -215,18 +205,16 @@ function PillarCard({
           )}
         </AnimatePresence>
       </div>
-      <AnimatePresence>
-        {filled ? (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            transition={{ duration: 0.28, ease: EASE }}
-            className="overflow-hidden pt-1.5 text-[11.5px] leading-snug text-ink-3"
-          >
-            {pillar.summary}
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+      {/* Always mounted so the card's height never changes — the summary slot
+          is reserved up front and only fades in (no height animation, which
+          would shift the whole page as the loop fills cards in). */}
+      <motion.div
+        animate={{ opacity: filled ? 1 : 0, y: filled ? 0 : 4 }}
+        transition={{ duration: 0.28, ease: EASE }}
+        className="pt-1.5 text-[11.5px] leading-snug text-ink-3"
+      >
+        {pillar.summary}
+      </motion.div>
     </div>
   );
 }
@@ -242,19 +230,16 @@ function PublishRow({
 }) {
   return (
     <div className="mt-1 flex flex-col gap-2 border-t border-black/[0.06] pt-2.5">
-      <AnimatePresence>
-        {published ? (
-          <motion.div
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.28, ease: EASE }}
-            className="flex items-center gap-1.5 rounded-card border border-ok/30 bg-ok/[0.06] px-2.5 py-1.5"
-          >
-            <Check size={13} className="text-ok" aria-hidden />
-            <span className="text-[12px] text-ink-2">Published and built.</span>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+      {/* Banner slot is always mounted (fades in) so publishing never grows
+          the panel and shifts the page. */}
+      <motion.div
+        animate={{ opacity: published ? 1 : 0, y: published ? 0 : 4 }}
+        transition={{ duration: 0.28, ease: EASE }}
+        className="flex items-center gap-1.5 rounded-card border border-ok/30 bg-ok/[0.06] px-2.5 py-1.5"
+      >
+        <Check size={13} className="text-ok" aria-hidden />
+        <span className="text-[12px] text-ink-2">Published and built.</span>
+      </motion.div>
       <motion.button
         type="button"
         tabIndex={-1}

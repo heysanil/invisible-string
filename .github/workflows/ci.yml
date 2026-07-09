@@ -34,6 +34,11 @@ jobs:
       - name: Web build
         run: bun run --cwd apps/web build
 
+      # Production build of the marketing/docs site — also the only lane that
+      # exercises the MDX pipeline (vite build compiles every .mdx doc page).
+      - name: Site build
+        run: bun run --cwd apps/site build
+
   integration:
     name: Gated integration tests (compose)
     runs-on:

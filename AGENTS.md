@@ -85,6 +85,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 - Tests never need a real provider key except the keyed lanes — the mock model rides `EVE_MOCK_AUTHORED_MODELS`; the copilot's scripted fake (`COPILOT_FAKE_SCRIPT`) is dropped in production builds.
 - Version pins are exact (`packages/compiler/versions.json`): eve ↔ `@workflow/world-postgres` beta ↔ `ai@7` ↔ provider majors. Never `@latest` in generated projects; any eve bump must pass the spike suites first.
 - The prod web gateway (`infra/nginx/web.conf`) enumerates the control plane's top-level route prefixes — adding a new prefix requires adding it there (else the SPA fallback swallows it).
+- **Adding a workspace requires adding its `package.json` COPY to every `infra/docker/*.Dockerfile`** — `bun.lock` covers all workspaces, so a missing manifest fails the in-image `bun install --frozen-lockfile` even when the image never builds that workspace (guard: `tests/integration/dockerfile-workspace-manifests.test.ts`).
 
 ## CI (`.github/workflows/ci.yml`)
 

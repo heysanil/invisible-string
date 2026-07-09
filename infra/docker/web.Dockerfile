@@ -4,10 +4,14 @@
 FROM oven/bun:1.3 AS build
 
 WORKDIR /app
+# Every workspace manifest ships before the frozen install — bun.lock covers ALL
+# workspaces, so a missing one fails the build ("lockfile had changes").
+# Guarded by tests/integration/dockerfile-workspace-manifests.test.ts.
 COPY package.json bun.lock tsconfig.json tsconfig.base.json ./
 COPY apps/control-plane/package.json apps/control-plane/
 COPY apps/worker/package.json apps/worker/
 COPY apps/web/package.json apps/web/
+COPY apps/site/package.json apps/site/
 COPY packages/compiler/package.json packages/compiler/
 COPY packages/db/package.json packages/db/
 COPY packages/design-tokens/package.json packages/design-tokens/

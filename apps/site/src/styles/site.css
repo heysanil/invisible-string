@@ -60,18 +60,3 @@
   overflow: hidden;
 }
 
-/* Monospace terminal surface used by the Compile section. */
-.terminal-line {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 12.5px;
-  line-height: 1.75;
-}
-
-/* Traffic-light dots on the terminal titlebar (monochrome — not decorative
-   color; these are pure ink at descending opacity). */
-.term-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.14);
-}

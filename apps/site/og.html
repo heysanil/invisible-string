@@ -1,0 +1,190 @@
+<!doctype html>
+<!--
+  Source for public/og.png — the 1200×630 social card.
+  Not deployed (lives outside public/). Regenerate the PNG with a browser
+  screenshot at 1200×630 device-scale 1 (see apps/site/README.md).
+  E1 language: monochrome ink × liquid-glass wash, spool mark, ink display type.
+  All CSS inline, system font stack, fixed 1200×630 body — no external assets.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+      }
+      body {
+        position: relative;
+        overflow: hidden;
+        background: linear-gradient(135deg, #eef0f4, #e8eaef, #f0eeea);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+        color: #111111;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* Blurred wash blobs — the E1 wallpaper, quieted for a card. */
+      .blob {
+        position: absolute;
+        border-radius: 999px;
+        filter: blur(90px);
+        opacity: 0.8;
+      }
+      .blob-1 {
+        width: 620px;
+        height: 620px;
+        top: -200px;
+        left: -160px;
+        background: radial-gradient(circle at 35% 35%, #d7dbe3 0%, transparent 70%);
+      }
+      .blob-2 {
+        width: 560px;
+        height: 560px;
+        right: -150px;
+        bottom: -190px;
+        background: radial-gradient(circle at 60% 60%, #e3ded4 0%, transparent 70%);
+      }
+      .blob-3 {
+        width: 480px;
+        height: 480px;
+        top: 34%;
+        left: 56%;
+        background: radial-gradient(circle at 50% 50%, #cfd4de 0%, transparent 70%);
+      }
+
+      /* Faint thread curve — the invisible string, made just visible. */
+      .thread {
+        position: absolute;
+        inset: 0;
+        width: 1200px;
+        height: 630px;
+      }
+
+      .frame {
+        position: relative;
+        z-index: 10;
+        height: 100%;
+        padding: 84px 88px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      .spool {
+        width: 60px;
+        height: 60px;
+        border-radius: 18px;
+        background: #111111;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .wordmark {
+        font-size: 26px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        color: #111111;
+      }
+
+      .headline {
+        font-size: 82px;
+        line-height: 1.04;
+        font-weight: 660;
+        letter-spacing: -0.03em;
+        max-width: 940px;
+      }
+      .headline .muted {
+        color: #555555;
+      }
+      .subline {
+        margin-top: 30px;
+        font-size: 30px;
+        line-height: 1.35;
+        font-weight: 400;
+        color: #555555;
+        max-width: 900px;
+      }
+      .foot {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        font-size: 22px;
+        color: #777777;
+      }
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: #999999;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+
+    <svg class="thread" viewBox="0 0 1200 630" fill="none" aria-hidden="true">
+      <path
+        d="M -40 150 C 320 90, 520 250, 760 210 C 1010 168, 1120 300, 1280 250"
+        stroke="rgba(17, 17, 17, 0.22)"
+        stroke-width="2"
+        stroke-linecap="round"
+      />
+    </svg>
+
+    <div class="frame">
+      <div class="brand">
+        <div class="spool">
+          <svg
+            width="34"
+            height="34"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="2.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M17 13.44 4.442 17.082A2 2 0 0 0 4.982 21H19a2 2 0 0 0 .558-3.921l-1.115-.32A2 2 0 0 1 17 14.837V7.66" />
+            <path d="m7 10.56 12.558-3.642A2 2 0 0 0 19.018 3H5a2 2 0 0 0-.558 3.921l1.115.32A2 2 0 0 1 7 9.163v7.178" />
+          </svg>
+        </div>
+        <span class="wordmark">invisible-string</span>
+      </div>
+
+      <div>
+        <h1 class="headline">
+          Describe the work,<br />
+          <span class="muted">consider it done.</span>
+        </h1>
+        <p class="subline">
+          Automate your work in plain language — open source, self-hostable.
+        </p>
+      </div>
+
+      <div class="foot">
+        <span>Describe.</span>
+        <span class="dot"></span>
+        <span>Publish.</span>
+        <span class="dot"></span>
+        <span>Done.</span>
+      </div>
+    </div>
+  </body>
+</html>

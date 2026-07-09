@@ -5,20 +5,20 @@ import { useRef, type ComponentType } from "react";
 import { LogoMark } from "../LogoMark";
 import { EASE, Reveal, SectionHeading } from "./parts";
 
-/* "Fired from anywhere." Five trigger chips fan in along hairline wires that
-   converge on the workflow node; a single ink pulse sweeps each wire. Sublabels
-   are the trigger editor's real microcopy. */
+/* "Starts where you work." Five trigger chips fan in along hairline wires that
+   converge on the workflow node; a single ink pulse sweeps each wire — one
+   workflow answering on every door it's wired to. */
 
 const TRIGGERS: ReadonlyArray<{
   label: string;
   sub: string;
   icon: ComponentType<{ size?: number }>;
 }> = [
-  { label: "Chat", sub: "Start runs from chat or the builder.", icon: MessageCircle },
-  { label: "Webhook", sub: "An HTTP POST with a JSON payload starts a run.", icon: Webhook },
-  { label: "Form", sub: "A shareable form submits fields to each run.", icon: SquarePen },
-  { label: "Slack", sub: "Mentions and messages in Slack trigger runs.", icon: Hash },
-  { label: "Schedule", sub: "A cron schedule runs the workflow automatically.", icon: Clock },
+  { label: "Chat", sub: "Ask for a run in chat, any time.", icon: MessageCircle },
+  { label: "Webhook", sub: "Anything that can send a request can start a run.", icon: Webhook },
+  { label: "Form", sub: "Share a form — every submission starts a run.", icon: SquarePen },
+  { label: "Slack", sub: "Mention it, or message it directly.", icon: Hash },
+  { label: "Schedule", sub: "Runs itself — daily, weekly, whenever you set.", icon: Clock },
 ];
 
 /* Wire start points: chip centers of five equal-height rows (percent of the
@@ -34,8 +34,8 @@ export function Triggers() {
     <section ref={sectionRef} className="site-container section-block">
       <SectionHeading
         eyebrow="Triggers"
-        title="Fired from anywhere."
-        lede="The same compiled agent answers to five doors. Wire up as many as you like — each run carries its trigger's payload."
+        title="Starts where you work."
+        lede="One workflow, five doors. Run it from chat, Slack, a form, a webhook, or a schedule — wire up as many as you like."
       />
 
       <div className="mt-12 grid items-center gap-4 md:grid-cols-[minmax(0,22rem)_1fr_auto] md:gap-0">
@@ -66,7 +66,7 @@ export function Triggers() {
               <LogoMark size={22} />
             </span>
             <span className="text-[13px] font-semibold text-ink">Workflow</span>
-            <span className="text-[11.5px] text-ink-4">one compiled agent</span>
+            <span className="text-[11.5px] text-ink-4">answers on every door</span>
           </div>
         </Reveal>
       </div>

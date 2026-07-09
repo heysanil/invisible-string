@@ -6,10 +6,11 @@ import { StatusChip } from "../ui";
 import { EASE, Reveal, SectionHeading, Vignette } from "./parts";
 import { useLoopPhase } from "./useLoopPhase";
 
-/* Durability theater — the platform's hardest-won feature, dramatized. A run
-   streams on worker A; worker A dies (desaturates, run parks amber); the run
-   token reroutes to worker B (shared-layout slide); the stream resumes; green
-   ✓. Postgres-backed durability = any worker can resume a parked run. */
+/* Reliability, dramatized — it finishes what it starts. A run works on server
+   one; server one goes down (desaturates, run parks amber); the run token
+   slides to server two (shared-layout slide); it resumes exactly where it left
+   off; green ✓. Every step is saved the moment it happens, so any server can
+   pick a parked run back up. */
 
 const PHASES = [2200, 1700, 1500, 2000, 2600] as const;
 
@@ -28,9 +29,9 @@ export function Durability() {
   } => {
     if (phase === 0) return { tone: "ok", label: "Running", kind: "pulse" };
     if (phase === 1) return { tone: "warn", label: "Parked", kind: "dot" };
-    if (phase === 2) return { tone: "warn", label: "Rerouting", kind: "dot" };
+    if (phase === 2) return { tone: "warn", label: "Moving", kind: "dot" };
     if (phase === 3) return { tone: "ok", label: "Running", kind: "pulse" };
-    return { tone: "ok", label: "Succeeded", kind: "check" };
+    return { tone: "ok", label: "Done", kind: "check" };
   })();
 
   return (
@@ -38,19 +39,19 @@ export function Durability() {
       <div className="grid items-center gap-10 lg:grid-cols-2">
         <SectionHeading
           align="left"
-          eyebrow="Durability"
-          title="Kill a worker mid-run. The run survives."
-          lede="Runs are durable in Postgres, not pinned to a process. When a worker dies, another picks the run up exactly where it parked — no lost steps, no restart."
+          eyebrow="Reliability"
+          title="It finishes what it starts."
+          lede="Every step is saved the moment it happens. If the server running your workflow dies mid-run, another picks up exactly where it left off — no lost work, no starting over."
         />
 
         <Reveal delay={0.1}>
           <Vignette
-            label="A run streaming on worker A; worker A dies and the run parks; it reroutes to worker B and resumes, finishing successfully."
+            label="A run in progress; the server running it goes down; the run moves to a healthy server, resumes where it left off, and finishes."
             className="p-4"
           >
             <div className="flex items-center justify-between">
               <span className="text-[13px] font-semibold text-ink">
-                Run · issue-triage #128
+                Run · Issue triage
               </span>
               <StatusChip tone={session.tone} dot={session.kind === "dot"}>
                 {session.kind === "pulse" ? (
@@ -69,14 +70,14 @@ export function Durability() {
 
             <div className="mt-4 grid grid-cols-2 gap-3">
               <WorkerCard
-                name="worker-a"
+                name="server one"
                 down={aDown}
                 active={!runOnB}
                 streaming={phase === 0}
                 done={false}
               />
               <WorkerCard
-                name="worker-b"
+                name="server two"
                 down={false}
                 active={runOnB}
                 streaming={bStreaming}
@@ -87,12 +88,12 @@ export function Durability() {
 
             <p className="mt-3 min-h-[1.25rem] text-[12px] text-ink-3">
               {phase === 1
-                ? "worker-a stopped heartbeating — the run is fenced and parked."
+                ? "Server one just went down mid-run. The run is parked, safe — nothing lost."
                 : phase === 2
-                  ? "Scheduler hands the parked run to a live worker…"
+                  ? "Handing the run to a healthy server…"
                   : done
-                    ? "Resumed on worker-b and finished. No steps lost."
-                    : "Streaming steps, checkpointed to Postgres."}
+                    ? "Picked up exactly where it left off — and finished. Nothing lost."
+                    : "Working — every step saved as it goes."}
             </p>
           </Vignette>
         </Reveal>
@@ -145,7 +146,7 @@ function WorkerCard({
       <div className="mt-2 h-6">
         {down ? (
           <StatusChip tone="warn" dot>
-            parked
+            offline
           </StatusChip>
         ) : done ? (
           <span className="inline-flex items-center gap-1 text-[11.5px] font-medium text-ok">
@@ -154,7 +155,7 @@ function WorkerCard({
         ) : streaming ? (
           <span className="inline-flex items-center gap-1.5 text-[11.5px] text-ink-3">
             <span aria-hidden className="dot-pulse size-1.5 rounded-full bg-ok" />
-            streaming
+            working
           </span>
         ) : idle ? (
           <span className="text-[11.5px] text-ink-4">idle</span>

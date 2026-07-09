@@ -144,3 +144,29 @@ doubles as the animation's legibility system.
 `public/favicon.svg` (the spool mark), `public/og.png` (1200×630, wash +
 wordmark; authored as SVG, converted once, PNG committed), full SEO/OG
 `<head>` in `index.html`.
+
+---
+
+## Superseded: messaging pivot (2026-07-09)
+
+The **copy and section arc** below are superseded by the messaging pivot
+(`docs/superpowers/specs/…` sibling / plan `can-we-build-a-lovely-stream.md`).
+The E1 design system, animation machinery, thread metaphor, and docs shell
+described above are **unchanged** — this was a messaging pivot, not a visual
+redesign. What changed:
+
+- **Aim**: every landing section now sells the *user outcome* (describe work in
+  plain language → it runs from where you work → you stay in control), not the
+  backend machinery (eve build / compile / worker pool / Postgres), which now
+  lives only in the docs and one sanctioned "Under the hood → architecture"
+  pointer strip beneath the control grid.
+- **Headline**: "Agent workflows, compiled." → **"Describe the work, consider
+  it done."** Tagline "Assemble. Compile. Run." → **"Describe. Publish. Done."**
+- **Section order** (`src/routes/index.tsx`): Hero → **Use cases** (new
+  `UseCases.tsx`, replaces `Compile.tsx`, wraps `id="product"`) → Pillars →
+  Copilot → Triggers → Reliability (`Durability.tsx`) under `id="how"` →
+  Control grid (`FeatureGrid.tsx`) → FinalCTA. Nav label "Product" → "Use
+  cases"; hash ids unchanged.
+- **Copy source of truth** is now the landing components themselves (all copy
+  inline, no shared constants) — read those files, not this spec's Part 1
+  copy, for current strings.

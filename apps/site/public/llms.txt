@@ -1,6 +1,6 @@
 # invisible-string
 
-> A multi-tenant cloud platform for agent workflows — assemble, compile, run. Workflows are described in four pillars (trigger · context · agent · instructions) and every published workflow compiles into a real, self-hosted eve agent running on a durable, Postgres-backed worker pool, fired from chat, webhooks, forms, or Slack.
+> An open-source, self-hostable platform for automating your work: describe a workflow in plain language — what starts it, what tools it can use, how it should think — and publish it to run from chat, Slack, forms, webhooks, or a schedule. Runs stream live, pause for human approval, and survive infrastructure failure without losing work.
 
 ## Docs
 

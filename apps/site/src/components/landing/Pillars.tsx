@@ -7,33 +7,33 @@ import { Reveal, SectionHeading } from "./parts";
 const PILLARS: ReadonlyArray<{
   label: string;
   icon: ComponentType<{ size?: number }>;
-  /** The app's real pillar-card one-liner (verbatim from the builder). */
+  /** The question this pillar answers for the user. */
   hint: string;
   copy: string;
 }> = [
   {
     label: "Trigger",
     icon: Zap,
-    hint: "How runs start",
-    copy: "Chat, webhook, form, Slack, or a schedule.",
+    hint: "What starts it",
+    copy: "A chat message, a Slack mention, a form, a webhook, or a schedule.",
   },
   {
     label: "Context",
     icon: Plug,
-    hint: "Tools and knowledge",
-    copy: "The MCP connections and skills the agent can reach for.",
+    hint: "What it can use",
+    copy: "The tools and knowledge it works with — GitHub, web search, your own skills.",
   },
   {
     label: "Agent",
     icon: Bot,
-    hint: "Model and persona",
-    copy: "Model presets — powerful, balanced, or quick.",
+    hint: "How it thinks",
+    copy: "Pick a preset: powerful for hard problems, balanced for most work, quick for the rest.",
   },
   {
     label: "Instructions",
     icon: FileText,
-    hint: "What the agent does",
-    copy: "The prompt that drives the agent, with @refs into context.",
+    hint: "What it should do",
+    copy: "Plain-language instructions, with @refs into the trigger and your tools.",
   },
 ];
 
@@ -41,9 +41,9 @@ export function Pillars() {
   return (
     <section className="site-container section-block">
       <SectionHeading
-        eyebrow="The model"
-        title="Four pillars. One workflow."
-        lede="Every workflow is the same four decisions. Fill them in; the rest compiles."
+        eyebrow="Describe it"
+        title="Four decisions. One workflow."
+        lede="Every workflow is the same four questions. Answer them — or just tell the copilot — and it's ready to run."
       />
       <div className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {PILLARS.map((p, i) => {

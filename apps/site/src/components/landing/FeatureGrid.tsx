@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import {
   GitBranch,
   Server,
@@ -17,33 +18,33 @@ const FEATURES: ReadonlyArray<{
   icon: ComponentType<{ size?: number }>;
 }> = [
   {
-    title: "Workspaces & SSO",
-    copy: "Multi-tenant from day one — organizations, roles, and OIDC single sign-on.",
+    title: "Your team, with roles",
+    copy: "Share a workspace with your team — roles decide who can build, run, and administer, with single sign-on if you use it.",
     icon: Users,
   },
   {
-    title: "Encrypted secrets",
-    copy: "Credentials sealed with AES-256-GCM envelope encryption, bound to the tenant.",
+    title: "Private credentials",
+    copy: "The accounts and keys your workflows use are encrypted at rest and never shown again — not in logs, not to the model.",
     icon: ShieldCheck,
   },
   {
-    title: "Version pinning",
-    copy: "A session keeps the exact compiled agent it started on. Publishing never breaks a live run.",
+    title: "No surprise changes",
+    copy: "A running session keeps the exact version of the workflow it started with. Publishing an update never breaks a run in flight.",
     icon: GitBranch,
   },
   {
-    title: "Human-in-the-loop",
-    copy: "Approvals park a run durably and resume it the moment someone signs off.",
+    title: "You approve the big steps",
+    copy: "A workflow can pause and wait — for hours if it has to — until someone signs off, then pick up right where it stopped.",
     icon: UserCheck,
   },
   {
-    title: "Model presets",
-    copy: "Powerful, balanced, or quick — with an allowlist that constrains what agents can route to.",
+    title: "Your models, your rules",
+    copy: "Powerful, balanced, or quick per workflow — chosen from the models your workspace has approved.",
     icon: SlidersHorizontal,
   },
   {
-    title: "Self-hostable",
-    copy: "The whole platform runs on one compose stack. Your keys, your infrastructure.",
+    title: "Runs on your machines",
+    copy: "Open source and self-hostable. Your keys and your data stay on infrastructure you control.",
     icon: Server,
   },
 ];
@@ -52,9 +53,9 @@ export function FeatureGrid() {
   return (
     <section className="site-container section-block">
       <SectionHeading
-        eyebrow="Platform"
-        title="Built like production software."
-        lede="The unglamorous guarantees that make an agent platform trustworthy."
+        eyebrow="Control"
+        title="You stay in control."
+        lede="The quiet guarantees that make it safe to hand real work to an agent."
       />
       <div className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {FEATURES.map((f, i) => {
@@ -72,6 +73,24 @@ export function FeatureGrid() {
           );
         })}
       </div>
+
+      {/* Under-the-hood pointer: the single sanctioned trace of the infra story,
+          handing the curious reader off to the architecture docs. */}
+      <Reveal className="mt-8 flex justify-center">
+        <p className="glass-panel rounded-capsule flex max-w-full flex-wrap items-center justify-center gap-x-1.5 gap-y-1 px-5 py-2.5 text-center text-[13px] text-ink-3">
+          <span>
+            Under the hood: every workflow compiles into its own versioned agent
+            on a durable worker pool.
+          </span>
+          <Link
+            to="/docs/$"
+            params={{ _splat: "platform/architecture" }}
+            className="lift font-medium text-ink-2 hover:text-ink"
+          >
+            Read the architecture →
+          </Link>
+        </p>
+      </Reveal>
     </section>
   );
 }

@@ -9,10 +9,11 @@ import { useLoopPhase } from "./useLoopPhase";
 
 /*
  * Hero centerpiece — a hand-built, vector-sharp miniature of the real builder,
- * looping autonomously (~13s, calm): the four pillar cards fill in one by one
- * and flip to a green ✓, "Publish" presses itself → "Published and built." →
- * a chat panel streams a working block that folds to a "Worked for 6s · 4
- * steps" receipt. Built entirely from E1 primitives — no screenshots.
+ * looping autonomously (~13s, calm): a workflow comes together as the four
+ * pillar cards fill in one by one and flip to a green ✓, "Publish" presses
+ * itself → "Published and built." → a chat panel streams a working block that
+ * folds to a "Worked for 6s · 4 steps" receipt. Built entirely from E1
+ * primitives — no screenshots.
  */
 
 // Phase timeline (ms). Parked on the last phase under reduced motion.
@@ -64,9 +65,7 @@ const PILLARS: ReadonlyArray<{
     summary: (
       <span className="flex flex-col gap-0.5">
         <span className="font-medium text-ink-2">Balanced</span>
-        <span className="font-mono text-[11px] text-ink-3">
-          deepseek/deepseek-v4-pro
-        </span>
+        <span className="text-[11px] text-ink-3">good for everyday work</span>
       </span>
     ),
   },
@@ -164,7 +163,7 @@ export function BuilderVignette() {
                 animate={{ opacity: 1 }}
                 className="flex h-full items-center px-1 text-[12px] text-ink-4"
               >
-                Assembling the workflow…
+                Describing the workflow…
               </motion.div>
             )}
           </AnimatePresence>

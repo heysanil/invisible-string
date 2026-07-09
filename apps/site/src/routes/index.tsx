@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useRef } from "react";
 
-import { Compile } from "../components/landing/Compile";
 import { Copilot } from "../components/landing/Copilot";
 import { Durability } from "../components/landing/Durability";
 import { FeatureGrid } from "../components/landing/FeatureGrid";
@@ -10,6 +9,7 @@ import { Hero } from "../components/landing/Hero";
 import { Pillars } from "../components/landing/Pillars";
 import { ThreadCanvas } from "../components/landing/ThreadCanvas";
 import { Triggers } from "../components/landing/Triggers";
+import { UseCases } from "../components/landing/UseCases";
 
 export const Route = createFileRoute("/")({ component: LandingPage });
 
@@ -28,13 +28,13 @@ function LandingPage() {
       <div className="relative z-10">
         <Hero />
         <div id="product" className="scroll-mt-28">
-          <Pillars />
+          <UseCases />
         </div>
         <div id="how" className="scroll-mt-28">
-          <Compile />
-          <Durability />
-          <Triggers />
+          <Pillars />
           <Copilot />
+          <Triggers />
+          <Durability />
         </div>
         <FeatureGrid />
         <FinalCTA />

@@ -11,10 +11,10 @@ export function FinalCTA() {
     <section className="site-container section-block">
       <Reveal>
         <GlassPanel className="flex flex-col items-center gap-6 px-6 py-16 text-center sm:py-20">
-          <h2 className="text-display-2 text-balance">Assemble. Compile. Run.</h2>
+          <h2 className="text-display-2 text-balance">Describe. Publish. Done.</h2>
           <p className="max-w-xl text-lede text-ink-2">
-            Four pillars in, a real self-hosted agent out — durable, versioned,
-            and fired from anywhere.
+            Your first workflow is a conversation away. Open source,
+            self-hostable, and ready to take work off your plate.
           </p>
           <div className="mt-2 flex flex-wrap items-center justify-center gap-3">
             <Link to="/docs" className={btnPrimaryLg}>

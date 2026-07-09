@@ -5,8 +5,8 @@ import { cn } from "../../lib/cn";
 import { EASE, Reveal, SectionHeading, Vignette } from "./parts";
 import { useLoopPhase } from "./useLoopPhase";
 
-/* "A copilot in the builder." The user asks for a Slack trigger; the copilot
-   replies with a structured mutation card (setTrigger · slack) with Apply /
+/* "Build it by talking." The user asks to trigger the workflow from Slack; the
+   copilot replies with a structured mutation card (Manual → Slack) with Apply /
    Dismiss capsules; Apply presses itself; the card collapses to a receipt and
    the Trigger pillar card flashes (the app's real pillar-flash keyframe). */
 
@@ -26,13 +26,13 @@ export function Copilot() {
         <SectionHeading
           align="left"
           eyebrow="Copilot"
-          title="A copilot in the builder."
-          lede="Describe what you want in plain language. The copilot proposes structured edits to your pillars — you Apply or Dismiss. Every change is a reviewable diff, never a black box."
+          title="Build it by talking."
+          lede="Tell the copilot what you want changed, in plain language. It proposes the edit, shows you the before and after, and waits — you Apply or Dismiss. Nothing changes behind your back."
         />
 
         <Reveal delay={0.1}>
           <Vignette
-            label="A user asks the copilot to add a Slack trigger; the copilot proposes a setTrigger mutation; Apply is pressed and the Trigger pillar updates to Slack."
+            label="A user asks the copilot to trigger the workflow from Slack; the copilot proposes the change, Apply is pressed, and the Trigger card updates to Slack."
             className="flex flex-col gap-3 p-4"
           >
             <div className="ml-auto max-w-[80%] rounded-card rounded-br-sm bg-ink px-3 py-1.5 text-[12.5px] text-white">
@@ -124,8 +124,7 @@ function MutationCard({ applying }: { applying: boolean }) {
         <div className="min-w-0 flex-1">
           <p className="text-[13px] font-semibold leading-snug text-ink">Set trigger to Slack</p>
           <p className="mt-0.5 text-[12px] leading-snug text-ink-3">
-            <span className="mono-chip">setTrigger · slack</span> — runs start from
-            mentions and messages.
+            Runs will start from Slack mentions and messages.
           </p>
         </div>
       </div>

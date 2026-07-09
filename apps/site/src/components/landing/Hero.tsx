@@ -45,10 +45,10 @@ export function Hero() {
         className="text-display-1 text-balance"
       >
         <motion.span variants={line} className="block">
-          Agent workflows,
+          Describe the work,
         </motion.span>
         <motion.span variants={line} className="block">
-          compiled.
+          consider it done.
         </motion.span>
       </motion.h1>
 
@@ -58,9 +58,9 @@ export function Hero() {
         transition={{ duration: 0.4, ease: EASE, delay: 0.28 }}
         className="mt-6 max-w-2xl text-lede text-ink-2"
       >
-        Describe a workflow in four pillars. It compiles into a real,
-        self-hosted agent on a durable worker pool — fired from chat, webhooks,
-        forms, or Slack.
+        Describe what you want done, in plain language. It becomes a workflow
+        that runs from chat, Slack, forms, or a schedule — live, reliable, and
+        yours to approve.
       </motion.p>
 
       <motion.div
@@ -87,7 +87,7 @@ export function Hero() {
         className="mt-16 w-full max-w-4xl sm:mt-20"
       >
         <Vignette
-          label="Four pillar cards fill in one by one, Publish builds the agent, and a chat run completes in 6 seconds."
+          label="A workflow comes together — trigger, context, agent, instructions — is published, then handles a request in chat in six seconds."
           className="p-0"
         >
           <BuilderVignette />

@@ -19,6 +19,11 @@ bun run --cwd apps/site test       # bun test (pure-logic specs only, see below)
 No infra is required — no Postgres, no Docker, no `.env`. This app is **not**
 part of `bun run dev` at the repo root; run it standalone.
 
+`og.html` (at the app root, outside `public/` so it's never deployed) is the
+source for the social card `public/og.png` — regenerate the PNG with a
+1200×630 device-scale-1 browser screenshot of it after changing the headline
+or subline.
+
 ## Build-time environment
 
 These are set by CI (`.github/workflows/site.yml`) and never belong in a local

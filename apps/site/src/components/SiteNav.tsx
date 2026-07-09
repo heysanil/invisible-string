@@ -49,7 +49,7 @@ export function SiteNav() {
           {/* Router links (with a hash) so the in-page anchors also work from
               /docs — a plain <a href="#product"> would no-op off the landing. */}
           <Link to="/" hash="product" className={navLinkCls}>
-            Product
+            Use cases
           </Link>
           <Link to="/" hash="how" className={navLinkCls}>
             How it works

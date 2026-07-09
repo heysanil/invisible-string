@@ -46,7 +46,7 @@ export function SiteFooter() {
           {/* Router links (with a hash) so the anchors also work from /docs —
               a plain <a href="#product"> would no-op off the landing. */}
           <Link to="/" hash="product" className="lift text-ink-2 hover:text-ink">
-            Product
+            Use cases
           </Link>
           <Link to="/" hash="how" className="lift text-ink-2 hover:text-ink">
             How it works
@@ -59,7 +59,7 @@ export function SiteFooter() {
           </a>
         </nav>
 
-        <p className="text-[12px] text-ink-2">Assemble. Compile. Run.</p>
+        <p className="text-[12px] text-ink-2">Describe. Publish. Done.</p>
       </div>
     </footer>
   );

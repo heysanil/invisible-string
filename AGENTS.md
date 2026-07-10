@@ -28,7 +28,7 @@ The living documents and what each owns:
 | `e2e/README.md` | Playwright harness operation |
 | `docs/DEPLOY.md` | Production deployment: prod compose operation, Dokploy, external data services, backups, upgrades |
 | `docs/SLACK.md` | Platform Slack app: manifest (`infra/slack/manifest.template.json` + drift test), credential wiring, workspace connect, trigger binding |
-| `apps/site/README.md` | Marketing/docs site: commands, GitHub Pages deploy, MDX authoring, token-extension rules |
+| `apps/site/README.md` | Marketing/docs site: commands, Cloudflare Workers deploy, MDX authoring, token-extension rules |
 
 If you add a subsystem, add its doc and list it here. If a doc contradicts the code, fix whichever is wrong — never leave them divergent.
 
@@ -73,7 +73,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 `apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs) · pillar CRUD · compiler invocation + `eve build` + tarball → object store (Garage) (cache keyed by content hash = pillar config + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) → dispatcher (`TriggerEvent` → compiled channel, version-bound JWT) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop.
 `apps/worker` (stateless Bun supervisor; boots agents under Node 24; mounted docker.sock): register/heartbeat/drain, ensure-agent → pull/extract → per-agent boot of the compiled entrypoint (`node .output/server/index.mjs` directly — `eve start` is only a CLI wrapper; spike finding 6), streaming reverse proxy, reapers (process idle 15 m, sandbox idle 30 m, artifact LRU 20 GiB).
-`apps/web`: the glass SPA. `apps/site`: standalone Vite + React static landing + docs SPA (MDX docs, E1 tokens via `packages/design-tokens`), deployed to GitHub Pages — no server, no compose service. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
+`apps/web`: the glass SPA. `apps/site`: standalone Vite + React static landing + docs SPA (MDX docs, E1 tokens via `packages/design-tokens`), deployed to Cloudflare Workers (assets-only Worker) at invisiblestring.io — no server, no compose service. `packages/{compiler,db,shared}` as labeled. Contract details: `docs/runtime-worker-contract.md`.
 
 ## Constraints that will bite you (learned empirically — full list in the design spec's "Live-doc corrections" + `spike/REPORT.md`)
 
@@ -93,7 +93,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 All jobs run on Namespace runners (`nscloud-ubuntu-24.04-amd64-*` labels). The eve npm cache (`~/.npm`) and Playwright browsers persist on a shared Namespace cache volume (tag `eve-npm`, mounted via `nscloud-cache-action` — no `actions/cache` tarball round-trips), and `release.yml` image builds use Namespace's pre-configured remote builders (no `setup-buildx-action`, no gha layer cache — cache lives builder-side).
 
-`.github/workflows/site.yml` is a separate, deliberately non-Namespace workflow (`ubuntu-latest`): on push to `main` touching `apps/site/**` or `packages/design-tokens/**`, it builds the static site (`SITE_BASE`/`VITE_SITE_URL` from `actions/configure-pages`) and deploys it to GitHub Pages via `actions/deploy-pages`. A static marketing/docs build needs no Namespace cache, and this keeps public-site deploys decoupled from the platform's CI runners.
+`.github/workflows/site.yml` is a separate, deliberately non-Namespace workflow (`ubuntu-latest`): pushes to `main` touching `apps/site/**` or `packages/design-tokens/**` build the static site (`VITE_SITE_URL=https://invisiblestring.io`) and deploy it to Cloudflare Workers (assets-only Worker `invisible-string-site`, config in `apps/site/wrangler.jsonc`, SPA fallback with real 200s) via `cloudflare/wrangler-action`; pull requests touching the same paths upload a preview version (`wrangler versions upload --preview-alias <branch>`) and comment the preview URLs on the PR (fork PRs skip — no secrets). Secrets: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`. A static marketing/docs build needs no Namespace cache, and this keeps public-site deploys decoupled from the platform's CI runners.
 
 ## Known residuals (documented, deliberate)
 

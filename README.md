@@ -265,8 +265,10 @@ Production runs as one single-host Docker Compose stack (`docker-compose.prod.ym
 `IMAGE_TAG`. Full runbook (Dokploy, external/managed data services, Cloudflare
 Tunnel, backups, upgrades, smoke checklist): **[`docs/DEPLOY.md`](docs/DEPLOY.md)**.
 
-The marketing/docs site (`apps/site`) deploys separately, to GitHub Pages, via
-`.github/workflows/site.yml` on pushes to `main`.
+The marketing/docs site (`apps/site`) deploys separately, to Cloudflare
+Workers at [invisiblestring.io](https://invisiblestring.io), via
+`.github/workflows/site.yml` — production on pushes to `main`, preview URLs
+on pull requests.
 
 ## Repo map
 
@@ -281,7 +283,7 @@ apps/
                    per-worker token identity
   web/             Vite + React SPA (chat, builder, context, settings)
   site/            Standalone Vite + React landing + docs site (MDX docs,
-                   E1 tokens), deployed to GitHub Pages — no server
+                   E1 tokens), deployed to Cloudflare Workers — no server
 packages/
   compiler/        Pure WorkflowDefinition -> eve project codegen
   db/              Drizzle schema, migrations, seeds (product DB)
@@ -306,7 +308,7 @@ docs/              Design spec, master plan, runtime contract (+ screenshots/)
 | [`packages/compiler/versions.json`](packages/compiler/versions.json) | Pinned runtime version matrix + rationale |
 | [`.env.example`](.env.example) | Canonical inventory of every environment variable |
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | Production deployment guide (prod compose, Dokploy, external data, backups, upgrades) |
-| [`apps/site/README.md`](apps/site/README.md) | Marketing/docs site: commands, GitHub Pages deploy, MDX authoring |
+| [`apps/site/README.md`](apps/site/README.md) | Marketing/docs site: commands, Cloudflare Workers deploy, MDX authoring |
 
 ---
 

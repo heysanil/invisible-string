@@ -1,0 +1,17 @@
+{
+  "name": "invisible-string-site",
+  "compatibility_date": "2026-07-09",
+  // Assets-only Worker: no `main` script — requests never invoke compute.
+  "assets": {
+    "directory": "./dist",
+    // Unmatched paths get index.html with HTTP 200 (replaces the GitHub
+    // Pages 404.html hack and its 404-status tradeoff).
+    "not_found_handling": "single-page-application"
+  },
+  // First deploy creates the apex DNS record + cert on the Cloudflare zone.
+  "routes": [{ "pattern": "invisiblestring.io", "custom_domain": true }],
+  // Production is only served from the custom domain…
+  "workers_dev": false,
+  // …but versioned preview URLs (used by PR previews) stay enabled.
+  "preview_urls": true
+}

@@ -7,25 +7,29 @@ on:
       - apps/site/**
       - packages/design-tokens/**
       - .github/workflows/site.yml
+  pull_request:
+    paths:
+      - apps/site/**
+      - packages/design-tokens/**
+      - .github/workflows/site.yml
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  VITE_SITE_URL: https://invisiblestring.io
 
 jobs:
-  build-and-deploy:
-    name: Build + deploy to GitHub Pages
+  deploy:
+    name: Build + deploy to Cloudflare Workers
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,23 +40,84 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Configure Pages
-        id: pages
-        uses: actions/configure-pages@v5
-
-      # base_path is "/<repo>" for project pages, "" once a custom domain is
-      # configured in Settings -> Pages (configure-pages flips it automatically
-      # — no workflow edit needed either way).
       - name: Build site
-        env:
-          SITE_BASE: ${{ steps.pages.outputs.base_path }}
-          VITE_SITE_URL: ${{ steps.pages.outputs.base_url }}
         run: bun run --cwd apps/site build
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
         with:
-          path: apps/site/dist
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.110.0"
+          workingDirectory: apps/site
+          command: deploy
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+  preview:
+    name: Build + upload preview version
+    # Fork PRs can't read repo secrets — skip rather than fail red.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build site
+        run: bun run --cwd apps/site build
+
+      # Alias rules: lowercase alphanumerics/dashes, starts with a letter,
+      # alias + "-invisible-string-site" must fit a 63-char DNS label → 41.
+      - name: Compute preview alias
+        id: alias
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          alias=$(printf '%s' "$BRANCH" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^[^a-z]*//' \
+            | cut -c1-41 \
+            | sed -e 's/-*$//')
+          if [ -z "$alias" ]; then alias="pr-${{ github.event.number }}"; fi
+          echo "alias=$alias" >> "$GITHUB_OUTPUT"
+
+      - name: Upload preview version
+        id: upload
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.110.0"
+          workingDirectory: apps/site
+          command: versions upload --preview-alias ${{ steps.alias.outputs.alias }}
+
+      - name: Comment preview URLs on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CMD_STDOUT: ${{ steps.upload.outputs.command-output }}
+          CMD_STDERR: ${{ steps.upload.outputs.command-stderr }}
+        run: |
+          urls=$(printf '%s\n%s\n' "$CMD_STDOUT" "$CMD_STDERR" \
+            | grep -Eo 'https://[a-z0-9-]+-invisible-string-site[a-z0-9.-]*\.workers\.dev' \
+            | sort -u)
+          if [ -z "$urls" ]; then
+            echo "::warning::no preview URLs found in wrangler output"
+            exit 0
+          fi
+          {
+            echo "### Site preview"
+            echo ""
+            printf '%s\n' "$urls" | sed 's/^/- /'
+            echo ""
+            echo "_Commit ${{ github.event.pull_request.head.sha }} · alias \`${{ steps.alias.outputs.alias }}\`_"
+          } > comment.md
+          gh pr comment ${{ github.event.number }} --repo ${{ github.repository }} \
+            --edit-last --create-if-none --body-file comment.md

@@ -2,15 +2,16 @@
 
 Standalone static site: the public landing page (`/`) and an E1-styled docs
 shell (`/docs/*`), built with Vite + React + TanStack Router and deployed to
-**GitHub Pages**. It shares nothing at runtime with `apps/web` — no server, no
-auth, no compose service — only the E1 design tokens (`packages/design-tokens`)
-are shared, on purpose (AGENTS.md rule 5).
+**Cloudflare Workers** (an assets-only Worker — static hosting, no compute) at
+<https://invisiblestring.io>. It shares nothing at runtime with `apps/web` — no
+server, no auth, no compose service — only the E1 design tokens
+(`packages/design-tokens`) are shared, on purpose (AGENTS.md rule 5).
 
 ## Commands
 
 ```sh
 bun run --cwd apps/site dev        # dev server (:5173 by default — pick a free port)
-bun run --cwd apps/site build      # tsc --noEmit && vite build && cp dist/index.html dist/404.html
+bun run --cwd apps/site build      # tsc --noEmit && vite build
 bun run --cwd apps/site preview    # serve the production build locally
 bun run --cwd apps/site typecheck  # tsc --noEmit only
 bun run --cwd apps/site test       # bun test (pure-logic specs only, see below)
@@ -31,36 +32,44 @@ These are set by CI (`.github/workflows/site.yml`) and never belong in a local
 
 | Variable | Set by | Purpose |
 |---|---|---|
-| `SITE_BASE` | `actions/configure-pages` (`base_path`) | Vite `base` + router `basepath`, normalized to `/` (root) or `/<repo>/` (project pages). Defaults to `/` for local dev. |
-| `VITE_SITE_URL` | `actions/configure-pages` (`base_url`) | Canonical/OG/Twitter URL substituted into `index.html`. Defaults to `http://localhost:5173` locally so the substitution never breaks a local build. |
+| `SITE_BASE` | nobody (local-only) | Vite `base` + router `basepath`. Defaults to `/`; CI never sets it — the deployed site always serves at the domain root. |
+| `VITE_SITE_URL` | `site.yml`, fixed to `https://invisiblestring.io` | Canonical/OG/Twitter URL substituted into `index.html`. Defaults to `http://localhost:5173` locally so the substitution never breaks a local build. |
 | `VITE_APP_URL` | unset by default | If set, the nav renders an "Open the app" CTA linking at it (e.g. the production SPA origin). Leave unset to hide the CTA. |
 
-`configure-pages`'s outputs flip automatically once a custom domain is added
-in Settings → Pages — no workflow edit needed either way.
+## Cloudflare Workers deploy
 
-## GitHub Pages setup (one-time)
+The site deploys as an **assets-only Worker** (`wrangler.jsonc` — name
+`invisible-string-site`, assets from `dist/`, no server code) with a
+custom-domain route for `invisiblestring.io`. CI (`site.yml`) does it all:
 
-1. Repo Settings → Pages → **Source: GitHub Actions**.
-2. Push to `main` touching `apps/site/**`, `packages/design-tokens/**`, or the
-   workflow file (or run the workflow manually via `workflow_dispatch`).
-3. Custom domain: configure it in Settings → Pages, not by committing a
-   `CNAME` file — GitHub manages that for you and `configure-pages` picks up
-   the change automatically.
-4. **Private repos need a paid GitHub plan** to serve Pages at all — public
-   repos get Pages for free. Non-blocking for this repo's default (public)
-   configuration, but worth knowing before flipping visibility.
+- **Push to `main`** touching `apps/site/**`, `packages/design-tokens/**`, or
+  the workflow → build + `wrangler deploy` (production).
+- **Pull request** touching the same paths → build + `wrangler versions
+  upload --preview-alias <branch>` → the per-commit and per-branch preview
+  URLs (`<alias>-invisible-string-site.<subdomain>.workers.dev`) are posted
+  as a PR comment. Fork PRs skip this (no secrets).
 
-## SPA-fallback / 404 tradeoff
+wrangler itself is deliberately **not** a workspace dependency — the root
+lockfile covers all workspaces, so it would inflate every prod Docker image's
+`bun install --frozen-lockfile`. CI pins it via `cloudflare/wrangler-action`.
 
-The build script copies `dist/index.html` to `dist/404.html` so GitHub Pages
-serves the SPA shell for any unmatched path (client-side routing works for
-deep links like `/docs/concepts/pillars`). The tradeoff: GitHub Pages responds
-with an actual HTTP **404 status** on those requests even though the body is
-the app shell — fine for humans (the router immediately renders the right
-page) but means crawlers/tools that check status codes literally will see
-"not found" for deep links. Acceptable for a docs site with no server-rendered
-pages; revisit only if SEO on deep docs URLs becomes a priority (would need
-prerendering, not a Pages-native fix).
+### One-time setup
+
+1. Create a Cloudflare API token from the **"Edit Cloudflare Workers"**
+   template on the account that owns the `invisiblestring.io` zone.
+2. Add repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+3. Confirm the apex of `invisiblestring.io` has no conflicting DNS record
+   (custom-domain creation refuses to overwrite an existing CNAME).
+4. After the first successful deploy, disable GitHub Pages in repo settings
+   (Settings → Pages) — the old Pages deployment is superseded.
+
+## SPA fallback
+
+`not_found_handling: "single-page-application"` in `wrangler.jsonc` serves
+the app shell with an HTTP **200** for any path that doesn't match a static
+asset, so deep links like `/docs/concepts/pillars` work for humans *and*
+status-code-checking crawlers. This replaces (and improves on) the old
+GitHub Pages `404.html` copy hack, which served the shell with a 404 status.
 
 ## MDX authoring
 

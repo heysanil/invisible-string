@@ -50,3 +50,11 @@ Platform-owned provider keys; per-run wall-clock + turn caps and per-workspace c
 
 ## Phases (acceptance in docs/PLAN.md)
 0 foundations + de-risking spike (kill-and-resume a parked run is the gate) · 1 compiler + runner spine · 2 four-pillar UI · 3 worker pool + triggers + HITL · 4 copilot. Cross-cutting: per-phase compose integration tests, Playwright E2E from Phase 2, replay chaos test as the eve-upgrade gate in CI.
+
+---
+
+## Superseded: agents-first pivot (2026-07-10)
+
+The **four-pillar product model, app shell, builder layout, and session model** above are superseded by `docs/superpowers/specs/2026-07-10-agents-first-redesign.md`: the **Agent** (PERSONA · MODEL · CONTEXT) is now the first-class entity and the compile unit; chat targets Agents directly; a **Workflow** is a standing delegation (TRIGGER → AGENT → INSTRUCTIONS) with no builds of its own. That spec's §4 lists the precise sections of this document it supersedes.
+
+The **E1 design tokens and the eve live-doc corrections above remain in force** — this was a product-model pivot, not a visual redesign or a runtime-facts change. Corrections that say "workflow version" now apply per **agent version** (one world DB per agent version; sessions pin the agent version).

@@ -16,8 +16,9 @@ The living documents and what each owns:
 |---|---|
 | `AGENTS.md` (this file) | Operational contract: commands, lanes, conventions, constraints |
 | `README.md` | Quickstart, product surfaces, copilot, repo map |
-| `INITIAL-SPEC.md` | The build brief — historical record, do **not** edit (its §2 locked decisions still bind) |
-| `docs/superpowers/specs/2026-07-02-invisible-string-design.md` | Approved design: product decisions, E1 design tokens, eve live-doc corrections |
+| `INITIAL-SPEC.md` | The build brief — historical record, do **not** edit (its §2 locked decisions still bind, except where superseded per the 2026-07-10 spec's §4) |
+| `docs/superpowers/specs/2026-07-02-invisible-string-design.md` | Approved design: product decisions, E1 design tokens, eve live-doc corrections — as amended by the 2026-07-10 spec |
+| `docs/superpowers/specs/2026-07-10-agents-first-redesign.md` | Agents-first redesign: concept model, IA, technical decisions, supersessions, vocabulary standard |
 | `docs/PLAN.md` | Master phase plan — update acceptance/status notes if scope shifts |
 | `docs/runtime-worker-contract.md` | Control-plane ↔ worker protocol: identity, ensure/dispatch, proxy, reapers |
 | `packages/compiler/README.md` + `WORLD-ISOLATION.md` | Codegen contract, `COMPILER_VERSION` discipline, world-DB isolation mechanism |

@@ -43,14 +43,17 @@ jobs:
       - name: Build site
         run: bun run --cwd apps/site build
 
+      # npx (not cloudflare/wrangler-action): the action falls back to
+      # `npm i wrangler` inside workingDirectory, and npm can't parse the
+      # Bun `workspace:*` protocol in apps/site/package.json. npx installs
+      # into its own cache and never touches the project manifest.
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "4.110.0"
-          workingDirectory: apps/site
-          command: deploy
+        working-directory: apps/site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: npx -y wrangler@4.110.0 deploy
 
   preview:
     name: Build + upload preview version
@@ -89,25 +92,28 @@ jobs:
           if [ -z "$alias" ]; then alias="pr-${{ github.event.number }}"; fi
           echo "alias=$alias" >> "$GITHUB_OUTPUT"
 
+      # Same npx-over-action rationale as the deploy job above.
       - name: Upload preview version
-        id: upload
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "4.110.0"
-          workingDirectory: apps/site
-          command: versions upload --preview-alias ${{ steps.alias.outputs.alias }}
+        working-directory: apps/site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+          ALIAS: ${{ steps.alias.outputs.alias }}
+        run: |
+          npx -y wrangler@4.110.0 versions upload \
+            --preview-alias "$ALIAS" 2>&1 \
+            | tee "$RUNNER_TEMP/wrangler-upload.txt"
 
       - name: Comment preview URLs on the PR
         env:
           GH_TOKEN: ${{ github.token }}
-          CMD_STDOUT: ${{ steps.upload.outputs.command-output }}
-          CMD_STDERR: ${{ steps.upload.outputs.command-stderr }}
+          ALIAS: ${{ steps.alias.outputs.alias }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.number }}
         run: |
-          urls=$(printf '%s\n%s\n' "$CMD_STDOUT" "$CMD_STDERR" \
-            | grep -Eo 'https://[a-z0-9-]+-invisible-string-site[a-z0-9.-]*\.workers\.dev' \
-            | sort -u)
+          urls=$(grep -Eo 'https://[a-z0-9-]+-invisible-string-site[a-z0-9.-]*\.workers\.dev' \
+            "$RUNNER_TEMP/wrangler-upload.txt" | sort -u)
           if [ -z "$urls" ]; then
             echo "::warning::no preview URLs found in wrangler output"
             exit 0
@@ -117,7 +123,7 @@ jobs:
             echo ""
             printf '%s\n' "$urls" | sed 's/^/- /'
             echo ""
-            echo "_Commit ${{ github.event.pull_request.head.sha }} · alias \`${{ steps.alias.outputs.alias }}\`_"
+            echo "_Commit $HEAD_SHA · alias \`$ALIAS\`_"
           } > comment.md
-          gh pr comment ${{ github.event.number }} --repo ${{ github.repository }} \
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --edit-last --create-if-none --body-file comment.md

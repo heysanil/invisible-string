@@ -51,7 +51,10 @@ custom-domain route for `invisiblestring.io`. CI (`site.yml`) does it all:
 
 wrangler itself is deliberately **not** a workspace dependency — the root
 lockfile covers all workspaces, so it would inflate every prod Docker image's
-`bun install --frozen-lockfile`. CI pins it via `cloudflare/wrangler-action`.
+`bun install --frozen-lockfile`. CI pins it inline (`npx -y wrangler@<x.y.z>`);
+`cloudflare/wrangler-action` is unusable here because its fallback
+`npm i wrangler` runs inside the working directory and npm chokes on the Bun
+`workspace:*` protocol in `package.json`.
 
 ### One-time setup
 

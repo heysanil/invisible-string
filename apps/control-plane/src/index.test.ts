@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import * as controlPlane from "./index";
 import { createAppStack } from "./index";
 
 // No DB connection is made here: postgres-js connects lazily, and none of
@@ -60,6 +61,18 @@ describe("control-plane app", () => {
     );
     expect(res.headers.get("access-control-allow-origin")).not.toBe(
       "https://evil.example.com",
+    );
+  });
+});
+
+describe("Bun.serve transport options", () => {
+  test("idle timeout is disabled — run-stream SSE tails and >10s dispatch awaits must outlive Bun's ~10s default idle kill", () => {
+    expect(controlPlane.BUN_SERVE_OPTIONS?.idleTimeout).toBe(0);
+  });
+
+  test("request body cap stays at 8 MiB (mirrors nginx client_max_body_size in infra/nginx/web.conf)", () => {
+    expect(controlPlane.BUN_SERVE_OPTIONS?.maxRequestBodySize).toBe(
+      8 * 1024 * 1024,
     );
   });
 });

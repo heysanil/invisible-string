@@ -438,15 +438,29 @@ export function createAppStack(
   };
 }
 
+/**
+ * Bun.serve transport options (Elysia forwards these verbatim).
+ *
+ * - maxRequestBodySize: refuse oversized uploads before buffering — the
+ *   largest legitimate body is a skill attachment (see resources/plugin.ts
+ *   SKILL_UPLOAD_MAX_BODY_BYTES); mirrors nginx client_max_body_size.
+ * - idleTimeout 0: Bun's default (~10s of socket inactivity) kills quiet
+ *   run-stream SSE tails mid-response (heartbeats default to 15s) and cuts
+ *   chat dispatches that await a cold agent boot before writing headers,
+ *   surfacing as gateway 502s. The worker disables it for the same reason
+ *   (apps/worker/src/server.ts); nginx/the edge proxy own the real timeouts.
+ */
+export const BUN_SERVE_OPTIONS = {
+  maxRequestBodySize: 8 * 1024 * 1024,
+  idleTimeout: 0,
+} as const;
+
 if (import.meta.main) {
   const stack = createAppStack();
   const { logger } = stack;
-  // Cap the request body at the transport (Bun.serve) so oversized uploads are
-  // refused before buffering — the largest legitimate body is a skill
-  // attachment (see resources/plugin.ts SKILL_UPLOAD_MAX_BODY_BYTES).
   stack.app.listen({
     port: stack.config.port,
-    maxRequestBodySize: 8 * 1024 * 1024,
+    ...BUN_SERVE_OPTIONS,
   });
   // One structured "ready" line with the resolved config. `fields` is
   // redaction-safe — every value here is non-secret, and the logger scrubs

@@ -296,6 +296,16 @@ Run against the deployed domain after every deploy:
 
 ## 12. Troubleshooting
 
+- **Instant 502s on chat sends / run streams through the edge proxy**
+  (Cloudflare `origin_bad_gateway`, or a bare Traefik/nginx `Bad Gateway`) on
+  images predating 2026-07-10 — the control plane didn't disable Bun's ~10 s
+  `idleTimeout`, so quiet SSE run tails were cut mid-response (heartbeats
+  default to 15 s) and chat dispatches awaiting a cold agent boot were killed
+  before response headers. Telltale: `docker compose logs web` full of
+  `upstream prematurely closed connection`. Fixed in code
+  (`BUN_SERVE_OPTIONS`, `apps/control-plane/src/index.ts`); on an affected
+  image, set `SSE_HEARTBEAT_MS=8000` in the environment as a stopgap and
+  upgrade.
 - **Garage crash-loops with `Error: IO error: Is a directory (os error 21)`**,
   or `migrate` fails with `database "product" does not exist` — you deployed a
   pre-2026-07-08 compose that bind-mounted `./infra/*` host files. Without a

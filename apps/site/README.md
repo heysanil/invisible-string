@@ -131,3 +131,5 @@ pure TypeScript (`src/lib/sidebar.ts`'s `buildSidebar`, `src/lib/toc.ts`'s
 `extractToc`) that tests exercise directly with plain data/DOM fixtures.
 Build-time correctness (does the MDX pipeline actually compile) is covered by
 `vite build` in CI (`ci.yml`'s unit job + `site.yml`), not by `bun test`.
+
+<!-- preview-loop test: safe to remove -->

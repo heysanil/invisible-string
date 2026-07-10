@@ -1,22 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  agentConfigSchema,
   buildReferenceInventory,
-  contextConfigSchema,
   cronExpressionSchema,
   formTriggerSchema,
   parseReferences,
   slackTriggerSchema,
   triggerConfigSchema,
-  workflowDefinitionSchema,
-  type WorkflowDefinitionInput,
-} from "./workflow-definition";
+  workflowConfigSchema,
+  type WorkflowConfigInput,
+} from "./workflow-config";
 
 const UUID_A = "6b4d8f6e-3a4e-4f6a-9a0e-2f6a1c9d8e7b";
-const UUID_B = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
-// ── Trigger pillar ──────────────────────────────────────────────────────────
+// ── Trigger ─────────────────────────────────────────────────────────────────
 
 describe("triggerConfigSchema", () => {
   test("manual and webhook triggers are bare discriminants", () => {
@@ -135,107 +132,49 @@ describe("triggerConfigSchema", () => {
   });
 });
 
-// ── Context pillar ──────────────────────────────────────────────────────────
+// ── Full config ─────────────────────────────────────────────────────────────
 
-describe("contextConfigSchema", () => {
-  test("defaults both id lists to empty arrays", () => {
-    expect(contextConfigSchema.parse({})).toEqual({
-      mcpConnectionIds: [],
-      skillIds: [],
-    });
-  });
-
-  test("accepts uuids, rejects non-uuids", () => {
-    expect(
-      contextConfigSchema.safeParse({ mcpConnectionIds: [UUID_A], skillIds: [UUID_B] })
-        .success,
-    ).toBe(true);
-    expect(
-      contextConfigSchema.safeParse({ mcpConnectionIds: ["linear"] }).success,
-    ).toBe(false);
-  });
-
-  test("rejects duplicate ids", () => {
-    expect(
-      contextConfigSchema.safeParse({ mcpConnectionIds: [UUID_A, UUID_A] }).success,
-    ).toBe(false);
-    expect(contextConfigSchema.safeParse({ skillIds: [UUID_B, UUID_B] }).success).toBe(
-      false,
-    );
-  });
-});
-
-// ── Agent pillar ────────────────────────────────────────────────────────────
-
-describe("agentConfigSchema", () => {
-  test("requires only agentPresetId; overrides optional", () => {
-    expect(agentConfigSchema.parse({ agentPresetId: UUID_A })).toEqual({
-      agentPresetId: UUID_A,
-    });
-    const full = agentConfigSchema.parse({
-      agentPresetId: UUID_A,
-      modelPreset: "quick",
-      modelId: "deepseek/deepseek-v4-flash",
-      reasoning: "high",
-    });
-    expect(full.modelPreset).toBe("quick");
-    expect(full.reasoning).toBe("high");
-  });
-
-  test("rejects unknown preset slugs and reasoning efforts", () => {
-    expect(
-      agentConfigSchema.safeParse({ agentPresetId: UUID_A, modelPreset: "turbo" })
-        .success,
-    ).toBe(false);
-    expect(
-      agentConfigSchema.safeParse({ agentPresetId: UUID_A, reasoning: "max" }).success,
-    ).toBe(false);
-  });
-
-  test("rejects non-uuid agentPresetId", () => {
-    expect(agentConfigSchema.safeParse({ agentPresetId: "general" }).success).toBe(
-      false,
-    );
-  });
-});
-
-// ── Full definition ─────────────────────────────────────────────────────────
-
-describe("workflowDefinitionSchema", () => {
-  test("parses a full four-pillar definition and applies nested defaults", () => {
+describe("workflowConfigSchema", () => {
+  test("parses a full config and applies nested defaults", () => {
     const input = {
       trigger: {
         type: "form",
         fields: [{ key: "email", label: "Email", type: "text" }],
       },
-      context: { mcpConnectionIds: [UUID_A] },
-      agent: { agentPresetId: UUID_B },
+      agentId: UUID_A,
       instructions: { markdown: "Email @trigger.email via @gmail. Use @skill.tone." },
-    } satisfies WorkflowDefinitionInput;
+    } satisfies WorkflowConfigInput;
 
-    const parsed = workflowDefinitionSchema.parse(input);
-    expect(parsed.context.skillIds).toEqual([]);
+    const parsed = workflowConfigSchema.parse(input);
     expect(parsed.trigger.type).toBe("form");
+    expect(parsed.agentId).toBe(UUID_A);
   });
 
-  test("empty instructions markdown is a valid DRAFT", () => {
-    expect(
-      workflowDefinitionSchema.safeParse({
-        trigger: { type: "manual" },
-        context: {},
-        agent: { agentPresetId: UUID_A },
-        instructions: { markdown: "" },
-      }).success,
-    ).toBe(true);
+  test("agentId defaults to null and instructions markdown to \"\" (valid DRAFT)", () => {
+    const parsed = workflowConfigSchema.parse({
+      trigger: { type: "manual" },
+      instructions: {},
+    });
+    expect(parsed.agentId).toBeNull();
+    expect(parsed.instructions.markdown).toBe("");
   });
 
-  test("rejects a definition missing a pillar", () => {
+  test("rejects a non-uuid agentId", () => {
     expect(
-      workflowDefinitionSchema.safeParse({
+      workflowConfigSchema.safeParse({
         trigger: { type: "manual" },
-        agent: { agentPresetId: UUID_A },
+        agentId: "general",
         instructions: { markdown: "" },
       }).success,
+    ).toBe(false);
+  });
+
+  test("rejects a config missing trigger or instructions", () => {
+    expect(
+      workflowConfigSchema.safeParse({ instructions: { markdown: "" } }).success,
+    ).toBe(false);
+    expect(
+      workflowConfigSchema.safeParse({ trigger: { type: "manual" } }).success,
     ).toBe(false);
   });
 });

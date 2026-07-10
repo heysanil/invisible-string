@@ -132,6 +132,7 @@
         "postgres": "^3.4.9",
       },
       "devDependencies": {
+        "@invisible-string/shared": "workspace:*",
         "drizzle-kit": "^0.31.10",
         "typescript": "^6.0.3",
       },

@@ -1,38 +1,105 @@
 /**
  * Copilot WS protocol (spec §12, PLAN Phase 4) — typed frames exchanged over
- * `WS /workspaces/:workspaceId/copilot` between the builder's docked copilot
- * rail and the control plane, plus the per-tool mutation param schemas.
+ * `WS /workspaces/:workspaceId/copilot` between a docked copilot rail (the
+ * workflow editor OR the agent editor — one socket, two surfaces) and the
+ * control plane, plus the per-tool mutation param schemas.
  *
  * Contract highlights:
  * - The copilot NEVER mutates the draft server-side. Every edit is a
  *   structured **proposal** `{id, tool, params, rationale}` streamed to the
  *   client; the client previews it and applies accepted mutations through the
- *   builder controller (single writer), then reports the outcome back with a
+ *   editor controller (single writer), then reports the outcome back with a
  *   `mutation_result` frame so the model's tool loop can continue.
- * - Mutation param schemas mirror `workflow-definition.ts` exactly — a
- *   proposal that parses here is directly applicable to the draft.
+ * - Each `user_message` names its `surface` ("workflow" | "agent"); the
+ *   server exposes the matching toolset — proposals for the other surface's
+ *   tools are a server bug.
+ * - Mutation param schemas mirror `workflow-config.ts` /
+ *   `agent-definition.ts` exactly — a proposal that parses here is directly
+ *   applicable to the draft.
  */
 import { z } from "zod";
 
 import {
   modelPresetSlugSchema,
   reasoningEffortSchema,
-  triggerConfigSchema,
-} from "./workflow-definition";
+} from "./agent-definition";
+import { triggerConfigSchema } from "./workflow-config";
 
-// ── mutation tools ───────────────────────────────────────────────────────────
+// ── surfaces ─────────────────────────────────────────────────────────────────
 
-/** What an addContext/removeContext id points at. */
-export const copilotContextKindSchema = z.enum(["connection", "skill"]);
-export type CopilotContextKind = z.infer<typeof copilotContextKindSchema>;
+/** Which editor a copilot turn is about. */
+export const copilotSurfaceSchema = z.enum(["workflow", "agent"]);
+export type CopilotSurface = z.infer<typeof copilotSurfaceSchema>;
 
-/** `setTrigger` replaces the whole TRIGGER pillar with a full trigger config. */
+// ── workflow-surface mutation tools ──────────────────────────────────────────
+
+/** `setTrigger` replaces the whole trigger config. */
 export const setTriggerParamsSchema = z.object({
   trigger: triggerConfigSchema,
 });
 export type SetTriggerParams = z.infer<typeof setTriggerParamsSchema>;
 
-/** `addContext` attaches an existing workspace/user resource to the CONTEXT pillar. */
+/** `setAgent` points the workflow at an agent (must exist and be published). */
+export const setAgentParamsSchema = z.object({
+  /** `agents` row id — must exist in the workspace inventory. */
+  agentId: z.uuid(),
+});
+export type SetAgentParams = z.infer<typeof setAgentParamsSchema>;
+
+/** `setInstructions` replaces the workflow's instructions markdown wholesale. */
+export const setInstructionsParamsSchema = z.object({
+  markdown: z.string().min(1),
+});
+export type SetInstructionsParams = z.infer<typeof setInstructionsParamsSchema>;
+
+/** Workflow-surface tool schemas — the validation source for its proposals. */
+export const workflowCopilotMutationParamSchemas = {
+  setTrigger: setTriggerParamsSchema,
+  setAgent: setAgentParamsSchema,
+  setInstructions: setInstructionsParamsSchema,
+} as const;
+
+export type WorkflowCopilotMutationTool =
+  keyof typeof workflowCopilotMutationParamSchemas;
+
+export const WORKFLOW_COPILOT_MUTATION_TOOLS = Object.keys(
+  workflowCopilotMutationParamSchemas,
+) as WorkflowCopilotMutationTool[];
+
+// ── agent-surface mutation tools ─────────────────────────────────────────────
+
+/** `setPersona` replaces the agent's persona markdown wholesale. */
+export const setPersonaParamsSchema = z.object({
+  markdown: z.string().min(1),
+});
+export type SetPersonaParams = z.infer<typeof setPersonaParamsSchema>;
+
+/**
+ * `setModel` updates the agent's model block. All fields optional so the
+ * copilot can change just the reasoning effort or just the preset, but at
+ * least one field must be present (an empty setModel is meaningless).
+ */
+export const setModelParamsSchema = z
+  .object({
+    preset: modelPresetSlugSchema.optional(),
+    /** Specific-model override; must pass the workspace allowlist. */
+    modelId: z.string().min(1).optional(),
+    reasoning: reasoningEffortSchema.optional(),
+  })
+  .refine(
+    (params) =>
+      params.preset !== undefined ||
+      params.modelId !== undefined ||
+      params.reasoning !== undefined,
+    { message: "setModel requires at least one of preset/modelId/reasoning" },
+  );
+export type SetModelParams = z.infer<typeof setModelParamsSchema>;
+
+/** What an addContext/removeContext id points at. */
+export const copilotContextKindSchema = z.enum(["connection", "skill"]);
+export type CopilotContextKind = z.infer<typeof copilotContextKindSchema>;
+
+/** `addContext` equips the agent with an existing workspace/user resource. */
 export const addContextParamsSchema = z.object({
   kind: copilotContextKindSchema,
   /** `mcp_connections.id` or `skills.id` — must exist in the workspace inventory. */
@@ -44,48 +111,27 @@ export type AddContextParams = z.infer<typeof addContextParamsSchema>;
 export const removeContextParamsSchema = addContextParamsSchema;
 export type RemoveContextParams = AddContextParams;
 
-/**
- * `setAgent` updates the AGENT pillar. All fields optional so the copilot can
- * change just the reasoning effort or just the preset, but at least one field
- * must be present (an empty setAgent is meaningless).
- */
-export const setAgentParamsSchema = z
-  .object({
-    /** `agents` row id — must exist in the workspace inventory. */
-    agentPresetId: z.uuid().optional(),
-    reasoning: reasoningEffortSchema.optional(),
-    /** Specific-model override; must pass the workspace allowlist. */
-    modelId: z.string().min(1).optional(),
-  })
-  .refine(
-    (params) =>
-      params.agentPresetId !== undefined ||
-      params.reasoning !== undefined ||
-      params.modelId !== undefined,
-    { message: "setAgent requires at least one of agentPresetId/reasoning/modelId" },
-  );
-export type SetAgentParams = z.infer<typeof setAgentParamsSchema>;
-
-/** `setModelPreset` re-points the AGENT pillar's model preset override. */
-export const setModelPresetParamsSchema = z.object({
-  slug: modelPresetSlugSchema,
-});
-export type SetModelPresetParams = z.infer<typeof setModelPresetParamsSchema>;
-
-/** `setInstructions` replaces the INSTRUCTIONS pillar markdown wholesale. */
-export const setInstructionsParamsSchema = z.object({
-  markdown: z.string().min(1),
-});
-export type SetInstructionsParams = z.infer<typeof setInstructionsParamsSchema>;
-
-/** Per-tool zod schemas — the single validation source for proposals. */
-export const copilotMutationParamSchemas = {
-  setTrigger: setTriggerParamsSchema,
+/** Agent-surface tool schemas — the validation source for its proposals. */
+export const agentCopilotMutationParamSchemas = {
+  setPersona: setPersonaParamsSchema,
+  setModel: setModelParamsSchema,
   addContext: addContextParamsSchema,
   removeContext: removeContextParamsSchema,
-  setAgent: setAgentParamsSchema,
-  setModelPreset: setModelPresetParamsSchema,
-  setInstructions: setInstructionsParamsSchema,
+} as const;
+
+export type AgentCopilotMutationTool =
+  keyof typeof agentCopilotMutationParamSchemas;
+
+export const AGENT_COPILOT_MUTATION_TOOLS = Object.keys(
+  agentCopilotMutationParamSchemas,
+) as AgentCopilotMutationTool[];
+
+// ── combined registry (proposal frames are surface-agnostic) ─────────────────
+
+/** Per-tool zod schemas across both surfaces (tool names never collide). */
+export const copilotMutationParamSchemas = {
+  ...workflowCopilotMutationParamSchemas,
+  ...agentCopilotMutationParamSchemas,
 } as const;
 
 export type CopilotMutationTool = keyof typeof copilotMutationParamSchemas;
@@ -134,8 +180,13 @@ export const COPILOT_MAX_DRAFT_CHARS = 131_072;
 
 export const copilotUserMessageFrameSchema = z.object({
   type: z.literal("user_message"),
-  /** Workflow being edited — its org must match the socket's workspace. */
-  workflowId: z.uuid(),
+  /** Which editor this turn is about — selects the toolset and prompt. */
+  surface: copilotSurfaceSchema,
+  /**
+   * The workflow/agent being edited (per `surface`) — its org must match the
+   * socket's workspace.
+   */
+  entityId: z.uuid(),
   /**
    * The CURRENT draft as the client sees it (the client is the single
    * writer; the server never trusts its own cached copy across turns).
@@ -179,8 +230,8 @@ export type CopilotMutationOutcome = z.infer<
 export const COPILOT_ERROR_CODES = [
   /** Frame failed schema validation (client bug). */
   "invalid_frame",
-  /** workflowId does not resolve inside the socket's workspace. */
-  "workflow_not_found",
+  /** entityId does not resolve to a surface row inside the socket's workspace. */
+  "entity_not_found",
   /** A turn is already streaming on this socket. */
   "turn_in_progress",
   /** Per-workspace concurrent copilot session cap reached. */

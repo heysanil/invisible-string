@@ -1,5 +1,6 @@
 /**
- * Product tables — INITIAL-SPEC.md §9 / docs/PLAN.md "Data model".
+ * Product tables — agents-first data model
+ * (docs/superpowers/specs/2026-07-10-agents-first-redesign.md).
  *
  * Conventions:
  * - Workspace = Better Auth organization; workspace scoping is
@@ -8,6 +9,10 @@
  * - Encrypted-at-rest values (AES-256-GCM envelope, packages/… crypto module)
  *   are stored as opaque `text` columns suffixed `_encrypted`; plaintext must
  *   never be logged or put in model context.
+ * - Agents are the compile unit: publishing an Agent snapshots its
+ *   AgentDefinition into `agent_versions` and builds one artifact per content
+ *   hash (`builds`). Workflows are standing delegations (trigger → agent →
+ *   instructions) with no builds of their own.
  * - `agent_sessions` are chat/eve sessions — distinct from Better Auth's
  *   `session` (login) table.
  */
@@ -51,14 +56,18 @@ export const modelPresetSlug = pgEnum("model_preset_slug", [
   "quick",
 ]);
 
-/** eve reasoning effort for agent presets. */
+/**
+ * eve reasoning effort for an agent's model config. The value itself lives in
+ * the AgentDefinition jsonb (agents.draft / agent_versions.definition); the
+ * enum stays defined for the db↔shared lockstep (`reasoningEffortSchema`).
+ */
 export const reasoningEffort = pgEnum("reasoning_effort", [
   "low",
   "medium",
   "high",
 ]);
 
-/** Build lifecycle for workflow versions and the build cache. */
+/** Build lifecycle for agent versions and the build cache. */
 export const buildStatus = pgEnum("build_status", [
   "pending",
   "building",
@@ -102,6 +111,16 @@ export const runStatus = pgEnum("run_status", [
   "canceled",
 ]);
 
+/**
+ * Outbound delivery of a run's final reply to its trigger surface (Slack
+ * today). Null on runs = no delivery owed.
+ */
+export const deliveryStatus = pgEnum("delivery_status", [
+  "pending",
+  "delivered",
+  "failed",
+]);
+
 /** Worker registry status (spec §9 workers). */
 export const workerStatus = pgEnum("worker_status", [
   "live",
@@ -119,7 +138,7 @@ const updatedAt = timestamp("updated_at", { withTimezone: true })
   .$onUpdate(() => new Date())
   .notNull();
 
-// ── Context pillar: MCP connections + skills ───────────────────────────────
+// ── Context resources: MCP connections + skills ────────────────────────────
 
 export const mcpConnections = pgTable(
   "mcp_connections",
@@ -254,8 +273,13 @@ export const modelAllowlist = pgTable(
   ],
 );
 
-// ── Agent pillar: agent presets ─────────────────────────────────────────────
+// ── Agents: the entity, its compiled versions, and the build cache ─────────
 
+/**
+ * An Agent — persona + model + equipped context (MCP connections, skills).
+ * Chat targets agents directly; workflows delegate to them. `draft` is the
+ * mutable AgentDefinition; publishing snapshots it into `agent_versions`.
+ */
 export const agents = pgTable(
   "agents",
   {
@@ -263,17 +287,31 @@ export const agents = pgTable(
     organizationId: text("organization_id")
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
+    /**
+     * Unique per workspace. The slugified name feeds the content hash —
+     * renaming an agent re-keys its world DB + JWT audience on next publish.
+     */
     name: text("name").notNull(),
     description: text("description"),
-    /** Base system-prompt / persona block prepended to instructions.md. */
-    basePrompt: text("base_prompt").notNull(),
-    reasoningEffort: reasoningEffort("reasoning_effort")
-      .default("medium")
+    /**
+     * Credentials owner (moved from workflows): user-scoped MCP connections
+     * resolve against this user on every dispatch path. Must remain a
+     * workspace member — the compiler rejects otherwise. Default: creator.
+     */
+    runAsUserId: text("run_as_user_id")
+      .notNull()
+      .references(() => user.id),
+    /**
+     * Mutable draft AgentDefinition JSON (persona markdown, model config,
+     * context refs). Schema is defined in packages/shared.
+     */
+    draft: jsonb("draft")
+      .$type<Record<string, unknown>>()
+      .default(sql`'{}'::jsonb`)
       .notNull(),
-    /** Workspace model preset this agent resolves through (default balanced). */
-    modelPreset: modelPresetSlug("model_preset").default("balanced").notNull(),
-    /** Optional specific-model override (must be allowlisted at compile). */
-    modelId: text("model_id"),
+    publishedVersionId: uuid("published_version_id").references(
+      (): AnyPgColumn => agentVersions.id,
+    ),
     createdAt,
     updatedAt,
   },
@@ -285,8 +323,58 @@ export const agents = pgTable(
   ],
 );
 
-// ── Workflows: drafts, versions, builds ─────────────────────────────────────
+/** Immutable AgentDefinition snapshots — one per publish; the compile unit. */
+export const agentVersions = pgTable(
+  "agent_versions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    /** Immutable AgentDefinition snapshot. */
+    definition: jsonb("definition").$type<Record<string, unknown>>().notNull(),
+    /** Hash of definition + resolved deps + compiler/eve versions + build env. */
+    contentHash: text("content_hash").notNull(),
+    compilerVersion: text("compiler_version").notNull(),
+    eveVersion: text("eve_version").notNull(),
+    /**
+     * Provider+model RESOLVED at publish (preset→model + allowlist check) and
+     * compiled into the version's agent.ts. Dispatch reads these to inject
+     * exactly ONE provider key matching what was compiled — re-resolving at
+     * session time could disagree with the baked model if workspace presets
+     * changed after publish.
+     */
+    modelProvider: modelProvider("model_provider").notNull(),
+    modelId: text("model_id").notNull(),
+    buildStatus: buildStatus("build_status").default("pending").notNull(),
+    createdAt,
+  },
+  (table) => [
+    index("agent_versions_agent_id_idx").on(table.agentId),
+    index("agent_versions_content_hash_idx").on(table.contentHash),
+  ],
+);
 
+/** Build cache: one row per content hash (identical definitions reuse the build). */
+export const builds = pgTable("builds", {
+  /** = agent_versions.content_hash. */
+  hash: text("hash").primaryKey(),
+  status: buildStatus("status").default("pending").notNull(),
+  /** Object-store key of the built .output tarball. */
+  artifactKey: text("artifact_key"),
+  errorLog: text("error_log"),
+  createdAt,
+  updatedAt,
+});
+
+// ── Workflows: standing delegations (trigger → agent → instructions) ───────
+
+/**
+ * A workflow delegates trigger events to an agent with rendered instructions.
+ * Publishing validates and snapshots `draft` → `published` — no compile/build
+ * of its own (the agent's artifact does the work); dispatch reads only the
+ * snapshot.
+ */
 export const workflows = pgTable(
   "workflows",
   {
@@ -296,73 +384,38 @@ export const workflows = pgTable(
       .references(() => organization.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     /**
-     * Credentials owner: user-scoped MCP connections resolve against this
-     * user for ALL trigger types (spec §2). Must remain a workspace member —
-     * the compiler rejects otherwise. Default: creator.
-     */
-    runAsUserId: text("run_as_user_id")
-      .notNull()
-      .references(() => user.id),
-    /**
-     * Mutable draft pillar config (WorkflowDefinition JSON: trigger config,
-     * context refs, agent ref, instructions markdown with @refs). Schema is
-     * defined in packages/shared.
+     * Mutable draft WorkflowConfig JSON (trigger config, agent ref,
+     * instructions markdown with @refs). Schema is defined in packages/shared.
      */
     draft: jsonb("draft")
       .$type<Record<string, unknown>>()
       .default(sql`'{}'::jsonb`)
       .notNull(),
-    publishedVersionId: uuid("published_version_id").references(
-      (): AnyPgColumn => workflowVersions.id,
-    ),
+    /**
+     * Immutable WorkflowConfig snapshot taken at publish; dispatch reads THIS,
+     * never the draft. Null until first publish.
+     */
+    published: jsonb("published").$type<Record<string, unknown> | null>(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    /** Kill switch: disabled workflows accept no trigger events. */
+    enabled: boolean("enabled").default(true).notNull(),
+    /**
+     * Denormalized from published.agentId so agent deletion is blocked
+     * (RESTRICT) while a published workflow still delegates to it. The binding
+     * floats: dispatch resolves the agent's CURRENT published version;
+     * sessions/runs pin the exact agent_version used.
+     */
+    publishedAgentId: uuid("published_agent_id").references(() => agents.id, {
+      onDelete: "restrict",
+    }),
     createdAt,
     updatedAt,
   },
-  (table) => [index("workflows_organization_id_idx").on(table.organizationId)],
-);
-
-export const workflowVersions = pgTable(
-  "workflow_versions",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    workflowId: uuid("workflow_id")
-      .notNull()
-      .references(() => workflows.id, { onDelete: "cascade" }),
-    /** Immutable pillar-config snapshot. */
-    config: jsonb("config").$type<Record<string, unknown>>().notNull(),
-    /** Hash of config + compiler/template version + pinned eve version. */
-    contentHash: text("content_hash").notNull(),
-    compilerVersion: text("compiler_version").notNull(),
-    eveVersion: text("eve_version").notNull(),
-    /**
-     * Provider+model RESOLVED at publish (preset→model + allowlist check) and
-     * compiled into the version's agent.ts. Dispatch reads these to inject
-     * exactly ONE provider key matching what was compiled — re-resolving at
-     * session time could disagree with the baked model if workspace presets
-     * changed after publish. Nullable only for pre-Phase-1 rows.
-     */
-    modelProvider: modelProvider("model_provider"),
-    modelId: text("model_id"),
-    buildStatus: buildStatus("build_status").default("pending").notNull(),
-    createdAt,
-  },
   (table) => [
-    index("workflow_versions_workflow_id_idx").on(table.workflowId),
-    index("workflow_versions_content_hash_idx").on(table.contentHash),
+    index("workflows_organization_id_idx").on(table.organizationId),
+    index("workflows_published_agent_id_idx").on(table.publishedAgentId),
   ],
 );
-
-/** Build cache: one row per content hash (identical config reuses the build). */
-export const workflowBuilds = pgTable("workflow_builds", {
-  /** = workflow_versions.content_hash. */
-  hash: text("hash").primaryKey(),
-  status: buildStatus("status").default("pending").notNull(),
-  /** Object-store key of the built .output tarball. */
-  artifactKey: text("artifact_key"),
-  errorLog: text("error_log"),
-  createdAt,
-  updatedAt,
-});
 
 // ── Runtime: workers, agent sessions, runs, run events ─────────────────────
 
@@ -405,13 +458,21 @@ export const agentSessions = pgTable(
     organizationId: text("organization_id")
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
-    workflowId: uuid("workflow_id")
+    agentId: uuid("agent_id")
       .notNull()
-      .references(() => workflows.id, { onDelete: "cascade" }),
-    /** Pinned at creation; publishing a new version affects new sessions only. */
-    workflowVersionId: uuid("workflow_version_id")
+      .references(() => agents.id, { onDelete: "cascade" }),
+    /** Pinned at creation; republishing the agent affects new sessions only. */
+    agentVersionId: uuid("agent_version_id")
       .notNull()
-      .references(() => workflowVersions.id),
+      .references(() => agentVersions.id),
+    /**
+     * Workflow provenance: set when a workflow dispatch created the session,
+     * null for direct chat. SET NULL on workflow deletion — the conversation
+     * outlives the delegation that spawned it.
+     */
+    workflowId: uuid("workflow_id").references(() => workflows.id, {
+      onDelete: "set null",
+    }),
     eveSessionId: text("eve_session_id"),
     continuationToken: text("continuation_token"),
     origin: sessionOrigin("origin").notNull(),
@@ -434,7 +495,7 @@ export const agentSessions = pgTable(
     updatedAt,
   },
   (table) => [
-    index("agent_sessions_workflow_id_idx").on(table.workflowId),
+    index("agent_sessions_agent_id_idx").on(table.agentId),
     index("agent_sessions_organization_id_idx").on(table.organizationId),
     index("agent_sessions_affinity_worker_id_idx").on(table.affinityWorkerId),
     // Dispatch hot path (spec §8 step 3): conversational triggers resolve
@@ -460,12 +521,28 @@ export const runs = pgTable(
     agentSessionId: uuid("agent_session_id")
       .notNull()
       .references(() => agentSessions.id, { onDelete: "cascade" }),
-    /** The normalized TriggerEvent envelope that started this run (spec §8). */
+    /**
+     * Storage-only provenance: the normalized TriggerEvent envelope that
+     * started this run (spec §8). Never sent to agents — dispatch renders it
+     * into `task_message` instead.
+     */
     triggerEvent: jsonb("trigger_event")
       .$type<Record<string, unknown>>()
       .notNull(),
+    /**
+     * Rendered instructions sent as the eve session message (resolved
+     * @trigger values baked in) for workflow-dispatched runs; null for chat.
+     */
+    taskMessage: text("task_message"),
     eveRunId: text("eve_run_id"),
     status: runStatus("status").default("queued").notNull(),
+    /**
+     * Outbound reply delivery for trigger surfaces that expect one (Slack
+     * today): `pending` at dispatch, then delivered/failed by the control
+     * plane's DeliveryService. Null = no delivery owed.
+     */
+    deliveryStatus: deliveryStatus("delivery_status"),
+    deliveryError: text("delivery_error"),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     error: text("error"),
@@ -492,7 +569,7 @@ export const runEvents = pgTable(
   (table) => [primaryKey({ columns: [table.runId, table.seq] })],
 );
 
-// ── Trigger pillar: integrations + trigger bindings ─────────────────────────
+// ── Trigger ingress: integrations + trigger bindings ────────────────────────
 
 export const integrations = pgTable(
   "integrations",
@@ -541,6 +618,13 @@ export const triggers = pgTable(
     }),
     /** Integration-specific binding (e.g. { channelId, mentionOnly: true }). */
     binding: jsonb("binding").$type<Record<string, unknown> | null>(),
+    /** 5-field UTC cron expression (type = schedule); synced at workflow publish. */
+    cron: text("cron"),
+    /**
+     * Next due fire time — the schedule ticker's cursor. Advanced BEFORE
+     * dispatch (no backfill); cleared when the workflow unpublishes/disables.
+     */
+    nextFireAt: timestamp("next_fire_at", { withTimezone: true }),
     enabled: boolean("enabled").default(true).notNull(),
     createdAt,
     updatedAt,
@@ -548,5 +632,9 @@ export const triggers = pgTable(
   (table) => [
     index("triggers_workflow_id_idx").on(table.workflowId),
     index("triggers_integration_id_idx").on(table.integrationId),
+    // Schedule-ticker hot path: due, enabled schedule triggers only.
+    index("triggers_next_fire_at_idx")
+      .on(table.nextFireAt)
+      .where(sql`${table.type} = 'schedule' AND ${table.enabled} = true`),
   ],
 );

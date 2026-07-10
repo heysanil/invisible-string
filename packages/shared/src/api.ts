@@ -1,10 +1,10 @@
 /**
- * API contracts (INITIAL-SPEC.md §10, docs/PLAN.md Phases 1–2): publish,
- * sessions, messages, run SSE frames, plus the full Phase-2 resource surface
- * (workflows CRUD, sessions list, run input, MCP connections + registry,
- * skills + attachments, model presets/allowlist, agent presets, members).
- * Single source of truth imported by apps/control-plane and apps/web —
- * neither side re-declares these.
+ * API contracts (INITIAL-SPEC.md §10, docs/PLAN.md Phases 1–2): agent
+ * CRUD/publish, sessions, messages, run SSE frames, plus the full resource
+ * surface (workflows CRUD + publish, sessions list, run input, MCP
+ * connections + registry, skills + attachments, model presets/allowlist,
+ * members). Single source of truth imported by apps/control-plane and
+ * apps/web — neither side re-declares these.
  *
  * Conventions:
  * - Request bodies get zod schemas (both sides validate). Responses ALSO get
@@ -21,16 +21,19 @@
  */
 import { z } from "zod";
 
+import {
+  agentDefinitionSchema,
+  modelPresetSlugSchema,
+  type AgentDefinition,
+} from "./agent-definition";
 import type { EveStreamEvent } from "./eve-events";
 import { triggerEventSchema, type TriggerEvent } from "./trigger-event";
 import {
   formFieldSchema,
-  modelPresetSlugSchema,
-  reasoningEffortSchema,
   slackTriggerBindingSchema,
-  workflowDefinitionSchema,
-  type WorkflowDefinition,
-} from "./workflow-definition";
+  workflowConfigSchema,
+  type WorkflowConfig,
+} from "./workflow-config";
 
 /** ISO-8601 timestamp (kept lenient on read; the DB serializer owns format). */
 const isoTimestamp = z.string().min(1);
@@ -62,6 +65,14 @@ export const runStatusSchema = z.enum([
   "canceled",
 ]);
 export type RunStatus = z.infer<typeof runStatusSchema>;
+
+/**
+ * Mirrors pgEnum `delivery_status` — outbound reply delivery (Slack today)
+ * performed by the control plane off the run's terminal event. Null on runs
+ * with no outbound leg (chat, webhook, form, schedule).
+ */
+export const deliveryStatusSchema = z.enum(["pending", "delivered", "failed"]);
+export type DeliveryStatus = z.infer<typeof deliveryStatusSchema>;
 
 /** Mirrors pgEnum `agent_session_status`. */
 export const agentSessionStatusSchema = z.enum([
@@ -173,9 +184,11 @@ export type DeleteResourceResponse = z.infer<
  */
 export interface AgentSessionDto {
   id: string;
-  workflowId: string;
-  /** Pinned at creation; publishing a new version affects new sessions only. */
-  workflowVersionId: string;
+  agentId: string;
+  /** Pinned at creation; publishing a new agent version affects new sessions only. */
+  agentVersionId: string;
+  /** Workflow that delegated the session (provenance); null for direct chat. */
+  workflowId: string | null;
   origin: SessionOrigin;
   status: AgentSessionStatus;
   /**
@@ -189,8 +202,9 @@ export interface AgentSessionDto {
 
 export const agentSessionDtoSchema = z.object({
   id: productId,
-  workflowId: productId,
-  workflowVersionId: productId,
+  agentId: productId,
+  agentVersionId: productId,
+  workflowId: productId.nullable(),
   origin: sessionOriginSchema,
   status: agentSessionStatusSchema,
   eveSessionId: z.string().nullable(),
@@ -210,8 +224,16 @@ export interface RunDto {
   id: string;
   agentSessionId: string;
   status: RunStatus;
-  /** The normalized envelope that started this run (spec §8). */
+  /** The provenance envelope that started this run (never sent to agents). */
   triggerEvent: TriggerEvent;
+  /**
+   * The rendered task message the agent actually received (`renderTaskMessage`
+   * over the workflow's instructions); null for chat runs (the chat message
+   * goes through verbatim).
+   */
+  taskMessage: string | null;
+  /** Outbound reply delivery state; null when the run has no outbound leg. */
+  deliveryStatus: DeliveryStatus | null;
   eveRunId: string | null;
   error: string | null;
   startedAt: string | null;
@@ -224,6 +246,8 @@ export const runDtoSchema = z.object({
   agentSessionId: productId,
   status: runStatusSchema,
   triggerEvent: triggerEventSchema,
+  taskMessage: z.string().nullable(),
+  deliveryStatus: deliveryStatusSchema.nullable(),
   eveRunId: z.string().nullable(),
   error: z.string().nullable(),
   startedAt: isoTimestamp.nullable(),
@@ -238,27 +262,28 @@ type _RunDtoLockstep = [
 const _runDtoLockstep: _RunDtoLockstep = [true, true];
 void _runDtoLockstep;
 
-// ── POST /workspaces/:workspaceId/workflows/:wfId/publish ───────────────────
+// ── POST /workspaces/:workspaceId/agents/:agentId/publish ───────────────────
 
 /**
- * Publish: snapshot the draft into an immutable `workflow_versions` row,
- * compile, and build — idempotent by content hash (config + compiler version
- * + eve version). No request body.
+ * Publish an agent: snapshot the draft into an immutable `agent_versions`
+ * row, compile, and build — idempotent by content hash (definition +
+ * resolved deps + compiler version + eve version + build-env epoch +
+ * workspace slug). No request body.
  */
-export interface PublishWorkflowResponse {
-  workflowId: string;
-  /** The `workflow_versions` row now set as `published_version_id`. */
+export interface PublishAgentResponse {
+  agentId: string;
+  /** The `agent_versions` row now set as `published_version_id`. */
   versionId: string;
   contentHash: string;
   buildStatus: BuildStatus;
-  /** True when the hash hit the `workflow_builds` cache (no new build ran). */
+  /** True when the hash hit the `builds` cache (no new build ran). */
   cached: boolean;
   /** Compiler/`eve build` error log when buildStatus is "failed". */
   buildError: string | null;
 }
 
-export const publishWorkflowResponseSchema = z.object({
-  workflowId: productId,
+export const publishAgentResponseSchema = z.object({
+  agentId: productId,
   versionId: productId,
   contentHash: z.string().min(1),
   buildStatus: buildStatusSchema,
@@ -267,22 +292,22 @@ export const publishWorkflowResponseSchema = z.object({
 });
 
 type _PublishLockstep = [
-  z.infer<typeof publishWorkflowResponseSchema> extends PublishWorkflowResponse
+  z.infer<typeof publishAgentResponseSchema> extends PublishAgentResponse
     ? true
     : never,
-  PublishWorkflowResponse extends z.infer<typeof publishWorkflowResponseSchema>
+  PublishAgentResponse extends z.infer<typeof publishAgentResponseSchema>
     ? true
     : never,
 ];
 const _publishLockstep: _PublishLockstep = [true, true];
 void _publishLockstep;
 
-// ── GET /workspaces/:workspaceId/workflows/:wfId/versions/:versionId/build ──
+// ── GET /workspaces/:workspaceId/agents/:agentId/versions/:versionId/build ──
 
 /**
- * Build status of a workflow version. The builder polls this after an async
- * publish (a fresh build answers "building" and progresses in the background)
- * so the rail can flip from "Building…" to the ready/error chip.
+ * Build status of an agent version. The agent editor polls this after an
+ * async publish (a fresh build answers "building" and progresses in the
+ * background) so the rail can flip from "Building…" to the ready/error chip.
  */
 export interface BuildStatusResponse {
   status: BuildStatus;
@@ -295,12 +320,12 @@ export const buildStatusResponseSchema = z.object({
   error: z.string().nullable(),
 });
 
-// ── POST /workspaces/:workspaceId/workflows/:wfId/versions/dry-run-compile ──
+// ── POST /workspaces/:workspaceId/agents/:agentId/dry-run-compile ───────────
 
 /**
- * Dry-run compile of the CURRENT draft (no rows written). Compile problems
- * are the PAYLOAD of a dry run (`ok: false`), not a failed request — the
- * builder renders them inline next to the pillar cards.
+ * Dry-run compile of the agent's CURRENT draft (no rows written). Compile
+ * problems are the PAYLOAD of a dry run (`ok: false`), not a failed request —
+ * the agent editor renders them inline next to the section cards.
  */
 export const dryRunCompileResponseSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), contentHash: z.string().min(1) }),
@@ -308,9 +333,13 @@ export const dryRunCompileResponseSchema = z.discriminatedUnion("ok", [
 ]);
 export type DryRunCompileResponse = z.infer<typeof dryRunCompileResponseSchema>;
 
-// ── POST /workspaces/:workspaceId/workflows/:wfId/sessions ──────────────────
+// ── POST /workspaces/:workspaceId/agents/:agentId/sessions ──────────────────
 
-/** Start a chat/manual session against the workflow's published version. */
+/**
+ * Start a chat session against the agent's published version (requires a
+ * ready build). Chat sessions have no workflow — `session.workflowId` is
+ * null.
+ */
 export const createSessionRequestSchema = z.object({
   /** First user message; becomes TriggerEvent.message of the first run. */
   message: z.string().min(1),
@@ -416,74 +445,107 @@ export function isRunStreamTerminalStatus(status: RunStatus): boolean {
 // Phase 2 — resource CRUD surface
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── Workflows CRUD ──────────────────────────────────────────────────────────
+// ── Workflows CRUD + publish ────────────────────────────────────────────────
 //
 //   GET    /workspaces/:workspaceId/workflows                → ListWorkflowsResponse
 //   POST   /workspaces/:workspaceId/workflows                → CreateWorkflowResponse (201)
 //   GET    /workspaces/:workspaceId/workflows/:wfId          → GetWorkflowResponse
 //   PATCH  /workspaces/:workspaceId/workflows/:wfId          → UpdateWorkflowResponse
 //   DELETE /workspaces/:workspaceId/workflows/:wfId          → DeleteResourceResponse
+//   POST   /workspaces/:workspaceId/workflows/:wfId/publish  → PublishWorkflowResponse
 //
-// Deleting a workflow cascades to versions/sessions/runs (DB FKs) — the UI
-// confirms destructive intent before calling.
+// Workflows have no builds: publish validates the draft (published agent,
+// non-empty instructions, legal @references), snapshots `draft` →
+// `published`, and syncs the trigger row — instant, no compile. Deleting a
+// workflow cascades to its trigger rows; its sessions survive with
+// `workflowId` nulled (provenance).
 
 const workflowNameSchema = z.string().trim().min(1).max(200);
 
-/** List-item projection (no draft payload). */
+/**
+ * One validation finding for a workflow draft (shared validator; returned on
+ * PATCH/GET and enforced at publish). `path` is a dot path into the config
+ * (e.g. "agentId", "instructions.markdown"); `severity: "error"` blocks
+ * publish, `"warning"` does not (e.g. an agent republish stranding a
+ * `@connection` ref — dispatch degrades gracefully).
+ */
+export const workflowDiagnosticSchema = z.object({
+  path: z.string(),
+  message: z.string().min(1),
+  severity: z.enum(["error", "warning"]),
+});
+export type WorkflowDiagnostic = z.infer<typeof workflowDiagnosticSchema>;
+
+export const workflowDiagnosticsSchema = z.array(workflowDiagnosticSchema);
+export type WorkflowDiagnostics = z.infer<typeof workflowDiagnosticsSchema>;
+
+/** List-item projection (no draft/published payloads). */
 export const workflowSummaryDtoSchema = z.object({
   id: productId,
   name: workflowNameSchema,
-  /** Credentials owner (spec §2) — must remain a workspace member. */
-  runAsUserId: authId,
-  publishedVersionId: productId.nullable(),
   /**
    * `draft.trigger.type` surfaced for list chips; null while the draft has
    * no shape-valid trigger yet.
    */
   triggerType: z.string().nullable(),
+  /** Name of the draft's agent; null while the draft names none. */
+  agentName: z.string().nullable(),
+  /** Master switch for trigger dispatch (publish state is `publishedAt`). */
+  enabled: z.boolean(),
+  publishedAt: isoTimestamp.nullable(),
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
 });
 export type WorkflowSummaryDto = z.infer<typeof workflowSummaryDtoSchema>;
 
 /**
- * Full workflow row. `draft` is served AS STORED (jsonb, draft-lenient —
- * legacy rows may predate the WorkflowDefinition schema); use
- * {@link parseWorkflowDraft} to get a shape-guarded definition.
+ * Full workflow row. `draft` and `published` are served AS STORED (jsonb;
+ * the draft is draft-lenient); use {@link parseWorkflowConfig} to get a
+ * shape-guarded config from either.
  */
-export const workflowDtoSchema = workflowSummaryDtoSchema.extend({
+export const workflowDtoSchema = z.object({
+  id: productId,
+  name: workflowNameSchema,
   draft: z.record(z.string(), z.unknown()),
+  /** Publish-time snapshot dispatch reads; null while never published. */
+  published: z.record(z.string(), z.unknown()).nullable(),
+  enabled: z.boolean(),
+  publishedAt: isoTimestamp.nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
 });
 export type WorkflowDto = z.infer<typeof workflowDtoSchema>;
 
-/** Shape-guarded view of a stored draft; null when empty or shape-invalid. */
-export function parseWorkflowDraft(draft: unknown): WorkflowDefinition | null {
-  const parsed = workflowDefinitionSchema.safeParse(draft);
+/**
+ * Shape-guarded view of a stored draft/published snapshot; null when empty
+ * or shape-invalid.
+ */
+export function parseWorkflowConfig(config: unknown): WorkflowConfig | null {
+  const parsed = workflowConfigSchema.safeParse(config);
   return parsed.success ? parsed.data : null;
 }
 
 export const createWorkflowRequestSchema = z.object({
   name: workflowNameSchema,
-  /** Full four-pillar draft; omitted = empty draft the builder fills in. */
-  draft: workflowDefinitionSchema.optional(),
-  /** Defaults to the creator. */
-  runAsUserId: authId.optional(),
+  /** Full config draft; omitted = empty draft the editor fills in. */
+  draft: workflowConfigSchema.optional(),
 });
 export type CreateWorkflowRequest = z.infer<typeof createWorkflowRequestSchema>;
 
 export const updateWorkflowRequestSchema = z
   .object({
     name: workflowNameSchema.optional(),
-    runAsUserId: authId.optional(),
-    /** Full replacement draft (the builder always writes whole definitions). */
-    draft: workflowDefinitionSchema.optional(),
+    /** Full replacement draft (the editor always writes whole configs). */
+    draft: workflowConfigSchema.optional(),
+    /** Pause/resume trigger dispatch without unpublishing. */
+    enabled: z.boolean().optional(),
   })
   .refine(
     (patch) =>
       patch.name !== undefined ||
-      patch.runAsUserId !== undefined ||
-      patch.draft !== undefined,
-    { message: "update at least one of name, runAsUserId, draft" },
+      patch.draft !== undefined ||
+      patch.enabled !== undefined,
+    { message: "update at least one of name, draft, enabled" },
   );
 export type UpdateWorkflowRequest = z.infer<typeof updateWorkflowRequestSchema>;
 
@@ -492,32 +554,41 @@ export const listWorkflowsResponseSchema = z.object({
 });
 export type ListWorkflowsResponse = z.infer<typeof listWorkflowsResponseSchema>;
 
+/**
+ * GET/PATCH/publish all answer the row plus current validator diagnostics
+ * (omitted when validation could not run) — the editor gets validation for
+ * free without a second round-trip, and a stale agent reference surfaces as
+ * a warning on plain GETs.
+ */
 export const getWorkflowResponseSchema = z.object({
   workflow: workflowDtoSchema,
+  diagnostics: workflowDiagnosticsSchema.optional(),
 });
 export type GetWorkflowResponse = z.infer<typeof getWorkflowResponseSchema>;
 
 export const createWorkflowResponseSchema = getWorkflowResponseSchema;
 export type CreateWorkflowResponse = GetWorkflowResponse;
 
-/**
- * A draft PATCH additionally carries dry-run-compile diagnostics (same payload
- * as the dry-run endpoint) so the builder gets validation for free without a
- * second round-trip. Omitted when the draft was not touched or the dry run
- * could not run (e.g. the object store was briefly down).
- */
-export const updateWorkflowResponseSchema = getWorkflowResponseSchema.extend({
-  diagnostics: dryRunCompileResponseSchema.optional(),
+export const updateWorkflowResponseSchema = getWorkflowResponseSchema;
+export type UpdateWorkflowResponse = GetWorkflowResponse;
+
+/** Publish response: the updated row (`published` freshly snapshotted). */
+export const publishWorkflowResponseSchema = z.object({
+  workflow: workflowDtoSchema,
 });
-export type UpdateWorkflowResponse = z.infer<typeof updateWorkflowResponseSchema>;
+export type PublishWorkflowResponse = z.infer<
+  typeof publishWorkflowResponseSchema
+>;
 
 // ── Sessions list ───────────────────────────────────────────────────────────
 //
-//   GET /workspaces/:workspaceId/sessions?workflowId=&status= → ListSessionsResponse
+//   GET /workspaces/:workspaceId/sessions?agentId=&workflowId=&status= → ListSessionsResponse
 //
 // Ordered by lastActivityAt descending (the chat list).
 
 export const listSessionsQuerySchema = z.object({
+  /** Restrict to one agent (the agent's chat history). */
+  agentId: productId.optional(),
   /** Restrict to one workflow (the workflow's session history panel). */
   workflowId: productId.optional(),
   status: agentSessionStatusSchema.optional(),
@@ -526,7 +597,9 @@ export type ListSessionsQuery = z.infer<typeof listSessionsQuerySchema>;
 
 /** Session list item: DTO + the fields the chat list renders. */
 export const agentSessionSummaryDtoSchema = agentSessionDtoSchema.extend({
-  workflowName: z.string(),
+  agentName: z.string(),
+  /** Workflow provenance for the origin chip; null for direct chat. */
+  workflowName: z.string().nullable(),
   /** Status of the most recent run; null before the first run lands. */
   lastRunStatus: runStatusSchema.nullable(),
   /** Max of session/run updatedAt — the list's sort key. */
@@ -995,75 +1068,125 @@ export type GetModelAllowlistEntryResponse = z.infer<
   typeof getModelAllowlistEntryResponseSchema
 >;
 
-// ── Agent presets (AGENT pillar) ────────────────────────────────────────────
+// ── Agents CRUD ─────────────────────────────────────────────────────────────
 //
-//   GET    /workspaces/:workspaceId/agents      → ListAgentPresetsResponse
-//   POST   /workspaces/:workspaceId/agents      → GetAgentPresetResponse (201)
-//   GET    /workspaces/:workspaceId/agents/:id  → GetAgentPresetResponse
-//   PATCH  /workspaces/:workspaceId/agents/:id  → GetAgentPresetResponse
-//   DELETE /workspaces/:workspaceId/agents/:id  → DeleteResourceResponse
+//   GET    /workspaces/:workspaceId/agents           → ListAgentsResponse
+//   POST   /workspaces/:workspaceId/agents           → CreateAgentResponse (201)
+//   GET    /workspaces/:workspaceId/agents/:agentId  → GetAgentResponse
+//   PATCH  /workspaces/:workspaceId/agents/:agentId  → UpdateAgentResponse
+//   DELETE /workspaces/:workspaceId/agents/:agentId  → DeleteResourceResponse
 //
-// Deleting a preset referenced by workflow drafts makes those drafts fail
-// publish with `agent_preset_not_found` — the UI warns before deleting.
+// (Lifecycle routes — publish, build status, dry-run-compile, sessions — are
+// documented at their schemas above.) Deleting an agent referenced by
+// workflows or sessions answers 409 `agent_in_use` — the UI warns before
+// deleting. NOTE the agent NAME feeds the content hash via its slug:
+// renaming re-keys the world DB + JWT audience on the next publish, exactly
+// like renaming a workflow used to.
 
-export const agentPresetDtoSchema = z.object({
+const agentNameSchema = z.string().trim().min(1).max(120);
+
+/**
+ * Full agent row. `draft` is served AS STORED (jsonb, draft-lenient); use
+ * {@link parseAgentDefinition} to get a shape-guarded definition.
+ */
+export const agentDtoSchema = z.object({
   id: productId,
-  name: z.string().min(1),
+  name: agentNameSchema,
   description: z.string().nullable(),
-  /** Persona block prepended to compiled instructions.md. */
-  basePrompt: z.string().min(1),
-  reasoningEffort: reasoningEffortSchema,
-  /** Workspace model preset this agent resolves through. */
-  modelPreset: modelPresetSlugSchema,
-  /** Specific-model override (wins over modelPreset; allowlist-checked). */
-  modelId: z.string().nullable(),
+  /** Credentials owner (spec §2) — must remain a workspace member. */
+  runAsUserId: authId,
+  draft: z.record(z.string(), z.unknown()),
+  publishedVersionId: productId.nullable(),
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
 });
-export type AgentPresetDto = z.infer<typeof agentPresetDtoSchema>;
+export type AgentDto = z.infer<typeof agentDtoSchema>;
 
-const agentPresetNameSchema = z.string().trim().min(1).max(120);
-
-export const createAgentPresetRequestSchema = z.object({
-  name: agentPresetNameSchema,
-  description: z.string().max(2000).optional(),
-  basePrompt: z.string().min(1).max(50_000),
-  reasoningEffort: reasoningEffortSchema.default("medium"),
-  modelPreset: modelPresetSlugSchema.default("balanced"),
-  modelId: z.string().min(1).optional(),
+/** List-item projection (no draft payload) + the fields the card grid renders. */
+export const agentSummaryDtoSchema = z.object({
+  id: productId,
+  name: agentNameSchema,
+  description: z.string().nullable(),
+  runAsUserId: authId,
+  publishedVersionId: productId.nullable(),
+  /** When the current published version was created; null while unpublished. */
+  publishedAt: isoTimestamp.nullable(),
+  /** Build status of the published version; null while unpublished. */
+  buildStatus: buildStatusSchema.nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
 });
-export type CreateAgentPresetRequest = z.infer<
-  typeof createAgentPresetRequestSchema
->;
+export type AgentSummaryDto = z.infer<typeof agentSummaryDtoSchema>;
 
-export const updateAgentPresetRequestSchema = z
+/** One immutable publish snapshot (`agent_versions` row). */
+export const agentVersionDtoSchema = z.object({
+  id: productId,
+  agentId: productId,
+  /** The AgentDefinition compiled into this version (served as stored). */
+  definition: z.record(z.string(), z.unknown()),
+  contentHash: z.string().min(1),
+  compilerVersion: z.string().min(1),
+  eveVersion: z.string().min(1),
+  /** Resolved model routing baked into the artifact. */
+  modelProvider: modelProviderSchema,
+  modelId: z.string().min(1),
+  buildStatus: buildStatusSchema,
+  createdAt: isoTimestamp,
+});
+export type AgentVersionDto = z.infer<typeof agentVersionDtoSchema>;
+
+/** Shape-guarded view of a stored draft/version definition; null when shape-invalid. */
+export function parseAgentDefinition(
+  definition: unknown,
+): AgentDefinition | null {
+  const parsed = agentDefinitionSchema.safeParse(definition);
+  return parsed.success ? parsed.data : null;
+}
+
+export const createAgentRequestSchema = z.object({
+  name: agentNameSchema,
+  description: z.string().max(2000).optional(),
+  /** Full definition draft; omitted = empty draft the editor fills in. */
+  draft: agentDefinitionSchema.optional(),
+  /** Defaults to the creator. */
+  runAsUserId: authId.optional(),
+});
+export type CreateAgentRequest = z.infer<typeof createAgentRequestSchema>;
+
+export const updateAgentRequestSchema = z
   .object({
-    name: agentPresetNameSchema.optional(),
+    name: agentNameSchema.optional(),
     description: z.string().max(2000).nullable().optional(),
-    basePrompt: z.string().min(1).max(50_000).optional(),
-    reasoningEffort: reasoningEffortSchema.optional(),
-    modelPreset: modelPresetSlugSchema.optional(),
-    /** null clears the specific-model override. */
-    modelId: z.string().min(1).nullable().optional(),
+    runAsUserId: authId.optional(),
+    /** Full replacement draft (the editor always writes whole definitions). */
+    draft: agentDefinitionSchema.optional(),
   })
   .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
     message: "update at least one field",
   });
-export type UpdateAgentPresetRequest = z.infer<
-  typeof updateAgentPresetRequestSchema
->;
+export type UpdateAgentRequest = z.infer<typeof updateAgentRequestSchema>;
 
-export const listAgentPresetsResponseSchema = z.object({
-  agents: z.array(agentPresetDtoSchema),
+export const listAgentsResponseSchema = z.object({
+  agents: z.array(agentSummaryDtoSchema),
 });
-export type ListAgentPresetsResponse = z.infer<
-  typeof listAgentPresetsResponseSchema
->;
+export type ListAgentsResponse = z.infer<typeof listAgentsResponseSchema>;
 
-export const getAgentPresetResponseSchema = z.object({
-  agent: agentPresetDtoSchema,
+export const getAgentResponseSchema = z.object({ agent: agentDtoSchema });
+export type GetAgentResponse = z.infer<typeof getAgentResponseSchema>;
+
+export const createAgentResponseSchema = getAgentResponseSchema;
+export type CreateAgentResponse = GetAgentResponse;
+
+/**
+ * A draft PATCH additionally carries dry-run-compile diagnostics (same
+ * payload as the dry-run endpoint) so the editor gets validation for free
+ * without a second round-trip. Omitted when the draft was not touched or the
+ * dry run could not run (e.g. the object store was briefly down).
+ */
+export const updateAgentResponseSchema = getAgentResponseSchema.extend({
+  diagnostics: dryRunCompileResponseSchema.optional(),
 });
-export type GetAgentPresetResponse = z.infer<typeof getAgentPresetResponseSchema>;
+export type UpdateAgentResponse = z.infer<typeof updateAgentResponseSchema>;
 
 // ── Workspace members ───────────────────────────────────────────────────────
 //

@@ -1,21 +1,23 @@
 /**
- * WorkflowDefinition — the draft pillar config (TRIGGER · CONTEXT · AGENT ·
- * INSTRUCTIONS) stored on `workflows.draft` and snapshotted immutably into
- * `workflow_versions.config` at publish (INITIAL-SPEC.md §1/§9, docs/PLAN.md
- * Phase 1). This is the input to `packages/compiler`'s pure
- * `compile(WorkflowDefinition, versions)`.
+ * WorkflowConfig — a standing delegation (TRIGGER → AGENT → INSTRUCTIONS)
+ * stored on `workflows.draft` and snapshotted into `workflows.published` at
+ * publish. Workflows compile nothing: the agent is the compile unit
+ * (agent-definition.ts); publish validates and snapshots, and dispatch
+ * renders `instructions` + the trigger event into the task message
+ * (render.ts) for the agent's current published version.
  *
- * Draft-lenient by design: a draft may be incomplete in ways the compiler
- * rejects at publish (empty instructions, unresolved @references, model not
- * allowlisted, run_as user no longer a member, …). This schema guards SHAPE,
- * not publishability.
+ * Draft-lenient by design: a draft may name no agent yet and carry empty
+ * instructions. Publish requires an existing PUBLISHED `agentId`, non-empty
+ * instructions, `@trigger` refs legal for the trigger type, and
+ * `@connection`/`@skill` refs within the agent's published context. This
+ * schema guards SHAPE, not publishability.
  *
- * Enum values here mirror packages/db pgEnums (`model_preset_slug`,
- * `reasoning_effort`, `trigger_type`) — keep them in lockstep.
+ * Trigger `type` values mirror the packages/db pgEnum `trigger_type` — keep
+ * them in lockstep.
  */
 import { z } from "zod";
 
-// ── TRIGGER pillar ──────────────────────────────────────────────────────────
+// ── TRIGGER ─────────────────────────────────────────────────────────────────
 
 /**
  * Form field kinds renderable by the Phase-2 form UI. The submitted values
@@ -130,9 +132,9 @@ export const slackTriggerSchema = z.object({
 
 /**
  * Five-field cron (minute hour day-of-month month day-of-week). Shape-only
- * check — eve's schedule compiler is the real validator. Schedules fire only
- * under `eve start` (PLAN correction 9), and compile to `agent/schedules/*`
- * rather than a dispatcher channel.
+ * check — the control plane's cron evaluator is the real validator. At
+ * publish the expression syncs to `triggers.cron`/`next_fire_at`; the
+ * schedule ticker fires due triggers through the ordinary dispatch path.
  */
 const CRON_5_FIELD_PATTERN = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/;
 
@@ -159,82 +161,13 @@ export const triggerConfigSchema = z.discriminatedUnion("type", [
 
 export type TriggerConfig = z.infer<typeof triggerConfigSchema>;
 
-// ── CONTEXT pillar ──────────────────────────────────────────────────────────
-
-const uuidArray = (what: string) =>
-  z
-    .array(z.uuid())
-    .superRefine((ids, ctx) => {
-      if (new Set(ids).size !== ids.length) {
-        ctx.addIssue({
-          code: "custom",
-          message: `duplicate ${what} ids`,
-        });
-      }
-    })
-    .default([]);
-
-/**
- * References into workspace/user context resources. Ids point at
- * `mcp_connections` / `skills` rows; the control plane resolves them to
- * concrete connection/skill definitions before compiling.
- */
-export const contextConfigSchema = z.object({
-  mcpConnectionIds: uuidArray("MCP connection"),
-  skillIds: uuidArray("skill"),
-});
-
-export type ContextConfig = z.infer<typeof contextConfigSchema>;
-
-// ── AGENT pillar ────────────────────────────────────────────────────────────
-
-/** Mirrors pgEnum `model_preset_slug` (spec §7). */
-export const modelPresetSlugSchema = z.enum(["powerful", "balanced", "quick"]);
-export type ModelPresetSlug = z.infer<typeof modelPresetSlugSchema>;
-
-/** Mirrors pgEnum `reasoning_effort`. */
-export const reasoningEffortSchema = z.enum(["low", "medium", "high"]);
-export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
-
-/**
- * Agent pillar: which agent preset runs, with optional per-workflow
- * overrides. Compile-time model resolution order (spec §7):
- * `modelId override → modelPreset (override, else the preset's default) →
- * workspace preset mapping → provider+modelId → emit model: in agent.ts`,
- * allowlist-checked at compile AND dispatch.
- */
-export const agentConfigSchema = z.object({
-  /** `agents` row (agent preset: persona prompt + default preset/reasoning). */
-  agentPresetId: z.uuid(),
-  /** Overrides the preset's workspace model preset (powerful/balanced/quick). */
-  modelPreset: modelPresetSlugSchema.optional(),
-  /** Specific-model override; wins over modelPreset. Must be allowlisted. */
-  modelId: z.string().min(1).optional(),
-  /** Overrides the preset's reasoning effort. */
-  reasoning: reasoningEffortSchema.optional(),
-});
-
-export type AgentConfig = z.infer<typeof agentConfigSchema>;
-
-// ── INSTRUCTIONS pillar ─────────────────────────────────────────────────────
-
-/**
- * Instructions markdown with inline `@references`. Empty is a valid DRAFT;
- * the compiler requires non-empty at publish (`instructions.md` is required
- * on the eve root agent).
- */
-export const instructionsConfigSchema = z.object({
-  markdown: z.string(),
-});
-
-export type InstructionsConfig = z.infer<typeof instructionsConfigSchema>;
-
 // ── @reference parsing ──────────────────────────────────────────────────────
 
 /**
  * `@trigger.<path>` — resolved at DISPATCH time against `TriggerEvent.data`
- * (dot path, e.g. `@trigger.customer.email` → `data.customer.email`).
- * A bare `@trigger` parses with `path: ""` so validators can flag it.
+ * (dot path, e.g. `@trigger.customer.email` → `data.customer.email`; see
+ * `renderTaskMessage` in render.ts). A bare `@trigger` parses with
+ * `path: ""` so validators can flag it.
  */
 export interface TriggerReference {
   kind: "trigger";
@@ -248,8 +181,9 @@ export interface TriggerReference {
 }
 
 /**
- * `@<connection>` — resolved at COMPILE time to literal text (+ description)
- * for an MCP connection in the workflow's context pillar.
+ * `@<connection>` — rewritten to literal text (+ description) for an MCP
+ * connection in the agent's context: at COMPILE time in personas, at
+ * DISPATCH time in workflow instructions.
  */
 export interface ConnectionReference {
   kind: "connection";
@@ -261,8 +195,10 @@ export interface ConnectionReference {
 }
 
 /**
- * `@skill.<slug>` — resolved at COMPILE time to literal text for an authored
- * skill. A bare `@skill` parses with `slug: ""` so validators can flag it.
+ * `@skill.<slug>` — rewritten to literal text for an authored skill in the
+ * agent's context (compile time in personas, dispatch time in workflow
+ * instructions). A bare `@skill` parses with `slug: ""` so validators can
+ * flag it.
  */
 export interface SkillReference {
   kind: "skill";
@@ -310,7 +246,8 @@ const REFERENCE_PATTERN =
  *
  * Purely lexical: matches inside code fences/inline code too, and does NOT
  * validate that referenced connections/skills/fields exist — that is the
- * compiler's (publish) and builder validation's (draft) job.
+ * compiler's (agent publish), workflow validator's (workflow publish), and
+ * editor validation's (draft) job.
  */
 export function parseReferences(markdown: string): ParsedReference[] {
   const refs: ParsedReference[] = [];
@@ -363,17 +300,27 @@ export function buildReferenceInventory(markdown: string): ReferenceInventory {
   };
 }
 
-// ── The full four-pillar definition ─────────────────────────────────────────
+// ── The full workflow config ────────────────────────────────────────────────
 
-export const workflowDefinitionSchema = z.object({
+export const workflowConfigSchema = z.object({
   trigger: triggerConfigSchema,
-  context: contextConfigSchema,
-  agent: agentConfigSchema,
-  instructions: instructionsConfigSchema,
+  /**
+   * The `agents` row that handles dispatched runs. FLOATING binding: dispatch
+   * resolves the agent's CURRENT published version; sessions/runs pin the
+   * exact version used. Null while drafting — publish requires a published
+   * agent.
+   */
+  agentId: z.uuid().nullable().default(null),
+  /**
+   * What the agent should do per run — markdown with inline `@references`,
+   * rendered into the task message at dispatch (render.ts). Empty is a valid
+   * DRAFT; publish requires non-empty markdown.
+   */
+  instructions: z.object({ markdown: z.string().default("") }),
 });
 
-/** Parsed (defaults applied) definition — what the compiler consumes. */
-export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema>;
+/** Parsed (defaults applied) config — what publish/dispatch consume. */
+export type WorkflowConfig = z.infer<typeof workflowConfigSchema>;
 
 /** Pre-parse shape (defaults still optional) — what API bodies may send. */
-export type WorkflowDefinitionInput = z.input<typeof workflowDefinitionSchema>;
+export type WorkflowConfigInput = z.input<typeof workflowConfigSchema>;

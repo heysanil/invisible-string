@@ -35,6 +35,53 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
   const orgId = `org-it-${suffix}`;
   const userId = `user-it-${suffix}`;
 
+  /** Minimal valid AgentDefinition literal (schema in packages/shared). */
+  const definition = {
+    persona: "You are an integration-test agent.",
+    model: { preset: "balanced", reasoning: "medium" },
+    context: { mcpConnectionIds: [], skillIds: [] },
+  };
+
+  /** agent → version → publish → build, returning the pinned ids. */
+  async function publishAgent(name: string, contentHash: string) {
+    const [agent] = await db
+      .insert(schema.agents)
+      .values({
+        organizationId: orgId,
+        name,
+        runAsUserId: userId,
+        draft: definition,
+      })
+      .returning();
+    const [version] = await db
+      .insert(schema.agentVersions)
+      .values({
+        agentId: agent!.id,
+        definition,
+        contentHash,
+        compilerVersion: "0.0.1",
+        eveVersion: "0.0.0-test",
+        modelProvider: "openrouter",
+        modelId: "deepseek/deepseek-v4-pro",
+        buildStatus: "succeeded",
+      })
+      .returning();
+    // Publish: circular FK agents.published_version_id → agent_versions.
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: version!.id })
+      .where(eq(schema.agents.id, agent!.id));
+    await db
+      .insert(schema.builds)
+      .values({
+        hash: contentHash,
+        status: "succeeded",
+        artifactKey: `artifacts/${contentHash}.tar.gz`,
+      })
+      .onConflictDoNothing({ target: schema.builds.hash });
+    return { agent: agent!, version: version! };
+  }
+
   beforeAll(async () => {
     db = createDb(testDatabaseUrl!, { max: 4 });
     await runMigrations(db);
@@ -62,13 +109,19 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
   });
 
   afterAll(async () => {
-    // FK cascades from organization/user remove the workspace-scoped rows.
+    // Unpin published versions so the circular FK does not block the cascade,
+    // then FK cascades from organization/user remove workspace-scoped rows.
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: null })
+      .where(eq(schema.agents.organizationId, orgId));
     await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
     await db.delete(schema.user).where(eq(schema.user.id, userId));
     await db.$client.end();
   });
 
   test("seedWorkspace is idempotent and preserves admin edits", async () => {
+    // No explicit owner: seeding resolves the org's owner member.
     await seedWorkspace(db, orgId);
     await seedWorkspace(db, orgId);
 
@@ -100,7 +153,14 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       "Product Designer",
       "Software Engineer",
     ]);
-    expect(agentRows.every((a) => a.modelPreset === "balanced")).toBe(true);
+    expect(agentRows.every((a) => a.runAsUserId === userId)).toBe(true);
+    expect(
+      agentRows.every(
+        (a) =>
+          (a.draft as { model: { preset: string } }).model.preset ===
+          "balanced",
+      ),
+    ).toBe(true);
 
     // Admin edit survives a re-seed (ON CONFLICT DO NOTHING).
     await db
@@ -148,59 +208,28 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(presetCount?.n).toBe(3);
   });
 
-  test("workflow → version → session → run → run_events round trip", async () => {
-    const [workflow] = await db
-      .insert(schema.workflows)
-      .values({
-        organizationId: orgId,
-        name: "It Works",
-        runAsUserId: userId,
-        draft: { instructions: "do the thing @trigger.payload" },
-      })
-      .returning();
-    expect(workflow).toBeDefined();
+  test("agent → version → session → run → run_events round trip", async () => {
+    const { agent, version } = await publishAgent("It Works", `hash-${suffix}`);
 
-    const [version] = await db
-      .insert(schema.workflowVersions)
-      .values({
-        workflowId: workflow!.id,
-        config: { instructions: "do the thing" },
-        contentHash: `hash-${suffix}`,
-        compilerVersion: "0.0.1",
-        eveVersion: "0.0.0-test",
-        buildStatus: "succeeded",
-      })
-      .returning();
-
-    // Publish: circular FK workflows.published_version_id → workflow_versions.
-    await db
-      .update(schema.workflows)
-      .set({ publishedVersionId: version!.id })
-      .where(eq(schema.workflows.id, workflow!.id));
-
-    await db.insert(schema.workflowBuilds).values({
-      hash: `hash-${suffix}`,
-      status: "succeeded",
-      artifactKey: `artifacts/hash-${suffix}.tar.gz`,
-    });
-
+    // Chat session: no workflow provenance.
     const [agentSession] = await db
       .insert(schema.agentSessions)
       .values({
         organizationId: orgId,
-        workflowId: workflow!.id,
-        workflowVersionId: version!.id,
+        agentId: agent.id,
+        agentVersionId: version.id,
         origin: "chat",
         principal: { workspaceId: orgId, userId, source: "chat" },
       })
       .returning();
+    expect(agentSession?.workflowId).toBeNull();
 
     const [run] = await db
       .insert(schema.runs)
       .values({
         agentSessionId: agentSession!.id,
         triggerEvent: {
-          workflowId: workflow!.id,
+          agentId: agent.id,
           triggerType: "manual",
           message: "hello",
           data: {},
@@ -209,6 +238,9 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
         status: "running",
       })
       .returning();
+    // Chat runs render no task message and owe no delivery.
+    expect(run?.taskMessage).toBeNull();
+    expect(run?.deliveryStatus).toBeNull();
 
     await db.insert(schema.runEvents).values([
       { runId: run!.id, seq: 0, event: { type: "session.created" } },
@@ -237,14 +269,12 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       /duplicate key|run_events_run_id_seq_pk/,
     );
 
-    // Cascade check: deleting the workflow removes versions/sessions/runs/events.
+    // Cascade check: deleting the agent removes versions/sessions/runs/events.
     await db
-      .update(schema.workflows)
+      .update(schema.agents)
       .set({ publishedVersionId: null })
-      .where(eq(schema.workflows.id, workflow!.id));
-    await db
-      .delete(schema.workflows)
-      .where(eq(schema.workflows.id, workflow!.id));
+      .where(eq(schema.agents.id, agent.id));
+    await db.delete(schema.agents).where(eq(schema.agents.id, agent.id));
     const [orphans] = await db
       .select({ n: count() })
       .from(schema.runEvents)
@@ -252,10 +282,102 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(orphans?.n).toBe(0);
   });
 
-  test("triggers.token_hash is unique", async () => {
+  test("workflow delegation: publish snapshot, RESTRICT guard, SET NULL provenance", async () => {
+    const { agent, version } = await publishAgent(
+      "Delegate",
+      `hash-wf-${suffix}`,
+    );
+
+    const config = {
+      trigger: { type: "webhook" },
+      agentId: agent.id,
+      instructions: { markdown: "Summarize @trigger.payload" },
+    };
     const [workflow] = await db
       .insert(schema.workflows)
-      .values({ organizationId: orgId, name: "Hooked", runAsUserId: userId })
+      .values({ organizationId: orgId, name: "It Delegates", draft: config })
+      .returning();
+    expect(workflow?.enabled).toBe(true);
+    expect(workflow?.published).toBeNull();
+
+    // Publish = snapshot draft → published + denormalized agent binding.
+    const publishedAt = new Date();
+    await db
+      .update(schema.workflows)
+      .set({ published: config, publishedAt, publishedAgentId: agent.id })
+      .where(eq(schema.workflows.id, workflow!.id));
+
+    // Deleting a delegated-to agent is blocked by the RESTRICT FK.
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: null })
+      .where(eq(schema.agents.id, agent.id));
+    let restrictError: unknown;
+    try {
+      await db.delete(schema.agents).where(eq(schema.agents.id, agent.id));
+    } catch (error) {
+      restrictError = error;
+    }
+    expect(errorText(restrictError)).toMatch(
+      /violates foreign key|workflows_published_agent_id_agents_id_fk/,
+    );
+
+    // Workflow-dispatched session: provenance set, run carries the rendered
+    // task message and owes a delivery (slack-origin).
+    const [dispatched] = await db
+      .insert(schema.agentSessions)
+      .values({
+        organizationId: orgId,
+        agentId: agent.id,
+        agentVersionId: version.id,
+        workflowId: workflow!.id,
+        origin: "slack",
+        principal: { workspaceId: orgId, source: "slack" },
+        slackThreadKey: `int-${suffix}:C1:171.001`,
+      })
+      .returning();
+    const [run] = await db
+      .insert(schema.runs)
+      .values({
+        agentSessionId: dispatched!.id,
+        triggerEvent: {
+          workflowId: workflow!.id,
+          agentId: agent.id,
+          triggerType: "slack",
+          message: "hello",
+          data: {},
+          principal: { workspaceId: orgId, source: "slack" },
+        },
+        taskMessage: "<workflow-task>Summarize hello</workflow-task>",
+        deliveryStatus: "pending",
+        status: "succeeded",
+      })
+      .returning();
+    expect(run?.deliveryStatus).toBe("pending");
+    await db
+      .update(schema.runs)
+      .set({ deliveryStatus: "delivered" })
+      .where(eq(schema.runs.id, run!.id));
+
+    // Deleting the workflow keeps the conversation: provenance goes NULL.
+    await db
+      .delete(schema.workflows)
+      .where(eq(schema.workflows.id, workflow!.id));
+    const [orphanSession] = await db
+      .select()
+      .from(schema.agentSessions)
+      .where(eq(schema.agentSessions.id, dispatched!.id));
+    expect(orphanSession).toBeDefined();
+    expect(orphanSession?.workflowId).toBeNull();
+
+    // With the workflow gone the agent is deletable again (cascades sessions).
+    await db.delete(schema.agents).where(eq(schema.agents.id, agent.id));
+  });
+
+  test("triggers.token_hash is unique; schedule triggers carry cron state", async () => {
+    const [workflow] = await db
+      .insert(schema.workflows)
+      .values({ organizationId: orgId, name: "Hooked" })
       .returning();
 
     const tokenHash = `sha256-${suffix}`;
@@ -279,11 +401,25 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       /duplicate key|triggers_token_hash_unique/,
     );
 
-    // Multiple NULL token hashes are fine (form/slack triggers have none).
+    // Multiple NULL token hashes are fine (form/slack/schedule have none).
     await db.insert(schema.triggers).values([
       { workflowId: workflow!.id, type: "form", formSchema: { fields: [] } },
       { workflowId: workflow!.id, type: "slack", binding: { channel: "C1" } },
     ]);
+
+    // Schedule triggers persist the ticker cursor (cron + next_fire_at).
+    const nextFireAt = new Date(Date.now() + 60_000);
+    const [scheduled] = await db
+      .insert(schema.triggers)
+      .values({
+        workflowId: workflow!.id,
+        type: "schedule",
+        cron: "*/5 * * * *",
+        nextFireAt,
+      })
+      .returning();
+    expect(scheduled?.cron).toBe("*/5 * * * *");
+    expect(scheduled?.nextFireAt?.getTime()).toBe(nextFireAt.getTime());
   });
 
   test("scope/owner CHECK constraints reject inconsistent mcp_connections and skills rows", async () => {

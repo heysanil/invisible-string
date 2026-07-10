@@ -15,15 +15,15 @@ export {
   runMigrations,
 } from "./migrate";
 export {
-  DEFAULT_AGENT_PRESETS,
+  DEFAULT_AGENTS,
   DEFAULT_MODEL_PRESETS,
   DEMO_ORG,
   DEMO_USER,
-  buildAgentPresetRows,
+  buildAgentRows,
   buildAllowlistRows,
   buildModelPresetRows,
   seedDemo,
   seedWorkspace,
-  type AgentPresetSeed,
+  type AgentSeed,
   type ModelPresetSeed,
 } from "./seed";

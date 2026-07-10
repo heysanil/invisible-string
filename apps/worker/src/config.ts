@@ -132,7 +132,11 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
     );
   }
 
-  const workerId = env.WORKER_ID?.trim() || crypto.randomUUID();
+  // Lowercased: the control plane round-trips this id through a Postgres
+  // uuid column (which lowercases it) and binds dispatch-token audiences to
+  // the DB value — a mixed-case WORKER_ID (macOS uuidgen emits uppercase)
+  // would register fine but fail every dispatch's case-sensitive guard.
+  const workerId = env.WORKER_ID?.trim().toLowerCase() || crypto.randomUUID();
 
   const port = parseIntVar(env.PORT, "PORT", 4000, 0, 65535, problems);
   const publicUrl =

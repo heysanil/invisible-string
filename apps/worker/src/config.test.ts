@@ -26,6 +26,14 @@ describe("loadConfig", () => {
     expect(config.workerId.length).toBeGreaterThan(8);
   });
 
+  test("normalizes WORKER_ID to lowercase (Postgres uuid columns lowercase the registered id; a case-sensitive dispatch guard must agree)", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      WORKER_ID: "4B10746B-F598-4EC9-89B2-5059E4B004DD",
+    });
+    expect(config.workerId).toBe("4b10746b-f598-4ec9-89b2-5059e4b004dd");
+  });
+
   test("lists every missing required variable at once", () => {
     expect(() => loadConfig({ WORKER_NODE_BIN: "/bin/echo" })).toThrow(ConfigError);
     try {

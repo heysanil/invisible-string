@@ -76,7 +76,7 @@ a filled copy.**
 | `PLATFORM_JWT_SECRET` | HMAC secret for platform JWTs | `openssl rand -base64 32` |
 | `BETTER_AUTH_SECRET` | Better Auth session secret | `openssl rand -base64 32` |
 | `WORKER_SHARED_SECRET` | Worker ↔ control-plane auth secret | `openssl rand -base64 32` |
-| `WORKER_ID` | Pinned worker identity; registration is allowlisted to it | `uuidgen` |
+| `WORKER_ID` | Pinned worker identity; registration is allowlisted to it. Lowercase — macOS `uuidgen` emits uppercase, and on images ≤ `v0.1.7` an uppercase id breaks every dispatch (§12); images > `v0.1.7` normalize it | `uuidgen \| tr '[:upper:]' '[:lower:]'` |
 | `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | Model provider (at least one) | — |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_SIGNING_SECRET` | Optional platform Slack app — all three or none ([SLACK.md](SLACK.md)) | — |
 | `CLOUDFLARED_TUNNEL_TOKEN` | Only with `--profile cloudflared` (§5) | — |
@@ -296,6 +296,18 @@ Run against the deployed domain after every deploy:
 
 ## 12. Troubleshooting
 
+- **Every chat send fails instantly with a 502 while health checks, login,
+  and worker registration all look fine** — check the `runs` table: if
+  `error` says `ensure-agent failed: 401 … missing or invalid
+  x-worker-secret header`, your `WORKER_ID` contains uppercase letters
+  (macOS `uuidgen` emits uppercase). Registration compares env-to-env and
+  passes, but the control plane binds dispatch tokens to the id as stored in
+  Postgres (a `uuid` column, which lowercases it) and the worker's guard
+  compares case-sensitively — so every dispatch is rejected and surfaces as
+  `worker_dispatch_failed` (HTTP 502; Cloudflare rebrands it as its own
+  `origin_bad_gateway` page). Fix: lowercase `WORKER_ID` (and
+  `WORKER_ALLOWED_IDS`) and redeploy, or upgrade to an image > `v0.1.7`,
+  which normalizes the id at config parse.
 - **Instant 502s on chat sends / run streams through the edge proxy**
   (Cloudflare `origin_bad_gateway`, or a bare Traefik/nginx `Bad Gateway`) on
   images predating 2026-07-10 — the control plane didn't disable Bun's ~10 s

@@ -11,6 +11,8 @@ import { useActiveWorkspaceId } from "../lib/workspace";
 interface ChatSearch {
   /** Preselected agent to open a new chat for (from the agent editor's "Chat with agent"). */
   agent?: string;
+  /** Session to open directly (from the workflow editor's test-run "View in Chat"). */
+  session?: string;
 }
 
 export const Route = createFileRoute("/_app/chat")({
@@ -20,14 +22,21 @@ export const Route = createFileRoute("/_app/chat")({
       typeof search.agent === "string" && search.agent.length > 0
         ? search.agent
         : undefined,
+    session:
+      typeof search.session === "string" && search.session.length > 0
+        ? search.session
+        : undefined,
   }),
 });
 
 function ChatPage() {
   const { workspaceId } = useActiveWorkspaceId();
-  const { agent: initialAgentId } = Route.useSearch();
+  const { agent: initialAgentId, session: initialSessionId } = Route.useSearch();
 
-  if (FIXTURE_MODE) return <FixtureChatShell />;
+  // Fixture mode still honors the agent deep link — the fixture agent
+  // editor's "Chat with agent" capsule navigates with ?agent=<id> and must
+  // open the new-chat composer, not silently drop the pick.
+  if (FIXTURE_MODE) return <FixtureChatShell initialAgentId={initialAgentId} />;
 
   // No active workspace yet (first load before the org resolves): keep the
   // section frame with a designed empty state rather than a blank pane.
@@ -59,5 +68,11 @@ function ChatPage() {
     );
   }
 
-  return <ChatShell workspaceId={workspaceId} initialAgentId={initialAgentId} />;
+  return (
+    <ChatShell
+      workspaceId={workspaceId}
+      initialAgentId={initialAgentId}
+      initialSessionId={initialSessionId}
+    />
+  );
 }

@@ -103,6 +103,67 @@ test("AgentSection lists PUBLISHED agents as a radio group and dispatches setAge
   });
 });
 
+test("AgentSection radio group: roving tabIndex + arrow keys move focus AND selection (ARIA contract)", async () => {
+  const dispatch = mock(() => {});
+  const view = renderWithRouter(
+    <AgentSection
+      agents={AGENTS}
+      selectedAgentId={FIXTURE_AGENT_IDS.execAssistant}
+      dispatch={dispatch}
+    />,
+  );
+  const group = await view.findByRole("radiogroup", { name: "Agent" });
+  const radios = within(group).getAllByRole("radio");
+  // The group offers PUBLISHED agents only, in inventory order.
+  const published = AGENTS.filter((agent) => agent.publishedVersionId !== null);
+  expect(radios).toHaveLength(published.length);
+
+  // ONE tab stop: only the selected card is tabbable.
+  expect(radios[0]!.getAttribute("tabindex")).toBe("0");
+  for (const radio of radios.slice(1)) {
+    expect(radio.getAttribute("tabindex")).toBe("-1");
+  }
+
+  // ArrowRight selects (and focuses) the next card…
+  radios[0]!.focus();
+  fireEvent.keyDown(group, { key: "ArrowRight" });
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "setAgentId",
+    id: published[1]!.id,
+  });
+  // …ArrowLeft wraps from the first card to the last…
+  radios[0]!.focus();
+  fireEvent.keyDown(group, { key: "ArrowLeft" });
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "setAgentId",
+    id: published[published.length - 1]!.id,
+  });
+  // …and Home jumps back to the first.
+  fireEvent.keyDown(group, { key: "Home" });
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "setAgentId",
+    id: published[0]!.id,
+  });
+});
+
+test("AgentSection shows a designed error state (with retry) when the agents query failed", async () => {
+  const onRetry = mock(() => {});
+  const view = renderWithRouter(
+    <AgentSection
+      agents={null}
+      isError
+      onRetry={onRetry}
+      selectedAgentId={null}
+      dispatch={() => {}}
+    />,
+  );
+  // null + isError is an ERROR, not loading — no skeletons forever.
+  const alert = await view.findByRole("alert");
+  expect(alert.textContent).toContain("Couldn't load this workspace's agents.");
+  fireEvent.click(view.getByRole("button", { name: "Try again" }));
+  expect(onRetry).toHaveBeenCalledTimes(1);
+});
+
 test("AgentSection flags a build-failed published agent on its card", async () => {
   const view = renderWithRouter(
     <AgentSection agents={AGENTS} selectedAgentId={null} dispatch={() => {}} />,

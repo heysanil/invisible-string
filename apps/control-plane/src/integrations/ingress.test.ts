@@ -936,6 +936,95 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(runs).toHaveLength(1); // exactly ONE dispatch for one user message
   });
 
+  test("Slack: a MID-TEXT mention's message twin is suppressed too (no duplicate continuation)", async () => {
+    const wfId = await createWorkflow("Slack Midtext Twin WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    // Slack fires app_mention for a mention ANYWHERE in the text — the raw
+    // `message.channels` twin must be dropped even when the mention is not
+    // leading (a leading-only check would double-dispatch once the first
+    // twin's run completes and the busy-guard no longer catches the second).
+    const ts = "1720000500.000900";
+    const mention = { type: "app_mention", user: "U9", text: "can <@U0BOT> summarize this?", ts, channel: "C-midtwin", team: "T-TEST" };
+    const twin = { type: "message", channel: "C-midtwin", channel_type: "channel", user: "U9", text: "can <@U0BOT> summarize this?", ts, team: "T-TEST" };
+    await postSlackEvent(mention, { eventId: randomUUID() });
+
+    const session = await until(async () => {
+      const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
+      return rows.find((s) => s.origin === "slack") ?? undefined;
+    }, "mid-text twin session");
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "mid-text twin run done");
+
+    // Twin lands AFTER the first run completed — the busy-guard cannot save
+    // us here; only twin suppression prevents a duplicate dispatch.
+    await postSlackEvent(twin, { eventId: randomUUID() });
+    await Bun.sleep(200);
+
+    const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session.id));
+    expect(runs).toHaveLength(1); // exactly ONE dispatch for one user message
+  });
+
+  test("Slack: a terminal (errored) session releases its thread key — the next thread message mints a fresh session instead of being dropped forever", async () => {
+    const wfId = await createWorkflow("Slack Recovery WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    const rootTs = "1720000600.000600";
+    await postSlackEvent({ type: "app_mention", user: "U5", text: "<@U0BOT> start a thread", ts: rootTs, channel: "C-recover", team: "T-TEST" });
+    const first = await until(async () => {
+      const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
+      return rows.find((s) => s.origin === "slack") ?? undefined;
+    }, "recovery session created");
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "recovery first run done");
+
+    // Poison the session the way a failed first dispatch used to: terminal
+    // status with the thread key STILL SET (legacy pre-fix shape — the
+    // dispatch-side eviction must handle rows markSession never cleaned).
+    await db
+      .update(schema.agentSessions)
+      .set({ status: "error" })
+      .where(eq(schema.agentSessions.id, first.id));
+
+    // A new mention in the SAME thread: findSlackThreadSession skips the
+    // errored row, and the new-session path must EVICT its key claim rather
+    // than throw session_busy (which Slack routing drops) — otherwise this
+    // thread is bricked forever.
+    await postSlackEvent({ type: "app_mention", user: "U5", text: "<@U0BOT> are you still there?", ts: "1720000700.000700", thread_ts: rootTs, channel: "C-recover", team: "T-TEST" });
+    const second = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+      return rows.find((s) => s.id !== first.id) ?? undefined;
+    }, "fresh session minted for the poisoned thread");
+    expect(second.slackThreadKey).toBe(first.slackThreadKey);
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, second.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "fresh session run dispatched");
+
+    // The evicted holder lost its key claim (the unique index slot is free).
+    const evicted = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, first.id)))[0]!;
+    expect(evicted.slackThreadKey).toBeNull();
+
+    // And the FORWARD path: markSession to a terminal status releases the key
+    // immediately (no eviction needed for sessions terminated after this fix).
+    await stack.runtime!.runStore.markSession(second.id, "closed");
+    const closed = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, second.id)))[0]!;
+    expect(closed.status).toBe("closed");
+    expect(closed.slackThreadKey).toBeNull();
+  });
+
   // ── disconnect ─────────────────────────────────────────────────────────────
 
   test("integration disconnect removes the row", async () => {

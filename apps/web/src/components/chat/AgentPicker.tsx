@@ -13,17 +13,21 @@ import {
   type AgentSummaryDto,
 } from "@invisible-string/shared";
 
+import { cn } from "../../lib/cn";
 import { AgentMonogram } from "../agents/AgentMonogram";
 import { EmptyState } from "../ui/EmptyState";
+import { StatusChip } from "../ui/StatusChip";
 import { Chip } from "./Chip";
 
 /**
- * Model chip label for an agent's draft definition: the explicit model
- * override when set, else the preset slug. Null when the stored draft is
+ * Model chip label for an agent definition: the explicit model override when
+ * set, else the preset slug. Callers pass the PUBLISHED definition (a new
+ * session pins the agent's published version — a draft-only model change
+ * must not be promised here). Null when the definition is missing or
  * shape-invalid (the chip is simply omitted).
  */
-export function agentModelLabel(draft: unknown): string | null {
-  const definition = parseAgentDefinition(draft);
+export function agentModelLabel(definitionLike: unknown): string | null {
+  const definition = parseAgentDefinition(definitionLike);
   if (definition === null) return null;
   return definition.model.modelId ?? definition.model.preset;
 }
@@ -137,12 +141,30 @@ export function AgentPicker({
             <ul className="flex flex-col gap-0.5">
               {filtered.map((agent) => {
                 const modelLabel = modelLabels?.get(agent.id) ?? null;
+                // A session runs the published version's BUILD — a failed or
+                // still-building version would 422 `version_not_ready` on the
+                // first message, so say so up front instead of offering a
+                // pick that fails with protocol copy.
+                const buildReady = agent.buildStatus === "succeeded";
                 return (
                   <li key={agent.id}>
                     <button
                       type="button"
                       onClick={() => onPick(agent)}
-                      className="lift flex w-full items-center gap-3 rounded-card px-3 py-2.5 text-left hover:bg-black/[0.04]"
+                      disabled={!buildReady}
+                      title={
+                        buildReady
+                          ? undefined
+                          : agent.buildStatus === "failed"
+                            ? "This agent's build failed — fix and republish it before chatting."
+                            : "This agent's build is still in progress — try again shortly."
+                      }
+                      className={cn(
+                        "flex w-full items-center gap-3 rounded-card px-3 py-2.5 text-left",
+                        buildReady
+                          ? "lift hover:bg-black/[0.04]"
+                          : "cursor-not-allowed opacity-60",
+                      )}
                     >
                       <AgentMonogram name={agent.name} size="md" />
                       <span className="flex min-w-0 flex-1 flex-col">
@@ -155,7 +177,14 @@ export function AgentPicker({
                           </span>
                         ) : null}
                       </span>
-                      {modelLabel !== null ? (
+                      {!buildReady ? (
+                        <StatusChip
+                          tone={agent.buildStatus === "failed" ? "error" : "neutral"}
+                          dot
+                        >
+                          {agent.buildStatus === "failed" ? "Build failed" : "Building…"}
+                        </StatusChip>
+                      ) : modelLabel !== null ? (
                         <Chip mono className="shrink-0" title="Resolved model">
                           {modelLabel}
                         </Chip>

@@ -105,13 +105,19 @@ authenticate by token/signature (no session):
   per-IP rate limit, and a 256 KiB body cap are checked BEFORE the HMAC;
   signature (`v0` HMAC) + 5-min replay window next; `event_id` dedup makes
   Slack retries idempotent; a `message` twin of an `app_mention` (one channel
-  mention arrives as BOTH, with different event_ids) is dropped by its leading
-  bot-mention prefix; routed by `team_id` → integration → bound workflows;
+  mention arrives as BOTH, with different event_ids) is dropped whenever the
+  message text contains the bot mention ANYWHERE (Slack fires `app_mention`
+  for mid-text mentions too — a leading-only check would double-dispatch
+  them); routed by `team_id` → integration → bound workflows;
   `thread_ts ↔ agent_session` continuation via the indexed
   `agent_sessions.slack_thread_key` column (partial unique per workflow — two
-  racing first-messages of a new thread resolve to one session). DMs
-  (`channel_type: im`) key the session on the IM channel itself, so a 1:1
-  conversation keeps one ongoing session without threading.
+  racing first-messages of a new thread resolve to one session, the loser's
+  `session_busy` is logged and dropped). A session that reaches a TERMINAL
+  status (closed/error) RELEASES its thread key (`markSession` nulls it, and
+  the new-session re-check evicts any legacy terminal holder), so the next
+  message in that thread mints a fresh session instead of being silently
+  dropped forever. DMs (`channel_type: im`) key the session on the IM channel
+  itself, so a 1:1 conversation keeps one ongoing session without threading.
 - `GET /integrations/slack/callback` — single platform Slack app OAuth
   redirect-back (state-signed); per-team bot token stored envelope-encrypted,
   keyed by `team_id`. The install kickoff is workspace-scoped:
@@ -158,9 +164,14 @@ injection are gone):
   (`message.completed` with `finishReason: "stop"`) as a threaded
   `chat.postMessage` with the team's decrypted bot token, then settles the
   marker (`delivered` / `failed` with a reason);
+- paths that mark a run terminal OUTSIDE the tailer hook (`failDispatch`, the
+  dispatch-time allowlist failure, cancel of an untailed run, the sweeper's
+  no-eve-session fail) call `deliver()` themselves, so the marker settles at
+  the moment of failure instead of lingering `pending`;
 - boot recovery (`reconcileInterruptedRuns` → `recoverPending`) finds
-  succeeded runs stuck `pending` (crash between terminal event and post),
-  recovers the reply from persisted `run_events`, and delivers late.
+  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal event
+  and post) recover the reply from persisted `run_events` and deliver late;
+  failed/canceled ones settle the ledger.
 
 Semantics are **at-least-once** (documented residual): the Slack post happens
 before the marker flips, so a crash in between re-delivers on recovery. The

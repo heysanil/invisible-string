@@ -14,12 +14,14 @@
  *    - otherwise → mark the run failed with completedAt so the cap slot frees
  *      and any SSE follower terminates on the persisted status.
  *
- * 2. STRANDED DELIVERIES (agents-first §5.5) — succeeded runs whose
- *    `delivery_status` is still `pending` (the process died between the
- *    terminal event and the Slack post): recover the final stop-message from
- *    persisted `run_events` and deliver late (at-least-once — see
- *    runs/delivery.ts). Runs only when a DeliveryService is wired (the
- *    integrations config may be absent).
+ * 2. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
+ *    `delivery_status` is still `pending`: succeeded ones (the process died
+ *    between the terminal event and the Slack post) recover the final
+ *    stop-message from persisted `run_events` and deliver late
+ *    (at-least-once — see runs/delivery.ts); failed/canceled ones — including
+ *    the rows sweep 1 just marked failed — settle the ledger (no reply
+ *    owed). Runs only when a DeliveryService is wired (the integrations
+ *    config may be absent).
  */
 import { and, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -36,7 +38,7 @@ export interface ReconcileOutcome {
 }
 
 export interface ReconcileOptions {
-  /** Settles succeeded runs stuck with a pending outbound reply. */
+  /** Settles terminal runs stuck with a pending outbound reply. */
   delivery?: DeliveryService;
   now?: Date;
 }

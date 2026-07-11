@@ -650,8 +650,13 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     // TWO events (`app_mention` AND `message.channels`) with DIFFERENT
     // event_ids, so event_id dedup cannot catch it. The app_mention twin is
     // authoritative (Slack pre-scopes it to our bot); drop the raw `message`
-    // twin so a single user message never dispatches twice. DMs are exempt —
-    // Slack sends no app_mention for IMs, the message.im IS the event.
+    // twin so a single user message never dispatches twice. Slack fires
+    // app_mention for a mention ANYWHERE in the text (not just leading), so
+    // the twin check must match mid-text mentions too — a leading-only check
+    // lets "can <@bot> summarize this?" in an active thread dispatch twice
+    // (both twins pass the busy-guard when they arrive seconds apart). DMs
+    // are exempt — Slack sends no app_mention for IMs, the message.im IS the
+    // event.
     const botUserId = (
       integration.metadata as Partial<SlackIntegrationMetadata> | null
     )?.botUserId;
@@ -660,7 +665,7 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       event.channel_type !== "im" &&
       typeof botUserId === "string" &&
       botUserId.length > 0 &&
-      (event.text ?? "").trimStart().startsWith(`<@${botUserId}>`)
+      (event.text ?? "").includes(`<@${botUserId}>`)
     ) {
       return;
     }
@@ -755,7 +760,16 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           fields: { source: "slack" },
         });
       } catch (error) {
-        if (isRuntimeApiError(error) && error.code === "session_busy") continue;
+        if (isRuntimeApiError(error) && error.code === "session_busy") {
+          // Expected under fan-out (a racing twin/duplicate already owns the
+          // thread's turn) — but never drop a Slack message with no trace.
+          logger.warn("dispatch.session_busy", {
+            workspaceId: workflow.organizationId,
+            workflowId: workflow.id,
+            fields: { source: "slack", dropped: true },
+          });
+          continue;
+        }
         logger.error("dispatch.failed", {
           workspaceId: workflow.organizationId,
           workflowId: workflow.id,

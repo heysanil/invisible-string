@@ -180,6 +180,8 @@ function fixtureAgent(input: {
       runAsUserId: FIXTURE_OWNER_USER_ID,
       draft: input.definition,
       publishedVersionId: versionId,
+      // Fixtures publish exactly their draft (draft == published definition).
+      publishedDefinition: input.published ? input.definition : null,
       createdAt: EARLIER,
       updatedAt: NOW,
     },

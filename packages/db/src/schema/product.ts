@@ -352,6 +352,14 @@ export const agentVersions = pgTable(
   (table) => [
     index("agent_versions_agent_id_idx").on(table.agentId),
     index("agent_versions_content_hash_idx").on(table.contentHash),
+    // Publish is "idempotent by content hash" — the DB enforces it, so two
+    // concurrent publishes of the same draft (e.g. the seeded-workspace kick
+    // racing a user's Publish click) resolve to ONE version row instead of
+    // duplicates in the version history.
+    uniqueIndex("agent_versions_agent_id_content_hash_uidx").on(
+      table.agentId,
+      table.contentHash,
+    ),
   ],
 );
 

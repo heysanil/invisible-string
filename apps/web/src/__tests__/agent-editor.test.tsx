@@ -12,6 +12,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AgentDefinition, AgentDto } from "@invisible-string/shared";
 
+import { dryRunAgentDiagnostics } from "../lib/agents/diagnostics";
 import {
   agentEditorReducer,
   agentEditorStatesEqual,
@@ -39,6 +40,7 @@ function agentRow(draft: unknown): AgentDto {
     runAsUserId: "user_1",
     draft: draft as AgentDto["draft"],
     publishedVersionId: null,
+    publishedDefinition: null,
     createdAt: NOW,
     updatedAt: NOW,
   };
@@ -133,6 +135,39 @@ test("context actions dedupe adds and filter removes", () => {
 
   state = agentEditorReducer(state, { type: "removeSkill", id: SKILL_ID });
   expect(state.definition.context.skillIds).toEqual([]);
+});
+
+test("draft_invalid issues with the server's DOT-JOINED string paths route to their section cards", () => {
+  // The real wire shape: compile-service.ts parseAgentDefinition serializes
+  // zod issues as {path: issue.path.join("."), message} — STRINGS, not arrays.
+  const diagnostics = dryRunAgentDiagnostics({
+    code: "draft_invalid",
+    message: "draft failed validation",
+    details: [
+      { path: "model", message: "Invalid input: expected object, received undefined" },
+      { path: "model.preset", message: "Invalid option" },
+      { path: "context", message: "Invalid input: expected object, received undefined" },
+      { path: "runAsUserId", message: "Required" },
+      { path: "", message: "unrooted issue" },
+    ],
+  });
+  expect(diagnostics.sections.model.map((d) => d.message)).toEqual([
+    "model: Invalid input: expected object, received undefined",
+    "model.preset: Invalid option",
+  ]);
+  expect(diagnostics.sections.context).toHaveLength(1);
+  expect(diagnostics.sections.access).toHaveLength(1);
+  // Pathless issues fall back to General with the bare message.
+  expect(diagnostics.general.map((d) => d.message)).toEqual(["unrooted issue"]);
+  // Defensive: a raw zod path ARRAY still routes.
+  const arrayShape = dryRunAgentDiagnostics({
+    code: "draft_invalid",
+    message: "draft failed validation",
+    details: [{ path: ["persona"], message: "Required" }],
+  });
+  expect(arrayShape.sections.persona.map((d) => d.message)).toEqual([
+    "persona: Required",
+  ]);
 });
 
 test("setRunAs swaps the credentials owner and flips equality", () => {

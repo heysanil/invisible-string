@@ -119,7 +119,12 @@ export function localAgentDiagnostics(
 /** Serialized issue shapes carried in dry-run/publish 422 `details`. */
 interface WireIssue {
   message: string;
-  /** zod path array (draft_invalid) or compiler dotted path (compile_failed). */
+  /**
+   * DOT-JOINED STRING for both codes: draft_invalid serializes zod issues as
+   * `{path: issue.path.join("."), message}` (compile-service.ts
+   * parseAgentDefinition) and compile_failed uses the compiler's dotted
+   * paths. A raw zod path ARRAY is also accepted defensively.
+   */
   path?: ReadonlyArray<string | number> | string;
 }
 
@@ -196,11 +201,17 @@ export function dryRunAgentDiagnostics(error: ApiErrorInfo): AgentDiagnostics {
 
   switch (error.code) {
     case "draft_invalid": {
-      // details = zod issues with array paths rooted at the definition key.
+      // details = zod issues rooted at the definition key. The server sends
+      // DOT-JOINED string paths (e.g. "model.preset" — see WireIssue.path);
+      // split them so the head segment routes to the right section card.
       let routed = false;
       for (const raw of details) {
         if (!isWireIssue(raw)) continue;
-        const path = Array.isArray(raw.path) ? raw.path : [];
+        const path = Array.isArray(raw.path)
+          ? raw.path
+          : typeof raw.path === "string" && raw.path.length > 0
+            ? raw.path.split(".")
+            : [];
         push(
           diagnostics,
           sectionFromPathHead(path[0]),

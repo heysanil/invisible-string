@@ -130,11 +130,11 @@ describe("redaction (secrets discipline)", () => {
       `postgres://${REDACTION_PLACEHOLDER}@db:5432/world`,
     );
     const redacted = redactLogFields({
-      worldUrl: "postgres://svc:hunter2@world-db:5432/ws_v_abc",
+      worldUrl: "postgres://svc:hunter2@world-db:5432/ag_v_abc",
       address: "https://worker-1.internal:8080",
     });
     expect(redacted.worldUrl).toBe(
-      `postgres://${REDACTION_PLACEHOLDER}@world-db:5432/ws_v_abc`,
+      `postgres://${REDACTION_PLACEHOLDER}@world-db:5432/ag_v_abc`,
     );
     // no userinfo → untouched
     expect(redacted.address).toBe("https://worker-1.internal:8080");

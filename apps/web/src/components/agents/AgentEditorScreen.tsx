@@ -201,18 +201,19 @@ export function AgentEditorScreen({
   async function onChatWithAgent() {
     setChatPending(true);
     try {
-      // A dirty draft (or a never-published agent) publishes first — chat
-      // always talks to a ready build.
-      if (controller.isDirty || agent.publishedVersionId === null) {
-        const response = await controller.publish();
-        if (!response) return; // publish surfaced its own error
-        if (response.buildStatus !== "succeeded") {
-          toast({
-            variant: "error",
-            message: "The agent must build cleanly before you can chat with it.",
-          });
-          return;
-        }
+      // Publish first, ALWAYS — chat pins the published version's BUILD, so
+      // a clean-but-build-failed publish must be caught here (with a clear
+      // message and a build retry), not fail session creation later with raw
+      // protocol copy ("version_not_ready"). For an already-published,
+      // already-built draft this is an idempotent content-hash cache hit.
+      const response = await controller.publish();
+      if (!response) return; // publish surfaced its own error
+      if (response.buildStatus !== "succeeded") {
+        toast({
+          variant: "error",
+          message: "The agent must build cleanly before you can chat with it.",
+        });
+        return;
       }
       navigate({ to: "/chat", search: { agent: agent.id } });
     } finally {
@@ -279,7 +280,7 @@ export function AgentEditorScreen({
                 resources={resources}
                 members={members}
                 modelPresets={modelPresets}
-                allowlist={allowlist ?? []}
+                allowlist={allowlist}
                 registerSection={registerSection}
                 onAskCopilot={askCopilot}
               />
@@ -299,7 +300,7 @@ export function AgentEditorScreen({
         onClose={() => setConfirmDelete(false)}
         onConfirm={onDelete}
         title={`Delete ${agent.name}?`}
-        description="Workflows delegating to this agent will stop publishing, and its chat history keeps the name for provenance. This cannot be undone."
+        description="This deletes the agent and its published versions, and cannot be undone. Deletion is blocked while any workflow or chat session still references the agent — remove those first."
         confirmLabel="Delete agent"
         destructive
         loading={deleteAgent.isPending}
@@ -332,7 +333,8 @@ export interface AgentSectionsProps {
   resources: ContextResources;
   members: readonly WorkspaceMemberDto[];
   modelPresets: readonly ModelPresetDto[];
-  allowlist: readonly ModelAllowlistEntryDto[];
+  /** Null while the allowlist query is in flight (checks/options wait). */
+  allowlist: readonly ModelAllowlistEntryDto[] | null;
   /** Ref-callback factory so the owner can anchor-scroll to each section. */
   registerSection: (section: AgentSection) => (el: HTMLElement | null) => void;
   onAskCopilot?: (prompt: string) => void;

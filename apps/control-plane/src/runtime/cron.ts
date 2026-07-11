@@ -17,8 +17,11 @@
  * names (the builder UI writes numeric expressions).
  *
  * DOM-OR-DOW (vixie rule): when BOTH day-of-month and day-of-week are
- * restricted (i.e. their field text is not exactly `*`), a date matches when
- * EITHER matches; when only one is restricted, that one must match.
+ * restricted, a date matches when EITHER matches; when only one is
+ * restricted, that one must match. "Restricted" follows vixie/cronie
+ * exactly: a field is UNrestricted when its text BEGINS with `*` — so `*`
+ * AND `*` -step forms like `*\/2` are unrestricted (AND semantics), while
+ * `1-31` (even though it matches every day) is restricted.
  *
  * All evaluation is UTC at minute precision (seconds/millis zeroed) — the
  * platform stores `next_fire_at` as timestamptz and compares in UTC.
@@ -42,7 +45,10 @@ export interface CronSchedule {
   months: ReadonlySet<number>;
   /** Normalized: 7 (Sunday) is folded into 0. */
   daysOfWeek: ReadonlySet<number>;
-  /** Field text was not exactly `*` (drives the DOM-OR-DOW rule). */
+  /**
+   * Field text did not BEGIN with `*` (drives the DOM-OR-DOW rule — vixie
+   * treats `*` and `*\/n` alike as unrestricted).
+   */
   domRestricted: boolean;
   dowRestricted: boolean;
 }
@@ -141,8 +147,10 @@ export function parseCronExpression(expression: string): CronSchedule {
     daysOfMonth: parseField(expression, FIELDS[2]!, domText),
     months: parseField(expression, FIELDS[3]!, monthText),
     daysOfWeek,
-    domRestricted: domText !== "*",
-    dowRestricted: dowText !== "*",
+    // Vixie/cronie: any dom/dow field BEGINNING with `*` (including `*/n`)
+    // is unrestricted — `0 0 */2 * 1` means "odd days AND Mondays", not OR.
+    domRestricted: !domText.startsWith("*"),
+    dowRestricted: !dowText.startsWith("*"),
   };
 }
 

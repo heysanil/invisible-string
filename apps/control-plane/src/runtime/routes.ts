@@ -37,6 +37,7 @@ import {
   postMessageRequestSchema,
   runCancelRequestSchema,
   runInputRequestSchema,
+  runWorkflowRequestSchema,
   type AgentDefinition,
   type AgentSessionDto,
   type BuildStatusResponse,
@@ -234,17 +235,6 @@ function parseBody<T>(schemaLike: { safeParse(v: unknown): { success: boolean; d
   return result.data;
 }
 
-/**
- * Manual "Run now" body: optional message + optional data so the workflow
- * editor's test-run popover can exercise webhook/form-shaped ingress. (Local
- * to this route today; promote to packages/shared if a second consumer
- * appears.)
- */
-const runWorkflowRequestSchema = z.object({
-  message: z.string().optional(),
-  data: z.record(z.string(), z.unknown()).optional(),
-});
-
 // ── dispatch helpers ────────────────────────────────────────────────────────
 
 /**
@@ -369,6 +359,15 @@ export async function failDispatch(
   if (options.failSessionId) {
     await deps.runStore.markSession(options.failSessionId, "error");
   }
+  // Settle a pending outbound-reply marker NOW (slack-origin runs are born
+  // owing one): the tailer hook never fires for a run that failed before its
+  // tail started, and only the boot sweep would otherwise clear it. deliver()
+  // no-ops for runs owing nothing and never throws.
+  await deps.delivery?.deliver({
+    runId,
+    status: "failed",
+    lastAssistantMessage: null,
+  });
   if (isRuntimeApiError(error)) throw error;
   throw errors.workerDispatchFailed(detail);
 }
@@ -422,7 +421,11 @@ export async function publishAgent(
   const compiled = compileOrThrow(deps.compile, definition, inputs, agent.name);
 
   // Idempotent by content hash: an existing version of this agent with
-  // the same hash is re-published, not duplicated.
+  // the same hash is re-published, not duplicated. The unique index on
+  // (agent_id, content_hash) makes this race-proof — two concurrent
+  // publishes of the same draft (the seeded-workspace kick vs a user click,
+  // two browser tabs) resolve to ONE row: the loser's insert no-ops on
+  // conflict and re-selects the winner's row.
   const existing = await deps.db
     .select()
     .from(schema.agentVersions)
@@ -448,8 +451,25 @@ export async function publishAgent(
         modelId: inputs.model.modelId,
         buildStatus: "pending",
       })
+      .onConflictDoNothing({
+        target: [schema.agentVersions.agentId, schema.agentVersions.contentHash],
+      })
       .returning();
-    version = inserted[0]!;
+    version = inserted[0];
+    if (!version) {
+      // Lost the race — adopt the concurrent publisher's row.
+      const winner = await deps.db
+        .select()
+        .from(schema.agentVersions)
+        .where(
+          and(
+            eq(schema.agentVersions.agentId, agent.id),
+            eq(schema.agentVersions.contentHash, compiled.hash),
+          ),
+        )
+        .limit(1);
+      version = winner[0]!;
+    }
   }
 
   await deps.db
@@ -1064,6 +1084,14 @@ export function runtimePlugin(deps: RuntimeDeps) {
             status: "canceled",
             error: reason,
             completedAt: new Date(),
+          });
+          // No tail ⇒ no tailer hook ⇒ settle a pending outbound-reply
+          // marker here (canceled runs owe no reply; deliver() no-ops for
+          // runs owing nothing).
+          await deps.delivery?.deliver({
+            runId: run.id,
+            status: "canceled",
+            lastAssistantMessage: null,
           });
           deps.bus.publish(run.id, {
             kind: "status",

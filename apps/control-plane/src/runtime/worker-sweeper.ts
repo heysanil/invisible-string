@@ -211,6 +211,13 @@ export function createWorkerSweeper(
       await clearAffinity(session.id);
       if (marked) {
         outcome.failed += 1;
+        // Settle a pending outbound-reply marker (no tail will ever fire the
+        // delivery hook for this run; deliver() no-ops for runs owing none).
+        await deps.delivery?.deliver({
+          runId: run.id,
+          status: "failed",
+          lastAssistantMessage: null,
+        });
         logger?.warn("run.failed", {
           runId: run.id,
           sessionId: session.id,

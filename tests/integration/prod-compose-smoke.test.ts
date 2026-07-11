@@ -36,13 +36,14 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const PROJECT = "psmoke";
 const BASE = "http://localhost:8080";
+const COMPOSE_FILES = ["docker-compose.prod.yml", "docker-compose.prod.build.yml"];
 
 const GATE_PROBLEMS: string[] = [];
 if (process.env.PROD_SMOKE !== "1") GATE_PROBLEMS.push("PROD_SMOKE not set to 1");
@@ -79,10 +80,33 @@ function writeSmokeEnvFile(): string {
 
 let composeBase: string[] = [];
 
+/**
+ * Environment for the spawned `docker compose`, with every variable the prod
+ * compose files interpolate REMOVED. Compose gives OS-environment values —
+ * even empty strings — precedence over `--env-file` during ${VAR}
+ * interpolation, and `bun test` auto-loads the repo .env into process.env, so
+ * an inherited env silently overrides smoke.env (observed: an empty
+ * `OPENROUTER_API_KEY=` .env line blanked the throwaway key → dispatch 500
+ * provider_key_missing). Scrubbing also guarantees a REAL host key can never
+ * leak into the smoke containers. The name list is parsed from the compose
+ * files themselves so new interpolations can't drift out of the scrub.
+ */
+function composeEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const file of COMPOSE_FILES) {
+    const text = readFileSync(join(REPO_ROOT, file), "utf8");
+    for (const match of text.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)/g)) {
+      delete env[match[1]!];
+    }
+  }
+  return env;
+}
+
 /** Compose against the smoke project; build/up output streams to the runner log. */
 async function compose(args: string[], timeoutMs: number): Promise<void> {
   const proc = Bun.spawn([...composeBase, ...args], {
     cwd: REPO_ROOT,
+    env: composeEnv(),
     stdout: "inherit",
     stderr: "inherit",
   });

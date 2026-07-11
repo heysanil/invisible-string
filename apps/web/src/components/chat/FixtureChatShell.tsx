@@ -37,7 +37,12 @@ const FIXTURE_MODEL_LABELS: ReadonlyMap<string, string> = new Map(
   }),
 );
 
-export function FixtureChatShell() {
+export function FixtureChatShell({
+  initialAgentId,
+}: {
+  /** ?agent= deep link (the fixture agent editor's "Chat with agent"). */
+  initialAgentId?: string;
+}) {
   const [activeId, setActiveId] = useState<string>(
     FIXTURE_SESSIONS[0]?.summary.id ?? "",
   );
@@ -46,8 +51,13 @@ export function FixtureChatShell() {
   // Locally answered approvals (fixture interactivity).
   const [answered, setAnswered] = useState<Set<string>>(new Set());
   const [pickerOpen, setPickerOpen] = useState(false);
-  /** Agent picked for a new chat — shows the real first-message composer. */
-  const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(null);
+  /** Agent picked for a new chat — shows the real first-message composer.
+   *  Seeded from the deep link so ?agent= opens the composer, same as prod. */
+  const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(
+    () =>
+      FIXTURE_AGENT_SUMMARIES.find((agent) => agent.id === initialAgentId) ??
+      null,
+  );
 
   const sessions: SessionListItem[] = FIXTURE_SESSIONS.map((session) => ({
     ...session.summary,

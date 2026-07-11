@@ -121,7 +121,7 @@ export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGri
         onClose={() => setPendingDelete(null)}
         onConfirm={() => void confirmDelete()}
         title={`Remove ${pendingDelete?.name ?? "connection"}?`}
-        description="Workflows that reference this connection will no longer be able to use its tools."
+        description="Agents that use this connection will no longer be able to reach its tools."
         confirmLabel="Remove"
         destructive
         loading={remove.isPending}
@@ -133,11 +133,11 @@ export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGri
         onConfirm={() => setBlocker(null)}
         blocker
         title="Still in use"
-        description="This connection is referenced by published workflows. Update or unpublish them first, then remove it."
+        description="The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it."
       >
-        {blocker && blocker.workflowNames.length > 0 ? (
+        {blocker && blocker.blockingNames.length > 0 ? (
           <ul className="mt-1 flex flex-col gap-1.5">
-            {blocker.workflowNames.map((name) => (
+            {blocker.blockingNames.map((name) => (
               <li
                 key={name}
                 className="flex items-center gap-2 rounded-card border border-black/[0.06] bg-white/50 px-3 py-2 text-[13px] text-ink-2"

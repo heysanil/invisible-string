@@ -14,10 +14,15 @@
  * - The TAILER's RunFinishedHook carries the run's last stop-message;
  *   {@link DeliveryService.deliver} posts it as a threaded chat.postMessage
  *   (same payload shape the dead codegen used) and settles the marker.
+ * - Paths that mark a run TERMINAL outside the tailer hook (failDispatch,
+ *   the dispatch-time allowlist failure, run cancel without a live tail, the
+ *   sweeper's no-eve-session fail) call deliver() themselves so the pending
+ *   marker settles at the moment of failure, not at the next boot.
  * - BOOT RECOVERY ({@link DeliveryService.recoverPending}, called from
- *   reconcileInterruptedRuns): succeeded runs stuck `pending` (control plane
- *   crashed between terminal event and delivery) recover their reply from the
- *   persisted `run_events` and deliver late.
+ *   reconcileInterruptedRuns): TERMINAL runs stuck `pending` (control plane
+ *   crashed between terminal event and delivery, or terminal rows written by
+ *   older code) either recover their reply from the persisted `run_events`
+ *   and deliver late (succeeded) or settle the ledger (failed/canceled).
  *
  * Semantics are AT-LEAST-ONCE (documented residual): the Slack post happens
  * before the marker flips, so a crash in between re-delivers on recovery. The
@@ -28,7 +33,7 @@
  * to the Slack client, and never logged (reply text is user content — also
  * never logged).
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
   DeliveryStatus,
@@ -142,8 +147,13 @@ export interface DeliveryIntegration {
 export interface DeliveryReader {
   loadRun(runId: string): Promise<DeliverableRun | null>;
   loadIntegration(integrationId: string): Promise<DeliveryIntegration | null>;
-  /** Recovery sweep scope: succeeded runs whose delivery is still pending. */
-  listPendingSucceededRunIds(): Promise<string[]>;
+  /**
+   * Recovery sweep scope: TERMINAL runs (succeeded/failed/canceled) whose
+   * delivery is still pending. Succeeded runs deliver late; failed/canceled
+   * runs settle the ledger — a run that failed before its tail ever started
+   * must not report a pending delivery forever.
+   */
+  listPendingTerminalRuns(): Promise<Array<{ id: string; status: RunStatus }>>;
   /** Persisted run events (seq order) — recovery recovers the reply here. */
   listRunEvents(runId: string): Promise<EveStreamEvent[]>;
 }
@@ -192,17 +202,17 @@ export function createDrizzleDeliveryReader(db: Db): DeliveryReader {
       return rows[0] ?? null;
     },
 
-    async listPendingSucceededRunIds() {
+    async listPendingTerminalRuns() {
       const rows = await db
-        .select({ id: schema.runs.id })
+        .select({ id: schema.runs.id, status: schema.runs.status })
         .from(schema.runs)
         .where(
           and(
-            eq(schema.runs.status, "succeeded"),
+            inArray(schema.runs.status, ["succeeded", "failed", "canceled"]),
             eq(schema.runs.deliveryStatus, "pending"),
           ),
         );
-      return rows.map((row) => row.id);
+      return rows;
     },
 
     async listRunEvents(runId) {
@@ -241,8 +251,10 @@ export interface DeliveryService {
    */
   deliver(input: DeliverInput): Promise<DeliveryOutcome>;
   /**
-   * Boot-time recovery sweep: every succeeded run stuck `pending` recovers
-   * its reply from persisted run_events and delivers late (at-least-once).
+   * Boot-time recovery sweep: every TERMINAL run stuck `pending` is settled
+   * — succeeded runs recover their reply from persisted run_events and
+   * deliver late (at-least-once); failed/canceled runs settle `failed`
+   * (no reply owed).
    */
   recoverPending(): Promise<{ delivered: number; failed: number; skipped: number }>;
 }
@@ -414,16 +426,16 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
 
     async recoverPending() {
       const tally = { delivered: 0, failed: 0, skipped: 0 };
-      const runIds = await reader.listPendingSucceededRunIds();
-      for (const runId of runIds) {
+      const stuck = await reader.listPendingTerminalRuns();
+      for (const run of stuck) {
         const outcome = await deliver({
-          runId,
-          status: "succeeded",
+          runId: run.id,
+          status: run.status,
           lastAssistantMessage: null,
         });
         tally[outcome] += 1;
       }
-      if (runIds.length > 0) {
+      if (stuck.length > 0) {
         logger.info("delivery.recovered", { fields: { ...tally } });
       }
       return tally;

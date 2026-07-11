@@ -68,6 +68,7 @@ function agentRow(id: string, name: string) {
     runAsUserId: "user_1",
     draft: {},
     publishedVersionId: null,
+    publishedDefinition: null,
     createdAt: NOW,
     updatedAt: NOW,
   };

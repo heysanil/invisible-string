@@ -78,10 +78,16 @@ function fakeWorld(options: { postResult?: PostMessageResult } = {}): FakeWorld 
       async loadIntegration(id) {
         return integrations.get(id) ?? null;
       },
-      async listPendingSucceededRunIds() {
+      async listPendingTerminalRuns() {
         return [...runs.values()]
-          .filter((r) => r.runStatus === "succeeded" && r.deliveryStatus === "pending")
-          .map((r) => r.runId);
+          .filter(
+            (r) =>
+              (r.runStatus === "succeeded" ||
+                r.runStatus === "failed" ||
+                r.runStatus === "canceled") &&
+              r.deliveryStatus === "pending",
+          )
+          .map((r) => ({ id: r.runId, status: r.runStatus }));
       },
       async listRunEvents(runId) {
         return events.get(runId) ?? [];
@@ -425,5 +431,21 @@ describe("DeliveryService.recoverPending", () => {
     const tally = await service(world).recoverPending();
     expect(tally).toEqual({ delivered: 0, failed: 1, skipped: 0 });
     expect(world.runs.get("stuck")!.deliveryStatus).toBe("failed");
+  });
+
+  test("FAILED and CANCELED runs stuck pending settle the ledger (no post, no reply owed)", async () => {
+    // A slack run that failed before its tail ever started (failDispatch,
+    // allowlist failure, sweeper) — or was canceled untailed — must not
+    // report `pending` forever: the sweep settles it `failed` without ever
+    // touching Slack.
+    const world = fakeWorld();
+    world.integrations.set(INTEGRATION_ID, slackIntegration());
+    world.runs.set("boom", slackRun({ runId: "boom", runStatus: "failed" }));
+    world.runs.set("halt", slackRun({ runId: "halt", runStatus: "canceled" }));
+    const tally = await service(world).recoverPending();
+    expect(tally).toEqual({ delivered: 0, failed: 2, skipped: 0 });
+    expect(world.posts).toHaveLength(0);
+    expect(world.runs.get("boom")!.deliveryStatus).toBe("failed");
+    expect(world.runs.get("halt")!.deliveryStatus).toBe("failed");
   });
 });

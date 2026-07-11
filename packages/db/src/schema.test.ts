@@ -204,6 +204,17 @@ describe("indexes and uniques", () => {
       unique!.config.columns.map((c) => (c as { name: string }).name),
     ).toEqual(["type", "external_id"]);
   });
+
+  test("agent_versions unique per (agent_id, content_hash) — publish idempotency is DB-enforced", () => {
+    const unique = config(schema.agentVersions).indexes.find(
+      (i) => i.config.unique,
+    );
+    expect(unique).toBeDefined();
+    expect(unique!.config.name).toBe("agent_versions_agent_id_content_hash_uidx");
+    expect(
+      unique!.config.columns.map((c) => (c as { name: string }).name),
+    ).toEqual(["agent_id", "content_hash"]);
+  });
 });
 
 describe("encrypted-at-rest columns are opaque text", () => {

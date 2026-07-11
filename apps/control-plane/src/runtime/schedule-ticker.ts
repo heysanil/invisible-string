@@ -170,8 +170,11 @@ export function createScheduleTicker(
         triggerType: "schedule",
         principal: { workspaceId: workflow.organizationId, source: "schedule" },
         ingress: {
-          // Instructions carry the task; the window rides as trigger data
-          // (`@trigger.scheduledFor` resolvable from instructions).
+          // Instructions carry the task; the fired window rides as trigger
+          // data purely as PROVENANCE on the run row. It is NOT addressable
+          // from instructions — the workflow validator rejects every
+          // `@trigger.*` reference for schedule triggers (they carry no
+          // dispatch data; workflow-validator.ts triggerCarriesData).
           message: "",
           data: { scheduledFor: due.scheduledFor.toISOString() },
         },

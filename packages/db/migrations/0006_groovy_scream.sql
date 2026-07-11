@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "agent_versions_agent_id_content_hash_uidx" ON "agent_versions" USING btree ("agent_id","content_hash");

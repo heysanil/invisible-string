@@ -144,6 +144,51 @@ export const customApprovalFixture: CompilerFixture = {
   },
 };
 
+/**
+ * FLAT skill (markdown only, no files → `agent/skills/<slug>.md`) + the
+ * seeded "powerful" preset model (z-ai/glm-5.2). Pins two emitted-surface
+ * branches no other fixture reaches, so the golden digest guards them:
+ * the flat-skill emission path (emitSkill's no-files branch — mcp-skill
+ * only covers the packaged directory form) and the
+ * OPENROUTER_CONTEXT_WINDOW_TOKENS entry for z-ai/glm-5.2 (codegen/agent.ts
+ * compaction threshold — a silent change here must fail the version-bump
+ * guard, not cache-hit stale artifacts).
+ */
+export const flatSkillFixture: CompilerFixture = {
+  name: "flat-skill",
+  definition: {
+    persona:
+      "You are the on-call communications writer. Draft succinct incident updates and follow @skill.incident-updates for structure and tone.",
+    model: { preset: "powerful", reasoning: "medium" },
+    context: {
+      mcpConnectionIds: [],
+      skillIds: ["1a2b3c4d-5e6f-4a70-8b91-c2d3e4f5a6b7"],
+    },
+  },
+  deps: {
+    versions: TEST_VERSIONS,
+    resolvedModel: { provider: "openrouter", modelId: "z-ai/glm-5.2" },
+    workspaceSlug: "acme",
+    agentSlug: "incident-writer",
+    connections: [],
+    skills: [
+      {
+        id: "1a2b3c4d-5e6f-4a70-8b91-c2d3e4f5a6b7",
+        slug: "incident-updates",
+        description:
+          "Use when writing customer-facing incident status updates.",
+        markdown: [
+          "# Incident updates",
+          "",
+          "1. State impact first, in plain language.",
+          "2. Give the next-update time explicitly.",
+          "3. Never speculate about root cause before mitigation.",
+        ].join("\n"),
+      },
+    ],
+  },
+};
+
 /** Anthropic provider + explicit modelId override (matching), dev build. */
 export const anthropicModelFixture: CompilerFixture = {
   name: "anthropic-model",
@@ -168,5 +213,6 @@ export const ALL_FIXTURES: readonly CompilerFixture[] = [
   basicFixture,
   mcpSkillFixture,
   customApprovalFixture,
+  flatSkillFixture,
   anthropicModelFixture,
 ];

@@ -103,6 +103,21 @@ export function useAgentController(
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // A promise that resolves when the in-flight save settles (for flush()).
   const inFlightSave = useRef<Promise<void> | null>(null);
+  // Editor unmount cancels the build-status poll loop (nothing renders the
+  // result anymore — without this, a fresh publish keeps fetching every
+  // 1.5 s for up to ~25 min after navigating away).
+  const disposedRef = useRef(false);
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+    };
+  }, []);
+  // The in-flight publish (single-flight): a second publish() while one is
+  // running — e.g. "Chat with agent" clicked mid-build — joins it instead of
+  // POSTing a concurrent /publish and racing a second poll loop into the
+  // same reducer.
+  const inFlightPublish = useRef<Promise<PublishAgentResponse | null> | null>(null);
 
   const isDirty = !agentEditorStatesEqual(state, savedRef.current);
 
@@ -206,47 +221,62 @@ export function useAgentController(
   // ── publish ────────────────────────────────────────────────────────────────
 
   const publish = useCallback(async (): Promise<PublishAgentResponse | null> => {
-    publishDispatch({ type: "start" });
-    try {
-      await flush();
-      const response = await publishAgent.mutateAsync(agent.id);
-      publishDispatch({ type: "received", response });
+    // Single-flight: join the running publish rather than starting a twin.
+    if (inFlightPublish.current) return inFlightPublish.current;
+    const promise = (async (): Promise<PublishAgentResponse | null> => {
+      publishDispatch({ type: "start" });
+      try {
+        await flush();
+        const response = await publishAgent.mutateAsync(agent.id);
+        publishDispatch({ type: "received", response });
 
-      // A fresh build answers "building"/"pending" and finishes in the
-      // background — poll the version's build status until it is terminal so
-      // the rail flips from "Building…" to the ready/error chip.
-      let current = response;
-      let attempts = 0;
-      while (
-        (current.buildStatus === "building" || current.buildStatus === "pending") &&
-        attempts < BUILD_POLL_MAX_ATTEMPTS
-      ) {
-        attempts += 1;
-        await sleep(pollIntervalMs);
-        try {
-          const status = await fetchAgentBuildStatus(
-            workspaceId,
-            agent.id,
-            response.versionId,
-          );
-          current = {
-            ...response,
-            buildStatus: status.status,
-            buildError: status.error,
-          };
-          publishDispatch({ type: "received", response: current });
-        } catch {
-          // Transient poll failure — keep waiting for the build to settle.
+        // A fresh build answers "building"/"pending" and finishes in the
+        // background — poll the version's build status until it is terminal
+        // so the rail flips from "Building…" to the ready/error chip. The
+        // loop stops when the editor unmounts (disposedRef): nothing renders
+        // the outcome anymore, and the next mount's publish is a cheap
+        // idempotent re-kick.
+        let current = response;
+        let attempts = 0;
+        while (
+          (current.buildStatus === "building" || current.buildStatus === "pending") &&
+          attempts < BUILD_POLL_MAX_ATTEMPTS &&
+          !disposedRef.current
+        ) {
+          attempts += 1;
+          await sleep(pollIntervalMs);
+          if (disposedRef.current) break;
+          try {
+            const status = await fetchAgentBuildStatus(
+              workspaceId,
+              agent.id,
+              response.versionId,
+            );
+            current = {
+              ...response,
+              buildStatus: status.status,
+              buildError: status.error,
+            };
+            publishDispatch({ type: "received", response: current });
+          } catch {
+            // Transient poll failure — keep waiting for the build to settle.
+          }
         }
+        return current;
+      } catch (error) {
+        const message =
+          error instanceof ApiError
+            ? error.message
+            : "Publish failed. Try again.";
+        publishDispatch({ type: "failed", message });
+        return null;
       }
-      return current;
-    } catch (error) {
-      const message =
-        error instanceof ApiError
-          ? error.message
-          : "Publish failed. Try again.";
-      publishDispatch({ type: "failed", message });
-      return null;
+    })();
+    inFlightPublish.current = promise;
+    try {
+      return await promise;
+    } finally {
+      inFlightPublish.current = null;
     }
   }, [flush, publishAgent, agent.id, workspaceId, pollIntervalMs]);
 

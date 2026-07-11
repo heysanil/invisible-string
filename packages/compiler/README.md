@@ -144,5 +144,7 @@ TEST_DATABASE_URL=… bun test src/world-isolation.test.ts
 
 Golden fixtures (`fixtures/<name>/`): `basic` (persona only), `mcp-skill`
 (bearer connection + packaged skill), `custom-approval` (headers auth +
-custom approval policy + tool filters), `anthropic-model` (anthropic
-provider + matching modelId override, dev build).
+custom approval policy + tool filters), `flat-skill` (markdown-only skill →
+flat `agent/skills/<slug>.md` + the seeded "powerful" preset model
+z-ai/glm-5.2, pinning its context-window entry), `anthropic-model`
+(anthropic provider + matching modelId override, dev build).

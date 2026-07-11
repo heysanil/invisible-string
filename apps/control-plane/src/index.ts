@@ -547,8 +547,9 @@ if (import.meta.main) {
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
     // they hold cap slots and hang SSE streams forever otherwise. The
-    // delivery sweep settles succeeded runs stranded with a pending Slack
-    // reply (at-least-once — see runs/delivery.ts).
+    // delivery sweep settles TERMINAL runs stranded with a pending Slack
+    // reply: succeeded ones deliver late (at-least-once), failed/canceled
+    // ones settle the ledger (see runs/delivery.ts).
     void reconcileInterruptedRuns(stack.runtime, {
       delivery: stack.runtime.delivery,
     })

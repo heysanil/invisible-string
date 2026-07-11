@@ -196,8 +196,10 @@ export interface DispatchTriggerInput {
    * {@link slackThreadKey}). Persisted on the indexed `slack_thread_key`
    * column; a per-key advisory lock + in-transaction re-check make two racing
    * first-messages of one thread resolve to ONE session (the loser gets a
-   * typed `session_busy`, which Slack routing drops silently). Ignored for
-   * continuations.
+   * typed `session_busy`, which Slack routing logs and drops). Only a LIVE
+   * (active/waiting) holder blocks: a closed/error holder is evicted — its
+   * key is released so the thread can start over (a terminal session can
+   * never be continued). Ignored for continuations.
    */
   newSessionSlackThreadKey?: string;
 }
@@ -288,7 +290,10 @@ export async function dispatchTriggerRun(
           sql`select pg_advisory_xact_lock(hashtext(${input.newSessionSlackThreadKey})::bigint)`,
         );
         const existing = await tx
-          .select({ id: schema.agentSessions.id })
+          .select({
+            id: schema.agentSessions.id,
+            status: schema.agentSessions.status,
+          })
           .from(schema.agentSessions)
           .where(
             and(
@@ -300,7 +305,27 @@ export async function dispatchTriggerRun(
             ),
           )
           .limit(1);
-        if (existing.length > 0) throw errors.sessionBusy();
+        const holder = existing[0];
+        if (holder) {
+          if (holder.status === "closed" || holder.status === "error") {
+            // DEAD holder: a terminal session can never continue this thread
+            // (findSlackThreadSession skips closed/error rows), so treating
+            // it as busy would silently brick the thread forever — every
+            // later message would 409 here and Slack routing drops
+            // session_busy. Evict its claim (markSession also releases the
+            // key on terminal transitions; this covers rows poisoned before
+            // that, e.g. by a failed first dispatch) and mint a fresh
+            // session under the advisory lock.
+            await tx
+              .update(schema.agentSessions)
+              .set({ slackThreadKey: null })
+              .where(eq(schema.agentSessions.id, holder.id));
+          } else {
+            // LIVE holder (active/waiting) — a concurrent first message won
+            // the race; this event is a duplicate turn, not a new thread.
+            throw errors.sessionBusy();
+          }
+        }
       }
       const inserted = await tx
         .insert(schema.agentSessions)
@@ -350,6 +375,14 @@ export async function dispatchTriggerRun(
       completedAt: new Date(),
     });
     if (isNewSession) await deps.runStore.markSession(session.id, "error");
+    // Settle a pending outbound-reply marker (slack-origin runs are born
+    // owing one) — this run never gets a tail, so the tailer hook will
+    // never fire for it. deliver() no-ops for runs owing nothing.
+    await deps.delivery?.deliver({
+      runId: run.id,
+      status: "failed",
+      lastAssistantMessage: null,
+    });
     deps.bus.publish(run.id, {
       kind: "status",
       frame: { runId: run.id, status: "failed", error: detail },

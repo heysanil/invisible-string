@@ -20,6 +20,7 @@ import {
   createSessionResponseSchema,
   type CreateSessionResponse,
   type FormField,
+  type RunWorkflowRequest,
   type TriggerConfig,
 } from "@invisible-string/shared";
 
@@ -36,19 +37,15 @@ import { useToast } from "../ui/Toast";
 
 // ── endpoint (Stage-3 route: POST .../workflows/:wfId/run) ──────────────────
 //
-// The server answers the same `{session, run}` envelope as chat session
-// creation (`CreateSessionResponse` in packages/shared) — a test run IS a
-// dispatched run riding the shared trigger path.
-
-export interface RunWorkflowBody {
-  message?: string;
-  data?: Record<string, unknown>;
-}
+// Body: the shared `runWorkflowRequestSchema` contract. The server answers
+// the same `{session, run}` envelope as chat session creation
+// (`CreateSessionResponse` in packages/shared) — a test run IS a dispatched
+// run riding the shared trigger path.
 
 export function runWorkflow(
   workspaceId: string,
   workflowId: string,
-  body: RunWorkflowBody,
+  body: RunWorkflowRequest,
 ): Promise<CreateSessionResponse> {
   return api.post(
     `/workspaces/${workspaceId}/workflows/${workflowId}/run`,
@@ -115,7 +112,7 @@ function TestRunBody({
 
   async function submit() {
     setError(null);
-    let body: RunWorkflowBody;
+    let body: RunWorkflowRequest;
     if (trigger.type === "webhook") {
       let data: unknown;
       try {
@@ -172,6 +169,7 @@ function TestRunBody({
         </p>
         <Link
           to="/chat"
+          search={{ session: started.session.id }}
           className="lift inline-flex items-center justify-center gap-1.5 rounded-capsule bg-ink px-4 py-2 text-[13px] font-medium text-white"
         >
           View in Chat <ExternalLink size={12} aria-hidden="true" />

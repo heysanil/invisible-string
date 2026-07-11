@@ -327,6 +327,26 @@ test("model section dispatches preset changes and flags off-allowlist overrides"
   expect(flagged.getByText(/not on the workspace allowlist/)).toBeTruthy();
 });
 
+test("model section does NOT flag an override while the allowlist is still loading (null)", () => {
+  const view = render(
+    <ModelSection
+      model={{
+        preset: "quick",
+        modelId: "internal/warehouse-1",
+        reasoning: "high",
+      }}
+      dispatch={() => {}}
+      modelPresets={MODEL_PRESETS}
+      allowlist={null}
+    />,
+  );
+  // Loading is not "empty allowlist": no false publish-blocking error…
+  expect(view.queryByText(/not on the workspace allowlist/)).toBeNull();
+  // …and the stored override stays visible in the Select (an option exists).
+  const select = view.getByLabelText("Model override (optional)") as HTMLSelectElement;
+  expect(select.value).toBe("internal/warehouse-1");
+});
+
 test("access section swaps the run-as member", () => {
   const onChangeRunAs = mock(() => {});
   const view = render(

@@ -49,7 +49,12 @@ export interface ModelSectionProps {
   model: AgentDefinition["model"];
   dispatch: (action: AgentEditorAction) => void;
   modelPresets: readonly ModelPresetDto[];
-  allowlist: readonly ModelAllowlistEntryDto[];
+  /**
+   * Null while the allowlist query is in flight — the off-allowlist error
+   * must NOT flash for a stored override we simply haven't verified yet
+   * (loading is not the same as "empty allowlist").
+   */
+  allowlist: readonly ModelAllowlistEntryDto[] | null;
 }
 
 export function ModelSection({
@@ -58,7 +63,26 @@ export function ModelSection({
   modelPresets,
   allowlist,
 }: ModelSectionProps) {
-  const enabledModels = allowlist.filter((entry) => entry.enabled);
+  const enabledModels = (allowlist ?? []).filter((entry) => entry.enabled);
+  const overrideOptions = [
+    { value: NO_OVERRIDE, label: "Use the preset's model" },
+    ...enabledModels.map((entry) => ({
+      value: entry.modelId,
+      label: `${shortModelId(entry.modelId)} · ${entry.provider}`,
+    })),
+  ];
+  // Keep the STORED override visible while the allowlist loads (or when it
+  // has since been removed from the allowlist) — a Select with no matching
+  // option would silently display the wrong value.
+  if (
+    model.modelId !== undefined &&
+    !overrideOptions.some((option) => option.value === model.modelId)
+  ) {
+    overrideOptions.push({
+      value: model.modelId,
+      label: shortModelId(model.modelId),
+    });
+  }
 
   return (
     <div className="flex flex-col gap-5">
@@ -84,13 +108,7 @@ export function ModelSection({
         <Select
           label="Model override (optional)"
           value={model.modelId ?? NO_OVERRIDE}
-          options={[
-            { value: NO_OVERRIDE, label: "Use the preset's model" },
-            ...enabledModels.map((entry) => ({
-              value: entry.modelId,
-              label: `${shortModelId(entry.modelId)} · ${entry.provider}`,
-            })),
-          ]}
+          options={overrideOptions}
           onChange={(event) => {
             const value = event.currentTarget.value;
             dispatch({
@@ -111,7 +129,9 @@ export function ModelSection({
           }
         />
       </div>
-      {model.modelId && !enabledModels.some((e) => e.modelId === model.modelId) ? (
+      {model.modelId &&
+      allowlist !== null &&
+      !enabledModels.some((e) => e.modelId === model.modelId) ? (
         <p className="-mt-3 px-0.5 text-[12px] text-err">
           {shortModelId(model.modelId)} is not on the workspace allowlist — it
           will be rejected at publish.

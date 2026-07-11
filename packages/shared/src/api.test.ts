@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   addModelAllowlistEntryRequestSchema,
+  agentDtoSchema,
   agentSessionSummaryDtoSchema,
   agentSummaryDtoSchema,
   agentVersionDtoSchema,
@@ -26,6 +27,7 @@ import {
   RUN_STREAM_EVENT_NAMES,
   runDtoSchema,
   runInputRequestSchema,
+  runWorkflowRequestSchema,
   updateAgentRequestSchema,
   updateMcpConnectionRequestSchema,
   updateModelPresetRequestSchema,
@@ -446,6 +448,44 @@ describe("agent schemas", () => {
   test("parseAgentDefinition guards shape and nulls legacy blobs", () => {
     expect(parseAgentDefinition(validAgentDraft)?.model.preset).toBe("balanced");
     expect(parseAgentDefinition({ basePrompt: "legacy preset" })).toBeNull();
+  });
+
+  test("agent DTO carries the published definition (null while unpublished)", () => {
+    const base = {
+      id: UUID,
+      name: "General Purpose",
+      description: null,
+      runAsUserId: "user_1",
+      draft: validAgentDraft,
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    expect(
+      agentDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: null,
+        publishedDefinition: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      agentDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: UUID_2,
+        publishedDefinition: validAgentDraft,
+      }).success,
+    ).toBe(true);
+    // The field is part of the contract — clients mirror dispatch through it.
+    expect(
+      agentDtoSchema.safeParse({ ...base, publishedVersionId: null }).success,
+    ).toBe(false);
+  });
+
+  test("run-workflow request: message and data both optional (schedule fires send {})", () => {
+    expect(runWorkflowRequestSchema.safeParse({}).success).toBe(true);
+    expect(
+      runWorkflowRequestSchema.safeParse({ message: "go", data: { a: 1 } }).success,
+    ).toBe(true);
+    expect(runWorkflowRequestSchema.safeParse({ data: [] }).success).toBe(false);
   });
 
   test("summary DTO distinguishes published from draft-only agents", () => {

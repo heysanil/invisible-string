@@ -7,7 +7,7 @@
 # Same app services as docker-compose.prod.yml minus the bundled postgres +
 # garage; DATABASE_URL / WORLD_DATABASE_URL / S3_* point at your managed
 # services instead. Requirements: the Postgres role needs CREATEDB unless the
-# databases are pre-created (per-version `ws_v_*` world DBs are created at
+# databases are pre-created (per-version `ag_v_*` world DBs are created at
 # publish time); the store must serve SigV4 presigned GETs reachable from the
 # worker.
 #

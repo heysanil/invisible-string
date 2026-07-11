@@ -124,8 +124,10 @@ test("manual trigger: requires a message, then posts {message} and offers View i
   expect(runFn).toHaveBeenCalledWith("ws-1", "wf-1", {
     message: "Summarize yesterday's tickets",
   });
+  // Deep-links the CREATED session — landing on the bare chat empty state
+  // would make the user hunt for the run they just started.
   const chatLink = q().getByRole("link", { name: /View in Chat/ });
-  expect(chatLink.getAttribute("href")).toBe("/chat");
+  expect(chatLink.getAttribute("href")).toBe("/chat?session=session-1");
 });
 
 test("webhook trigger: rejects invalid and non-object JSON, then posts {data}", async () => {

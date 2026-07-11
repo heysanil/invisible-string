@@ -179,6 +179,28 @@ describe("nextFire", () => {
     );
   });
 
+  test("a dom/dow field beginning with * (e.g. */2) is UNrestricted — vixie AND semantics", () => {
+    // "0 0 */2 * 1": midnight on odd days, Mondays only (vixie/cronie).
+    // From Fri 2026-07-10: Mon the 13th is odd → fires; treating */2 as
+    // restricted would wrongly fire on Sat the 11th (odd day OR Monday).
+    const s = parseCronExpression("0 0 */2 * 1");
+    expect(s.domRestricted).toBe(false);
+    expect(s.dowRestricted).toBe(true);
+    expect(next("0 0 */2 * 1", "2026-07-10T00:00:00.000Z")).toBe(
+      "2026-07-13T00:00:00.000Z",
+    );
+    // Symmetric: "*/2" in DOW is unrestricted too — "0 0 13 * */2" is "the
+    // 13th, on any even weekday" under AND, not "13th OR even weekdays".
+    const t = parseCronExpression("0 0 13 * */2");
+    expect(t.domRestricted).toBe(true);
+    expect(t.dowRestricted).toBe(false);
+    // From 2026-07-10: the next 13th falling on an even weekday (Sun/Tue/
+    // Thu/Sat) — Mon 2026-07-13 is skipped; Thu 2026-08-13 matches.
+    expect(next("0 0 13 * */2", "2026-07-10T00:00:00.000Z")).toBe(
+      "2026-08-13T00:00:00.000Z",
+    );
+  });
+
   test("accepts a pre-parsed schedule", () => {
     const schedule = parseCronExpression("*/30 * * * *");
     expect(nextFire(schedule, at("2026-07-10T12:01:00.000Z"))?.toISOString()).toBe(

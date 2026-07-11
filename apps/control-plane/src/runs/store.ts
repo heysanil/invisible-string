@@ -61,6 +61,14 @@ export interface RunStore {
     status: "delivered" | "failed",
     error?: string | null,
   ): Promise<boolean>;
+  /**
+   * Update a session's status. Transitioning to a TERMINAL status
+   * (closed/error) also releases the session's `slack_thread_key`: a terminal
+   * session can never continue its Slack thread (findSlackThreadSession skips
+   * it), so keeping the key would permanently block the partial unique index
+   * slot — every later message in that thread would 409 `session_busy` and be
+   * silently dropped, with no recovery path.
+   */
   markSession(agentSessionId: string, status: AgentSessionStatus): Promise<void>;
   updateSessionContinuation(
     agentSessionId: string,
@@ -167,7 +175,15 @@ export function createDrizzleRunStore(db: Db): RunStore {
     async markSession(agentSessionId, status) {
       await db
         .update(schema.agentSessions)
-        .set({ status })
+        .set({
+          status,
+          // Terminal sessions release their Slack thread key (see the
+          // interface doc) so the next thread message can mint a fresh
+          // session instead of being dropped forever.
+          ...(status === "closed" || status === "error"
+            ? { slackThreadKey: null }
+            : {}),
+        })
         .where(eq(schema.agentSessions.id, agentSessionId));
     },
 

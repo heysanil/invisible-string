@@ -185,7 +185,12 @@ The automated version of this smoke — plus a full agent publish through the
 gateway, with `eve build` running inside the control-plane container — is
 `tests/integration/prod-compose-smoke.test.ts` (`PROD_SMOKE=1`, compose
 project `psmoke`; CI runs it in the `prod-compose` job). Run it after any
-change to the Dockerfiles, the compose files, or the build steps.
+change to the Dockerfiles, the compose files, or the build steps. The harness
+scrubs every compose-interpolated variable from the environment it spawns
+`docker compose` with: compose gives OS-env values — even empty strings —
+precedence over `--env-file`, and `bun test` auto-loads the repo `.env`, so
+without the scrub a stray `OPENROUTER_API_KEY=` line (or a real host key)
+would override the throwaway smoke secrets.
 
 ---
 

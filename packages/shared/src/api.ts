@@ -358,6 +358,21 @@ export const createSessionResponseSchema = z.object({
   run: runDtoSchema,
 });
 
+// ── POST /workspaces/:workspaceId/workflows/:wfId/run ───────────────────────
+
+/**
+ * Manual "Run now" body: optional message + optional structured data so the
+ * workflow editor's test-run popover can exercise webhook/form-shaped
+ * ingress. The server answers the same `{session, run}` envelope as chat
+ * session creation ({@link createSessionResponseSchema}) — a test run IS a
+ * dispatched run riding the shared trigger path.
+ */
+export const runWorkflowRequestSchema = z.object({
+  message: z.string().optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
+export type RunWorkflowRequest = z.infer<typeof runWorkflowRequestSchema>;
+
 // ── POST /sessions/:id/messages ─────────────────────────────────────────────
 
 /**
@@ -637,7 +652,7 @@ export type RunInputRequest = z.infer<typeof runInputRequestSchema>;
 export const runInputResponseSchema = z.object({ run: runDtoSchema });
 export type RunInputResponse = z.infer<typeof runInputResponseSchema>;
 
-// ── MCP connections (CONTEXT pillar) ────────────────────────────────────────
+// ── MCP connections (agent context) ─────────────────────────────────────────
 //
 // BOTH scopes (spec §9 — "Both workspace- and user-level required"):
 //   workspace: /workspaces/:workspaceId/mcp-connections[...]
@@ -893,7 +908,7 @@ export type InstallMcpConnectionRequest = z.infer<
   typeof installMcpConnectionRequestSchema
 >;
 
-// ── Skills (CONTEXT pillar) ─────────────────────────────────────────────────
+// ── Skills (agent context) ──────────────────────────────────────────────────
 //
 // Scoped like MCP connections:
 //   workspace: /workspaces/:workspaceId/skills[...]
@@ -1097,6 +1112,14 @@ export const agentDtoSchema = z.object({
   runAsUserId: authId,
   draft: z.record(z.string(), z.unknown()),
   publishedVersionId: productId.nullable(),
+  /**
+   * The CURRENT published version's definition (served as stored, like
+   * `draft`); null while unpublished. This is what the server-side workflow
+   * validator and dispatch resolve `@connection`/`@skill` references against
+   * — clients mirroring dispatch behavior (the workflow builder's reference
+   * sources, chat's resolved-model chips) MUST read this, not `draft`.
+   */
+  publishedDefinition: z.record(z.string(), z.unknown()).nullable(),
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
 });
@@ -1481,7 +1504,7 @@ export type ListIntegrationsResponse = z.infer<
 //   POST /workflows/:workflowId/triggers/:id/rotate-token       → CreateWebhookTokenResponse (plaintext ONCE)
 //   PUT  /workflows/:workflowId/triggers/slack                  → GetTriggerBindingResponse
 //
-// A trigger row is created at publish from the workflow's TRIGGER pillar. The
+// A trigger row is created at publish from the workflow's trigger config. The
 // webhook/form ingress token is GENERATED here, shown ONCE, and stored only as
 // a SHA-256 hash on `triggers.token_hash` (secrets discipline). `tokenSuffix`
 // (last 4 chars, non-secret) may be persisted in `triggers.binding` for display

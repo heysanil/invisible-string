@@ -11,7 +11,7 @@
  * workflow surface.
  */
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   Bot,
@@ -29,13 +29,12 @@ import {
   type ReactNode,
 } from "react";
 import type {
-  AgentContext,
   AgentSummaryDto,
   GetWorkflowResponse,
   WorkflowConfig,
   WorkflowDto,
 } from "@invisible-string/shared";
-import { parseAgentDefinition, parseWorkflowConfig } from "@invisible-string/shared";
+import { parseWorkflowConfig } from "@invisible-string/shared";
 
 import { AgentSection } from "../components/builder/AgentSection";
 import { DiagnosticsList } from "../components/builder/DiagnosticsList";
@@ -51,6 +50,7 @@ import { Panel } from "../components/ui/Panel";
 import { Spinner } from "../components/ui/Spinner";
 import { StatusChip } from "../components/ui/StatusChip";
 import { useToast } from "../components/ui/Toast";
+import { useSelectedAgentContext } from "../lib/builder/agent-context";
 import { countIssues } from "../lib/builder/diagnostics";
 import {
   definitionsEqual,
@@ -66,7 +66,7 @@ import {
   type SaveStatus,
 } from "../lib/builder/useBuilderController";
 import { workflowCopilotAdapter } from "../lib/copilot/mutations";
-import { fetchAgent, useAgents } from "../lib/queries/agents";
+import { useAgents } from "../lib/queries/agents";
 import { queryKeys } from "../lib/queries/keys";
 import { useUpdateWorkflow, useWorkflow } from "../lib/queries/workflows";
 import { errorMessage } from "../lib/forms";
@@ -144,34 +144,13 @@ function BuilderLoader({
       workflow={workflow.data}
       resources={resources}
       agents={agents.data ?? null}
+      // null + error ≠ loading: the Agent section must show a designed error
+      // state with retry, not skeleton ghost cards forever.
+      agentsError={agents.isError}
+      onRetryAgents={() => void agents.refetch()}
       {...(initialDiagnostics ? { initialDiagnostics } : {})}
     />
   );
-}
-
-/**
- * The SELECTED agent's attached context (what `@connection`/`@skill`
- * autocomplete + local checks resolve against). Null while no agent is
- * selected or its detail is still loading.
- */
-function useSelectedAgentContext(
-  workspaceId: string,
-  agentId: string | null,
-): AgentContext | null {
-  const query = useQuery({
-    queryKey: queryKeys.agents.detail(workspaceId, agentId ?? "unselected"),
-    queryFn: ({ signal }) => fetchAgent(workspaceId, agentId!, signal),
-    enabled: agentId !== null,
-    staleTime: 30_000,
-    // A shape-invalid stored draft has no knowable context — judge refs
-    // against nothing rather than pretending everything resolves.
-    select: (data) =>
-      parseAgentDefinition(data.agent.draft)?.context ?? {
-        mcpConnectionIds: [],
-        skillIds: [],
-      },
-  });
-  return agentId === null ? null : (query.data ?? null);
 }
 
 function Builder({
@@ -179,12 +158,16 @@ function Builder({
   workflow,
   resources,
   agents,
+  agentsError = false,
+  onRetryAgents,
   initialDiagnostics,
 }: {
   workspaceId: string;
   workflow: WorkflowDto;
   resources: ReturnType<typeof useContextResources>;
   agents: readonly AgentSummaryDto[] | null;
+  agentsError?: boolean;
+  onRetryAgents?: () => void;
   initialDiagnostics?: GetWorkflowResponse["diagnostics"];
 }) {
   const { toast } = useToast();
@@ -382,6 +365,8 @@ function Builder({
                     {section === "agent" ? (
                       <AgentSection
                         agents={agents}
+                        isError={agentsError}
+                        {...(onRetryAgents ? { onRetry: onRetryAgents } : {})}
                         selectedAgentId={definition.agentId}
                         dispatch={dispatch}
                       />

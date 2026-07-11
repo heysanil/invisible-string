@@ -2,16 +2,16 @@
 
 **Contract: ONE WORLD POSTGRES *DATABASE* PER AGENT VERSION.**
 The generated project reads `WORKFLOW_POSTGRES_URL` **as-is**; the control
-plane provisions a dedicated database `ws_v_<hash12>` (first 12 hex chars
-of the agent-version hash; the prefix renames to `ag_v_` with the
-control-plane stage of the agents-first pivot) on the world Postgres
-server, runs the world-postgres bootstrap against it once, and passes a URL
-whose *database name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is
-set for observability only — it does **not** isolate.
+plane provisions a dedicated database `ag_v_<hash12>` (first 12 hex chars
+of the agent-version hash) on the world Postgres server, runs the
+world-postgres bootstrap against it once, and passes a URL whose *database
+name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is set for
+observability only — it does **not** isolate.
 
 ## Why not schema-per-version via `search_path`? (verified — it does NOT work)
 
-The plan of record was a schema `ws_v_<hash12>` pinned via the connection
+The plan of record was a schema `ws_v_<hash12>` (the pre-agents-first
+prefix) pinned via the connection
 string's `search_path`. Verified against the shipped package
 (`spike/agent-project/node_modules/@workflow/world-postgres@5.0.0-beta.20`),
 world-postgres does not honor it:
@@ -56,15 +56,15 @@ unit Postgres actually enforces and the only input world-postgres accepts.
 
 The **gated test proves the fix** (part 2): two databases on one server are
 bootstrapped; an active (`running`) row planted in A is invisible to B's
-`workflow_runs` — a booting agent pointed at its own `ws_v_<hash12>`
+`workflow_runs` — a booting agent pointed at its own `ag_v_<hash12>`
 database can never see (or re-drive) another version's runs.
 
 ## Operational notes for the supervisor / build service (Phase-1/3 consumers)
 
 - Naming + provisioning are implemented control-plane-side in
   `apps/control-plane/src/build/world.ts` (`worldNameForHash` →
-  `ws_v_<first 12 hash chars>`); this document is the contract it satisfies.
-- Provision: `CREATE DATABASE "ws_v_<hash12>"` (idempotent check first),
+  `ag_v_<first 12 hash chars>`); this document is the contract it satisfies.
+- Provision: `CREATE DATABASE "ag_v_<hash12>"` (idempotent check first),
   then `node_modules/@workflow/world-postgres/bin/setup.js` with
   `WORKFLOW_POSTGRES_URL` pointing at it (runs drizzle migrations + the
   graphile-worker bootstrap; safe to re-run).
@@ -86,7 +86,7 @@ database can never see (or re-drive) another version's runs.
   wrong). world-postgres @5.0.0-beta.20 serializes run replays with an
   in-PROCESS map only, and `reenqueueActiveRuns` enqueues graphile jobs with
   no idempotencyKey/queueName — a second process booting against the same
-  `ws_v_<hash12>` creates duplicate jobs for runs actively executing on the
+  `ag_v_<hash12>` creates duplicate jobs for runs actively executing on the
   first, and two pollers replay the same run concurrently (double-executed
   side effects, racing event log). The platform enforces the single-writer
   constraint via scheduler warm-preference + placement reservations, drain

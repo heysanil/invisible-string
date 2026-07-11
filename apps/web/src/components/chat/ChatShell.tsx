@@ -31,17 +31,22 @@ import { ThreadContainer } from "./ThreadContainer";
 export function ChatShell({
   workspaceId,
   initialAgentId,
+  initialSessionId,
 }: {
   workspaceId: string;
   /** When set (from the agent editor's "Chat with agent"), open a new chat for this agent. */
   initialAgentId?: string;
+  /** When set (from the workflow editor's test-run "View in Chat"), open this session. */
+  initialSessionId?: string;
 }) {
   const toast = useToast();
   const sessionsQuery = useSessions(workspaceId);
   const agentsQuery = useAgents(workspaceId);
   const createSession = useCreateSession(workspaceId);
 
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    initialSessionId ?? null,
+  );
   const [pickerOpen, setPickerOpen] = useState(false);
   /** Agent chosen in the picker → the composer collects the first message. */
   const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(null);
@@ -65,9 +70,10 @@ export function ChatShell({
   }, [initialAgentId, agents]);
 
   // Model chips (picker rows + new-chat header) derive from each agent's
-  // draft definition — the list DTO carries no model. Details are fetched
-  // lazily (picker open / agent drafted) into the same cache `useAgent`
-  // reads, so the editor route reuses them.
+  // PUBLISHED definition — a new session pins the agent's published version,
+  // so a draft-only model change must not show up here. The list DTO carries
+  // no model; details are fetched lazily (picker open / agent drafted) into
+  // the same cache `useAgent` reads, so the editor route reuses them.
   const publishedAgents = useMemo(
     () => (agents ?? []).filter((agent) => agent.publishedVersionId !== null),
     [agents],
@@ -87,7 +93,9 @@ export function ChatShell({
     agentDetails.forEach((query, index) => {
       const agent = publishedAgents[index];
       const label =
-        query.data === undefined ? null : agentModelLabel(query.data.agent.draft);
+        query.data === undefined
+          ? null
+          : agentModelLabel(query.data.agent.publishedDefinition);
       if (agent !== undefined && label !== null) labels.set(agent.id, label);
     });
     return labels;

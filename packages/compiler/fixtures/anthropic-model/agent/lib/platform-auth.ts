@@ -15,7 +15,7 @@ import {
  * reach the agent. Production artifacts omit it (spike/REPORT.md finding 16).
  */
 export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "agent-version:7926de351e5565a9d985b3898c10d2596966ab2736a813bd444aca98a330ba10";
+export const PLATFORM_JWT_AUDIENCE = "agent-version:9ca5c640ed13558566739b1c42c1e99476d89a2ca3007a4b5274e6e3ea58b7d2";
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {

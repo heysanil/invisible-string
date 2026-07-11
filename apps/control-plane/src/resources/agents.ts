@@ -38,7 +38,10 @@ export interface AgentActor {
 
 type AgentRow = typeof schema.agents.$inferSelect;
 
-export function agentDto(row: AgentRow): AgentDto {
+export function agentDto(
+  row: AgentRow,
+  publishedDefinition: Record<string, unknown> | null,
+): AgentDto {
   return {
     id: row.id,
     name: row.name,
@@ -46,9 +49,28 @@ export function agentDto(row: AgentRow): AgentDto {
     runAsUserId: row.runAsUserId,
     draft: (row.draft as Record<string, unknown>) ?? {},
     publishedVersionId: row.publishedVersionId,
+    publishedDefinition,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+/**
+ * The CURRENT published version's definition (what dispatch and the workflow
+ * validator resolve against) — null while unpublished. Served on the agent
+ * DTO so the SPA can mirror dispatch-time reference resolution exactly.
+ */
+async function loadPublishedDefinition(
+  db: Db,
+  publishedVersionId: string | null,
+): Promise<Record<string, unknown> | null> {
+  if (!publishedVersionId) return null;
+  const rows = await db
+    .select({ definition: schema.agentVersions.definition })
+    .from(schema.agentVersions)
+    .where(eq(schema.agentVersions.id, publishedVersionId))
+    .limit(1);
+  return (rows[0]?.definition as Record<string, unknown> | undefined) ?? null;
 }
 
 function compileDeps(deps: ResourceDeps): CompileServiceDeps {
@@ -137,7 +159,12 @@ export async function getAgent(
   id: string,
 ): Promise<GetAgentResponse> {
   const row = await loadOwned(deps.db, organizationId, id);
-  return { agent: agentDto(row) };
+  return {
+    agent: agentDto(
+      row,
+      await loadPublishedDefinition(deps.db, row.publishedVersionId),
+    ),
+  };
 }
 
 export async function createAgent(
@@ -161,7 +188,8 @@ export async function createAgent(
       draft: (input.draft as Record<string, unknown> | undefined) ?? {},
     })
     .returning();
-  return { agent: agentDto(rows[0]!) };
+  // A freshly created agent is never published.
+  return { agent: agentDto(rows[0]!, null) };
 }
 
 export async function updateAgent(
@@ -216,7 +244,13 @@ export async function updateAgent(
     }
   }
 
-  return { agent: agentDto(agent), ...(diagnostics ? { diagnostics } : {}) };
+  return {
+    agent: agentDto(
+      agent,
+      await loadPublishedDefinition(deps.db, agent.publishedVersionId),
+    ),
+    ...(diagnostics ? { diagnostics } : {}),
+  };
 }
 
 /**

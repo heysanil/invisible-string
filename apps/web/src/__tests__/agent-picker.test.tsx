@@ -79,6 +79,21 @@ test("picking a row hands back the agent summary", async () => {
   expect(onPick.mock.calls[0]?.[0]?.id).toBe(FIXTURE_SUPPORT_TRIAGER.agent.id);
 });
 
+test("a published agent whose build FAILED is disabled with a chip (session create would 422)", async () => {
+  const onPick = mock((_agent: AgentSummaryDto) => {});
+  const view = renderWithRouter(
+    <AgentPicker agents={SUMMARIES} modelLabels={LABELS} onPick={onPick} onClose={() => {}} />,
+  );
+  // "Data analyst" is the published-but-build-failed fixture: still listed
+  // (visibility beats mystery) but not pickable — the first message would
+  // fail with raw protocol copy ("version_not_ready") otherwise.
+  const row = (await view.findByText("Data analyst")).closest("button")!;
+  expect(row.hasAttribute("disabled")).toBe(true);
+  expect(view.getByText("Build failed")).toBeTruthy();
+  fireEvent.click(row);
+  expect(onPick).not.toHaveBeenCalled();
+});
+
 test("Escape closes the picker", async () => {
   const onClose = mock(() => {});
   const view = renderWithRouter(

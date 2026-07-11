@@ -17,18 +17,37 @@ import type { AgentSummaryDto } from "@invisible-string/shared";
 import type { BuilderAction } from "../../lib/builder/model";
 import { cn } from "../../lib/cn";
 import { AgentMonogram } from "../agents/AgentMonogram";
+import { ErrorState } from "../ui/ErrorState";
 import { Skeleton } from "../ui/Skeleton";
 import { StatusChip } from "../ui/StatusChip";
 
 export interface AgentSectionProps {
   /** Workspace agent inventory; null while loading. */
   agents: readonly AgentSummaryDto[] | null;
+  /** The agents-list query FAILED (null + isError ≠ loading — show an error, not skeletons forever). */
+  isError?: boolean;
+  onRetry?: () => void;
   /** The draft's `agentId`. */
   selectedAgentId: string | null;
   dispatch: (action: BuilderAction) => void;
 }
 
-export function AgentSection({ agents, selectedAgentId, dispatch }: AgentSectionProps) {
+export function AgentSection({
+  agents,
+  isError = false,
+  onRetry,
+  selectedAgentId,
+  dispatch,
+}: AgentSectionProps) {
+  if (agents === null && isError) {
+    return (
+      <ErrorState
+        compact
+        message="Couldn't load this workspace's agents."
+        {...(onRetry ? { onRetry } : {})}
+      />
+    );
+  }
   if (agents === null) {
     return (
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2" aria-hidden="true">
@@ -60,20 +79,11 @@ export function AgentSection({ agents, selectedAgentId, dispatch }: AgentSection
       {published.length === 0 ? (
         <NoPublishedAgents />
       ) : (
-        <div
-          role="radiogroup"
-          aria-label="Agent"
-          className="grid grid-cols-1 gap-2.5 sm:grid-cols-2"
-        >
-          {published.map((agent) => (
-            <AgentCard
-              key={agent.id}
-              agent={agent}
-              selected={agent.id === selectedAgentId}
-              onSelect={() => dispatch({ type: "setAgentId", id: agent.id })}
-            />
-          ))}
-        </div>
+        <AgentRadioGroup
+          agents={published}
+          selectedAgentId={selectedAgentId}
+          onSelect={(id) => dispatch({ type: "setAgentId", id })}
+        />
       )}
     </div>
   );
@@ -81,13 +91,87 @@ export function AgentSection({ agents, selectedAgentId, dispatch }: AgentSection
 
 // ── Cards ───────────────────────────────────────────────────────────────────
 
+/**
+ * ARIA radio-group keyboard contract (same as the SegmentedControl
+ * primitive): ONE tab stop (roving tabIndex on the selected card, first card
+ * when nothing is selected) and Arrow/Home/End moving both focus and
+ * selection — a screen reader announcing "radio, 1 of N" must get working
+ * arrow keys, and a workspace full of agents must not flood the Tab order.
+ */
+function AgentRadioGroup({
+  agents,
+  selectedAgentId,
+  onSelect,
+}: {
+  agents: readonly AgentSummaryDto[];
+  selectedAgentId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const selectedIndex = agents.findIndex((agent) => agent.id === selectedAgentId);
+  const tabbableIndex = selectedIndex >= 0 ? selectedIndex : 0;
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    let next: number;
+    const current = (() => {
+      const radios = Array.from(
+        event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+      );
+      const focused = radios.findIndex((el) => el === document.activeElement);
+      return { radios, index: focused >= 0 ? focused : tabbableIndex };
+    })();
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        next = (current.index + 1) % agents.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        next = (current.index - 1 + agents.length) % agents.length;
+        break;
+      case "Home":
+        next = 0;
+        break;
+      case "End":
+        next = agents.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    current.radios[next]?.focus();
+    const target = agents[next];
+    if (target) onSelect(target.id);
+  }
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Agent"
+      onKeyDown={onKeyDown}
+      className="grid grid-cols-1 gap-2.5 sm:grid-cols-2"
+    >
+      {agents.map((agent, index) => (
+        <AgentCard
+          key={agent.id}
+          agent={agent}
+          selected={agent.id === selectedAgentId}
+          tabbable={index === tabbableIndex}
+          onSelect={() => onSelect(agent.id)}
+        />
+      ))}
+    </div>
+  );
+}
+
 function AgentCard({
   agent,
   selected,
+  tabbable,
   onSelect,
 }: {
   agent: AgentSummaryDto;
   selected: boolean;
+  tabbable: boolean;
   onSelect: () => void;
 }) {
   const buildFailed = agent.buildStatus === "failed";
@@ -101,6 +185,7 @@ function AgentCard({
         type="button"
         role="radio"
         aria-checked={selected}
+        tabIndex={tabbable ? 0 : -1}
         onClick={onSelect}
         className={cn(
           "lift flex h-full w-full items-start gap-3 rounded-card-lg border p-3.5 text-left",

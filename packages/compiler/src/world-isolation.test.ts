@@ -117,8 +117,8 @@ describe.skipIf(!GATE)("world isolation (gated)", () => {
       // which already disproves search_path isolation; including public lets
       // it finish so we can show where the tables actually land.)
       // Arbitrary would-be per-version schema name (the control plane's
-      // world prefix — ws_v_ today, ag_v_ once the control-plane stage of
-      // the agents-first rename lands — is irrelevant to this proof).
+      // world prefix — ag_v_, see build/world.ts worldNameForHash — is
+      // irrelevant to this proof).
       const pinnedSchema = "ag_v_deadbeef0000";
       await querySql(dbUrl(DB_A), `create schema "${pinnedSchema}"`);
       await bootstrapWorld(

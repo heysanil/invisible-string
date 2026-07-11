@@ -10,7 +10,7 @@
  * of rebuilding. Set E2E_FRESH_DB=1 to drop + recreate it for a clean slate.
  * Fresh users/orgs per spec avoid cross-run data bleed either way; stale dead
  * worker rows are ignored by the scheduler's heartbeat TTL. World DBs
- * (ws_v_<hash>) persist and are content-addressed.
+ * (ag_v_<hash>) persist and are content-addressed.
  *
  * Admin DDL goes through `createDb().$client` — the workspace db package's
  * postgres-js instance. (Bun's built-in SQL cannot open a socket to the

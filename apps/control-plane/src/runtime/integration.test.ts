@@ -5,19 +5,22 @@
  * Full loop against a FAKE agent/worker (one Bun.serve speaking the eve HTTP
  * contract verified in Phase 0: 202 session create, NDJSON stream with
  * `?startIndex=` resume, continuation-token follow-ups) with a stub compiler
- * and fake build steps injected:
+ * and fake build steps injected — agents-first: the AGENT is the compile
+ * unit, chat targets agents, workflows dispatch rendered task messages:
  *
- *   publish → version snapshot + build (cache + idempotency)
+ *   agent publish → version snapshot + build (cache + idempotency)
  *   dry-run-compile → structured errors
- *   session create → scheduler → ensure-agent env contract → eve 202 →
- *     agent_sessions/runs rows → tailer → run_events
+ *   chat session create → scheduler → ensure-agent env contract → eve 202 →
+ *     agent_sessions/runs rows (workflowId null) → tailer → run_events
+ *   workflow manual /run → published snapshot → rendered taskMessage →
+ *     session with workflow provenance
  *   SSE → Last-Event-ID replay + live follow
  *   follow-up message → same eve session, new run, startIndex resume
  *   ownership → 403 (foreign workspace path) / 404 (foreign rows)
  *   caps → 429 at the per-workspace concurrent-run cap
  *
- * The REAL compiler + `eve build` path is exercised in the Integrate stage,
- * not here (per plan).
+ * The REAL compiler + `eve build` path is exercised in the acceptance
+ * suites, not here (per plan).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -31,19 +34,20 @@ import {
   encryptSecret,
   generateMasterKeyBase64,
   parseMasterKey,
+  type AgentDefinitionInput,
   type CreateSessionResponse,
+  type GetAgentResponse,
   type GetSessionResponse,
   type PostMessageResponse,
-  type PublishWorkflowResponse,
+  type PublishAgentResponse,
   type RunEventFrame,
   type RunStatusFrame,
-  type WorkflowDefinition,
 } from "@invisible-string/shared";
 
 import { createMemoryArtifactStore } from "../artifacts";
 import {
-  WorkflowCompileError,
-  type CompileWorkflowFn,
+  AgentCompileError,
+  type CompileAgentFn,
 } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
@@ -289,10 +293,10 @@ class FakeWorker {
 
 const STUB_EVE_VERSION = "0.19.0";
 
-const stubCompile: CompileWorkflowFn = (request) => {
-  if (request.definition.instructions.markdown.trim() === "") {
-    throw new WorkflowCompileError([
-      { path: "instructions.markdown", message: "instructions must not be empty" },
+const stubCompile: CompileAgentFn = (request) => {
+  if (request.definition.persona.trim() === "") {
+    throw new AgentCompileError([
+      { path: "persona", message: "persona must not be empty" },
     ]);
   }
   const hash = createHash("sha256")
@@ -302,6 +306,8 @@ const stubCompile: CompileWorkflowFn = (request) => {
         model: { provider: request.model.provider, modelId: request.model.modelId },
         connections: request.connections.map((c) => [c.name, c.url, c.envTokenVar]),
         skills: request.skills.map((s) => [s.name, s.content]),
+        workspace: request.workspaceSlug,
+        agent: request.agentSlug,
         eve: STUB_EVE_VERSION,
       }),
     )
@@ -309,7 +315,7 @@ const stubCompile: CompileWorkflowFn = (request) => {
   return {
     files: new Map([
       ["package.json", JSON.stringify({ name: "stub-agent", private: true })],
-      ["instructions.md", request.definition.instructions.markdown],
+      ["agent/instructions.md", request.definition.persona],
     ]),
     hash,
     compilerVersion: "stub-compiler-1",
@@ -425,10 +431,9 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   // Owner workspace state shared across tests.
   let ownerCookie: string;
   let orgId: string;
-  let workflowId: string;
-  let agentPresetId: string;
+  let agentId: string;
   let mcpConnectionId: string;
-  let definition: WorkflowDefinition;
+  let draft: AgentDefinitionInput;
   let contentHash: string;
   let versionId: string;
   let sessionId: string;
@@ -480,6 +485,22 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     return { cookie, orgId: org!.id, userId: session!.user.id };
   }
 
+  /** Create an agent via the API and return its id. */
+  async function createAgent(
+    cookie: string,
+    workspaceId: string,
+    name: string,
+    definition: AgentDefinitionInput,
+  ): Promise<string> {
+    const res = await api("POST", `/workspaces/${workspaceId}/agents`, {
+      cookie,
+      body: { name, draft: definition },
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as GetAgentResponse;
+    return body.agent.id;
+  }
+
   async function freshWorkerHeartbeat(): Promise<void> {
     await db
       .update(schema.workers)
@@ -519,13 +540,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     const owner = await signUpWithOrg("Runtime Owner");
     ownerCookie = owner.cookie;
     orgId = owner.orgId;
-    await seedWorkspace(db, orgId);
-
-    const agentRows = await db
-      .select({ id: schema.agents.id })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agentRows[0]!.id;
+    await seedWorkspace(db, orgId, owner.userId);
 
     // MCP connection with an envelope-encrypted token (workspace scope).
     const mcpRows = await db
@@ -549,22 +564,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       .set({ authConfigEncrypted: JSON.stringify(envelope) })
       .where(eq(schema.mcpConnections.id, mcpConnectionId));
 
-    definition = {
-      trigger: { type: "manual" },
+    draft = {
+      persona: "Be helpful. Use @linear when asked.",
+      model: { preset: "balanced", reasoning: "medium" },
       context: { mcpConnectionIds: [mcpConnectionId], skillIds: [] },
-      agent: { agentPresetId },
-      instructions: { markdown: "Be helpful. Use @linear when asked." },
     };
-    const wfRows = await db
-      .insert(schema.workflows)
-      .values({
-        organizationId: orgId,
-        name: "Runtime Test Workflow",
-        runAsUserId: owner.userId,
-        draft: definition as unknown as Record<string, unknown>,
-      })
-      .returning({ id: schema.workflows.id });
-    workflowId = wfRows[0]!.id;
+    agentId = await createAgent(ownerCookie, orgId, "Runtime Test Agent", draft);
 
     // Start from a clean worker registry — workers are GLOBAL (selectWorker is
     // not workspace-scoped), so a stray live row from another suite sharing
@@ -588,13 +593,13 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
   // ── publish + build ───────────────────────────────────────────────────────
 
-  test("publish snapshots an immutable version, resolves the model, and builds", async () => {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`, {
+  test("publish snapshots an immutable agent version, resolves the model, and builds", async () => {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`, {
       cookie: ownerCookie,
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as PublishWorkflowResponse;
-    expect(body.workflowId).toBe(workflowId);
+    const body = (await res.json()) as PublishAgentResponse;
+    expect(body.agentId).toBe(agentId);
     expect(body.contentHash).toHaveLength(64);
     expect(body.cached).toBeFalse();
     contentHash = body.contentHash;
@@ -612,15 +617,20 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(build.artifactKey).toBe(`artifacts/${contentHash}.tar.gz`);
     expect(await artifacts.exists(build.artifactKey!)).toBeTrue();
 
-    // World provisioned once for this version (design correction #10).
-    expect(provisionedHashes).toEqual([contentHash]);
+    // World provisioned once for this version (design correction #10). The
+    // signup's fire-and-forget seed-agent publish provisions its OWN hash in
+    // the background — count only this version's.
+    expect(provisionedHashes.filter((hash) => hash === contentHash)).toEqual([
+      contentHash,
+    ]);
 
     // Version row: immutable snapshot + resolved model (balanced preset).
     const versions = await db
       .select()
-      .from(schema.workflowVersions)
-      .where(eq(schema.workflowVersions.id, versionId));
+      .from(schema.agentVersions)
+      .where(eq(schema.agentVersions.id, versionId));
     expect(versions[0]).toMatchObject({
+      agentId,
       contentHash,
       compilerVersion: "stub-compiler-1",
       eveVersion: STUB_EVE_VERSION,
@@ -628,51 +638,56 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       modelId: "deepseek/deepseek-v4-pro",
       buildStatus: "succeeded",
     });
+    // The snapshot is the parsed (defaults-applied) AgentDefinition.
+    expect(versions[0]!.definition).toMatchObject({
+      persona: draft.persona,
+      context: { mcpConnectionIds: [mcpConnectionId], skillIds: [] },
+    });
 
     // Draft is now published.
-    const wf = await db
-      .select({ publishedVersionId: schema.workflows.publishedVersionId })
-      .from(schema.workflows)
-      .where(eq(schema.workflows.id, workflowId));
-    expect(wf[0]?.publishedVersionId).toBe(versionId);
+    const agents = await db
+      .select({ publishedVersionId: schema.agents.publishedVersionId })
+      .from(schema.agents)
+      .where(eq(schema.agents.id, agentId));
+    expect(agents[0]?.publishedVersionId).toBe(versionId);
   });
 
   test("republish of an identical draft is idempotent by hash (cache hit)", async () => {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`, {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`, {
       cookie: ownerCookie,
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as PublishWorkflowResponse;
+    const body = (await res.json()) as PublishAgentResponse;
     expect(body.versionId).toBe(versionId);
     expect(body.contentHash).toBe(contentHash);
     expect(body.buildStatus).toBe("succeeded");
     expect(body.cached).toBeTrue();
-    // No second world provisioning, no second build.
-    expect(provisionedHashes).toEqual([contentHash]);
+    // No second world provisioning, no second build for THIS hash (the
+    // signup's background seed-agent publish owns its own separate hash).
+    expect(provisionedHashes.filter((hash) => hash === contentHash)).toEqual([
+      contentHash,
+    ]);
   });
 
   test("dry-run-compile: ok+hash for a valid draft; structured errors otherwise", async () => {
     const ok = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/versions/dry-run-compile`,
+      `/workspaces/${orgId}/agents/${agentId}/dry-run-compile`,
       { cookie: ownerCookie },
     );
     expect(ok.status).toBe(200);
     expect(await ok.json()).toEqual({ ok: true, contentHash });
 
-    // Empty instructions → compiler's typed error, surfaced structurally.
+    // Empty persona → compiler's typed error, surfaced structurally.
     await db
-      .update(schema.workflows)
+      .update(schema.agents)
       .set({
-        draft: {
-          ...definition,
-          instructions: { markdown: "" },
-        } as unknown as Record<string, unknown>,
+        draft: { ...draft, persona: "" } as unknown as Record<string, unknown>,
       })
-      .where(eq(schema.workflows.id, workflowId));
+      .where(eq(schema.agents.id, agentId));
     const bad = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/versions/dry-run-compile`,
+      `/workspaces/${orgId}/agents/${agentId}/dry-run-compile`,
       { cookie: ownerCookie },
     );
     expect(bad.status).toBe(200);
@@ -682,37 +697,52 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
     // Non-allowlisted model override → typed model error (pre-compile).
     await db
-      .update(schema.workflows)
+      .update(schema.agents)
       .set({
         draft: {
-          ...definition,
-          agent: { agentPresetId, modelId: "not/allowed" },
+          ...draft,
+          model: { preset: "balanced", modelId: "not/allowed", reasoning: "medium" },
         } as unknown as Record<string, unknown>,
       })
-      .where(eq(schema.workflows.id, workflowId));
+      .where(eq(schema.agents.id, agentId));
     const banned = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/versions/dry-run-compile`,
+      `/workspaces/${orgId}/agents/${agentId}/dry-run-compile`,
       { cookie: ownerCookie },
     );
     const bannedBody = (await banned.json()) as { ok: boolean; error: { code: string } };
     expect(bannedBody.ok).toBeFalse();
     expect(bannedBody.error.code).toBe("model_not_allowlisted");
 
+    // Shape-invalid draft → draft_invalid, still as dry-run payload.
+    await db
+      .update(schema.agents)
+      .set({ draft: { persona: 42 } as unknown as Record<string, unknown> })
+      .where(eq(schema.agents.id, agentId));
+    const invalid = await api(
+      "POST",
+      `/workspaces/${orgId}/agents/${agentId}/dry-run-compile`,
+      { cookie: ownerCookie },
+    );
+    expect(invalid.status).toBe(200);
+    const invalidBody = (await invalid.json()) as { ok: boolean; error: { code: string } };
+    expect(invalidBody.ok).toBeFalse();
+    expect(invalidBody.error.code).toBe("draft_invalid");
+
     // Restore the good draft.
     await db
-      .update(schema.workflows)
-      .set({ draft: definition as unknown as Record<string, unknown> })
-      .where(eq(schema.workflows.id, workflowId));
+      .update(schema.agents)
+      .set({ draft: draft as unknown as Record<string, unknown> })
+      .where(eq(schema.agents.id, agentId));
   });
 
-  // ── sessions + runs + tailer ─────────────────────────────────────────────
+  // ── chat sessions + runs + tailer ────────────────────────────────────────
 
-  test("session creation dispatches with the exact env contract and tails run events", async () => {
+  test("chat session creation dispatches with the exact env contract and tails run events", async () => {
     await freshWorkerHeartbeat();
     const res = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+      `/workspaces/${orgId}/agents/${agentId}/sessions`,
       { cookie: ownerCookie, body: { message: "hello agent" } },
     );
     expect(res.status).toBe(201);
@@ -720,12 +750,19 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     sessionId = body.session.id;
     firstRunId = body.run.id;
     expect(body.session.eveSessionId).toBe("eve-sess-1");
-    expect(body.session.workflowVersionId).toBe(versionId);
+    expect(body.session.agentId).toBe(agentId);
+    expect(body.session.agentVersionId).toBe(versionId);
+    // Direct chat carries no workflow provenance.
+    expect(body.session.workflowId).toBeNull();
     expect(body.run.triggerEvent).toMatchObject({
-      workflowId,
+      agentId,
+      workflowId: null,
       triggerType: "manual",
       message: "hello agent",
     });
+    // The chat message goes through verbatim — no rendered task message.
+    expect(body.run.taskMessage).toBeNull();
+    expect(body.run.deliveryStatus).toBeNull();
 
     // ensure-agent env contract (SECRETS go here and only here).
     expect(fixture.ensureCalls).toHaveLength(1);
@@ -733,7 +770,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(ensure.hash).toBe(contentHash);
     expect(ensure.artifactUrl).toContain(`${contentHash}.tar.gz`);
     expect(ensure.env.WORKFLOW_POSTGRES_URL).toContain(
-      `ws_v_${contentHash.slice(0, 12)}`,
+      `ag_v_${contentHash.slice(0, 12)}`,
     );
     expect(ensure.env.WORKFLOW_POSTGRES_JOB_PREFIX).toBe(contentHash);
     // The agent receives the DERIVED per-version secret, never the master.
@@ -747,6 +784,8 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(ensure.env.OPENROUTER_BASE_URL).toBe(OPENROUTER_BASE_URL);
     expect(ensure.env).not.toHaveProperty("ANTHROPIC_API_KEY");
     expect(ensure.env.MCP_LINEAR_TOKEN).toBe("lin-secret-token");
+    // No per-trigger env exists anymore (delivery is control-plane-side).
+    expect(ensure.env).not.toHaveProperty("SLACK_BOT_TOKEN");
 
     // The tailer lands the full scripted turn in run_events, then the run
     // is marked succeeded (session.waiting with no pending input).
@@ -811,6 +850,80 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(events.map((e) => e.seq).sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6]);
   });
 
+  // ── workflow manual "Run now" ────────────────────────────────────────────
+
+  test("workflow /run dispatches the published snapshot with a rendered taskMessage", async () => {
+    await freshWorkerHeartbeat();
+    // A webhook-shaped workflow delegating to the published agent.
+    const created = await api("POST", `/workspaces/${orgId}/workflows`, {
+      cookie: ownerCookie,
+      body: {
+        name: "Runtime Run-now Workflow",
+        draft: {
+          trigger: { type: "webhook" },
+          agentId,
+          instructions: { markdown: "Reply politely to @trigger.customer.email about their request." },
+        },
+      },
+    });
+    expect(created.status).toBe(201);
+    const wfId = ((await created.json()) as { workflow: { id: string } }).workflow.id;
+
+    // Run-now before publish → typed 409.
+    const early = await api(
+      "POST",
+      `/workspaces/${orgId}/workflows/${wfId}/run`,
+      { cookie: ownerCookie, body: { message: "too early" } },
+    );
+    expect(early.status).toBe(409);
+    expect(((await early.json()) as { error: { code: string } }).error.code).toBe(
+      "workflow_not_published",
+    );
+
+    const published = await api(
+      "POST",
+      `/workspaces/${orgId}/workflows/${wfId}/publish`,
+      { cookie: ownerCookie },
+    );
+    expect(published.status).toBe(200);
+
+    const res = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
+      cookie: ownerCookie,
+      body: {
+        message: "manual test run",
+        data: { customer: { email: "kim@example.com" } },
+      },
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as CreateSessionResponse;
+
+    // Workflow provenance on the session; the exact agent version pinned.
+    expect(body.session.workflowId).toBe(wfId);
+    expect(body.session.agentId).toBe(agentId);
+    expect(body.session.agentVersionId).toBe(versionId);
+
+    // The agent received the RENDERED task message, not the raw envelope —
+    // and the run row carries it as provenance.
+    expect(body.run.taskMessage).not.toBeNull();
+    expect(body.run.taskMessage!).toContain("<workflow-task>");
+    expect(body.run.taskMessage!).toContain("kim@example.com");
+    expect(body.run.triggerEvent).toMatchObject({
+      agentId,
+      workflowId: wfId,
+      triggerType: "manual",
+    });
+    const eveSession = fixture.sessions.get(body.session.eveSessionId!)!;
+    expect(eveSession.receivedMessages[0]).toBe(body.run.taskMessage!);
+
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, body.run.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "run-now run to succeed");
+  });
+
   // ── SSE ─────────────────────────────────────────────────────────────────
 
   test("SSE replays run_events and closes with a terminal run_status", async () => {
@@ -867,7 +980,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // Path addresses a workspace that is not the caller's active one → 403.
     const publish = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/publish`,
+      `/workspaces/${orgId}/agents/${agentId}/publish`,
       { cookie: stranger.cookie },
     );
     expect(publish.status).toBe(403);
@@ -889,6 +1002,15 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     });
     expect(stream.status).toBe(404);
 
+    // A foreign AGENT row is invisible too (chat create in own workspace,
+    // foreign agent id) — existence-hiding, not 403.
+    const foreignAgent = await api(
+      "POST",
+      `/workspaces/${stranger.orgId}/agents/${agentId}/sessions`,
+      { cookie: stranger.cookie, body: { message: "not yours" } },
+    );
+    expect(foreignAgent.status).toBe(404);
+
     // The stranger's snooping never reached the worker plane.
     expect(fixture.sessions.get("eve-sess-1")!.receivedMessages).not.toContain("let me in");
 
@@ -904,7 +1026,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // Two held runs occupy the whole cap (MAX_CONCURRENT_RUNS_PER_WORKSPACE=2).
     const first = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+      `/workspaces/${orgId}/agents/${agentId}/sessions`,
       { cookie: ownerCookie, body: { message: "HOLD one" } },
     );
     // Surface the error envelope on failure — a bare status mismatch hides
@@ -917,7 +1039,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     heldSessionId = ((await first.json()) as CreateSessionResponse).session.id;
     const second = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+      `/workspaces/${orgId}/agents/${agentId}/sessions`,
       { cookie: ownerCookie, body: { message: "HOLD two" } },
     );
     expect(second.status).toBe(201);
@@ -934,7 +1056,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
     const third = await api(
       "POST",
-      `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+      `/workspaces/${orgId}/agents/${agentId}/sessions`,
       { cookie: ownerCookie, body: { message: "one too many" } },
     );
     expect(third.status).toBe(429);
@@ -972,42 +1094,28 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // Use a FRESH workspace so the run cap (already saturated above) does
     // not shadow the scheduler error.
     const fresh = await signUpWithOrg("Scheduler Test");
-    await seedWorkspace(db, fresh.orgId);
-    const agentRows = await db
-      .select({ id: schema.agents.id })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, fresh.orgId));
-    const freshDefinition: WorkflowDefinition = {
-      trigger: { type: "manual" },
+    await seedWorkspace(db, fresh.orgId, fresh.userId);
+    const freshAgentId = await createAgent(fresh.cookie, fresh.orgId, "Scheduler agent", {
+      persona: "Hi.",
+      model: { preset: "balanced", reasoning: "medium" },
       context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId: agentRows[0]!.id },
-      instructions: { markdown: "Hi." },
-    };
-    const wf = await db
-      .insert(schema.workflows)
-      .values({
-        organizationId: fresh.orgId,
-        name: "Scheduler wf",
-        runAsUserId: fresh.userId,
-        draft: freshDefinition as unknown as Record<string, unknown>,
-      })
-      .returning({ id: schema.workflows.id });
+    });
     const publish = await api(
       "POST",
-      `/workspaces/${fresh.orgId}/workflows/${wf[0]!.id}/publish`,
+      `/workspaces/${fresh.orgId}/agents/${freshAgentId}/publish`,
       { cookie: fresh.cookie },
     );
     expect(publish.status).toBe(200);
-    const publishBody = (await publish.json()) as PublishWorkflowResponse;
+    const publishBody = (await publish.json()) as PublishAgentResponse;
     await stack.runtime!.buildService.waitFor(publishBody.contentHash);
     await until(async () => {
       const record = await stack.runtime!.buildStore.get(publishBody.contentHash);
       return record?.status === "succeeded" || undefined;
-    }, "fresh workflow build");
+    }, "fresh agent build");
 
     const res = await api(
       "POST",
-      `/workspaces/${fresh.orgId}/workflows/${wf[0]!.id}/sessions`,
+      `/workspaces/${fresh.orgId}/agents/${freshAgentId}/sessions`,
       { cookie: fresh.cookie, body: { message: "anyone there?" } },
     );
     expect(res.status).toBe(503);
@@ -1015,36 +1123,23 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(body.error.code).toBe("no_live_worker");
   });
 
-  test("unpublished workflow → typed 409 on session creation", async () => {
+  test("unpublished agent → typed 409 on session creation", async () => {
     const fresh = await signUpWithOrg("Unpublished");
-    await seedWorkspace(db, fresh.orgId);
-    const agentRows = await db
-      .select({ id: schema.agents.id })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, fresh.orgId));
-    const wf = await db
-      .insert(schema.workflows)
-      .values({
-        organizationId: fresh.orgId,
-        name: "Draft only",
-        runAsUserId: fresh.userId,
-        draft: {
-          trigger: { type: "manual" },
-          context: { mcpConnectionIds: [], skillIds: [] },
-          agent: { agentPresetId: agentRows[0]!.id },
-          instructions: { markdown: "Hi." },
-        } as unknown as Record<string, unknown>,
-      })
-      .returning({ id: schema.workflows.id });
+    await seedWorkspace(db, fresh.orgId, fresh.userId);
+    const draftAgentId = await createAgent(fresh.cookie, fresh.orgId, "Draft only", {
+      persona: "Hi.",
+      model: { preset: "balanced", reasoning: "medium" },
+      context: { mcpConnectionIds: [], skillIds: [] },
+    });
 
     const res = await api(
       "POST",
-      `/workspaces/${fresh.orgId}/workflows/${wf[0]!.id}/sessions`,
+      `/workspaces/${fresh.orgId}/agents/${draftAgentId}/sessions`,
       { cookie: fresh.cookie, body: { message: "run it" } },
     );
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("workflow_not_published");
+    expect(body.error.code).toBe("agent_not_published");
   });
 
   // ── boot reconciliation ───────────────────────────────────────────────────
@@ -1062,8 +1157,9 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .insert(schema.agentSessions)
         .values({
           organizationId: orgId,
-          workflowId,
-          workflowVersionId: versionId,
+          agentId,
+          agentVersionId: versionId,
+          workflowId: null,
           eveSessionId,
           continuationToken: eveSessionId ? `ct-${eveSessionId}` : null,
           origin: "chat",
@@ -1080,7 +1176,8 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .values({
           agentSessionId,
           triggerEvent: {
-            workflowId,
+            agentId,
+            workflowId: null,
             triggerType: "manual",
             message: "orphan",
             data: {},
@@ -1104,7 +1201,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // The two live HOLD tails from the caps test are skipped (still owned by
     // this process's tailer manager) — only true orphans are touched.
     const outcome = await reconcileInterruptedRuns(stack.runtime!);
-    expect(outcome).toEqual({ resumed: 1, failed: 1 });
+    expect(outcome).toMatchObject({ resumed: 1, failed: 1 });
 
     const dead = await db
       .select({ status: schema.runs.status, completedAt: schema.runs.completedAt, error: schema.runs.error })

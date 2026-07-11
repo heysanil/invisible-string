@@ -2,7 +2,9 @@
  * Copilot WS tests — no DB, no real model. The socket is exercised against a
  * real Elysia server with injected fakes: mocked workspace lookups, a static
  * inventory, and the deterministic scripted transport (the same fake-LLM
- * mode COPILOT_FAKE_SCRIPT enables).
+ * mode COPILOT_FAKE_SCRIPT enables). Both surfaces are covered: workflow
+ * (setTrigger/setAgent/setInstructions) and agent
+ * (setPersona/setModel/addContext/removeContext).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
@@ -14,7 +16,11 @@ import { loadCopilotConfig, type CopilotConfig } from "./config";
 import type { WorkspaceInventory } from "./inventory";
 import { copilotPlugin, type CopilotDeps } from "./plugin";
 import { createScriptedTransport, type ScriptedStep } from "./transport";
-import { validateMutation } from "./validate";
+import {
+  validateMutation,
+  type AgentDraftState,
+  type WorkflowDraftState,
+} from "./validate";
 
 const ORG = "org-1";
 const OTHER_ORG = "org-2";
@@ -22,7 +28,8 @@ const WORKFLOW_ID = "aaaaaaaa-1111-4222-8333-444444444444";
 const CONNECTION_ID = "bbbbbbbb-1111-4222-8333-444444444444";
 const DISABLED_CONNECTION_ID = "bbbbbbbb-2222-4222-8333-444444444444";
 const SKILL_ID = "cccccccc-1111-4222-8333-444444444444";
-const AGENT_ID = "dddddddd-1111-4222-8333-444444444444";
+const PUBLISHED_AGENT_ID = "dddddddd-1111-4222-8333-444444444444";
+const UNPUBLISHED_AGENT_ID = "dddddddd-2222-4222-8333-444444444444";
 
 const inventory: WorkspaceInventory = {
   connections: [
@@ -44,14 +51,22 @@ const inventory: WorkspaceInventory = {
   skills: [
     { id: SKILL_ID, name: "Triage Guide", slug: "triage-guide", description: null },
   ],
-  agentPresets: [
+  agents: [
     {
-      id: AGENT_ID,
+      id: PUBLISHED_AGENT_ID,
       name: "Support Agent",
+      description: "handles support requests",
+      published: true,
+      contextConnectionSlugs: ["linear"],
+      contextSkillSlugs: ["triage-guide"],
+    },
+    {
+      id: UNPUBLISHED_AGENT_ID,
+      name: "Draft Agent",
       description: null,
-      reasoningEffort: "medium",
-      modelPreset: "balanced",
-      modelId: null,
+      published: false,
+      contextConnectionSlugs: [],
+      contextSkillSlugs: [],
     },
   ],
   modelPresets: [
@@ -87,6 +102,18 @@ const fakeWorkspaceDeps: WorkspaceDeps = {
   },
 };
 
+/** Per-surface entity rows living in ORG only. */
+const fakeEntityExists: CopilotDeps["entityExists"] = async (
+  surface,
+  entityId,
+  organizationId,
+) => {
+  if (organizationId !== ORG) return false;
+  return surface === "workflow"
+    ? entityId === WORKFLOW_ID
+    : entityId === PUBLISHED_AGENT_ID || entityId === UNPUBLISHED_AGENT_ID;
+};
+
 interface TestServer {
   /** Socket URL for ORG (the common case). */
   url: string;
@@ -112,8 +139,7 @@ function startServer(
     config: { ...loadCopilotConfig({}), ...configOverrides },
     transport,
     loadInventory: async () => inventory,
-    workflowExists: async (workflowId, organizationId) =>
-      workflowId === WORKFLOW_ID && organizationId === ORG,
+    entityExists: fakeEntityExists,
     ...depsOverrides,
   };
   const app = new Elysia().use(copilotPlugin(deps)).listen(0);
@@ -191,15 +217,29 @@ class Client {
   }
 }
 
-function userMessage(message = "help me build this") {
+function workflowMessage(message = "help me build this workflow") {
   return {
     type: "user_message",
-    workflowId: WORKFLOW_ID,
+    surface: "workflow",
+    entityId: WORKFLOW_ID,
     draft: {
       trigger: { type: "manual" },
-      context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId: AGENT_ID },
+      agentId: null,
       instructions: { markdown: "" },
+    },
+    message,
+  };
+}
+
+function agentMessage(message = "help me shape this agent") {
+  return {
+    type: "user_message",
+    surface: "agent",
+    entityId: PUBLISHED_AGENT_ID,
+    draft: {
+      persona: "You are a helpful support agent.",
+      model: { preset: "balanced", reasoning: "medium" },
+      context: { mcpConnectionIds: [], skillIds: [] },
     },
     message,
   };
@@ -230,13 +270,24 @@ describe("copilot ws auth + scoping", () => {
     expect(await client.opened).toBe(false);
   });
 
-  test("workflow outside the active workspace → workflow_not_found", async () => {
+  test("workflow entity outside the active workspace → entity_not_found", async () => {
     const server = startServer([{ text: "hi" }]);
     const client = new Client(server.urlFor(OTHER_ORG), `user=alice;org=${OTHER_ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
     const error = await client.waitFor((f) => f.type === "error");
-    expect(error).toMatchObject({ type: "error", code: "workflow_not_found" });
+    expect(error).toMatchObject({ type: "error", code: "entity_not_found" });
+    client.close();
+  });
+
+  test("entity existence is checked PER SURFACE — a workflow id is not an agent", async () => {
+    const server = startServer([{ text: "hi" }]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send({ ...agentMessage(), entityId: WORKFLOW_ID });
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "entity_not_found" });
+    expect(server.transport.requests).toHaveLength(0);
     client.close();
   });
 
@@ -249,9 +300,22 @@ describe("copilot ws auth + scoping", () => {
     expect(error).toMatchObject({ type: "error", code: "invalid_frame" });
     client.close();
   });
+
+  test("user_message without a surface → invalid_frame", async () => {
+    const server = startServer([{ text: "hi" }]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    const frame = workflowMessage() as Record<string, unknown>;
+    delete frame.surface;
+    client.send(frame);
+    const error = await client.waitFor((f) => f.type === "error");
+    expect(error).toMatchObject({ type: "error", code: "invalid_frame" });
+    expect(server.transport.requests).toHaveLength(0);
+    client.close();
+  });
 });
 
-describe("copilot tool loop", () => {
+describe("copilot workflow-surface tool loop", () => {
   test("propose → accept → final message round trip (deltas stream)", async () => {
     const server = startServer([
       {
@@ -270,7 +334,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("run this every weekday at 9"));
+    client.send(workflowMessage("run this every weekday at 9"));
 
     const proposalFrame = await client.waitFor((f) => f.type === "proposal");
     expect(proposalFrame.type === "proposal" && proposalFrame.proposal).toMatchObject({
@@ -304,67 +368,6 @@ describe("copilot tool loop", () => {
     client.close();
   });
 
-  test("schema-invalid tool call is NOT forwarded and the model self-corrects", async () => {
-    const server = startServer([
-      {
-        toolCalls: [{ toolName: "setModelPreset", input: { slug: "fastest" } }],
-      },
-      {
-        toolCalls: [{ toolName: "setModelPreset", input: { slug: "quick" } }],
-      },
-      { text: "Switched to quick." },
-    ]);
-    const client = new Client(server.url, `user=alice;org=${ORG}`);
-    expect(await client.opened).toBe(true);
-    client.send(userMessage("use the cheapest model"));
-
-    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
-    // Only the corrected call reaches the client.
-    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(1);
-    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
-      { slug: "quick" },
-    );
-    const proposalId =
-      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
-    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
-    await client.waitFor((f) => f.type === "done");
-
-    // The invalid call came back to the model as a tool error.
-    const secondRequest = server.transport.requests[1]!;
-    expect(JSON.stringify(secondRequest.messages)).toContain("INVALID TOOL CALL");
-    client.close();
-  });
-
-  test("semantic-invalid call (unknown context id) is bounced to the model", async () => {
-    const server = startServer([
-      {
-        toolCalls: [
-          {
-            toolName: "addContext",
-            input: { kind: "skill", id: "eeeeeeee-1111-4222-8333-444444444444" },
-          },
-        ],
-      },
-      { toolCalls: [{ toolName: "addContext", input: { kind: "skill", id: SKILL_ID } }] },
-      { text: "attached." },
-    ]);
-    const client = new Client(server.url, `user=alice;org=${ORG}`);
-    expect(await client.opened).toBe(true);
-    client.send(userMessage("attach the triage skill"));
-    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
-    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
-      { kind: "skill", id: SKILL_ID },
-    );
-    const proposalId =
-      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
-    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
-    await client.waitFor((f) => f.type === "done");
-    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
-      "does not exist",
-    );
-    client.close();
-  });
-
   test("propose → reject feeds the reason back and the model adapts", async () => {
     const server = startServer([
       {
@@ -384,7 +387,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
 
     const first = await client.waitFor((f) => f.type === "proposal");
     const firstId = first.type === "proposal" ? first.proposal.id : "";
@@ -410,9 +413,60 @@ describe("copilot tool loop", () => {
     client.close();
   });
 
-  test("setInstructions @refs must be ATTACHED, not merely workspace-known (compiler parity)", async () => {
+  test("setAgent must name a PUBLISHED agent — unpublished bounces to the model", async () => {
     const server = startServer([
-      // Workspace-unknown ref → bounced.
+      {
+        toolCalls: [
+          { toolName: "setAgent", input: { agentId: UNPUBLISHED_AGENT_ID } },
+        ],
+      },
+      {
+        toolCalls: [
+          { toolName: "setAgent", input: { agentId: PUBLISHED_AGENT_ID } },
+        ],
+      },
+      { text: "Support Agent selected." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(workflowMessage("use the draft agent"));
+
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    // Only the published-agent call reaches the client.
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(1);
+    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
+      { agentId: PUBLISHED_AGENT_ID },
+    );
+    client.send({
+      type: "mutation_result",
+      proposalId: proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "no published version",
+    );
+    client.close();
+  });
+
+  test("setInstructions @refs must be in the (turn-updated) selected agent's published context", async () => {
+    const server = startServer([
+      // No agent selected yet → bounced.
+      {
+        toolCalls: [
+          {
+            toolName: "setInstructions",
+            input: { markdown: "Use @linear to file issues." },
+          },
+        ],
+      },
+      // Select the published agent first (accepted) …
+      {
+        toolCalls: [
+          { toolName: "setAgent", input: { agentId: PUBLISHED_AGENT_ID } },
+        ],
+      },
+      // … a slug outside its published context is still bounced …
       {
         toolCalls: [
           {
@@ -421,27 +475,14 @@ describe("copilot tool loop", () => {
           },
         ],
       },
-      // Known in the workspace but NOT attached to the draft → also bounced
-      // (publish would throw UNRESOLVED_REFERENCE).
+      // … and its own context slugs now validate.
       {
         toolCalls: [
           {
             toolName: "setInstructions",
-            input: { markdown: "Use @linear to file issues." },
-          },
-        ],
-      },
-      // Attach it first (accepted), then the same instructions are valid.
-      {
-        toolCalls: [
-          { toolName: "addContext", input: { kind: "connection", id: CONNECTION_ID } },
-        ],
-      },
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
-            input: { markdown: "Use @linear to file issues." },
+            input: {
+              markdown: "Use @linear and follow @skill.triage-guide.",
+            },
           },
         ],
       },
@@ -449,10 +490,10 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
 
     const first = await client.waitFor((f) => f.type === "proposal");
-    expect(first.type === "proposal" && first.proposal.tool).toBe("addContext");
+    expect(first.type === "proposal" && first.proposal.tool).toBe("setAgent");
     client.send({
       type: "mutation_result",
       proposalId: first.type === "proposal" ? first.proposal.id : "",
@@ -472,10 +513,10 @@ describe("copilot tool loop", () => {
     await client.waitFor((f) => f.type === "done");
     // Both invalid variants came back to the model as tool errors.
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
-      "unknown connection",
+      "has no agent",
     );
-    expect(JSON.stringify(server.transport.requests[2]!.messages)).toContain(
-      "not attached",
+    expect(JSON.stringify(server.transport.requests[3]!.messages)).toContain(
+      "is not in agent",
     );
     client.close();
   });
@@ -529,7 +570,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
 
     const triggerProposal = await client.waitFor((f) => f.type === "proposal");
     expect(triggerProposal.type === "proposal" && triggerProposal.proposal.tool).toBe(
@@ -559,6 +600,194 @@ describe("copilot tool loop", () => {
     client.close();
   });
 
+  test("agent-surface tools are rejected on the workflow surface", async () => {
+    const server = startServer([
+      { toolCalls: [{ toolName: "setPersona", input: { markdown: "Be nice." } }] },
+      { text: "understood." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(workflowMessage());
+    await client.waitFor((f) => f.type === "done");
+    // Never surfaced as a proposal; bounced to the model instead.
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(0);
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "not available on the workflow surface",
+    );
+    client.close();
+  });
+});
+
+describe("copilot agent-surface tool loop", () => {
+  test("schema-invalid tool call is NOT forwarded and the model self-corrects", async () => {
+    const server = startServer([
+      // Empty setModel fails the ≥1-field refinement.
+      { toolCalls: [{ toolName: "setModel", input: {} }] },
+      { toolCalls: [{ toolName: "setModel", input: { preset: "quick" } }] },
+      { text: "Switched to quick." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage("use the cheapest model"));
+
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    // Only the corrected call reaches the client.
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(1);
+    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
+      { preset: "quick" },
+    );
+    const proposalId =
+      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
+    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
+    await client.waitFor((f) => f.type === "done");
+
+    // The invalid call came back to the model as a tool error.
+    const secondRequest = server.transport.requests[1]!;
+    expect(JSON.stringify(secondRequest.messages)).toContain("INVALID TOOL CALL");
+    client.close();
+  });
+
+  test("semantic-invalid call (unknown context id) is bounced to the model", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          {
+            toolName: "addContext",
+            input: { kind: "skill", id: "eeeeeeee-1111-4222-8333-444444444444" },
+          },
+        ],
+      },
+      { toolCalls: [{ toolName: "addContext", input: { kind: "skill", id: SKILL_ID } }] },
+      { text: "attached." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage("attach the triage skill"));
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
+      { kind: "skill", id: SKILL_ID },
+    );
+    const proposalId =
+      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
+    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "does not exist",
+    );
+    client.close();
+  });
+
+  test("setPersona @refs must be ATTACHED, not merely workspace-known (compiler parity)", async () => {
+    const server = startServer([
+      // Workspace-unknown ref → bounced.
+      {
+        toolCalls: [
+          {
+            toolName: "setPersona",
+            input: { markdown: "Use @github to file issues." },
+          },
+        ],
+      },
+      // Known in the workspace but NOT attached to the draft → also bounced
+      // (publish would throw UNRESOLVED_REFERENCE).
+      {
+        toolCalls: [
+          {
+            toolName: "setPersona",
+            input: { markdown: "Use @linear to file issues." },
+          },
+        ],
+      },
+      // Attach it first (accepted), then the same persona is valid.
+      {
+        toolCalls: [
+          { toolName: "addContext", input: { kind: "connection", id: CONNECTION_ID } },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            toolName: "setPersona",
+            input: { markdown: "Use @linear to file issues." },
+          },
+        ],
+      },
+      { text: "written." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage());
+
+    const first = await client.waitFor((f) => f.type === "proposal");
+    expect(first.type === "proposal" && first.proposal.tool).toBe("addContext");
+    client.send({
+      type: "mutation_result",
+      proposalId: first.type === "proposal" ? first.proposal.id : "",
+      outcome: "accepted",
+    });
+    const second = await client.waitFor(
+      (f) => f.type === "proposal" && f.proposal.tool === "setPersona",
+    );
+    expect(
+      second.type === "proposal" && JSON.stringify(second.proposal.params),
+    ).toContain("@linear");
+    client.send({
+      type: "mutation_result",
+      proposalId: second.type === "proposal" ? second.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    // Both invalid variants came back to the model as tool errors.
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "unknown connection",
+    );
+    expect(JSON.stringify(server.transport.requests[2]!.messages)).toContain(
+      "not attached",
+    );
+    client.close();
+  });
+
+  test("setPersona rejects @trigger refs (compile error TRIGGER_REF_NOT_ALLOWED parity)", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          {
+            toolName: "setPersona",
+            input: { markdown: "Always read @trigger.subject first." },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            toolName: "setPersona",
+            input: { markdown: "You triage inbound support requests." },
+          },
+        ],
+      },
+      { text: "persona written." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage());
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    expect(
+      proposalFrame.type === "proposal" &&
+        JSON.stringify(proposalFrame.proposal.params),
+    ).not.toContain("@trigger");
+    client.send({
+      type: "mutation_result",
+      proposalId:
+        proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "not allowed in an agent persona",
+    );
+    client.close();
+  });
+
   test("addContext with a DISABLED connection is bounced (publish would reject it)", async () => {
     const server = startServer([
       {
@@ -578,7 +807,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("attach the crm"));
+    client.send(agentMessage("attach the crm"));
     const proposalFrame = await client.waitFor((f) => f.type === "proposal");
     expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
       { kind: "connection", id: CONNECTION_ID },
@@ -596,6 +825,62 @@ describe("copilot tool loop", () => {
     client.close();
   });
 
+  test("setModel modelId must be on the enabled allowlist", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          { toolName: "setModel", input: { modelId: "vendor/disabled-model" } },
+        ],
+      },
+      {
+        toolCalls: [
+          { toolName: "setModel", input: { modelId: "anthropic/claude-sonnet-5" } },
+        ],
+      },
+      { text: "model set." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage("pin the model"));
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
+      { modelId: "anthropic/claude-sonnet-5" },
+    );
+    client.send({
+      type: "mutation_result",
+      proposalId:
+        proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "allowlist",
+    );
+    client.close();
+  });
+
+  test("workflow-surface tools are rejected on the agent surface", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          { toolName: "setTrigger", input: { trigger: { type: "webhook" } } },
+        ],
+      },
+      { text: "understood." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage());
+    await client.waitFor((f) => f.type === "done");
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(0);
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "not available on the agent surface",
+    );
+    client.close();
+  });
+});
+
+describe("copilot budgets + aborts", () => {
   test("over-budget turn ends with a clean over_budget error", async () => {
     const server = startServer(
       [{ text: "expensive answer", outputTokens: 999_999 }],
@@ -603,7 +888,7 @@ describe("copilot tool loop", () => {
     );
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "over_budget" });
     client.close();
@@ -611,12 +896,12 @@ describe("copilot tool loop", () => {
 
   test("runaway tool loop hits the step cap", async () => {
     const looping: ScriptedStep[] = Array.from({ length: 10 }, () => ({
-      toolCalls: [{ toolName: "setModelPreset", input: { slug: "fastest" } }],
+      toolCalls: [{ toolName: "setModel", input: {} }],
     }));
     const server = startServer(looping, { maxStepsPerTurn: 3 });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(agentMessage());
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "over_budget" });
     client.close();
@@ -633,7 +918,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
     await client.waitFor((f) => f.type === "proposal");
     client.send({ type: "abort" });
     const done = await client.waitFor((f) => f.type === "done");
@@ -654,7 +939,7 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("first turn"));
+    client.send(workflowMessage("first turn"));
     await client.waitFor((f) => f.type === "proposal");
     client.send({ type: "abort" });
     await client.waitFor((f) => f.type === "done");
@@ -662,7 +947,7 @@ describe("copilot tool loop", () => {
     // Second turn on the same socket must reach the model with every
     // assistant tool-call paired to a tool result (Anthropic/OpenAI both 400
     // on dangling tool_use).
-    client.send(userMessage("second turn"));
+    client.send(workflowMessage("second turn"));
     await client.waitFor(
       (f) => f.type === "done" && f.reason === "completed",
     );
@@ -691,14 +976,14 @@ describe("copilot tool loop", () => {
   test("an abort racing ahead of the turn start cancels it before any model call", async () => {
     const server = startServer([{ text: "never reached" }], {}, {
       // Hold the pre-turn scope check long enough for the abort to land.
-      workflowExists: async () => {
+      entityExists: async () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         return true;
       },
     });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("start"));
+    client.send(workflowMessage("start"));
     client.send({ type: "abort" });
     const done = await client.waitFor((f) => f.type === "done");
     expect(done).toMatchObject({ type: "done", reason: "aborted" });
@@ -717,9 +1002,9 @@ describe("copilot tool loop", () => {
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage());
+    client.send(workflowMessage());
     await client.waitFor((f) => f.type === "proposal");
-    client.send(userMessage("second message while busy"));
+    client.send(workflowMessage("second message while busy"));
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "turn_in_progress" });
     client.send({ type: "abort" });
@@ -764,9 +1049,9 @@ describe("copilot budget + frame bounds", () => {
     });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("first"));
+    client.send(workflowMessage("first"));
     await client.waitFor((f) => f.type === "done");
-    client.send(userMessage("second"));
+    client.send(workflowMessage("second"));
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "over_budget" });
     // Only the first turn reached the model.
@@ -781,9 +1066,9 @@ describe("copilot budget + frame bounds", () => {
     );
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("first"));
+    client.send(workflowMessage("first"));
     await client.waitFor((f) => f.type === "done");
-    client.send(userMessage("second"));
+    client.send(workflowMessage("second"));
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "over_budget" });
     expect(server.transport.requests).toHaveLength(1);
@@ -794,7 +1079,7 @@ describe("copilot budget + frame bounds", () => {
     const server = startServer([{ text: "hi" }]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    const frame = userMessage("hello");
+    const frame = workflowMessage("hello");
     (frame.draft as Record<string, unknown>).blob = "x".repeat(140_000);
     client.send(frame);
     const error = await client.waitFor((f) => f.type === "error");
@@ -816,11 +1101,11 @@ describe("copilot per-turn re-authorization", () => {
     });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("first"));
+    client.send(workflowMessage("first"));
     await client.waitFor((f) => f.type === "done");
 
     revoked = true;
-    client.send(userMessage("second"));
+    client.send(workflowMessage("second"));
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "unauthorized" });
     const closed = await client.closed;
@@ -841,11 +1126,11 @@ describe("copilot per-turn re-authorization", () => {
     });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(userMessage("first"));
+    client.send(workflowMessage("first"));
     await client.waitFor((f) => f.type === "done");
 
     removed = true;
-    client.send(userMessage("second"));
+    client.send(workflowMessage("second"));
     const error = await client.waitFor((f) => f.type === "error");
     expect(error).toMatchObject({ type: "error", code: "unauthorized" });
     expect((await client.closed).code).toBe(1008);
@@ -867,29 +1152,98 @@ describe("copilot config guards", () => {
 });
 
 describe("validateMutation", () => {
-  test("setAgent modelId must be allowlisted AND enabled", () => {
+  const workflowState = (
+    overrides: Partial<Omit<WorkflowDraftState, "surface">> = {},
+  ): WorkflowDraftState => ({
+    surface: "workflow",
+    trigger: { type: "manual" },
+    agentId: null,
+    ...overrides,
+  });
+  const agentState = (
+    overrides: Partial<Omit<AgentDraftState, "surface">> = {},
+  ): AgentDraftState => ({
+    surface: "agent",
+    connectionIds: new Set(),
+    skillIds: new Set(),
+    ...overrides,
+  });
+
+  test("setAgent requires an existing, PUBLISHED agent", () => {
     const ok = validateMutation(
       "setAgent",
+      { agentId: PUBLISHED_AGENT_ID },
+      inventory,
+      workflowState(),
+    );
+    expect(ok.ok).toBe(true);
+    const unknown = validateMutation(
+      "setAgent",
+      { agentId: "eeeeeeee-1111-4222-8333-444444444444" },
+      inventory,
+      workflowState(),
+    );
+    expect(unknown.ok).toBe(false);
+    expect(!unknown.ok && unknown.message).toContain("does not exist");
+    const unpublished = validateMutation(
+      "setAgent",
+      { agentId: UNPUBLISHED_AGENT_ID },
+      inventory,
+      workflowState(),
+    );
+    expect(unpublished.ok).toBe(false);
+    expect(!unpublished.ok && unpublished.message).toContain("no published version");
+  });
+
+  test("unknown tool name is invalid on both surfaces", () => {
+    expect(
+      validateMutation("dropDatabase", {}, inventory, workflowState()).ok,
+    ).toBe(false);
+    expect(validateMutation("dropDatabase", {}, inventory, agentState()).ok).toBe(
+      false,
+    );
+  });
+
+  test("tools from the other surface are rejected, with a surface-naming message", () => {
+    const personaOnWorkflow = validateMutation(
+      "setPersona",
+      { markdown: "Be nice." },
+      inventory,
+      workflowState(),
+    );
+    expect(personaOnWorkflow.ok).toBe(false);
+    expect(!personaOnWorkflow.ok && personaOnWorkflow.message).toContain(
+      "not available on the workflow surface",
+    );
+    const triggerOnAgent = validateMutation(
+      "setTrigger",
+      { trigger: { type: "manual" } },
+      inventory,
+      agentState(),
+    );
+    expect(triggerOnAgent.ok).toBe(false);
+    expect(!triggerOnAgent.ok && triggerOnAgent.message).toContain(
+      "not available on the agent surface",
+    );
+  });
+
+  test("setModel modelId must be allowlisted AND enabled", () => {
+    const ok = validateMutation(
+      "setModel",
       { modelId: "anthropic/claude-sonnet-5" },
       inventory,
+      agentState(),
     );
     expect(ok.ok).toBe(true);
     const disabled = validateMutation(
-      "setAgent",
+      "setModel",
       { modelId: "vendor/disabled-model" },
       inventory,
+      agentState(),
     );
     expect(disabled.ok).toBe(false);
-    const unknownPreset = validateMutation(
-      "setAgent",
-      { agentPresetId: "eeeeeeee-1111-4222-8333-444444444444" },
-      inventory,
-    );
-    expect(unknownPreset.ok).toBe(false);
-  });
-
-  test("unknown tool name is invalid", () => {
-    expect(validateMutation("dropDatabase", {}, inventory).ok).toBe(false);
+    const empty = validateMutation("setModel", {}, inventory, agentState());
+    expect(empty.ok).toBe(false);
   });
 
   test("addContext rejects disabled connections; removeContext still allows them", () => {
@@ -897,6 +1251,7 @@ describe("validateMutation", () => {
       "addContext",
       { kind: "connection", id: DISABLED_CONNECTION_ID },
       inventory,
+      agentState(),
     );
     expect(add.ok).toBe(false);
     expect(!add.ok && add.message).toContain("disabled");
@@ -904,22 +1259,100 @@ describe("validateMutation", () => {
       "removeContext",
       { kind: "connection", id: DISABLED_CONNECTION_ID },
       inventory,
+      agentState(),
     );
     expect(remove.ok).toBe(true);
   });
 
-  test("setInstructions treats a disabled connection's slug as unknown", () => {
+  test("setPersona treats a disabled connection's slug as unknown", () => {
     const result = validateMutation(
-      "setInstructions",
+      "setPersona",
       { markdown: "Use @old-crm for history." },
       inventory,
-      {
-        connectionIds: new Set([DISABLED_CONNECTION_ID]),
-        skillIds: new Set(),
-        trigger: { type: "manual" },
-      },
+      agentState({ connectionIds: new Set([DISABLED_CONNECTION_ID]) }),
     );
     expect(result.ok).toBe(false);
     expect(!result.ok && result.message).toContain("unknown connection");
+  });
+
+  test("setPersona rejects @trigger refs outright", () => {
+    const result = validateMutation(
+      "setPersona",
+      { markdown: "Always read @trigger.subject." },
+      inventory,
+      agentState(),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("not allowed in an agent persona");
+  });
+
+  test("workflow setInstructions checks refs against the SELECTED agent's published context", () => {
+    // No agent selected → any context ref is a problem.
+    const noAgent = validateMutation(
+      "setInstructions",
+      { markdown: "Use @linear." },
+      inventory,
+      workflowState(),
+    );
+    expect(noAgent.ok).toBe(false);
+    expect(!noAgent.ok && noAgent.message).toContain("has no agent");
+
+    // Selected but unpublished agent → still a problem.
+    const unpublished = validateMutation(
+      "setInstructions",
+      { markdown: "Use @linear." },
+      inventory,
+      workflowState({ agentId: UNPUBLISHED_AGENT_ID }),
+    );
+    expect(unpublished.ok).toBe(false);
+    expect(!unpublished.ok && unpublished.message).toContain("no published version");
+
+    // Selected agent that has since been deleted → still a problem.
+    const deleted = validateMutation(
+      "setInstructions",
+      { markdown: "Use @linear." },
+      inventory,
+      workflowState({ agentId: "ffffffff-1111-4222-8333-444444444444" }),
+    );
+    expect(deleted.ok).toBe(false);
+    expect(!deleted.ok && deleted.message).toContain("no longer exists");
+
+    // Published agent: its own context slugs pass, others bounce.
+    const selected = workflowState({ agentId: PUBLISHED_AGENT_ID });
+    const ok = validateMutation(
+      "setInstructions",
+      { markdown: "Use @linear and @skill.triage-guide." },
+      inventory,
+      selected,
+    );
+    expect(ok.ok).toBe(true);
+    const outside = validateMutation(
+      "setInstructions",
+      { markdown: "Use @github." },
+      inventory,
+      selected,
+    );
+    expect(outside.ok).toBe(false);
+    expect(!outside.ok && outside.message).toContain("is not in agent");
+  });
+
+  test("workflow setInstructions flags bare @trigger and skips trigger checks on unparseable triggers", () => {
+    const bare = validateMutation(
+      "setInstructions",
+      { markdown: "Start from @trigger data." },
+      inventory,
+      workflowState({ trigger: { type: "webhook" } }),
+    );
+    expect(bare.ok).toBe(false);
+    expect(!bare.ok && bare.message).toContain("bare");
+
+    // Unparseable draft trigger (null) — lenient: trigger refs pass through.
+    const lenient = validateMutation(
+      "setInstructions",
+      { markdown: "Read @trigger.subject." },
+      inventory,
+      workflowState({ trigger: null }),
+    );
+    expect(lenient.ok).toBe(true);
   });
 });

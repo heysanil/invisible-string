@@ -1,13 +1,14 @@
 /**
- * Phase-2 resource-CRUD integration tests — gated on TEST_DATABASE_URL (skip
- * cleanly when unset; the compose integration stage provides it).
+ * Resource-CRUD integration tests — gated on TEST_DATABASE_URL (skip cleanly
+ * when unset; the compose integration stage provides it).
  *
  * Covers the authz matrix (outsider 403 on paths / 404 on foreign rows; member
  * ok; owner/admin-only ops), secrets-never-echoed, the registry proxy (stubbed
- * registry), delete-referenced-connection 409, the skill attachment
- * upload→publish path (bytes threaded into the compiler), model/agent preset
- * guards, member passthrough, and the HITL run-input round trip against a fake
- * eve worker that parks on approval.
+ * registry), delete-referenced-connection 409 (agents reference connections
+ * now), the skill attachment upload→agent-publish path (bytes threaded into
+ * the compiler), model preset guards, agents CRUD (+ inline dry-run
+ * diagnostics, run-as membership, delete guard), member passthrough, and the
+ * HITL run-input round trip against a fake eve worker that parks on approval.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,7 +20,9 @@ import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
+  type AgentDefinitionInput,
   type CreateSessionResponse,
+  type GetAgentResponse,
   type GetMcpConnectionResponse,
   type GetSkillResponse,
   type GetWorkflowResponse,
@@ -27,19 +30,18 @@ import {
   type ListSessionsResponse,
   type ListWorkflowsResponse,
   type ListWorkspaceMembersResponse,
-  type PublishWorkflowResponse,
+  type PublishAgentResponse,
   type RegistrySearchResponse,
   type RegistryServerSummary,
-  type RunDto,
   type RunInputResponse,
-  type WorkflowDefinition,
+  type UpdateAgentResponse,
 } from "@invisible-string/shared";
 
 import { createMemoryArtifactStore } from "../artifacts";
 import {
-  WorkflowCompileError,
+  AgentCompileError,
   type CompileRequest,
-  type CompileWorkflowFn,
+  type CompileAgentFn,
 } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
@@ -62,11 +64,11 @@ const MASTER_KEY_B64 = generateMasterKeyBase64();
 const STUB_EVE_VERSION = "0.19.0";
 const capturedCompiles: CompileRequest[] = [];
 
-const stubCompile: CompileWorkflowFn = (request) => {
+const stubCompile: CompileAgentFn = (request) => {
   capturedCompiles.push(request);
-  if (request.definition.instructions.markdown.trim() === "") {
-    throw new WorkflowCompileError([
-      { path: "instructions.markdown", message: "instructions must not be empty" },
+  if (request.definition.persona.trim() === "") {
+    throw new AgentCompileError([
+      { path: "persona", message: "persona must not be empty" },
     ]);
   }
   const hash = createHash("sha256")
@@ -76,12 +78,13 @@ const stubCompile: CompileWorkflowFn = (request) => {
         model: request.model.modelId,
         connections: request.connections.map((c) => [c.name, c.url, c.envTokenVar, c.authHeaders]),
         skills: request.skills.map((s) => [s.name, s.content, s.files ?? null]),
+        agent: request.agentSlug,
         eve: STUB_EVE_VERSION,
       }),
     )
     .digest("hex");
   return {
-    files: new Map([["instructions.md", request.definition.instructions.markdown]]),
+    files: new Map([["agent/instructions.md", request.definition.persona]]),
     hash,
     compilerVersion: "stub-compiler-1",
     eveVersion: STUB_EVE_VERSION,
@@ -312,6 +315,16 @@ async function until<T>(fn: () => Promise<T | undefined | false>, what: string, 
   }
 }
 
+/** Minimal valid AgentDefinition draft for these tests. */
+function agentDraft(overrides: Partial<AgentDefinitionInput> = {}): AgentDefinitionInput {
+  return {
+    persona: "Be helpful.",
+    model: { preset: "balanced", reasoning: "medium" },
+    context: { mcpConnectionIds: [], skillIds: [] },
+    ...overrides,
+  };
+}
+
 if (!TEST_DATABASE_URL) {
   console.warn("[resources] TEST_DATABASE_URL not set — skipping resource integration tests");
 }
@@ -327,7 +340,8 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
   let ownerCookie: string;
   let orgId: string;
   let ownerUserId: string;
-  let agentPresetId: string;
+  /** The seeded "General Purpose" agent (chat + HITL target). */
+  let seededAgentId: string;
 
   async function api(
     method: string,
@@ -405,9 +419,12 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     ownerCookie = owner.cookie;
     orgId = owner.orgId;
     ownerUserId = owner.userId;
-    await seedWorkspace(db, orgId);
-    const agents = await db.select({ id: schema.agents.id }).from(schema.agents).where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agents[0]!.id;
+    await seedWorkspace(db, orgId, ownerUserId);
+    const seeded = await db
+      .select({ id: schema.agents.id })
+      .from(schema.agents)
+      .where(and(eq(schema.agents.organizationId, orgId), eq(schema.agents.name, "General Purpose")));
+    seededAgentId = seeded[0]!.id;
 
     // Start from a clean worker registry — workers are GLOBAL (selectWorker is
     // not workspace-scoped), so stray live rows from another suite/run sharing
@@ -435,24 +452,26 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(create.status).toBe(201);
     const wf = ((await create.json()) as GetWorkflowResponse).workflow;
     expect(wf.name).toBe("My Workflow");
-    expect(wf.runAsUserId).toBe(ownerUserId);
+    expect(wf.published).toBeNull();
+    expect(wf.enabled).toBeTrue();
 
-    const list = await api("GET", `/workspaces/${orgId}/workflows`, { cookie: ownerCookie });
-    const workflows = ((await list.json()) as ListWorkflowsResponse).workflows;
-    expect(workflows.some((w) => w.id === wf.id)).toBeTrue();
-
-    // Draft update returns dry-run diagnostics inline (ok for a valid draft).
-    const draft: WorkflowDefinition = {
+    // Draft update returns validator diagnostics inline.
+    const draft = {
       trigger: { type: "manual" },
-      context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId },
+      agentId: seededAgentId,
       instructions: { markdown: "Be helpful." },
     };
     const patch = await api("PATCH", `/workspaces/${orgId}/workflows/${wf.id}`, { cookie: ownerCookie, body: { draft } });
     expect(patch.status).toBe(200);
-    const patchBody = (await patch.json()) as GetWorkflowResponse & { diagnostics?: { ok: boolean } };
-    expect(patchBody.workflow.triggerType).toBe("manual");
-    expect(patchBody.diagnostics?.ok).toBeTrue();
+    const patchBody = (await patch.json()) as GetWorkflowResponse;
+    expect(Array.isArray(patchBody.diagnostics)).toBeTrue();
+
+    // List summaries surface the draft trigger type + agent name.
+    const list = await api("GET", `/workspaces/${orgId}/workflows`, { cookie: ownerCookie });
+    const workflows = ((await list.json()) as ListWorkflowsResponse).workflows;
+    const summary = workflows.find((w) => w.id === wf.id);
+    expect(summary?.triggerType).toBe("manual");
+    expect(summary?.agentName).toBe("General Purpose");
 
     // A member (non-admin) cannot delete; an owner/admin can.
     await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
@@ -479,15 +498,6 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     // Anonymous → 401.
     const anon = await api("GET", `/workspaces/${orgId}/workflows`);
     expect(anon.status).toBe(401);
-  });
-
-  test("workflows: run_as user must be a workspace member", async () => {
-    const res = await api("POST", `/workspaces/${orgId}/workflows`, {
-      cookie: ownerCookie,
-      body: { name: "Bad RunAs", runAsUserId: "not-a-member" },
-    });
-    expect(res.status).toBe(422);
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("run_as_user_not_member");
   });
 
   // ── MCP connections + secrets + registry + delete guard ──────────────────
@@ -527,31 +537,32 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(wsConns.some((c) => c.name === "Personal")).toBeFalse();
   });
 
-  test("mcp connections: DELETE blocked (409) while a workflow references it", async () => {
+  test("mcp connections: DELETE blocked (409) while an agent references it", async () => {
     const create = await api("POST", `/workspaces/${orgId}/mcp-connections`, {
       cookie: ownerCookie,
       body: { name: "Referenced", url: "https://mcp.example/ref" },
     });
     const connId = ((await create.json()) as GetMcpConnectionResponse).connection.id;
-    const wf = await api("POST", `/workspaces/${orgId}/workflows`, {
+    const agent = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
       body: {
         name: "Uses Connection",
-        draft: {
-          trigger: { type: "manual" },
+        draft: agentDraft({
+          persona: "Use it.",
           context: { mcpConnectionIds: [connId], skillIds: [] },
-          agent: { agentPresetId },
-          instructions: { markdown: "Use it." },
-        },
+        }),
       },
     });
-    const wfName = ((await wf.json()) as GetWorkflowResponse).workflow.name;
+    expect(agent.status).toBe(201);
+    const agentName = ((await agent.json()) as GetAgentResponse).agent.name;
 
     const del = await api("DELETE", `/workspaces/${orgId}/mcp-connections/${connId}`, { cookie: ownerCookie });
     expect(del.status).toBe(409);
-    const body = (await del.json()) as { error: { code: string; details?: { workflows?: string[] } } };
+    // details = bare array of referencing AGENT names (the SPA blocker parser
+    // reads bare arrays and keyed shapes alike).
+    const body = (await del.json()) as { error: { code: string; details?: string[] } };
     expect(body.error.code).toBe("connection_in_use");
-    expect(body.error.details?.workflows).toContain(wfName);
+    expect(body.error.details).toContain(agentName);
   });
 
   test("mcp registry: proxy search + install create a registry-sourced connection", async () => {
@@ -582,9 +593,9 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(missing.status).toBe(404);
   });
 
-  // ── skills + attachments → publish threads bytes into the compiler ───────
+  // ── skills + attachments → agent publish threads bytes into the compiler ──
 
-  test("skills: CRUD + attachment upload; publish emits the packaged skill", async () => {
+  test("skills: CRUD + attachment upload; agent publish emits the packaged skill", async () => {
     const create = await api("POST", `/workspaces/${orgId}/skills`, {
       cookie: ownerCookie,
       body: { name: "Triage", description: "How to triage", content: "# Triage\n\nSee references/rota.md" },
@@ -603,24 +614,23 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(withFile.files[0]!.key).toBe(`skills/${skill.id}/references/rota.md`);
     expect(await artifacts.exists(withFile.files[0]!.key)).toBeTrue();
 
-    const wf = await api("POST", `/workspaces/${orgId}/workflows`, {
+    const agentRes = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
       body: {
-        name: "Skill Publish",
-        draft: {
-          trigger: { type: "manual" },
+        name: "Skill Agent",
+        draft: agentDraft({
+          persona: "Follow the skill.",
           context: { mcpConnectionIds: [], skillIds: [skill.id] },
-          agent: { agentPresetId },
-          instructions: { markdown: "Follow the skill." },
-        },
+        }),
       },
     });
-    const wfId = ((await wf.json()) as GetWorkflowResponse).workflow.id;
+    expect(agentRes.status).toBe(201);
+    const skillAgentId = ((await agentRes.json()) as GetAgentResponse).agent.id;
 
     capturedCompiles.length = 0;
-    const publish = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/publish`, { cookie: ownerCookie });
+    const publish = await api("POST", `/workspaces/${orgId}/agents/${skillAgentId}/publish`, { cookie: ownerCookie });
     expect(publish.status).toBe(200);
-    const pub = (await publish.json()) as PublishWorkflowResponse;
+    const pub = (await publish.json()) as PublishAgentResponse;
     await stack.runtime!.buildService.waitFor(pub.contentHash);
     await until(async () => (await stack.runtime!.buildStore.get(pub.contentHash))?.status === "succeeded" || undefined, "build to succeed");
 
@@ -641,7 +651,7 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(((await upload.json()) as { error: { code: string } }).error.code).toBe("skill_file_too_large");
   });
 
-  // ── model presets + allowlist + agents ───────────────────────────────────
+  // ── model presets + allowlist ────────────────────────────────────────────
 
   test("model presets/allowlist: re-point checks the allowlist; remove-referenced is 409", async () => {
     // Add a model to the allowlist, point the "quick" preset at it, then fail
@@ -715,28 +725,85 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(failOpen.status).toBe(201);
   });
 
-  test("agent presets: CRUD + model override validated against the allowlist", async () => {
-    const bad = await api("POST", `/workspaces/${orgId}/agents`, {
+  // ── agents CRUD ──────────────────────────────────────────────────────────
+
+  test("agents: CRUD + inline dry-run diagnostics + run-as membership + delete guard", async () => {
+    // run_as user must be a workspace member.
+    const badRunAs = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
-      body: { name: "Custom", basePrompt: "You are custom.", modelId: "vendor/not-allowed" },
+      body: { name: "Bad RunAs", runAsUserId: "not-a-member" },
     });
-    expect(bad.status).toBe(422);
+    expect(badRunAs.status).toBe(422);
+    expect(((await badRunAs.json()) as { error: { code: string } }).error.code).toBe("run_as_user_not_member");
 
     const create = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
-      body: { name: "Custom", basePrompt: "You are custom." },
+      body: { name: "Custom", draft: agentDraft() },
     });
     expect(create.status).toBe(201);
-    const agentId = ((await create.json()) as { agent: { id: string } }).agent.id;
+    const agent = ((await create.json()) as GetAgentResponse).agent;
+    // run-as defaults to the creator.
+    expect(agent.runAsUserId).toBe(ownerUserId);
 
-    // Duplicate name → 409.
+    // Duplicate name → 409 (names feed the content hash via the slug).
     const dup = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
-      body: { name: "Custom", basePrompt: "again" },
+      body: { name: "Custom" },
     });
     expect(dup.status).toBe(409);
 
-    const del = await api("DELETE", `/workspaces/${orgId}/agents/${agentId}`, { cookie: ownerCookie });
+    // Draft PATCH returns dry-run diagnostics inline: a non-allowlisted
+    // model override is the diagnostics PAYLOAD, not a failed save.
+    const badModel = await api("PATCH", `/workspaces/${orgId}/agents/${agent.id}`, {
+      cookie: ownerCookie,
+      body: {
+        draft: agentDraft({
+          model: { preset: "balanced", modelId: "vendor/not-allowed", reasoning: "medium" },
+        }),
+      },
+    });
+    expect(badModel.status).toBe(200);
+    const badModelBody = (await badModel.json()) as UpdateAgentResponse;
+    expect(badModelBody.diagnostics).toMatchObject({
+      ok: false,
+      error: { code: "model_not_allowlisted" },
+    });
+
+    const goodPatch = await api("PATCH", `/workspaces/${orgId}/agents/${agent.id}`, {
+      cookie: ownerCookie,
+      body: { draft: agentDraft({ persona: "You are custom." }) },
+    });
+    expect(goodPatch.status).toBe(200);
+    const goodBody = (await goodPatch.json()) as UpdateAgentResponse;
+    expect(goodBody.diagnostics).toMatchObject({ ok: true });
+
+    // DELETE is guarded while a workflow references the agent.
+    const wf = await api("POST", `/workspaces/${orgId}/workflows`, {
+      cookie: ownerCookie,
+      body: {
+        name: "Uses Agent",
+        draft: {
+          trigger: { type: "manual" },
+          agentId: agent.id,
+          instructions: { markdown: "Delegate." },
+        },
+      },
+    });
+    expect(wf.status).toBe(201);
+    const wfId = ((await wf.json()) as GetWorkflowResponse).workflow.id;
+
+    const blocked = await api("DELETE", `/workspaces/${orgId}/agents/${agent.id}`, { cookie: ownerCookie });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as { error: { code: string } }).error.code).toBe("agent_in_use");
+
+    await api("DELETE", `/workspaces/${orgId}/workflows/${wfId}`, { cookie: ownerCookie });
+
+    // A member (non-admin) cannot delete; an owner/admin can.
+    await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    const denied = await api("DELETE", `/workspaces/${orgId}/agents/${agent.id}`, { cookie: ownerCookie });
+    expect(denied.status).toBe(403);
+    await db.update(schema.member).set({ role: "owner" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    const del = await api("DELETE", `/workspaces/${orgId}/agents/${agent.id}`, { cookie: ownerCookie });
     expect(del.status).toBe(200);
   });
 
@@ -751,20 +818,13 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
 
   test("run input: parks on approval then resumes to success; session list reflects it", async () => {
     await freshWorker();
-    const draft: WorkflowDefinition = {
-      trigger: { type: "manual" },
-      context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId },
-      instructions: { markdown: "Gate deletes behind approval." },
-    };
-    const wf = await api("POST", `/workspaces/${orgId}/workflows`, { cookie: ownerCookie, body: { name: "Approval WF", draft } });
-    const wfId = ((await wf.json()) as GetWorkflowResponse).workflow.id;
-    const pub = (await (await api("POST", `/workspaces/${orgId}/workflows/${wfId}/publish`, { cookie: ownerCookie })).json()) as PublishWorkflowResponse;
+    // Publish the seeded "General Purpose" agent and chat with it.
+    const pub = (await (await api("POST", `/workspaces/${orgId}/agents/${seededAgentId}/publish`, { cookie: ownerCookie })).json()) as PublishAgentResponse;
     await stack.runtime!.buildService.waitFor(pub.contentHash);
-    await until(async () => (await stack.runtime!.buildStore.get(pub.contentHash))?.status === "succeeded" || undefined, "approval wf build");
+    await until(async () => (await stack.runtime!.buildStore.get(pub.contentHash))?.status === "succeeded" || undefined, "seeded agent build");
 
     await freshWorker();
-    const sessionRes = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/sessions`, { cookie: ownerCookie, body: { message: "APPROVE the delete" } });
+    const sessionRes = await api("POST", `/workspaces/${orgId}/agents/${seededAgentId}/sessions`, { cookie: ownerCookie, body: { message: "APPROVE the delete" } });
     expect(sessionRes.status).toBe(201);
     const { session, run } = (await sessionRes.json()) as CreateSessionResponse;
 
@@ -792,12 +852,14 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(again.status).toBe(409);
     expect(((await again.json()) as { error: { code: string } }).error.code).toBe("no_pending_input");
 
-    // Session list carries the workflow name + latest run status + ordering.
-    const list = await api("GET", `/workspaces/${orgId}/sessions?workflowId=${wfId}`, { cookie: ownerCookie });
+    // Session list carries the agent name + latest run status; direct chat
+    // has no workflow provenance.
+    const list = await api("GET", `/workspaces/${orgId}/sessions?agentId=${seededAgentId}`, { cookie: ownerCookie });
     expect(list.status).toBe(200);
     const sessions = ((await list.json()) as ListSessionsResponse).sessions;
     const listed = sessions.find((s) => s.id === session.id);
-    expect(listed?.workflowName).toBe("Approval WF");
+    expect(listed?.agentName).toBe("General Purpose");
+    expect(listed?.workflowName).toBeNull();
     expect(listed?.lastRunStatus).toBe("succeeded");
   });
 });

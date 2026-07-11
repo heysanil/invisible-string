@@ -1,10 +1,10 @@
 /**
- * Phase-2 resource CRUD plugin — wires the HTTP surface for workflows,
+ * Resource CRUD plugin — wires the HTTP surface for agents, workflows,
  * sessions (list), MCP connections (+ registry proxy/install), skills
- * (+ attachments), model presets/allowlist, agent presets, and members onto
- * the pure service functions in this directory. Mounted unconditionally
- * (product CRUD does not require the runtime env); skill uploads that need the
- * object store fail with a typed error when it is unconfigured.
+ * (+ attachments), model presets/allowlist, and members onto the pure
+ * service functions in this directory. Mounted unconditionally (product CRUD
+ * does not require the runtime env); skill uploads that need the object
+ * store fail with a typed error when it is unconfigured.
  *
  * Scopes: workspace resources use the `requireWorkspace` macro (role-gated
  * where noted); user-scoped `/me/...` resources use the `requireAuth` macro.
@@ -14,6 +14,13 @@ import { SKILL_FILE_MAX_BYTES } from "@invisible-string/shared";
 
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { workspacePlugin } from "../workspace";
+import {
+  createAgent,
+  deleteAgent,
+  getAgent,
+  listAgents,
+  updateAgent,
+} from "./agents";
 import type { ResourceDeps, Scope } from "./common";
 import { listWorkspaceMembers } from "./members";
 import {
@@ -26,14 +33,9 @@ import {
 } from "./mcp-connections";
 import {
   addModelAllowlistEntry,
-  createAgentPreset,
-  deleteAgentPreset,
   deleteModelAllowlistEntry,
-  getAgentPreset,
-  listAgentPresets,
   listModelAllowlist,
   listModelPresets,
-  updateAgentPreset,
   updateModelAllowlistEntry,
   updateModelPreset,
 } from "./presets";
@@ -54,6 +56,7 @@ import {
   deleteWorkflow,
   getWorkflow,
   listWorkflows,
+  publishWorkflow,
   updateWorkflow,
 } from "./workflows";
 
@@ -153,6 +156,15 @@ export function resourcesPlugin(deps: ResourceDeps) {
         ({ workspace, params }) =>
           deleteWorkflow(deps, workspace.organizationId, params.wfId),
         { requireWorkspace: "admin" },
+      )
+      // Publish = validate + snapshot draft→published + sync the trigger row.
+      // NO compile/build (the agent is the compile unit) — member-gated like
+      // create/edit; blocking diagnostics 422 `workflow_validation_failed`.
+      .post(
+        "/workspaces/:workspaceId/workflows/:wfId/publish",
+        ({ workspace, params }) =>
+          publishWorkflow(deps, workspace.organizationId, params.wfId),
+        { requireWorkspace: true },
       )
 
       // ── Sessions list (workspace-scoped) ──────────────────────────────────
@@ -410,39 +422,46 @@ export function resourcesPlugin(deps: ResourceDeps) {
         { requireWorkspace: "admin" },
       )
 
-      // ── Agent presets ─────────────────────────────────────────────────────
+      // ── Agents (workspace-scoped; role rules match workflows: member
+      // creates/edits — agents are a primary product surface, not settings —
+      // and delete is admin-gated like other destructive ops) ───────────────
       .get(
         "/workspaces/:workspaceId/agents",
-        ({ workspace }) => listAgentPresets(deps, workspace.organizationId),
+        ({ workspace }) => listAgents(deps, workspace.organizationId),
         { requireWorkspace: true },
       )
-      // Agent presets are shared, settings-managed context every workflow
-      // builds on (basePrompt + model override) — mutations are admin-gated,
-      // matching model-presets/allowlist and the spec's "role checks on
-      // settings mutations" (reads stay member-visible for the builder).
       .post(
         "/workspaces/:workspaceId/agents",
         async ({ workspace, body, set }) => {
-          const result = await createAgentPreset(deps, workspace.organizationId, body);
+          const result = await createAgent(
+            deps,
+            { organizationId: workspace.organizationId, userId: workspace.userId },
+            body,
+          );
           set.status = 201;
           return result;
         },
-        { requireWorkspace: "admin" },
+        { requireWorkspace: true },
       )
       .get(
-        "/workspaces/:workspaceId/agents/:id",
-        ({ workspace, params }) => getAgentPreset(deps, workspace.organizationId, params.id),
+        "/workspaces/:workspaceId/agents/:agentId",
+        ({ workspace, params }) => getAgent(deps, workspace.organizationId, params.agentId),
         { requireWorkspace: true },
       )
       .patch(
-        "/workspaces/:workspaceId/agents/:id",
+        "/workspaces/:workspaceId/agents/:agentId",
         ({ workspace, params, body }) =>
-          updateAgentPreset(deps, workspace.organizationId, params.id, body),
-        { requireWorkspace: "admin" },
+          updateAgent(
+            deps,
+            { organizationId: workspace.organizationId, userId: workspace.userId },
+            params.agentId,
+            body,
+          ),
+        { requireWorkspace: true },
       )
       .delete(
-        "/workspaces/:workspaceId/agents/:id",
-        ({ workspace, params }) => deleteAgentPreset(deps, workspace.organizationId, params.id),
+        "/workspaces/:workspaceId/agents/:agentId",
+        ({ workspace, params }) => deleteAgent(deps, workspace.organizationId, params.agentId),
         { requireWorkspace: "admin" },
       )
 

@@ -1,23 +1,23 @@
 /**
- * Preset→model resolution + allowlist validation (spec §7; runs FIRST in the
- * publish path, before any compile work, so typed errors surface to the API).
+ * Model resolution for an AgentDefinition's MODEL config (spec §7; runs FIRST
+ * in the agent publish path, before any compile work, so typed errors surface
+ * to the API).
  *
  * Resolution order (spec §7):
- *   1. workflow `modelId` override            — wins outright
- *   2. workflow `modelPreset` override        — else the agent preset's slug
- *   3. workspace model_presets mapping        — slug → provider + modelId
- *   4. model_allowlist check (enabled)        — ALWAYS, on the final model
+ *   1. `definition.model.modelId` override    — wins outright
+ *   2. `definition.model.preset` slug         — workspace model_presets
+ *      mapping (slug → provider + modelId)
+ *   3. model_allowlist check (enabled)        — ALWAYS, on the final model
+ *
+ * Reasoning effort lives on the definition itself (`model.reasoning`) and is
+ * compiled directly — it is not part of resolution.
  *
  * Pure core (`resolveModel`) over pre-loaded rows so it unit-tests without a
  * database; `loadModelResolutionData` is the drizzle loader.
  */
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type {
-  AgentConfig,
-  ModelPresetSlug,
-  ReasoningEffort,
-} from "@invisible-string/shared";
+import type { AgentModel, ModelPresetSlug } from "@invisible-string/shared";
 
 import type { Db } from "../db";
 import { errors } from "./errors";
@@ -29,19 +29,6 @@ export interface ResolvedModel {
   modelId: string;
   /** The preset slug the model came through (absent for modelId overrides). */
   presetSlug?: ModelPresetSlug;
-  reasoning: ReasoningEffort;
-  /** Agent-preset persona, prepended to instructions.md by the compiler. */
-  agentName: string;
-  basePrompt: string;
-}
-
-export interface AgentPresetRow {
-  id: string;
-  name: string;
-  basePrompt: string;
-  reasoningEffort: ReasoningEffort;
-  modelPreset: ModelPresetSlug;
-  modelId: string | null;
 }
 
 export interface ModelPresetRow {
@@ -57,8 +44,6 @@ export interface AllowlistRow {
 }
 
 export interface ModelResolutionData {
-  /** The agents row named by agentPresetId; null when it doesn't exist. */
-  agentPreset: AgentPresetRow | null;
   /** All workspace model presets. */
   modelPresets: ModelPresetRow[];
   /** All workspace allowlist rows. */
@@ -67,15 +52,9 @@ export interface ModelResolutionData {
 
 /** Pure resolution — throws typed RuntimeApiErrors (422s). */
 export function resolveModel(
-  agent: AgentConfig,
+  model: AgentModel,
   data: ModelResolutionData,
 ): ResolvedModel {
-  const preset = data.agentPreset;
-  if (!preset) throw errors.agentPresetNotFound(agent.agentPresetId);
-
-  const reasoning = agent.reasoning ?? preset.reasoningEffort;
-  const base = { reasoning, agentName: preset.name, basePrompt: preset.basePrompt };
-
   const findAllowed = (modelId: string, provider?: ModelProvider) =>
     data.allowlist.find(
       (row) =>
@@ -84,56 +63,35 @@ export function resolveModel(
         (provider === undefined || row.provider === provider),
     );
 
-  // 1. Specific-model override (workflow-level wins over the agent preset's).
-  const modelIdOverride = agent.modelId ?? preset.modelId ?? undefined;
-  if (modelIdOverride !== undefined) {
-    const allowed = findAllowed(modelIdOverride);
-    if (!allowed) throw errors.modelNotAllowlisted(modelIdOverride);
-    return { ...base, provider: allowed.provider, modelId: modelIdOverride };
+  // 1. Specific-model override wins outright; provider from the allowlist row.
+  if (model.modelId !== undefined) {
+    const allowed = findAllowed(model.modelId);
+    if (!allowed) throw errors.modelNotAllowlisted(model.modelId);
+    return { provider: allowed.provider, modelId: model.modelId };
   }
 
-  // 2./3. Preset slug → workspace mapping.
-  const slug = agent.modelPreset ?? preset.modelPreset;
-  const mapping = data.modelPresets.find((row) => row.slug === slug);
-  if (!mapping) throw errors.modelPresetNotFound(slug);
+  // 2. Preset slug → workspace mapping.
+  const mapping = data.modelPresets.find((row) => row.slug === model.preset);
+  if (!mapping) throw errors.modelPresetNotFound(model.preset);
 
-  // 4. Allowlist check on the resolved model.
+  // 3. Allowlist check on the resolved model.
   if (!findAllowed(mapping.modelId, mapping.provider)) {
     throw errors.modelNotAllowlisted(mapping.modelId);
   }
 
   return {
-    ...base,
     provider: mapping.provider,
     modelId: mapping.modelId,
-    presetSlug: slug,
+    presetSlug: model.preset,
   };
 }
 
-/** Load the rows {@link resolveModel} needs for one workspace + agent preset. */
+/** Load the rows {@link resolveModel} needs for one workspace. */
 export async function loadModelResolutionData(
   db: Db,
   organizationId: string,
-  agentPresetId: string,
 ): Promise<ModelResolutionData> {
-  const [agentRows, presetRows, allowRows] = await Promise.all([
-    db
-      .select({
-        id: schema.agents.id,
-        name: schema.agents.name,
-        basePrompt: schema.agents.basePrompt,
-        reasoningEffort: schema.agents.reasoningEffort,
-        modelPreset: schema.agents.modelPreset,
-        modelId: schema.agents.modelId,
-      })
-      .from(schema.agents)
-      .where(
-        and(
-          eq(schema.agents.id, agentPresetId),
-          eq(schema.agents.organizationId, organizationId),
-        ),
-      )
-      .limit(1),
+  const [presetRows, allowRows] = await Promise.all([
     db
       .select({
         slug: schema.modelPresets.slug,
@@ -153,7 +111,6 @@ export async function loadModelResolutionData(
   ]);
 
   return {
-    agentPreset: agentRows[0] ?? null,
     modelPresets: presetRows,
     allowlist: allowRows,
   };

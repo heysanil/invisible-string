@@ -29,7 +29,21 @@ import { authSchema } from "./auth-schema";
 import type { Config } from "./config";
 import type { Db } from "./db";
 
-export function createAuth(config: Config, db: Db) {
+/**
+ * Post-auth lifecycle hooks the app stack can attach. Kept OUT of the Better
+ * Auth config type so the auth module never needs the runtime dependency
+ * graph (build service, workers) — callers wire what they need.
+ */
+export interface AuthHooks {
+  /**
+   * Fired after a brand-new organization has been seeded with the workspace
+   * defaults (model presets, allowlist, default agents). Consumers treat this
+   * as fire-and-forget: it must never throw into the signup request.
+   */
+  onWorkspaceSeeded?: (organizationId: string) => void;
+}
+
+export function createAuth(config: Config, db: Db, hooks: AuthHooks = {}) {
   return betterAuth({
     baseURL: config.betterAuthUrl,
     basePath: "/api/auth",
@@ -70,11 +84,14 @@ export function createAuth(config: Config, db: Db) {
       organization({
         creatorRole: "owner",
         // A new workspace must arrive with the locked defaults (model presets,
-        // allowlist, agent presets) so the builder is usable immediately — the
-        // seed is idempotent and never clobbers later admin edits.
+        // allowlist, default agents) so chat and the editors are usable
+        // immediately — the seed is idempotent and never clobbers later admin
+        // edits. The creator becomes the seed agents' run-as user
+        // (agents.run_as_user_id is NOT NULL).
         organizationHooks: {
-          afterCreateOrganization: async ({ organization: org }) => {
-            await seedWorkspace(db, org.id);
+          afterCreateOrganization: async ({ organization: org, user }) => {
+            await seedWorkspace(db, org.id, user.id);
+            hooks.onWorkspaceSeeded?.(org.id);
           },
         },
       }),

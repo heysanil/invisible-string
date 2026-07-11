@@ -1,5 +1,5 @@
 /**
- * Skill CRUD (CONTEXT pillar) + file attachments, both scopes.
+ * Skill CRUD (agent CONTEXT) + file attachments, both scopes.
  *
  * Attachments are stored in the object store under
  * `skills/<skillId>/<filename>`; the `skills.files` jsonb column records

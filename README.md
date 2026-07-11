@@ -63,21 +63,24 @@ flowchart LR
     end
 
     CP --- PG[("product<br/>Postgres")]
-    AG --- WPG[("world Postgres<br/>one DB per version")]
+    AG --- WPG[("world Postgres<br/>one DB per agent version")]
 ```
 
-- **Control plane** (`apps/control-plane`) — auth & orgs, pillar CRUD, compiler
-  invocation + `eve build` + artifact upload (cache keyed by content hash),
-  scheduler (session affinity → artifact-warm → any live worker, with
-  dead-worker sweep + fencing), trigger ingress → dispatcher (version-bound
-  JWTs), NDJSON tailer → resumable SSE, and the copilot WebSocket tool loop.
+- **Control plane** (`apps/control-plane`) — auth & orgs, agent + workflow
+  CRUD, compiler invocation + `eve build` + artifact upload (cache keyed by
+  content hash), scheduler (session affinity → artifact-warm → any live
+  worker, with dead-worker sweep + fencing), trigger ingress + schedule
+  ticker → dispatcher (renders the workflow's instructions + trigger event
+  into the task message and delivers it to the bound agent version over
+  eve's session API, version-bound JWTs), outbound Slack reply delivery,
+  NDJSON tailer → resumable SSE, and the copilot WebSocket tool loop.
 - **Worker** (`apps/worker`) — a stateless Bun supervisor that pulls artifacts,
   boots each compiled agent under Node 24, reverse-proxies traffic to it, and
   reaps idle processes, idle sandboxes, and cold artifacts.
-- **Compiler** (`packages/compiler`) — pure `WorkflowDefinition` → eve project
+- **Compiler** (`packages/compiler`) — pure `AgentDefinition` → eve project
   codegen, golden-digest-guarded and versioned (`COMPILER_VERSION`).
-- **Durability** — each workflow version gets its own world Postgres database
-  (`ws_v_<hash12>`) with a single writer enforced by fencing, so a mid-run
+- **Durability** — each agent version gets its own world Postgres database
+  (`ag_v_<hash12>`) with a single writer enforced by fencing, so a mid-run
   worker crash resumes instead of corrupting.
 
 The full control-plane ↔ worker protocol lives in

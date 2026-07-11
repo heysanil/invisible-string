@@ -1,10 +1,12 @@
 /**
- * World isolation: ONE WORLD POSTGRES *DATABASE* PER WORKFLOW VERSION.
+ * World isolation: ONE WORLD POSTGRES *DATABASE* PER AGENT VERSION.
  *
- * Design correction #10 mandates "one world Postgres schema per workflow
- * version" because WORKFLOW_POSTGRES_JOB_PREFIX does NOT isolate agents
- * sharing a world DB (spike/REPORT.md finding 11: `reenqueueActiveRuns`
- * re-drives OTHER agents' runs on boot).
+ * Design correction #10 mandates one world Postgres database per compiled
+ * version (the agent is the compile unit) because
+ * WORKFLOW_POSTGRES_JOB_PREFIX does NOT isolate agents sharing a world DB
+ * (spike/REPORT.md finding 11: `reenqueueActiveRuns` re-drives OTHER agents'
+ * runs on boot). `WORKFLOW_POSTGRES_*` env names are the world package's
+ * contract — never rename them.
  *
  * MECHANISM NOTE — why a database and not a `search_path` pg schema:
  * `@workflow/world-postgres@5.0.0-beta.20` hardcodes its pg schema in the
@@ -12,20 +14,17 @@
  * — verified against the installed package), so every query is
  * schema-QUALIFIED (`"workflow"."workflow_runs"`) and `search_path` cannot
  * redirect it; graphile-worker likewise installs into its own `graphile_worker`
- * schema. A per-version `CREATE SCHEMA ws_v_<hash12>` + search_path would
+ * schema. A per-version `CREATE SCHEMA ag_v_<hash12>` + search_path would
  * LOOK isolated while every version still shared `workflow.*` — silent
  * cross-agent re-enqueue, the exact bug we must prevent. A dedicated
  * DATABASE per version gives real isolation with the same naming contract.
  *
- * NOTE(integration): packages/compiler's WORLD-ISOLATION.md did not exist
- * when this was written (compiler is built in parallel). This module is the
- * control-plane implementation of the correction-#10 contract:
- *   WORKFLOW_POSTGRES_URL = <world server>/ws_v_<hash12>
- * If the compiler doc lands with a different mechanism, reconcile HERE (the
- * naming + provisioning entrypoints are the only touch points).
+ * This module is the control-plane implementation of the correction-#10
+ * contract (packages/compiler/WORLD-ISOLATION.md):
+ *   WORKFLOW_POSTGRES_URL = <world server>/ag_v_<hash12>
  *
  * Provisioning runs on the FIRST build of a version (build service step):
- *   1. CREATE DATABASE "ws_v_<hash12>" (idempotent via pg_database check)
+ *   1. CREATE DATABASE "ag_v_<hash12>" (idempotent via pg_database check)
  *   2. run @workflow/world-postgres setupDatabase against it (the built
  *      project's own node_modules — exact pinned beta), which creates the
  *      `workflow` schema tables + graphile_worker (REPORT finding 8).
@@ -34,13 +33,13 @@ import { join } from "node:path";
 
 import { SQL } from "bun";
 
-/** ws_v_<first 12 hex chars> — stable, valid unquoted pg identifier. */
+/** ag_v_<first 12 hex chars> — stable, valid unquoted pg identifier. */
 export function worldNameForHash(contentHash: string): string {
   const cleaned = contentHash.toLowerCase().replace(/[^a-z0-9]/g, "");
   if (cleaned.length < 12) {
     throw new Error(`content hash too short for a world name: "${contentHash}"`);
   }
-  return `ws_v_${cleaned.slice(0, 12)}`;
+  return `ag_v_${cleaned.slice(0, 12)}`;
 }
 
 /** Point a world-server URL at a specific per-version database. */
@@ -69,7 +68,7 @@ export interface CreateWorldProvisionerOptions {
   runSetupDatabase: (projectDir: string, worldUrl: string) => Promise<void>;
 }
 
-const VALID_WORLD_NAME = /^ws_v_[a-z0-9]{12}$/;
+const VALID_WORLD_NAME = /^ag_v_[a-z0-9]{12}$/;
 
 /** Ownership marker table inside each world database (collision guard). */
 const WORLD_OWNER_TABLE = "_invisible_string_world_owner";

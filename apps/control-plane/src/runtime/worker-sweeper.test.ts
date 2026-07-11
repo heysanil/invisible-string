@@ -45,7 +45,7 @@ describe.skipIf(!TEST_DATABASE_URL)("worker sweeper failover", () => {
   const suffix = randomUUID().slice(0, 8);
   const orgId = `org-sw-${suffix}`;
   const userId = `user-sw-${suffix}`;
-  let workflowId: string;
+  let agentId: string;
   let versionId: string;
   const contentHash = `sweephash${suffix}`;
 
@@ -93,8 +93,9 @@ describe.skipIf(!TEST_DATABASE_URL)("worker sweeper failover", () => {
       .insert(schema.agentSessions)
       .values({
         organizationId: orgId,
-        workflowId,
-        workflowVersionId: versionId,
+        agentId,
+        agentVersionId: versionId,
+        workflowId: null,
         eveSessionId: opts.eveSessionId,
         continuationToken: opts.eveSessionId ? "cont-token" : null,
         origin: "chat",
@@ -107,7 +108,7 @@ describe.skipIf(!TEST_DATABASE_URL)("worker sweeper failover", () => {
       .insert(schema.runs)
       .values({
         agentSessionId: sessionRows[0]!.id,
-        triggerEvent: { workflowId, triggerType: "manual", data: {}, principal: {} },
+        triggerEvent: { agentId, workflowId: null, triggerType: "manual", data: {}, principal: {} },
         status: opts.runStatus,
       })
       .returning();
@@ -129,19 +130,21 @@ describe.skipIf(!TEST_DATABASE_URL)("worker sweeper failover", () => {
       slug: `sw-${suffix}`,
       createdAt: NOW,
     });
-    const wf = await db
-      .insert(schema.workflows)
-      .values({ organizationId: orgId, name: "sweeper wf", runAsUserId: userId, draft: {} })
+    const agent = await db
+      .insert(schema.agents)
+      .values({ organizationId: orgId, name: "sweeper agent", runAsUserId: userId, draft: {} })
       .returning();
-    workflowId = wf[0]!.id;
+    agentId = agent[0]!.id;
     const ver = await db
-      .insert(schema.workflowVersions)
+      .insert(schema.agentVersions)
       .values({
-        workflowId,
-        config: { pillars: true },
+        agentId,
+        definition: { persona: "sweep" },
         contentHash,
         compilerVersion: "stub",
         eveVersion: "0.19.0",
+        modelProvider: "openrouter",
+        modelId: "deepseek/deepseek-v4-flash",
         buildStatus: "succeeded",
       })
       .returning();

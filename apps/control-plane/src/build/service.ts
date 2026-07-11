@@ -1,18 +1,18 @@
 /**
- * Build service (docs/PLAN.md Phase 1 task 3): compiled files → npm install →
- * eve build → tar.gz → object store, recorded in `workflow_builds`.
+ * Build service: compiled files → npm install → eve build → tar.gz → object
+ * store, recorded in `builds`. The agent is the compile unit — one build per
+ * agent-version content hash.
  *
- * - CACHE: `workflow_builds` is keyed by content hash; an existing
- *   `succeeded` row (with its artifact still present) short-circuits the
- *   whole pipeline.
+ * - CACHE: `builds` is keyed by content hash; an existing `succeeded` row
+ *   (with its artifact still present) short-circuits the whole pipeline.
  * - SINGLE-FLIGHT: concurrent ensureBuild calls for one hash coalesce onto
  *   one in-process build (Map<hash, Promise>). Cross-process locking is a
  *   Phase-3 concern (single control plane in Phase 1).
  * - WORLD: the first build of a version provisions + bootstraps its dedicated
  *   world database (build/world.ts — design correction #10).
- * - STATUS: `workflow_builds.status` and every `workflow_versions` row with
- *   the same content hash move building → succeeded|failed together; the
- *   error log is persisted for the API to surface.
+ * - STATUS: `builds.status` and every `agent_versions` row with the same
+ *   content hash move building → succeeded|failed together; the error log is
+ *   persisted for the API to surface.
  */
 import { join } from "node:path";
 
@@ -42,17 +42,17 @@ export interface BuildStore {
 export function createDrizzleBuildStore(db: Db): BuildStore {
   async function setVersionsStatus(hash: string, status: BuildStatus) {
     await db
-      .update(schema.workflowVersions)
+      .update(schema.agentVersions)
       .set({ buildStatus: status })
-      .where(eq(schema.workflowVersions.contentHash, hash));
+      .where(eq(schema.agentVersions.contentHash, hash));
   }
 
   return {
     async get(hash) {
       const rows = await db
         .select()
-        .from(schema.workflowBuilds)
-        .where(eq(schema.workflowBuilds.hash, hash))
+        .from(schema.builds)
+        .where(eq(schema.builds.hash, hash))
         .limit(1);
       const row = rows[0];
       if (!row) return null;
@@ -65,26 +65,26 @@ export function createDrizzleBuildStore(db: Db): BuildStore {
     },
     async markBuilding(hash) {
       await db
-        .insert(schema.workflowBuilds)
+        .insert(schema.builds)
         .values({ hash, status: "building", artifactKey: null, errorLog: null })
         .onConflictDoUpdate({
-          target: schema.workflowBuilds.hash,
+          target: schema.builds.hash,
           set: { status: "building", artifactKey: null, errorLog: null },
         });
       await setVersionsStatus(hash, "building");
     },
     async markSucceeded(hash, artifactKey) {
       await db
-        .update(schema.workflowBuilds)
+        .update(schema.builds)
         .set({ status: "succeeded", artifactKey, errorLog: null })
-        .where(eq(schema.workflowBuilds.hash, hash));
+        .where(eq(schema.builds.hash, hash));
       await setVersionsStatus(hash, "succeeded");
     },
     async markFailed(hash, errorLog) {
       await db
-        .update(schema.workflowBuilds)
+        .update(schema.builds)
         .set({ status: "failed", errorLog })
-        .where(eq(schema.workflowBuilds.hash, hash));
+        .where(eq(schema.builds.hash, hash));
       await setVersionsStatus(hash, "failed");
     },
   };

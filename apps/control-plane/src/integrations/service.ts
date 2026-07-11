@@ -2,10 +2,12 @@
  * Integrations + trigger-binding persistence (Phase 3 task 3). DB queries and
  * row→DTO mappers behind the ingress + CRUD routes:
  *
- * - trigger rows (`triggers`): one per workflow, created/updated lazily when a
- *   webhook/form token is minted or a Slack binding is set. Stores the token
- *   HASH only (never plaintext); the non-secret token suffix + Slack routing
- *   binding live on `triggers.binding` (jsonb).
+ * - trigger rows (`triggers`): one per workflow, synced from the published
+ *   WorkflowConfig at workflow publish ({@link syncTriggerForPublish}) and
+ *   updated when a webhook/form token is minted or a Slack binding is set.
+ *   Stores the token HASH only (never plaintext); the non-secret token suffix
+ *   + Slack routing binding live on `triggers.binding` (jsonb); schedule
+ *   triggers carry `cron` + `next_fire_at` (the ticker's cursor).
  * - integration rows (`integrations`): one platform Slack app install per team,
  *   keyed by (type, external_id) with the bot token envelope-encrypted.
  */
@@ -20,9 +22,11 @@ import {
   type SlackTriggerBinding,
   type TriggerBindingDto,
   type TriggerTypeEnum,
+  type WorkflowConfig,
 } from "@invisible-string/shared";
 
-import type { Db } from "../db";
+import type { Db, DbClient } from "../db";
+import { nextFire } from "../runtime/cron";
 import { errors } from "../runtime/errors";
 
 type TriggerRow = typeof schema.triggers.$inferSelect;
@@ -148,7 +152,7 @@ export async function resolveTriggerByTokenHash(
 
 /** Get-or-create the workflow's trigger row of the given type. */
 export async function upsertTriggerType(
-  db: Db,
+  db: DbClient,
   workflowId: string,
   type: TriggerTypeEnum,
 ): Promise<TriggerRow> {
@@ -198,6 +202,132 @@ export async function setTriggerToken(
     .where(eq(schema.triggers.id, triggerId))
     .returning();
   return updated[0]!;
+}
+
+/**
+ * Next fire STRICTLY AFTER `after` for a 5-field UTC cron expression, or null
+ * when the expression never fires (or the evaluator rejects it). The workflow
+ * validator uses the null case as its deep cron check.
+ */
+export function nextScheduleFire(cron: string, after: Date): Date | null {
+  try {
+    return nextFire(cron, after) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sync the workflow's trigger row with a freshly PUBLISHED WorkflowConfig
+ * (workflow publish → this; no compile/build). The row's `type` follows the
+ * snapshot; fields that belong to other trigger types are cleared so retired
+ * bindings cannot keep routing (a forgotten webhook token must not outlive a
+ * switch to slack/schedule/manual). Type-specific sync:
+ *
+ * - schedule: `cron` + `next_fire_at` (strictly after `now`; null while the
+ *   workflow is disabled — the ticker's cursor).
+ * - slack: binding RULES (channelId / mentionOnly / DMs) are part of the
+ *   published config, so a republish must refresh the persisted row —
+ *   otherwise ingress keeps routing on stale rules. The integration (team)
+ *   pointer is user-managed (PUT …/triggers/slack) and preserved; nothing
+ *   routes until a team is bound.
+ * - form: `form_schema` snapshots the published fields (ingress validates
+ *   submissions against the ROW; token mint/rotate keeps syncing it too).
+ * - webhook/form keep their minted token hash (+ suffix binding) across
+ *   republish; rotation stays explicit.
+ *
+ * `enabled` mirrors the workflow's master switch at publish time.
+ */
+export async function syncTriggerForPublish(
+  db: DbClient,
+  workflow: { id: string; enabled: boolean },
+  config: WorkflowConfig,
+  now: Date = new Date(),
+): Promise<TriggerRow> {
+  const trigger = config.trigger;
+  const row = await upsertTriggerType(db, workflow.id, trigger.type);
+
+  const patch: Partial<typeof schema.triggers.$inferInsert> = {
+    enabled: workflow.enabled,
+    cron: null,
+    nextFireAt: null,
+  };
+  switch (trigger.type) {
+    case "schedule":
+      patch.cron = trigger.cron;
+      patch.nextFireAt = workflow.enabled
+        ? nextScheduleFire(trigger.cron, now)
+        : null;
+      patch.tokenHash = null;
+      patch.binding = null;
+      patch.formSchema = null;
+      patch.integrationId = null;
+      break;
+    case "slack":
+      patch.tokenHash = null;
+      patch.formSchema = null;
+      patch.binding = row.integrationId
+        ? (trigger.binding as unknown as Record<string, unknown>)
+        : null;
+      break;
+    case "form":
+      patch.formSchema = { fields: trigger.fields };
+      patch.integrationId = null;
+      break;
+    case "webhook":
+      patch.formSchema = null;
+      patch.integrationId = null;
+      break;
+    case "manual":
+      patch.tokenHash = null;
+      patch.binding = null;
+      patch.formSchema = null;
+      patch.integrationId = null;
+      break;
+  }
+
+  const updated = await db
+    .update(schema.triggers)
+    .set(patch)
+    .where(eq(schema.triggers.id, row.id))
+    .returning();
+  return updated[0]!;
+}
+
+/**
+ * Sync the trigger row when the workflow's master `enabled` switch flips
+ * (PATCH). Disabling clears `next_fire_at` (the ticker skips the trigger)
+ * but keeps `cron`; re-enabling a published schedule recomputes the next
+ * fire strictly after `now` — missed windows are never backfilled. No-op for
+ * workflows that have no trigger row yet (never published, no token minted).
+ */
+export async function syncTriggerEnabled(
+  db: DbClient,
+  workflowId: string,
+  enabled: boolean,
+  publishedConfig: WorkflowConfig | null,
+  now: Date = new Date(),
+): Promise<void> {
+  const rows = await db
+    .select()
+    .from(schema.triggers)
+    .where(eq(schema.triggers.workflowId, workflowId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return;
+
+  const patch: Partial<typeof schema.triggers.$inferInsert> = { enabled };
+  if (row.type === "schedule") {
+    const cron =
+      publishedConfig?.trigger.type === "schedule"
+        ? publishedConfig.trigger.cron
+        : row.cron;
+    patch.nextFireAt = enabled && cron ? nextScheduleFire(cron, now) : null;
+  }
+  await db
+    .update(schema.triggers)
+    .set(patch)
+    .where(eq(schema.triggers.id, row.id));
 }
 
 /** Point a Slack trigger at an installed integration + routing rules. */

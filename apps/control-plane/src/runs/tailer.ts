@@ -42,11 +42,22 @@ import type {
 import type { RunEventBus } from "./bus";
 import type { RunStore } from "./store";
 
-/** Terminal-run notification (metrics seam): status + wall-clock of the tail. */
+/**
+ * Terminal-run notification (metrics + outbound-delivery seam): status,
+ * wall-clock of the tail, and the run's final assistant reply.
+ */
 export type RunFinishedHook = (info: {
   runId: string;
   status: Extract<RunStatus, "succeeded" | "failed" | "waiting" | "canceled">;
   durationMs: number;
+  /**
+   * Text of the last `message.completed` with `finishReason: "stop"` seen in
+   * THIS run's own turn (leftover events drained from a previous turn never
+   * count — same gate as terminal classification). Null when the run produced
+   * no terminal reply. The DeliveryService posts this back to the trigger
+   * surface (Slack) for runs owing a `delivery_status = pending` reply.
+   */
+  lastAssistantMessage: string | null;
 }) => void;
 
 // ── NDJSON parsing ──────────────────────────────────────────────────────────
@@ -219,6 +230,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   // unless a user cancel flipped this flag, which marks it "canceled".
   let canceledByUser = false;
   let finished = false;
+  // Final assistant reply of THIS run (see RunFinishedHook). Only tracked
+  // once the run's own turn boundary has been seen — a leftover stop-message
+  // drained from a previous turn must never be delivered as this run's reply.
+  let lastAssistantMessage: string | null = null;
   // Detach (dead-worker failover) aborts the loop but leaves the run's status
   // untouched so a re-tail on another worker can pick it up.
   let detaching = false;
@@ -254,7 +269,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     if (sessionStatus) await store.markSession(agentSessionId, sessionStatus);
     publishStatus(status, error ?? null);
     const durationMs = Date.now() - tailStartedAt;
-    onFinish?.({ runId, status, durationMs });
+    onFinish?.({ runId, status, durationMs, lastAssistantMessage });
     const level = status === "failed" ? "warn" : "info";
     log?.emit(level, `run.${status}`, {
       durationMs,
@@ -333,6 +348,14 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               pendingInput = false;
             }
             pendingInput = nextPendingInputRequest(pendingInput, event);
+            if (
+              sawOwnTurn &&
+              event.type === "message.completed" &&
+              event.data.finishReason === "stop" &&
+              typeof event.data.message === "string"
+            ) {
+              lastAssistantMessage = event.data.message;
+            }
 
             const terminal =
               sawOwnTurn || event.type === "session.failed"

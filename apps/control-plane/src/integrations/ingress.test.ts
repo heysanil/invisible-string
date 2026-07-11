@@ -1,19 +1,24 @@
 /**
- * Trigger ingress + integrations integration tests (docs/PLAN.md Phase 3
- * task 3.6) — gated on TEST_DATABASE_URL (skip cleanly when unset; the compose
- * integration stage provides it).
+ * Trigger ingress + integrations integration tests — gated on
+ * TEST_DATABASE_URL (skip cleanly when unset; the compose integration stage
+ * provides it).
  *
- * Full loop against a FAKE agent/worker whose eve surface additionally speaks
- * the compiled trigger-channel contract (POST /eve/v1/platform/<trigger> →
- * 202 { ok, sessionId, continuationToken }) and a STUB Slack server (there is
- * no real Slack in CI). Covers, per the task's task-3.6 checklist:
+ * AGENTS-FIRST: the fake agent/worker exposes ONLY eve's default channel
+ * (`POST /eve/v1/session`, `POST /eve/v1/session/:id`, the NDJSON stream) —
+ * there are no compiled trigger channels. The suite proves the new dispatch
+ * contract end to end against a real Postgres, a stub Slack server, and a
+ * stub compiler:
  *
- *   webhook ingress → TriggerEvent → dispatch (+ token-HASH lookup, never
- *     plaintext) · form field validation · payload cap · rate-limit 429 ·
- *   Slack signature/replay/dedup · Slack mention → dispatch → thread reply =
- *     SAME session (continuation) · Slack OAuth install + callback · list /
- *     disconnect · dispatch-time allowlist re-validation FAILS the run · run
- *     cancel.
+ *   webhook ingress → RENDERED task message opens the eve session (resolved
+ *     `@trigger.*` baked in; TriggerEvent stays storage-only provenance) ·
+ *   trigger-row form-schema validation · enabled/published gating · payload
+ *     cap · rate-limit 429 · idempotency ·
+ *   dispatch-time allowlist re-validation FAILS the run · run cancel ·
+ *   Slack signature/replay/dedup/twin suppression · mention → dispatch (NO
+ *     SLACK_BOT_TOKEN in agent env) → thread reply CONTINUES the same eve
+ *     session · slack-origin runs owe `delivery_status = pending` and the
+ *     DeliveryService settles them via chat.postMessage (threaded) ·
+ *   Slack OAuth install + callback + tenant binding · list / disconnect.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -29,24 +34,33 @@ import {
 import { signOAuthState } from "./slack-oauth";
 import {
   generateMasterKeyBase64,
+  parseMasterKey,
+  type AgentDefinition,
   type CreateWebhookTokenResponse,
   type RunDto,
+  type TriggerConfig,
   type TriggerIngressResponse,
-  type WorkflowDefinition,
+  type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
 import { createMemoryArtifactStore } from "../artifacts";
 import {
-  WorkflowCompileError,
-  type CompileWorkflowFn,
+  AgentCompileError,
+  type CompileAgentFn,
 } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
+import { createLogger } from "../log";
 import { runMigrations } from "../migrate";
 import {
   derivePlatformJwtSecret,
   PLATFORM_JWT_ISSUER,
   platformJwtAudienceForHash,
 } from "../runtime/jwt";
+import {
+  createDeliveryService,
+  createDrizzleDeliveryReader,
+} from "../runs/delivery";
+import { createSlackClient } from "./slack-client";
 import { createAppStack, type AppStack } from "../index";
 import { hashIngressToken } from "./tokens";
 
@@ -58,7 +72,7 @@ const OPENROUTER_KEY = "test-openrouter-key";
 const SLACK_SIGNING_SECRET = "ingress-slack-signing-secret-000000";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 
-// ── fake agent/worker (eve + trigger-channel contract) ──────────────────────
+// ── fake agent/worker (eve DEFAULT channel only) ─────────────────────────────
 
 interface FakeSession {
   id: string;
@@ -70,9 +84,11 @@ interface EnsureCall {
   hash: string;
   env: Record<string, string>;
 }
-interface TriggerCall {
-  triggerType: string;
-  event: Record<string, unknown>;
+interface SessionMessage {
+  kind: "create" | "continue";
+  hash: string;
+  sessionId: string;
+  message: string;
 }
 
 const TERMINAL = new Set(["session.waiting", "session.completed", "session.failed"]);
@@ -80,7 +96,8 @@ const TERMINAL = new Set(["session.waiting", "session.completed", "session.faile
 class FakeWorker {
   readonly sessions = new Map<string, FakeSession>();
   readonly ensureCalls: EnsureCall[] = [];
-  readonly triggerCalls: TriggerCall[] = [];
+  /** Every task message that opened or continued an eve session. */
+  readonly sessionMessages: SessionMessage[] = [];
   private server: ReturnType<typeof Bun.serve> | null = null;
   private counter = 0;
 
@@ -171,25 +188,41 @@ class FakeWorker {
       return Response.json({ ok: true });
     }
 
-    const platformMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/platform\/([^/]+)$/);
-    if (platformMatch && req.method === "POST") {
-      if (!(await this.verifyJwt(req, platformMatch[1]!))) {
+    // eve default channel: create session (202 async).
+    const createMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/session$/);
+    if (createMatch && req.method === "POST") {
+      if (!(await this.verifyJwt(req, createMatch[1]!))) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
-      const event = (await req.json()) as Record<string, unknown>;
-      this.triggerCalls.push({ triggerType: platformMatch[2]!, event });
-      const ct = typeof event.continuationToken === "string" ? event.continuationToken : undefined;
-      let session = ct ? [...this.sessions.values()].find((s) => s.continuationToken === ct) : undefined;
-      if (!session) {
-        const id = `eve-${++this.counter}`;
-        session = { id, continuationToken: ct ?? `trig-${id}`, events: [], turns: 0 };
-        this.sessions.set(id, session);
-      }
-      this.pushTurn(session, String(event.message ?? ""));
+      const body = (await req.json()) as { message?: string };
+      const id = `eve-${++this.counter}`;
+      const session: FakeSession = { id, continuationToken: `ct-${id}`, events: [], turns: 0 };
+      this.sessions.set(id, session);
+      const message = String(body.message ?? "");
+      this.sessionMessages.push({ kind: "create", hash: createMatch[1]!, sessionId: id, message });
+      this.pushTurn(session, message);
       return Response.json(
-        { ok: true, sessionId: session.id, continuationToken: session.continuationToken },
+        { sessionId: session.id, continuationToken: session.continuationToken },
         { status: 202 },
       );
+    }
+
+    // eve default channel: continue session (202 async).
+    const continueMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/session\/([^/]+)$/);
+    if (continueMatch && req.method === "POST") {
+      if (!(await this.verifyJwt(req, continueMatch[1]!))) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const session = this.sessions.get(continueMatch[2]!);
+      if (!session) return new Response("no session", { status: 404 });
+      const body = (await req.json()) as { continuationToken?: string; message?: string };
+      if (body.continuationToken !== session.continuationToken) {
+        return Response.json({ error: "bad continuation token" }, { status: 409 });
+      }
+      const message = String(body.message ?? "");
+      this.sessionMessages.push({ kind: "continue", hash: continueMatch[1]!, sessionId: session.id, message });
+      this.pushTurn(session, message);
+      return Response.json({}, { status: 202 });
     }
 
     const streamMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/session\/([^/]+)\/stream$/);
@@ -208,7 +241,7 @@ class FakeWorker {
 // ── stub Slack server (oauth.v2.access + chat.postMessage) ──────────────────
 
 class SlackStub {
-  readonly postMessages: unknown[] = [];
+  readonly postMessages: Array<Record<string, unknown>> = [];
   private server: ReturnType<typeof Bun.serve> | null = null;
   team = { id: "T-TEST", name: "Ingress Team" };
 
@@ -233,7 +266,7 @@ class SlackStub {
           });
         }
         if (url.pathname === "/chat.postMessage") {
-          this.postMessages.push(await req.json());
+          this.postMessages.push((await req.json()) as Record<string, unknown>);
           return Response.json({ ok: true, ts: "1.0" });
         }
         return new Response("not found", { status: 404 });
@@ -249,12 +282,12 @@ class SlackStub {
 // ── stub compiler + fake build steps ────────────────────────────────────────
 
 const STUB_EVE_VERSION = "0.19.0";
-const stubCompile: CompileWorkflowFn = (request) => {
-  if (request.definition.instructions.markdown.trim() === "") {
-    throw new WorkflowCompileError([{ path: "instructions.markdown", message: "empty" }]);
+const stubCompile: CompileAgentFn = (request) => {
+  if (request.definition.persona.trim() === "") {
+    throw new AgentCompileError([{ path: "persona", message: "empty" }]);
   }
   const hash = createHash("sha256")
-    .update(JSON.stringify({ def: request.definition, model: request.model.modelId, eve: STUB_EVE_VERSION }))
+    .update(JSON.stringify({ def: request.definition, slug: request.agentSlug, model: request.model.modelId, eve: STUB_EVE_VERSION }))
     .digest("hex");
   return {
     files: new Map([["package.json", "{}"]]),
@@ -301,7 +334,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
   let ownerCookie: string;
   let orgId: string;
   let userId: string;
-  let agentPresetId: string;
+  let agentId: string;
 
   async function api(method: string, path: string, options: { body?: unknown; cookie?: string; headers?: Record<string, string>; rawBody?: string } = {}): Promise<Response> {
     return stack.app.handle(
@@ -335,29 +368,67 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     return { cookie, orgId: org!.id, userId: session!.user.id };
   }
 
-  async function createWorkflow(name: string, trigger: WorkflowDefinition["trigger"]): Promise<string> {
-    const definition: WorkflowDefinition = {
-      trigger,
+  /** Create + publish an agent (real publish route, stub compile/build). */
+  async function createPublishedAgent(): Promise<string> {
+    const definition: AgentDefinition = {
+      persona: "Be a helpful ingress test agent.",
+      model: { preset: "balanced", reasoning: "medium" },
       context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId },
-      instructions: { markdown: "Be helpful. @trigger.repo" },
     };
     const rows = await db
-      .insert(schema.workflows)
-      .values({ organizationId: orgId, name, runAsUserId: userId, draft: definition as unknown as Record<string, unknown> })
-      .returning({ id: schema.workflows.id });
-    return rows[0]!.id;
-  }
-
-  async function publish(workflowId: string): Promise<void> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`, { cookie: ownerCookie });
+      .insert(schema.agents)
+      .values({
+        organizationId: orgId,
+        name: `Ingress Agent ${randomUUID().slice(0, 8)}`,
+        runAsUserId: userId,
+        draft: definition as unknown as Record<string, unknown>,
+      })
+      .returning({ id: schema.agents.id });
+    const id = rows[0]!.id;
+    const res = await api("POST", `/workspaces/${orgId}/agents/${id}/publish`, { cookie: ownerCookie });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { contentHash: string };
     await stack.runtime!.buildService.waitFor(body.contentHash);
     await until(async () => {
       const record = await stack.runtime!.buildStore.get(body.contentHash);
       return record?.status === "succeeded" ? record : undefined;
-    }, "build");
+    }, "agent build");
+    return id;
+  }
+
+  /**
+   * Create a workflow delegating to the published agent. Publish = snapshot
+   * written by the test (workflow publish routes are proven in
+   * resources/workflows.test.ts; ingress only reads the snapshot + trigger
+   * row).
+   */
+  async function createWorkflow(
+    name: string,
+    trigger: TriggerConfig,
+    options: { publish?: boolean; enabled?: boolean; instructions?: string } = {},
+  ): Promise<string> {
+    const config: WorkflowConfigInput = {
+      trigger,
+      agentId,
+      instructions: { markdown: options.instructions ?? "Be helpful. @trigger.repo" },
+    };
+    const rows = await db
+      .insert(schema.workflows)
+      .values({
+        organizationId: orgId,
+        name,
+        draft: config as unknown as Record<string, unknown>,
+        ...(options.publish === false
+          ? {}
+          : {
+              published: config as unknown as Record<string, unknown>,
+              publishedAt: new Date(),
+              publishedAgentId: agentId,
+            }),
+        enabled: options.enabled ?? true,
+      })
+      .returning({ id: schema.workflows.id });
+    return rows[0]!.id;
   }
 
   async function mintToken(workflowId: string): Promise<CreateWebhookTokenResponse> {
@@ -403,15 +474,15 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     ownerCookie = owner.cookie;
     orgId = owner.orgId;
     userId = owner.userId;
-    await seedWorkspace(db, orgId);
-    const agentRows = await db.select({ id: schema.agents.id }).from(schema.agents).where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agentRows[0]!.id;
+    await seedWorkspace(db, orgId, userId);
 
     // Start from a clean worker registry — workers are GLOBAL (selectWorker is
     // not workspace-scoped), so stray live rows from another suite/run sharing
     // this DB would be dispatched to. This suite owns exactly one worker.
     await db.delete(schema.workers);
     await db.insert(schema.workers).values({ address: worker.url, status: "live", lastHeartbeatAt: new Date() });
+
+    agentId = await createPublishedAgent();
   }, 60_000);
 
   afterAll(async () => {
@@ -427,9 +498,8 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   // ── webhook ──────────────────────────────────────────────────────────────
 
-  test("webhook ingress: token-HASH lookup (never plaintext), dispatch, run streams", async () => {
+  test("webhook ingress: token-HASH lookup, RENDERED task message opens the eve session, run streams", async () => {
     const wfId = await createWorkflow("Webhook WF", { type: "webhook" });
-    await publish(wfId);
     const minted = await mintToken(wfId);
     expect(minted.token).toStartWith("whk_");
     expect(minted.ingressUrl).toBe(`https://app.test/t/${minted.token}`);
@@ -439,22 +509,41 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(rows[0]!.tokenHash).toBe(hashIngressToken(minted.token));
     expect(rows[0]!.tokenHash).not.toBe(minted.token);
 
-    const before = worker.triggerCalls.length;
+    const before = worker.sessionMessages.length;
     const res = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ repo: "acme/app", message: "run it" }) });
     expect(res.status).toBe(202);
     const ack = (await res.json()) as TriggerIngressResponse;
     expect(ack.accepted).toBe(true);
 
-    // The dispatcher POSTed the envelope to the compiled webhook channel.
-    const call = await until(async () => worker.triggerCalls.slice(before).find((c) => c.triggerType === "webhook"), "webhook dispatch");
-    expect(call.event.workflowId).toBe(wfId);
-    expect((call.event.data as Record<string, unknown>).repo).toBe("acme/app");
+    // The dispatcher opened an eve session with the RENDERED task message:
+    // instructions with @trigger.repo resolved, trigger context appended.
+    const opened = await until(
+      async () => worker.sessionMessages.slice(before).find((m) => m.kind === "create" && m.message.includes("acme/app")),
+      "eve session created",
+    );
+    expect(opened.message).toContain("<workflow-task>");
+    expect(opened.message).toContain("Be helpful. acme/app");
+    expect(opened.message).toContain("trigger.repo: acme/app");
+    expect(opened.message).toContain("run it");
 
     const run = await until(async () => {
       const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
       return r[0] && (r[0].status === "succeeded" || r[0].status === "failed") ? r[0] : undefined;
     }, "run terminal");
     expect(run.status).toBe("succeeded");
+    // Provenance: the rendered message is persisted; the envelope carries the
+    // agent + workflow; webhooks owe no outbound delivery.
+    expect(run.taskMessage).toBe(opened.message);
+    const envelope = run.triggerEvent as { agentId?: string; workflowId?: string; message?: string };
+    expect(envelope.agentId).toBe(agentId);
+    expect(envelope.workflowId).toBe(wfId);
+    expect(envelope.message).toBe("run it");
+    expect(run.deliveryStatus).toBeNull();
+
+    // The session pinned the agent + its published version.
+    const sessions = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, run.agentSessionId));
+    expect(sessions[0]!.agentId).toBe(agentId);
+    expect(sessions[0]!.workflowId).toBe(wfId);
   });
 
   test("webhook: unknown token → 404 (existence-hiding)", async () => {
@@ -464,7 +553,6 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   test("webhook: oversized body → 413", async () => {
     const wfId = await createWorkflow("Webhook Big", { type: "webhook" });
-    await publish(wfId);
     const minted = await mintToken(wfId);
     const huge = JSON.stringify({ blob: "x".repeat(300 * 1024) });
     const res = await api("POST", `/t/${minted.token}`, { rawBody: huge });
@@ -473,7 +561,6 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   test("webhook: idempotency key returns the SAME run", async () => {
     const wfId = await createWorkflow("Webhook Idem", { type: "webhook" });
-    await publish(wfId);
     const minted = await mintToken(wfId);
     const headers = { "idempotency-key": "idem-abc" };
     const a = (await (await api("POST", `/t/${minted.token}`, { rawBody: "{}", headers })).json()) as TriggerIngressResponse;
@@ -482,9 +569,27 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(b.sessionId).toBe(a.sessionId);
   });
 
+  test("kill switch: a disabled workflow accepts no trigger events (403)", async () => {
+    const wfId = await createWorkflow("Disabled WF", { type: "webhook" }, { enabled: false });
+    const minted = await mintToken(wfId);
+    const res = await api("POST", `/t/${minted.token}`, { rawBody: "{}" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("trigger_disabled");
+  });
+
+  test("an unpublished workflow cannot be dispatched (409)", async () => {
+    const wfId = await createWorkflow("Draft WF", { type: "webhook" }, { publish: false });
+    const minted = await mintToken(wfId);
+    const res = await api("POST", `/t/${minted.token}`, { rawBody: "{}" });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("workflow_not_published");
+  });
+
   // ── form ─────────────────────────────────────────────────────────────────
 
-  test("form ingress: validates required fields against the published schema", async () => {
+  test("form ingress: validates against the trigger row's synced form schema", async () => {
     const wfId = await createWorkflow("Form WF", {
       type: "form",
       fields: [
@@ -492,18 +597,21 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
         { key: "message", label: "Message", type: "textarea", required: false },
       ],
     });
-    await publish(wfId);
     const minted = await mintToken(wfId);
 
     const bad = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ values: { message: "hi" } }) });
     expect(bad.status).toBe(422); // missing required "repo"
 
-    const before = worker.triggerCalls.length;
+    const before = worker.sessionMessages.length;
     const good = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ values: { repo: "acme/app", message: "hello" } }) });
     expect(good.status).toBe(202);
-    const call = await until(async () => worker.triggerCalls.slice(before).find((c) => c.triggerType === "form"), "form dispatch");
-    expect((call.event.data as Record<string, unknown>).repo).toBe("acme/app");
-    expect(call.event.message).toBe("hello");
+    const opened = await until(
+      async () => worker.sessionMessages.slice(before).find((m) => m.kind === "create"),
+      "form dispatch",
+    );
+    // Submitted values resolved into the task message + trigger context.
+    expect(opened.message).toContain("Be helpful. acme/app");
+    expect(opened.message).toContain("hello");
   });
 
   // ── rate limit ─────────────────────────────────────────────────────────────
@@ -524,18 +632,16 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   test("allowlist re-validation: a now-disallowed model FAILS the run (not executed)", async () => {
     const wfId = await createWorkflow("Allowlist WF", { type: "webhook" });
-    await publish(wfId);
     const minted = await mintToken(wfId);
 
-    // The version compiled the balanced preset model; disable it on the
+    // The agent version compiled the balanced preset model; disable it on the
     // CURRENT allowlist after publish.
-    const version = (await db.select().from(schema.workflowVersions).where(eq(schema.workflowVersions.workflowId, wfId)))[0]!;
     await db
       .update(schema.modelAllowlist)
       .set({ enabled: false })
       .where(eq(schema.modelAllowlist.organizationId, orgId));
 
-    const beforeCalls = worker.triggerCalls.length;
+    const beforeSessions = worker.sessionMessages.length;
     const res = await api("POST", `/t/${minted.token}`, { rawBody: "{}" });
     expect(res.status).toBe(202);
     const ack = (await res.json()) as TriggerIngressResponse;
@@ -546,18 +652,16 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     }, "failed run");
     expect(run.error).toContain("no longer on this workspace's allowlist");
     // Never dispatched to the agent.
-    expect(worker.triggerCalls.length).toBe(beforeCalls);
+    expect(worker.sessionMessages.length).toBe(beforeSessions);
 
     // Restore for other tests.
     await db.update(schema.modelAllowlist).set({ enabled: true }).where(eq(schema.modelAllowlist.organizationId, orgId));
-    void version;
   });
 
   // ── run cancel ─────────────────────────────────────────────────────────────
 
   test("run cancel: aborts a running run and marks it canceled", async () => {
     const wfId = await createWorkflow("Cancel WF", { type: "webhook" });
-    await publish(wfId);
     const minted = await mintToken(wfId);
 
     // "HOLD" keeps the fake stream open → run stays running.
@@ -678,10 +782,13 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(res.status).toBe(401);
   });
 
-  test("Slack: mention dispatches; a thread reply CONTINUES the same session", async () => {
+  test("Slack: mention dispatches (task message, NO bot token in agent env); a thread reply CONTINUES the same eve session; delivery settles the pending reply", async () => {
     // Bind a slack-trigger workflow to the installed team integration.
-    const wfId = await createWorkflow("Slack WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
-    await publish(wfId);
+    const wfId = await createWorkflow(
+      "Slack WF",
+      { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } },
+      { instructions: "Reply helpfully. @trigger.text" },
+    );
     const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
     const bind = await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
       cookie: ownerCookie,
@@ -691,6 +798,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
     // A root mention (thread_ts absent → threadKey = its own ts).
     const rootTs = "1720000100.000100";
+    const beforeMessages = worker.sessionMessages.length;
     const mention = await postSlackEvent({ type: "app_mention", user: "U777", text: "<@U0BOT> hello there", ts: rootTs, channel: "C-slack", team: "T-TEST" });
     expect(mention.status).toBe(200);
 
@@ -698,31 +806,83 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
       return rows.find((s) => s.origin === "slack") ?? undefined;
     }, "slack session created");
-    // SLACK_BOT_TOKEN was injected into the agent env for outbound replies.
-    const ensure = worker.ensureCalls.find((c) => c.env.SLACK_BOT_TOKEN === "xoxb-ingress-bot-token");
-    expect(ensure).toBeTruthy();
 
-    await until(async () => {
+    // AGENTS-FIRST: the mention became a RENDERED task message on eve's
+    // default channel, and NO Slack secret ever entered agent env.
+    const opened = await until(
+      async () => worker.sessionMessages.slice(beforeMessages).find((m) => m.kind === "create"),
+      "slack eve session",
+    );
+    expect(opened.message).toContain("Reply helpfully. hello there");
+    for (const ensure of worker.ensureCalls) {
+      expect(ensure.env.SLACK_BOT_TOKEN).toBeUndefined();
+      expect(ensure.env.SLACK_API_BASE_URL).toBeUndefined();
+    }
+
+    const firstRun = await until(async () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session1.id));
-      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+      return runs.find((r) => r.status === "succeeded");
     }, "first slack run done");
+    // Slack-origin runs owe an outbound reply: dispatch marks `pending`, and
+    // the app stack's tailer-hooked DeliveryService settles it to `delivered`
+    // moments later (either state may be observed here — never null).
+    expect(firstRun.deliveryStatus).not.toBeNull();
+    expect(["pending", "delivered"]).toContain(firstRun.deliveryStatus!);
 
-    // A reply IN the thread (thread_ts = the root ts), no mention.
+    // The stack's own DeliveryService (tailer onFinish hook) posts the
+    // terminal reply back to the thread and settles the marker — through the
+    // real drizzle reader over the persisted rows.
+    const settled = await until(async () => {
+      const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, firstRun.id));
+      return rows[0]!.deliveryStatus === "delivered" ? rows[0] : undefined;
+    }, "reply delivered to slack");
+    expect(settled.deliveryStatus).toBe("delivered");
+    const posted = slack.postMessages.find(
+      (m) => m.channel === "C-slack" && m.thread_ts === rootTs,
+    )!;
+    expect(posted).toBeTruthy();
+    expect(String(posted.text)).toStartWith("echo:");
+
+    // A second settle attempt (boot recovery racing the tailer hook) is
+    // CAS'd out — the marker only flips from `pending`, so the reply is
+    // never double-posted (at-least-once, single ledger writer).
+    const delivery = createDeliveryService({
+      reader: createDrizzleDeliveryReader(db),
+      runStore: stack.runtime!.runStore,
+      slackClient: createSlackClient({ apiBaseUrl: slack.url }),
+      masterKey: parseMasterKey(MASTER_KEY_B64),
+      logger: createLogger({ sink: () => {}, minLevel: "error" }),
+    });
+    const outcome = await delivery.deliver({
+      runId: firstRun.id,
+      status: "succeeded",
+      lastAssistantMessage: null, // would force recovery from run_events
+    });
+    expect(outcome).toBe("skipped");
+    expect(
+      slack.postMessages.filter((m) => m.channel === "C-slack" && m.thread_ts === rootTs),
+    ).toHaveLength(1);
+
+    // A reply IN the thread (thread_ts = the root ts), no mention — must ride
+    // the SAME eve session as a continuation (native eve session API).
     const reply = await postSlackEvent({ type: "message", channel: "C-slack", channel_type: "channel", user: "U777", text: "and one more thing", ts: "1720000200.000200", thread_ts: rootTs, team: "T-TEST" });
     expect(reply.status).toBe(200);
 
-    // Same session (continuation) → a SECOND run on session1, no new session.
     await until(async () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session1.id));
       return runs.length >= 2 ? true : undefined;
     }, "thread reply continued the session");
+    const continued = worker.sessionMessages.find(
+      (m) => m.kind === "continue" && m.sessionId === session1.eveSessionId,
+    )!;
+    expect(continued).toBeTruthy();
+    expect(continued.message).toContain("and one more thing");
     const slackSessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
     expect(slackSessions).toHaveLength(1);
   });
 
   test("Slack: retried event_id is de-duplicated (no second dispatch)", async () => {
     const wfId = await createWorkflow("Slack Dedup WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
-    await publish(wfId);
     const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
     await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
       cookie: ownerCookie,
@@ -746,7 +906,6 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   test("Slack: the message twin of an app_mention (same channel:ts) does NOT double-dispatch", async () => {
     const wfId = await createWorkflow("Slack Twin WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
-    await publish(wfId);
     const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
     await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
       cookie: ownerCookie,

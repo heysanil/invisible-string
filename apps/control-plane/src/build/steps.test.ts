@@ -55,11 +55,11 @@ describe("buildStepEnv (build-subprocess secrets scrub)", () => {
 
   test("per-step extras ride along (and win over the base)", () => {
     const env = buildStepEnv(
-      { NODE_ENV: "production", WORKFLOW_POSTGRES_URL: "postgres://world/ws_v_x" },
+      { NODE_ENV: "production", WORKFLOW_POSTGRES_URL: "postgres://world/ag_v_x" },
       base,
     );
     expect(env.NODE_ENV).toBe("production");
-    expect(env.WORKFLOW_POSTGRES_URL).toBe("postgres://world/ws_v_x");
+    expect(env.WORKFLOW_POSTGRES_URL).toBe("postgres://world/ag_v_x");
     expect(env.PATH).toBe("/usr/bin");
   });
 });
@@ -152,11 +152,11 @@ describe("createBuildSteps node invocation (no mise binary at runtime)", () => {
   test("world setup runs node directly with the node bin dir prepended to PATH", async () => {
     const { calls, run } = capture();
     const runner = createSetupDatabaseRunner(run, NODE_BIN_DIR);
-    await runner("/tmp/proj", "postgres://dev:dev@localhost:5432/ws_v_abc");
+    await runner("/tmp/proj", "postgres://dev:dev@localhost:5432/ag_v_abc");
     const call = calls[0];
     expect(call?.cmd[0]).toBe("node");
     expect(call?.env?.PATH?.startsWith(`${NODE_BIN_DIR}:`)).toBe(true);
-    expect(call?.env?.WORKFLOW_POSTGRES_URL).toBe("postgres://dev:dev@localhost:5432/ws_v_abc");
+    expect(call?.env?.WORKFLOW_POSTGRES_URL).toBe("postgres://dev:dev@localhost:5432/ag_v_abc");
   });
 
   test("steps fail with setup guidance when no Node 24 runtime was resolved", async () => {

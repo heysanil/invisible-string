@@ -1,13 +1,29 @@
 /**
- * Trigger dispatch (docs/PLAN.md Phase 3 task 3.2) — the shared path every
- * NON-chat trigger (webhook / form / slack) takes from a normalized
- * TriggerEvent to a running eve session:
+ * Trigger dispatch — the shared path every NON-chat trigger (webhook / form /
+ * slack / schedule / manual "Run now") takes from a normalized ingress event
+ * to a running eve session against the workflow's agent:
  *
- *   resolve published+ready version → DISPATCH-TIME ALLOWLIST RE-VALIDATION →
- *   scheduler pick → (create | continue) agent_session + run (cap-locked) →
- *   ensure-agent (+ slack bot token) → POST the envelope to the compiled
- *   agent's `/eve/v1/platform/<trigger>` channel (version-bound JWT) →
- *   persist eve session ids → start the NDJSON tailer.
+ *   resolve the agent's ready published version → scheduler pick →
+ *   renderTaskMessage(instructions, event) → (create | continue)
+ *   agent_session + run (cap-locked, task-message + delivery provenance) →
+ *   DISPATCH-TIME ALLOWLIST RE-VALIDATION → ensure-agent →
+ *   createEveSession(taskMessage) | continueEveSession → persist eve ids →
+ *   start the NDJSON tailer.
+ *
+ * AGENTS-FIRST CONTRACT (2026-07-10 redesign): compiled agents expose ONLY
+ * eve's default channel — there is no trigger channel and the TriggerEvent
+ * envelope is never sent to the agent. The control plane renders the
+ * workflow's instructions against the event (`renderTaskMessage`, shared) and
+ * sends THAT string as the eve session message; the envelope is persisted on
+ * the run purely as provenance. Slack replies are delivered by the
+ * control-plane DeliveryService off the run's terminal event (runs/delivery),
+ * so agent env is identical across all dispatch paths — no per-trigger env
+ * injection exists anymore.
+ *
+ * FLOATING BINDING: a workflow snapshot names an agent, not a version. A NEW
+ * session runs the agent's CURRENT published version; a CONTINUATION (Slack
+ * thread reply) always runs the session's PINNED version — republishing never
+ * migrates a live session.
  *
  * DISPATCH-TIME MODEL ALLOWLIST RE-VALIDATION (spec §7 / design correction):
  * a version's model was allowlisted at publish, but the workspace allowlist is
@@ -16,37 +32,40 @@
  * the CURRENT allowlist; if it is now disallowed we FAIL the run with a clear
  * error and never dispatch it. {@link assertModelAllowlistedAtDispatch}.
  *
- * The chat/manual path stays in runtime/routes.ts (it drives eve's default
- * channel via POST /eve/v1/session); this module reuses that file's exported
- * dispatch primitives (ensureAgentOnWorker/startTail/failDispatch/…) so the
- * two paths share one env contract, cap discipline, and tailer wiring.
+ * The chat path stays in runtime/routes.ts (sessions target agents directly);
+ * this module reuses that file's exported dispatch primitives
+ * (ensureAgentOnWorker/startTail/failDispatch/…) so the two paths share one
+ * env contract, cap discipline, and tailer wiring.
  */
 import { and, eq, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type {
-  SessionOrigin,
-  TriggerEvent,
-  TriggerPrincipal,
+import {
+  renderTaskMessage,
+  type ModelProvider,
+  type SessionOrigin,
+  type TriggerEvent,
+  type TriggerPrincipal,
+  type WorkflowConfig,
 } from "@invisible-string/shared";
 
 import type { Db, DbClient } from "../db";
+import { publishedWorkflowOf } from "../resources/workflows";
 import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
 import { errors, isRuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
-import type { ModelProvider } from "./model-resolution";
 import {
   countDispatchingRuns,
   ensureAgentOnWorker,
   failDispatch,
+  requireReadyAgentVersion,
   startTail,
-  type ReadyVersion,
+  type ReadyAgentVersion,
   type RuntimeDeps,
 } from "./routes";
 import { selectWorker } from "./scheduler";
 
 type SessionRow = typeof schema.agentSessions.$inferSelect;
 type RunRow = typeof schema.runs.$inferSelect;
-type VersionModel = { modelProvider: ModelProvider | null; modelId: string | null };
 
 // ── Dispatch-time model-allowlist re-validation ──────────────────────────────
 
@@ -70,16 +89,14 @@ export function isModelAllowlisted(
 /**
  * Re-check a version's compiled model against the CURRENT workspace allowlist.
  * Throws {@link errors.modelDisallowedAtDispatch} when the model is no longer
- * allowed (removed or disabled). Legacy versions with no stored provider/model
- * cannot be re-checked and are allowed through (they predate the stored-model
- * contract; the compile-time check still gated them).
+ * allowed (removed or disabled). `agent_versions.model_provider`/`model_id`
+ * are NOT NULL — every version can be re-checked.
  */
 export async function assertModelAllowlistedAtDispatch(
   db: Db,
   organizationId: string,
-  version: VersionModel,
+  version: { modelProvider: ModelProvider; modelId: string },
 ): Promise<void> {
-  if (!version.modelProvider || !version.modelId) return;
   const rows = await db
     .select({
       provider: schema.modelAllowlist.provider,
@@ -93,31 +110,81 @@ export async function assertModelAllowlistedAtDispatch(
   }
 }
 
+// ── Published-workflow → ready-agent resolution ──────────────────────────────
+
+type WorkflowRow = typeof schema.workflows.$inferSelect;
+
+export interface WorkflowDispatchTarget {
+  /** The immutable published WorkflowConfig snapshot (never the draft). */
+  snapshot: WorkflowConfig;
+  /** The delegated agent's CURRENT published version, build-ready. */
+  agent: ReadyAgentVersion;
+}
+
+/**
+ * Resolve a workflow row to its UNATTENDED-dispatch target: kill switch +
+ * published snapshot ({@link publishedWorkflowOf}) + the delegated agent's
+ * CURRENT published version with a ready build (floating binding — see the
+ * module header). Shared by the trigger-ingress routes and the schedule
+ * ticker; the manual "Run now" route deliberately bypasses the `enabled`
+ * check (an explicit member action) and composes the same pieces itself.
+ * Throws typed RuntimeApiErrors: `trigger_disabled` (kill switch),
+ * `workflow_not_published`, `workflow_agent_missing`, `agent_not_published`,
+ * `version_not_ready`.
+ */
+export async function resolveWorkflowDispatchTarget(
+  deps: RuntimeDeps,
+  workflow: WorkflowRow,
+): Promise<WorkflowDispatchTarget> {
+  if (!workflow.enabled) throw errors.triggerDisabled();
+  const { config, agentId } = publishedWorkflowOf(workflow);
+
+  const agentRows = await deps.db
+    .select({ publishedVersionId: schema.agents.publishedVersionId })
+    .from(schema.agents)
+    .where(
+      and(
+        eq(schema.agents.id, agentId),
+        eq(schema.agents.organizationId, workflow.organizationId),
+      ),
+    )
+    .limit(1);
+  const agentRow = agentRows[0];
+  if (!agentRow) throw errors.workflowAgentMissing();
+  if (!agentRow.publishedVersionId) throw errors.agentNotPublished();
+
+  const agent = await requireReadyAgentVersion(deps, agentRow.publishedVersionId);
+  return { snapshot: config, agent };
+}
+
 // ── Trigger dispatch ─────────────────────────────────────────────────────────
 
 export interface DispatchTriggerInput {
   organizationId: string;
-  workflowId: string;
+  /** The delegating workflow: id (provenance) + its published snapshot. */
+  workflow: {
+    id: string;
+    snapshot: WorkflowConfig;
+  };
   /**
-   * The version to run. For a NEW session this is the workflow's published
-   * version; for a CONTINUATION it MUST be the existing session's pinned
-   * version (immutable — republishing never migrates a live session).
+   * The agent version to run. For a NEW session this is the agent's CURRENT
+   * published version; for a CONTINUATION it MUST be the existing session's
+   * pinned version (immutable — republishing never migrates a live session).
    */
-  ready: ReadyVersion;
+  agent: ReadyAgentVersion;
   origin: SessionOrigin;
-  /** Compiled channel route segment: "webhook" | "form" | "slack". */
+  /** TriggerEvent provenance type: "webhook" | "form" | "slack" | "schedule" | "manual". */
   triggerType: string;
   principal: TriggerPrincipal;
-  message: string;
-  data: Record<string, unknown>;
+  /** Normalized ingress payload the instructions render against. */
+  ingress: {
+    /** Model-facing prompt / primary input (may be empty, e.g. schedules). */
+    message: string;
+    /** Structured fields `@trigger.*` references resolve against. */
+    data: Record<string, unknown>;
+  };
   /** Continuation (e.g. a Slack thread reply): reuse this session. */
   existingSession?: SessionRow;
-  /**
-   * Extra spawn-time-only agent env, e.g. the Slack team bot token
-   * `SLACK_BOT_TOKEN` for a slack-triggered version (rides the same secret env
-   * channel as provider keys / MCP tokens; never written to disk or logs).
-   */
-  extraAgentEnv?: Record<string, string>;
   /**
    * Extra fields folded into a NEW session's stored `principal` jsonb (e.g.
    * `slackThreadKey` so future thread replies map back to this session).
@@ -143,21 +210,23 @@ export interface DispatchTriggerResult {
 }
 
 /**
- * Dispatch one trigger event through a compiled agent's custom trigger channel.
- * Creates (or continues) the session + a run, re-validates the allowlist,
- * ensure-agents the version on a live worker, POSTs the envelope, and starts
- * the tailer. Typed RuntimeApiErrors propagate (the ingress route maps them);
- * a now-disallowed model is a FAILED run, not a thrown request error.
+ * Dispatch one trigger event: render the workflow's instructions into the
+ * task message, create (or continue) the session + a run, re-validate the
+ * allowlist, ensure-agent the version on a live worker, send the task message
+ * to the agent's eve session, and start the tailer. Typed RuntimeApiErrors
+ * propagate (the ingress route maps them); a now-disallowed model is a FAILED
+ * run, not a thrown request error.
  */
 export async function dispatchTriggerRun(
   deps: RuntimeDeps,
   input: DispatchTriggerInput,
 ): Promise<DispatchTriggerResult> {
   const { db, runtime } = deps;
-  const hash = input.ready.version.contentHash;
+  const version = input.agent.version;
+  const hash = version.contentHash;
 
   // Observe every ingress-triggered dispatch on the fleet metrics registry
-  // (GET /internal/metrics), keyed by the real trigger type (webhook/form/slack).
+  // (GET /internal/metrics), keyed by the real trigger type.
   deps.metrics.recordTrigger(input.triggerType, "received");
 
   const { worker } = await selectWorker(db, {
@@ -167,12 +236,20 @@ export async function dispatchTriggerRun(
     affinityWorkerId: input.existingSession?.affinityWorkerId,
   });
 
+  // The task message IS what the agent receives (agents-first: no envelope
+  // crosses the wire). Rendered once, persisted on the run as provenance.
+  const taskMessage = renderTaskMessage(input.workflow.snapshot.instructions.markdown, {
+    message: input.ingress.message,
+    data: input.ingress.data,
+  });
+
   const continuationToken = input.existingSession?.continuationToken ?? undefined;
   const triggerEvent: TriggerEvent = {
-    workflowId: input.workflowId,
+    agentId: version.agentId,
+    workflowId: input.workflow.id,
     triggerType: input.triggerType,
-    message: input.message,
-    data: input.data,
+    message: input.ingress.message,
+    data: input.ingress.data,
     principal: input.principal,
     ...(continuationToken ? { continuationToken } : {}),
   };
@@ -180,7 +257,9 @@ export async function dispatchTriggerRun(
   // Session + run rows land BEFORE the eve dispatch (202-async window: a crash
   // mid-dispatch leaves a visible failed run, never an untracked, uncapped eve
   // session), inside one advisory-locked transaction so the per-workspace cap
-  // is atomic and a busy session cannot double-dispatch.
+  // is atomic and a busy session cannot double-dispatch. Slack-origin runs are
+  // born owing a reply (`delivery_status = pending`) — the DeliveryService
+  // settles it off the terminal event.
   const { session, run } = await db.transaction(async (tx: DbClient) => {
     await lockWorkspaceRunCap(tx, input.organizationId);
     if (input.existingSession) {
@@ -213,7 +292,7 @@ export async function dispatchTriggerRun(
           .from(schema.agentSessions)
           .where(
             and(
-              eq(schema.agentSessions.workflowId, input.workflowId),
+              eq(schema.agentSessions.workflowId, input.workflow.id),
               eq(
                 schema.agentSessions.slackThreadKey,
                 input.newSessionSlackThreadKey,
@@ -227,8 +306,9 @@ export async function dispatchTriggerRun(
         .insert(schema.agentSessions)
         .values({
           organizationId: input.organizationId,
-          workflowId: input.workflowId,
-          workflowVersionId: input.ready.version.id,
+          agentId: version.agentId,
+          agentVersionId: version.id,
+          workflowId: input.workflow.id,
           eveSessionId: null,
           continuationToken: null,
           origin: input.origin,
@@ -246,6 +326,8 @@ export async function dispatchTriggerRun(
       .values({
         agentSessionId: sessionRow.id,
         triggerEvent: triggerEvent as unknown as Record<string, unknown>,
+        taskMessage,
+        deliveryStatus: input.origin === "slack" ? "pending" : null,
         status: "queued",
       })
       .returning();
@@ -257,7 +339,7 @@ export async function dispatchTriggerRun(
   // DISPATCH-TIME ALLOWLIST RE-VALIDATION: fail the run (do not execute) when
   // the version's compiled model is no longer allowlisted.
   try {
-    await assertModelAllowlistedAtDispatch(db, input.organizationId, input.ready.version);
+    await assertModelAllowlistedAtDispatch(db, input.organizationId, version);
   } catch (error) {
     if (!isRuntimeApiError(error)) throw error;
     deps.metrics.recordTrigger(input.triggerType, "failed");
@@ -280,41 +362,67 @@ export async function dispatchTriggerRun(
   }
 
   const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
-  let created;
+  let eveSessionId: string;
   try {
     await ensureAgentOnWorker(
       deps,
       { id: worker.id, address: worker.address },
-      input.ready,
+      input.agent,
       input.organizationId,
-      input.extraAgentEnv,
     );
-    created = await deps.workerClient.postTriggerEvent(
-      worker.address,
-      hash,
-      await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-      input.triggerType,
-      triggerEvent as unknown as Record<string, unknown>,
-    );
+    if (isNewSession || !input.existingSession?.eveSessionId || !continuationToken) {
+      // New session (or a session eve never acked): the task message opens
+      // the eve session (202 async).
+      const created = await deps.workerClient.createEveSession(
+        worker.address,
+        hash,
+        await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+        taskMessage,
+      );
+      eveSessionId = created.sessionId;
+      await db
+        .update(schema.agentSessions)
+        .set({
+          eveSessionId: created.sessionId,
+          continuationToken: created.continuationToken,
+          status: "active",
+          affinityWorkerId: worker.id,
+        })
+        .where(eq(schema.agentSessions.id, session.id));
+      session.eveSessionId = created.sessionId;
+      session.continuationToken = created.continuationToken;
+    } else {
+      // Continuation (Slack thread reply): the task message rides the SAME
+      // eve session as a follow-up turn — continuity is native to eve's
+      // session API, no custom channel involved.
+      eveSessionId = input.existingSession.eveSessionId;
+      const result = await deps.workerClient.continueEveSession(
+        worker.address,
+        hash,
+        await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+        eveSessionId,
+        { continuationToken, message: taskMessage },
+      );
+      if (result.continuationToken) {
+        // eve may rotate the token on follow-ups.
+        await deps.runStore.updateSessionContinuation(
+          session.id,
+          result.continuationToken,
+        );
+        session.continuationToken = result.continuationToken;
+      }
+      await db
+        .update(schema.agentSessions)
+        .set({ status: "active", affinityWorkerId: worker.id })
+        .where(eq(schema.agentSessions.id, session.id));
+    }
   } catch (error) {
     deps.metrics.recordTrigger(input.triggerType, "failed");
     await failDispatch(deps, run.id, error, isNewSession ? { failSessionId: session.id } : {});
     throw error; // unreachable — failDispatch always throws
   }
 
-  await db
-    .update(schema.agentSessions)
-    .set({
-      eveSessionId: created.sessionId,
-      continuationToken: created.continuationToken,
-      status: "active",
-      affinityWorkerId: worker.id,
-    })
-    .where(eq(schema.agentSessions.id, session.id));
-  session.eveSessionId = created.sessionId;
-  session.continuationToken = created.continuationToken;
-
-  startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
+  startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
 
   deps.metrics.recordTrigger(input.triggerType, "dispatched");
   return { session, run, dispatched: true };

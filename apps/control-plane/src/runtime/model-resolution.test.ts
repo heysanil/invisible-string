@@ -1,24 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { RuntimeApiError } from "./errors";
-import {
-  resolveModel,
-  type AgentPresetRow,
-  type ModelResolutionData,
-} from "./model-resolution";
+import { agentModelSchema } from "@invisible-string/shared";
 
-const PRESET: AgentPresetRow = {
-  id: "agent-1",
-  name: "General Purpose",
-  basePrompt: "You are helpful.",
-  reasoningEffort: "medium",
-  modelPreset: "balanced",
-  modelId: null,
-};
+import { RuntimeApiError } from "./errors";
+import { resolveModel, type ModelResolutionData } from "./model-resolution";
 
 function data(overrides: Partial<ModelResolutionData> = {}): ModelResolutionData {
   return {
-    agentPreset: PRESET,
     modelPresets: [
       { slug: "powerful", provider: "openrouter", modelId: "z-ai/glm-5.2" },
       { slug: "balanced", provider: "openrouter", modelId: "deepseek/deepseek-v4-pro" },
@@ -35,6 +23,11 @@ function data(overrides: Partial<ModelResolutionData> = {}): ModelResolutionData
   };
 }
 
+/** Defaults-applied AgentModel (what a parsed AgentDefinition carries). */
+function model(input: Record<string, unknown> = {}) {
+  return agentModelSchema.parse(input);
+}
+
 function codeOf(fn: () => unknown): string {
   try {
     fn();
@@ -46,29 +39,24 @@ function codeOf(fn: () => unknown): string {
 }
 
 describe("resolveModel", () => {
-  test("agent preset's default slug maps through workspace presets", () => {
-    const resolved = resolveModel({ agentPresetId: PRESET.id }, data());
-    expect(resolved).toMatchObject({
+  test("default preset (balanced) maps through the workspace presets", () => {
+    const resolved = resolveModel(model(), data());
+    expect(resolved).toEqual({
       provider: "openrouter",
       modelId: "deepseek/deepseek-v4-pro",
       presetSlug: "balanced",
-      reasoning: "medium",
-      agentName: "General Purpose",
     });
   });
 
-  test("workflow modelPreset override beats the agent preset's slug", () => {
-    const resolved = resolveModel(
-      { agentPresetId: PRESET.id, modelPreset: "quick" },
-      data(),
-    );
+  test("an explicit preset slug maps through the workspace presets", () => {
+    const resolved = resolveModel(model({ preset: "quick" }), data());
     expect(resolved.modelId).toBe("deepseek/deepseek-v4-flash");
     expect(resolved.presetSlug).toBe("quick");
   });
 
-  test("workflow modelId override wins outright, provider from allowlist", () => {
+  test("modelId override wins outright, provider from the allowlist row", () => {
     const resolved = resolveModel(
-      { agentPresetId: PRESET.id, modelId: "claude-opus-4-8", modelPreset: "quick" },
+      model({ preset: "quick", modelId: "claude-opus-4-8" }),
       data(),
     );
     expect(resolved.provider).toBe("anthropic");
@@ -76,49 +64,21 @@ describe("resolveModel", () => {
     expect(resolved.presetSlug).toBeUndefined();
   });
 
-  test("agent preset's own modelId override applies when workflow has none", () => {
-    const resolved = resolveModel(
-      { agentPresetId: PRESET.id },
-      data({ agentPreset: { ...PRESET, modelId: "z-ai/glm-5.2" } }),
-    );
-    expect(resolved.modelId).toBe("z-ai/glm-5.2");
-  });
-
-  test("reasoning override on the workflow wins", () => {
-    const resolved = resolveModel(
-      { agentPresetId: PRESET.id, reasoning: "high" },
-      data(),
-    );
-    expect(resolved.reasoning).toBe("high");
-  });
-
-  test("missing agent preset → agent_preset_not_found", () => {
-    expect(
-      codeOf(() => resolveModel({ agentPresetId: "nope" }, data({ agentPreset: null }))),
-    ).toBe("agent_preset_not_found");
-  });
-
   test("missing workspace preset mapping → model_preset_not_found", () => {
-    expect(
-      codeOf(() =>
-        resolveModel({ agentPresetId: PRESET.id }, data({ modelPresets: [] })),
-      ),
-    ).toBe("model_preset_not_found");
+    expect(codeOf(() => resolveModel(model(), data({ modelPresets: [] })))).toBe(
+      "model_preset_not_found",
+    );
   });
 
   test("non-allowlisted override → model_not_allowlisted", () => {
     expect(
-      codeOf(() =>
-        resolveModel({ agentPresetId: PRESET.id, modelId: "not/allowed" }, data()),
-      ),
+      codeOf(() => resolveModel(model({ modelId: "not/allowed" }), data())),
     ).toBe("model_not_allowlisted");
   });
 
   test("a DISABLED allowlist row does not allow the model", () => {
     expect(
-      codeOf(() =>
-        resolveModel({ agentPresetId: PRESET.id, modelId: "banned/model" }, data()),
-      ),
+      codeOf(() => resolveModel(model({ modelId: "banned/model" }), data())),
     ).toBe("model_not_allowlisted");
   });
 
@@ -127,7 +87,7 @@ describe("resolveModel", () => {
     stripped.allowlist = stripped.allowlist.filter(
       (row) => row.modelId !== "deepseek/deepseek-v4-pro",
     );
-    expect(codeOf(() => resolveModel({ agentPresetId: PRESET.id }, stripped))).toBe(
+    expect(codeOf(() => resolveModel(model(), stripped))).toBe(
       "model_not_allowlisted",
     );
   });

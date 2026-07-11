@@ -1,42 +1,39 @@
 import { describe, expect, test } from "bun:test";
 
 import { compile, RUNTIME_VERSIONS, type CompileDeps } from "@invisible-string/compiler";
-import type { WorkflowDefinition } from "@invisible-string/shared";
+import { agentDefinitionSchema, type AgentDefinition } from "@invisible-string/shared";
 
-import { compileWorkflow } from "./compiler-adapter";
+import { compileAgent } from "./compiler-adapter";
 import type { CompileConnection, CompileRequest } from "./compiler-contract";
 import { BUILD_ENV_EPOCH } from "./steps";
-
-function baseRequest(connection: CompileConnection): CompileRequest {
-  const definition: WorkflowDefinition = {
-    trigger: { type: "manual" },
-    context: { mcpConnectionIds: [connection.id], skillIds: [] },
-    agent: { agentPresetId: "0f8b6c1e-4a6f-4a5e-9b3d-1c2e3f405060" },
-    instructions: { markdown: `Use @${slug(connection.name)} to look things up.` },
-  };
-  return {
-    definition,
-    model: {
-      provider: "openrouter",
-      modelId: "deepseek/deepseek-v4-flash",
-      reasoning: "medium",
-      agentName: "General Purpose",
-      basePrompt: "You are helpful.",
-    },
-    connections: [connection],
-    skills: [],
-    workspaceSlug: "acme",
-    workflowSlug: "lookup",
-  };
-}
 
 function slug(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-describe("compileWorkflow — MCP auth wiring", () => {
+function baseRequest(connection: CompileConnection): CompileRequest {
+  const definition: AgentDefinition = agentDefinitionSchema.parse({
+    persona: `Use @${slug(connection.name)} to look things up.`,
+    model: { preset: "balanced", reasoning: "medium" },
+    context: { mcpConnectionIds: [connection.id], skillIds: [] },
+  });
+  return {
+    definition,
+    model: {
+      provider: "openrouter",
+      modelId: "deepseek/deepseek-v4-flash",
+      presetSlug: "balanced",
+    },
+    connections: [connection],
+    skills: [],
+    workspaceSlug: "acme",
+    agentSlug: "lookup",
+  };
+}
+
+describe("compileAgent — MCP auth wiring", () => {
   test("bearer auth reads the token env var (adapter ↔ codegen agree)", () => {
-    const result = compileWorkflow(
+    const result = compileAgent(
       baseRequest({
         id: "7d3f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6",
         name: "Linear",
@@ -55,7 +52,7 @@ describe("compileWorkflow — MCP auth wiring", () => {
   });
 
   test("header auth reads each header value from its injected env var", () => {
-    const result = compileWorkflow(
+    const result = compileAgent(
       baseRequest({
         id: "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
         name: "Docs API",
@@ -77,7 +74,7 @@ describe("compileWorkflow — MCP auth wiring", () => {
   });
 });
 
-describe("compileWorkflow — build-env epoch in the content hash", () => {
+describe("compileAgent — build-env epoch in the content hash", () => {
   const connection: CompileConnection = {
     id: "7d3f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6",
     name: "Linear",
@@ -98,13 +95,7 @@ describe("compileWorkflow — build-env epoch in the content hash", () => {
         modelId: request.model.modelId,
       },
       workspaceSlug: request.workspaceSlug,
-      workflowSlug: request.workflowSlug,
-      agentPreset: {
-        id: request.definition.agent.agentPresetId,
-        name: request.model.agentName,
-        persona: request.model.basePrompt,
-        defaultReasoning: request.model.reasoning,
-      },
+      agentSlug: request.agentSlug,
       connections: [
         {
           id: connection.id,
@@ -122,7 +113,7 @@ describe("compileWorkflow — build-env epoch in the content hash", () => {
 
   test("BUILD_ENV_EPOCH re-keys the content hash (regression: the eve-build routing placeholder changed artifact bytes without changing the hash — poisoned artifacts kept cache-hitting)", () => {
     const request = baseRequest(connection);
-    const adapted = compileWorkflow(request);
+    const adapted = compileAgent(request);
     const withoutEpoch = compile(request.definition, rawDeps(request));
     const withEpoch = compile(request.definition, {
       ...rawDeps(request),
@@ -140,7 +131,7 @@ describe("compileWorkflow — build-env epoch in the content hash", () => {
   });
 
   test("the baked platform-JWT audience is bound to the SAME hash the control plane keys by (an outward hash the compiled agent doesn't know would 401 every platform token)", () => {
-    const adapted = compileWorkflow(baseRequest(connection));
+    const adapted = compileAgent(baseRequest(connection));
     const authLib = adapted.files.get("agent/lib/platform-auth.ts");
     expect(authLib).toBeDefined();
     expect(authLib!).toContain(adapted.hash);

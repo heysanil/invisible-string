@@ -4,34 +4,54 @@
  * cap slots, hanging their SSE streams on heartbeats, and never recording
  * eve's durably-completed turn).
  *
- * On startup, every queued/running run is swept:
- * - session has an eve session AND its affinity worker is still live →
- *   restart the tail (tailRun is crash-safe: seq/startIndex derive from what
- *   is already persisted; the terminal gate handles a mid-turn resume).
- * - otherwise → mark the run failed with completedAt so the cap slot frees
- *   and any SSE follower terminates on the persisted status.
+ * On startup, two sweeps:
+ *
+ * 1. INTERRUPTED RUNS — every queued/running run:
+ *    - session has an eve session AND its affinity worker is still live →
+ *      restart the tail (tailRun is crash-safe: seq/startIndex derive from
+ *      what is already persisted; the terminal gate handles a mid-turn
+ *      resume).
+ *    - otherwise → mark the run failed with completedAt so the cap slot frees
+ *      and any SSE follower terminates on the persisted status.
+ *
+ * 2. STRANDED DELIVERIES (agents-first §5.5) — succeeded runs whose
+ *    `delivery_status` is still `pending` (the process died between the
+ *    terminal event and the Slack post): recover the final stop-message from
+ *    persisted `run_events` and deliver late (at-least-once — see
+ *    runs/delivery.ts). Runs only when a DeliveryService is wired (the
+ *    integrations config may be absent).
  */
 import { and, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
+import type { DeliveryService } from "../runs/delivery";
 import { startTail, type RuntimeDeps } from "./routes";
 import { isWorkerLive, toSchedulableWorker } from "./scheduler";
 
 export interface ReconcileOutcome {
   resumed: number;
   failed: number;
+  /** Stranded-delivery sweep tally (zeros when no DeliveryService is wired). */
+  deliveries: { delivered: number; failed: number; skipped: number };
+}
+
+export interface ReconcileOptions {
+  /** Settles succeeded runs stuck with a pending outbound reply. */
+  delivery?: DeliveryService;
+  now?: Date;
 }
 
 export async function reconcileInterruptedRuns(
   deps: RuntimeDeps,
-  now: Date = new Date(),
+  options: ReconcileOptions = {},
 ): Promise<ReconcileOutcome> {
+  const now = options.now ?? new Date();
   const rows = await deps.db
     .select({
       run: schema.runs,
       session: schema.agentSessions,
       worker: schema.workers,
-      contentHash: schema.workflowVersions.contentHash,
+      contentHash: schema.agentVersions.contentHash,
     })
     .from(schema.runs)
     .innerJoin(
@@ -39,8 +59,8 @@ export async function reconcileInterruptedRuns(
       eq(schema.runs.agentSessionId, schema.agentSessions.id),
     )
     .innerJoin(
-      schema.workflowVersions,
-      eq(schema.agentSessions.workflowVersionId, schema.workflowVersions.id),
+      schema.agentVersions,
+      eq(schema.agentSessions.agentVersionId, schema.agentVersions.id),
     )
     .leftJoin(
       schema.workers,
@@ -48,7 +68,11 @@ export async function reconcileInterruptedRuns(
     )
     .where(and(inArray(schema.runs.status, ["queued", "running"])));
 
-  const outcome: ReconcileOutcome = { resumed: 0, failed: 0 };
+  const outcome: ReconcileOutcome = {
+    resumed: 0,
+    failed: 0,
+    deliveries: { delivered: 0, failed: 0, skipped: 0 },
+  };
   for (const row of rows) {
     // A tail already running in THIS process (normal operation) is left
     // alone — reconcile only adopts orphans.
@@ -80,6 +104,10 @@ export async function reconcileInterruptedRuns(
       });
       outcome.failed += 1;
     }
+  }
+
+  if (options.delivery) {
+    outcome.deliveries = await options.delivery.recoverPending();
   }
   return outcome;
 }

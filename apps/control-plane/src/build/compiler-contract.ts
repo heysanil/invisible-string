@@ -3,16 +3,17 @@
  *
  * This file defines the injectable interface the build/publish paths consume
  * (tests inject stubs); the production implementation is the adapter over
- * @invisible-string/compiler in `compiler-adapter.ts`. The control plane
- * resolves preset→model and validates the allowlist BEFORE calling compile
+ * @invisible-string/compiler in `compiler-adapter.ts`. The AGENT is the
+ * compile unit: the control plane resolves the definition's model
+ * (preset→provider+id) and validates the allowlist BEFORE calling compile
  * (typed errors surface to the API), so the compiler receives an
  * already-resolved model.
  */
-import type { WorkflowDefinition } from "@invisible-string/shared";
+import type { AgentDefinition } from "@invisible-string/shared";
 
 import type { ResolvedModel } from "../runtime/model-resolution";
 
-/** One MCP connection, resolved from the context pillar's ids. */
+/** One MCP connection, resolved from the definition's context ids. */
 export interface CompileConnection {
   id: string;
   name: string;
@@ -42,7 +43,7 @@ export interface CompileConnection {
   approvalPolicy: Record<string, unknown> | null;
 }
 
-/** One authored skill, resolved from the context pillar's ids. */
+/** One authored skill, resolved from the definition's context ids. */
 export interface CompileSkill {
   id: string;
   name: string;
@@ -57,7 +58,8 @@ export interface CompileSkill {
 }
 
 export interface CompileRequest {
-  definition: WorkflowDefinition;
+  /** The AgentDefinition snapshot being compiled (persona · model · context). */
+  definition: AgentDefinition;
   /** Publish-time resolved provider/model (allowlist-checked upstream). */
   model: ResolvedModel;
   connections: CompileConnection[];
@@ -65,41 +67,43 @@ export interface CompileRequest {
   /**
    * Human-readable identity baked into the generated project (package name,
    * instructions header). Lowercase kebab-case — the routes slugify the
-   * organization slug / workflow name before compiling. Participates in the
-   * content hash (renaming a workflow re-keys its artifact).
+   * organization slug / agent name before compiling. Both participate in the
+   * content hash (renaming an agent re-keys its artifact, world DB, and JWT
+   * audience on the next publish; workspaceSlug keeps tenants isolated).
    */
   workspaceSlug: string;
-  workflowSlug: string;
+  agentSlug: string;
 }
 
 export interface CompileResult {
   /** Relative path → file content of the emitted eve project. */
   files: ReadonlyMap<string, string>;
   /**
-   * Content hash covering config + compiler version + eve version + the
-   * build-environment epoch (build/steps.ts BUILD_ENV_EPOCH — build-step
-   * changes that alter artifact bytes must re-key cached artifacts).
+   * Content hash covering definition + resolved deps + compiler version +
+   * eve version + the build-environment epoch (build/steps.ts BUILD_ENV_EPOCH
+   * — build-step changes that alter artifact bytes must re-key cached
+   * artifacts).
    */
   hash: string;
   compilerVersion: string;
   eveVersion: string;
 }
 
-/** One structured compile problem (builder UI renders these). */
+/** One structured compile problem (the agent editor renders these). */
 export interface CompileIssue {
   path?: string;
   message: string;
 }
 
 /** Typed compile failure — publish/dry-run translate it to a 422. */
-export class WorkflowCompileError extends Error {
-  override readonly name = "WorkflowCompileError";
+export class AgentCompileError extends Error {
+  override readonly name = "AgentCompileError";
   constructor(public readonly issues: CompileIssue[]) {
     super(
       issues.map((issue) => (issue.path ? `${issue.path}: ${issue.message}` : issue.message)).join("; ") ||
-        "workflow failed to compile",
+        "agent failed to compile",
     );
   }
 }
 
-export type CompileWorkflowFn = (request: CompileRequest) => CompileResult;
+export type CompileAgentFn = (request: CompileRequest) => CompileResult;

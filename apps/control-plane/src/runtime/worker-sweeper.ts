@@ -30,7 +30,7 @@ import type { Logger } from "@invisible-string/shared";
 
 import {
   ensureAgentOnWorker,
-  requireReadyVersion,
+  requireReadyAgentVersion,
   startTail,
   type RuntimeDeps,
 } from "./routes";
@@ -126,7 +126,7 @@ export function createWorkerSweeper(
       .select({
         run: schema.runs,
         session: schema.agentSessions,
-        contentHash: schema.workflowVersions.contentHash,
+        contentHash: schema.agentVersions.contentHash,
       })
       .from(schema.runs)
       .innerJoin(
@@ -138,8 +138,8 @@ export function createWorkerSweeper(
         eq(schema.agentSessions.affinityWorkerId, schema.workers.id),
       )
       .innerJoin(
-        schema.workflowVersions,
-        eq(schema.agentSessions.workflowVersionId, schema.workflowVersions.id),
+        schema.agentVersions,
+        eq(schema.agentSessions.agentVersionId, schema.agentVersions.id),
       )
       .where(
         and(
@@ -160,7 +160,7 @@ export function createWorkerSweeper(
         logger?.error("sweeper.failover_error", {
           runId: row.run.id,
           sessionId: row.session.id,
-          workflowId: row.session.workflowId,
+          workflowId: row.session.workflowId ?? undefined,
           err: error,
         });
       }
@@ -193,7 +193,7 @@ export function createWorkerSweeper(
       logger?.info("sweeper.parked_cleared", {
         runId: run.id,
         sessionId: session.id,
-        workflowId: session.workflowId,
+        workflowId: session.workflowId ?? undefined,
         msg: "parked session affinity cleared — approval reschedules elsewhere",
       });
       return;
@@ -214,7 +214,7 @@ export function createWorkerSweeper(
         logger?.warn("run.failed", {
           runId: run.id,
           sessionId: session.id,
-          workflowId: session.workflowId,
+          workflowId: session.workflowId ?? undefined,
           msg: "home worker died before the eve session was established",
         });
       }
@@ -224,7 +224,7 @@ export function createWorkerSweeper(
     const result = await resumeRun({
       run,
       session,
-      versionId: session.workflowVersionId,
+      versionId: session.agentVersionId,
       contentHash: row.contentHash,
       eveSessionId: session.eveSessionId,
     });
@@ -233,7 +233,7 @@ export function createWorkerSweeper(
       logger?.info("sweeper.run_resumed", {
         runId: run.id,
         sessionId: session.id,
-        workflowId: session.workflowId,
+        workflowId: session.workflowId ?? undefined,
         msg: "stranded run re-tailed on a fresh worker",
       });
     } else {
@@ -297,7 +297,7 @@ function defaultResumeRun(deps: RuntimeDeps): ResumeRunFn {
     // then resume against the fresh worker.
     await deps.tailers.detach(run.id);
 
-    const ready = await requireReadyVersion(deps, versionId);
+    const ready = await requireReadyAgentVersion(deps, versionId);
     await ensureAgentOnWorker(deps, picked.worker, ready, session.organizationId);
 
     await db

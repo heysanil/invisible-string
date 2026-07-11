@@ -1,24 +1,18 @@
 /**
- * Model layer + AGENT pillar CRUD (workspace-scoped):
+ * Model layer CRUD (workspace-scoped):
  * - model presets: three fixed slugs, re-pointed via PUT (allowlist-checked).
  * - model allowlist: add / toggle / remove; a model referenced by a preset (or
- *   an agent preset's override) cannot be removed.
- * - agent presets: full CRUD; a model override is validated against the
- *   allowlist.
+ *   an agent draft's specific-model override) cannot be removed.
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   addModelAllowlistEntryRequestSchema,
-  createAgentPresetRequestSchema,
-  updateAgentPresetRequestSchema,
   updateModelAllowlistEntryRequestSchema,
   updateModelPresetRequestSchema,
   type DeleteResourceResponse,
-  type GetAgentPresetResponse,
   type GetModelAllowlistEntryResponse,
   type GetModelPresetResponse,
-  type ListAgentPresetsResponse,
   type ListModelAllowlistResponse,
   type ListModelPresetsResponse,
   type ModelProvider,
@@ -28,7 +22,6 @@ import type { Db } from "../db";
 import { errors } from "../runtime/errors";
 import { catalogHasModel } from "./openrouter-catalog";
 import {
-  agentPresetDto,
   modelAllowlistEntryDto,
   modelPresetDto,
   parseBody,
@@ -172,7 +165,11 @@ export async function updateModelAllowlistEntry(
   return { entry: modelAllowlistEntryDto(rows[0]!) };
 }
 
-/** Preset slugs / agent names that would break if this model were removed. */
+/**
+ * Preset slugs / agent names that would break if this model were removed.
+ * Agents override models inside their draft AgentDefinition
+ * (`draft.model.modelId`) — the jsonb path query mirrors that shape.
+ */
 export async function modelReferences(
   db: Db,
   organizationId: string,
@@ -196,7 +193,7 @@ export async function modelReferences(
       .where(
         and(
           eq(schema.agents.organizationId, organizationId),
-          eq(schema.agents.modelId, modelId),
+          sql`${schema.agents.draft} -> 'model' ->> 'modelId' = ${modelId}`,
         ),
       ),
   ]);
@@ -230,126 +227,5 @@ export async function deleteModelAllowlistEntry(
   await deps.db
     .delete(schema.modelAllowlist)
     .where(eq(schema.modelAllowlist.id, id));
-  return { id, deleted: true };
-}
-
-// ── agent presets ─────────────────────────────────────────────────────────────
-
-export async function listAgentPresets(
-  deps: ResourceDeps,
-  organizationId: string,
-): Promise<ListAgentPresetsResponse> {
-  const rows = await deps.db
-    .select()
-    .from(schema.agents)
-    .where(eq(schema.agents.organizationId, organizationId))
-    .orderBy(schema.agents.name);
-  return { agents: rows.map(agentPresetDto) };
-}
-
-export async function getAgentPreset(
-  deps: ResourceDeps,
-  organizationId: string,
-  id: string,
-): Promise<GetAgentPresetResponse> {
-  const rows = await deps.db
-    .select()
-    .from(schema.agents)
-    .where(and(eq(schema.agents.id, id), eq(schema.agents.organizationId, organizationId)))
-    .limit(1);
-  if (rows.length === 0) throw errors.notFound("agent_preset");
-  return { agent: agentPresetDto(rows[0]!) };
-}
-
-async function assertNameFree(
-  db: Db,
-  organizationId: string,
-  name: string,
-  exceptId?: string,
-): Promise<void> {
-  const rows = await db
-    .select({ id: schema.agents.id })
-    .from(schema.agents)
-    .where(and(eq(schema.agents.organizationId, organizationId), eq(schema.agents.name, name)))
-    .limit(1);
-  const clash = rows[0];
-  if (clash && clash.id !== exceptId) throw errors.nameTaken("agent_preset", name);
-}
-
-export async function createAgentPreset(
-  deps: ResourceDeps,
-  organizationId: string,
-  body: unknown,
-): Promise<GetAgentPresetResponse> {
-  const input = parseBody(createAgentPresetRequestSchema, body);
-  if (input.modelId && !(await isAllowlisted(deps.db, organizationId, undefined, input.modelId))) {
-    throw errors.modelNotAllowlisted(input.modelId);
-  }
-  await assertNameFree(deps.db, organizationId, input.name);
-  const rows = await deps.db
-    .insert(schema.agents)
-    .values({
-      organizationId,
-      name: input.name,
-      description: input.description ?? null,
-      basePrompt: input.basePrompt,
-      reasoningEffort: input.reasoningEffort,
-      modelPreset: input.modelPreset,
-      modelId: input.modelId ?? null,
-    })
-    .returning();
-  return { agent: agentPresetDto(rows[0]!) };
-}
-
-export async function updateAgentPreset(
-  deps: ResourceDeps,
-  organizationId: string,
-  id: string,
-  body: unknown,
-): Promise<GetAgentPresetResponse> {
-  const input = parseBody(updateAgentPresetRequestSchema, body);
-  const rows0 = await deps.db
-    .select()
-    .from(schema.agents)
-    .where(and(eq(schema.agents.id, id), eq(schema.agents.organizationId, organizationId)))
-    .limit(1);
-  if (rows0.length === 0) throw errors.notFound("agent_preset");
-
-  if (
-    input.modelId != null &&
-    !(await isAllowlisted(deps.db, organizationId, undefined, input.modelId))
-  ) {
-    throw errors.modelNotAllowlisted(input.modelId);
-  }
-  if (input.name !== undefined) {
-    await assertNameFree(deps.db, organizationId, input.name, id);
-  }
-
-  const patch: Partial<typeof schema.agents.$inferInsert> = {};
-  if (input.name !== undefined) patch.name = input.name;
-  if (input.description !== undefined) patch.description = input.description;
-  if (input.basePrompt !== undefined) patch.basePrompt = input.basePrompt;
-  if (input.reasoningEffort !== undefined) patch.reasoningEffort = input.reasoningEffort;
-  if (input.modelPreset !== undefined) patch.modelPreset = input.modelPreset;
-  if (input.modelId !== undefined) patch.modelId = input.modelId;
-
-  const rows = await deps.db
-    .update(schema.agents)
-    .set(patch)
-    .where(and(eq(schema.agents.id, id), eq(schema.agents.organizationId, organizationId)))
-    .returning();
-  return { agent: agentPresetDto(rows[0]!) };
-}
-
-export async function deleteAgentPreset(
-  deps: ResourceDeps,
-  organizationId: string,
-  id: string,
-): Promise<DeleteResourceResponse> {
-  const rows = await deps.db
-    .delete(schema.agents)
-    .where(and(eq(schema.agents.id, id), eq(schema.agents.organizationId, organizationId)))
-    .returning({ id: schema.agents.id });
-  if (rows.length === 0) throw errors.notFound("agent_preset");
   return { id, deleted: true };
 }

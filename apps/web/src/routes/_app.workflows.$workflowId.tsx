@@ -488,7 +488,10 @@ function BuilderHeader({
   }
 
   return (
-    <Panel className="panel-enter flex items-center gap-3 px-4 py-2.5">
+    // z-10: the Run popover drops DOWN out of this panel over the row below;
+    // without it the copilot dock (a later glass-panel sibling, its own
+    // stacking context) paints over the open popover.
+    <Panel className="panel-enter z-10 flex items-center gap-3 px-4 py-2.5">
       <Link
         to="/workflows"
         aria-label="Back to workflows"

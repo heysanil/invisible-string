@@ -16,8 +16,12 @@
 import { Link } from "@tanstack/react-router";
 import { Check, ExternalLink, Play, Rocket } from "lucide-react";
 import { useState } from "react";
-import { z } from "zod";
-import type { FormField, TriggerConfig } from "@invisible-string/shared";
+import {
+  createSessionResponseSchema,
+  type CreateSessionResponse,
+  type FormField,
+  type TriggerConfig,
+} from "@invisible-string/shared";
 
 import { api, ApiError } from "../../lib/api-client";
 import { cn } from "../../lib/cn";
@@ -31,12 +35,10 @@ import { Textarea } from "../ui/Textarea";
 import { useToast } from "../ui/Toast";
 
 // ── endpoint (Stage-3 route: POST .../workflows/:wfId/run) ──────────────────
-
-const runWorkflowResponseSchema = z.object({
-  runId: z.string().min(1),
-  sessionId: z.string().min(1),
-});
-export type RunWorkflowResponse = z.infer<typeof runWorkflowResponseSchema>;
+//
+// The server answers the same `{session, run}` envelope as chat session
+// creation (`CreateSessionResponse` in packages/shared) — a test run IS a
+// dispatched run riding the shared trigger path.
 
 export interface RunWorkflowBody {
   message?: string;
@@ -47,10 +49,10 @@ export function runWorkflow(
   workspaceId: string,
   workflowId: string,
   body: RunWorkflowBody,
-): Promise<RunWorkflowResponse> {
+): Promise<CreateSessionResponse> {
   return api.post(
     `/workspaces/${workspaceId}/workflows/${workflowId}/run`,
-    runWorkflowResponseSchema,
+    createSessionResponseSchema,
     { body },
   );
 }
@@ -107,7 +109,7 @@ function TestRunBody({
   const [fieldValues, setFieldValues] = useState<Record<string, unknown>>({});
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [started, setStarted] = useState<RunWorkflowResponse | null>(null);
+  const [started, setStarted] = useState<CreateSessionResponse | null>(null);
 
   const needsPublish = !isPublished || isDirty;
 

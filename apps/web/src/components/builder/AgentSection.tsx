@@ -91,50 +91,61 @@ function AgentCard({
   onSelect: () => void;
 }) {
   const buildFailed = agent.buildStatus === "failed";
+  // The selected card's "Edit agent" capsule is a SIBLING of the radio,
+  // absolutely positioned over the card's bottom-right corner — a focusable
+  // link nested inside the radio button violates WCAG 4.1.2
+  // (nested-interactive) and swallows selection clicks that land on it.
   return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={selected}
-      onClick={onSelect}
-      className={cn(
-        "lift flex items-start gap-3 rounded-card-lg border p-3.5 text-left",
-        selected
-          ? "border-ink/80 bg-white shadow-[0_2px_10px_rgba(0,0,0,0.06)]"
-          : "border-black/10 bg-white/40 hover:border-black/20 hover:bg-white/60",
-      )}
-    >
-      <AgentMonogram name={agent.name} active={selected} />
-      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="text-[13.5px] font-semibold text-ink">{agent.name}</span>
-        {agent.description ? (
-          <span className="line-clamp-2 text-[12px] leading-snug text-ink-3">
-            {agent.description}
-          </span>
-        ) : null}
-        <span className="mt-1 flex flex-wrap items-center gap-1.5">
-          {buildFailed ? (
-            <StatusChip tone="error" dot>
-              Build failed
-            </StatusChip>
-          ) : (
-            <StatusChip tone="success" dot>
-              Published
-            </StatusChip>
-          )}
-          {selected ? (
-            <Link
-              to="/agents/$agentId"
-              params={{ agentId: agent.id }}
-              onClick={(event) => event.stopPropagation()}
-              className="lift inline-flex items-center gap-1 rounded-capsule border border-black/10 bg-white/60 px-2 py-0.5 text-[11px] font-medium text-ink-2 hover:text-ink"
-            >
-              Edit agent <ExternalLink size={10} aria-hidden="true" />
-            </Link>
+    <div className="relative">
+      <button
+        type="button"
+        role="radio"
+        aria-checked={selected}
+        onClick={onSelect}
+        className={cn(
+          "lift flex h-full w-full items-start gap-3 rounded-card-lg border p-3.5 text-left",
+          selected
+            ? "border-ink/80 bg-white shadow-[0_2px_10px_rgba(0,0,0,0.06)]"
+            : "border-black/10 bg-white/40 hover:border-black/20 hover:bg-white/60",
+        )}
+      >
+        <AgentMonogram name={agent.name} active={selected} />
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="text-[13.5px] font-semibold text-ink">{agent.name}</span>
+          {agent.description ? (
+            <span className="line-clamp-2 text-[12px] leading-snug text-ink-3">
+              {agent.description}
+            </span>
           ) : null}
+          <span
+            className={cn(
+              "mt-1 flex flex-wrap items-center gap-1.5",
+              // Keep the chips clear of the overlaid edit capsule.
+              selected && "pr-24",
+            )}
+          >
+            {buildFailed ? (
+              <StatusChip tone="error" dot>
+                Build failed
+              </StatusChip>
+            ) : (
+              <StatusChip tone="success" dot>
+                Published
+              </StatusChip>
+            )}
+          </span>
         </span>
-      </span>
-    </button>
+      </button>
+      {selected ? (
+        <Link
+          to="/agents/$agentId"
+          params={{ agentId: agent.id }}
+          className="lift absolute bottom-3 right-3 inline-flex items-center gap-1 rounded-capsule border border-black/10 bg-white/60 px-2 py-0.5 text-[11px] font-medium text-ink-2 hover:text-ink"
+        >
+          Edit agent <ExternalLink size={10} aria-hidden="true" />
+        </Link>
+      ) : null}
+    </div>
   );
 }
 

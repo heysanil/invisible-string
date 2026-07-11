@@ -8,7 +8,10 @@ import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
-import type { TriggerConfig } from "@invisible-string/shared";
+import type {
+  CreateSessionResponse,
+  TriggerConfig,
+} from "@invisible-string/shared";
 
 import {
   collectFormData,
@@ -24,8 +27,46 @@ afterEach(cleanup);
 
 const q = () => within(document.body);
 
+/** The server's real response envelope — `{session, run}` per shared contract. */
+function startedResponse(): CreateSessionResponse {
+  const at = "2026-07-10T00:00:00.000Z";
+  return {
+    session: {
+      id: "session-1",
+      agentId: "agent-1",
+      agentVersionId: "version-1",
+      workflowId: "wf-1",
+      origin: "chat",
+      status: "active",
+      eveSessionId: null,
+      createdAt: at,
+      updatedAt: at,
+    },
+    run: {
+      id: "run-1",
+      agentSessionId: "session-1",
+      status: "queued",
+      triggerEvent: {
+        agentId: "agent-1",
+        workflowId: "wf-1",
+        triggerType: "manual",
+        message: "go",
+        data: {},
+        principal: { workspaceId: "ws-1", userId: "user-1", source: "manual" },
+      },
+      taskMessage: null,
+      deliveryStatus: null,
+      eveRunId: null,
+      error: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: at,
+    },
+  };
+}
+
 function okRunFn() {
-  return mock(async () => ({ runId: "run-1", sessionId: "session-1" }));
+  return mock(async () => startedResponse());
 }
 
 function baseProps(

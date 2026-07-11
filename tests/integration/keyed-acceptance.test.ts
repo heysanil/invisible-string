@@ -5,11 +5,12 @@
  * that watches the ai@7 ↔ @openrouter/ai-sdk-provider@6.0.0-alpha.1 pairing
  * (packages/compiler/versions.json) under real API traffic.
  *
- * Proves (same spine as tests/integration/phase1-acceptance.test.ts, but with
- * NO EVE_MOCK_AUTHORED_MODELS and NO dead-port OPENROUTER_BASE_URL override):
- *   1. publish → real compile + eve build → tarball in Garage (quick preset →
- *      deepseek/deepseek-v4-flash).
- *   2. create session "ping" → the run streams REAL model tokens
+ * Proves (same agent spine as tests/integration/phase1-acceptance.test.ts,
+ * but with NO EVE_MOCK_AUTHORED_MODELS and NO dead-port OPENROUTER_BASE_URL
+ * override — the AGENT is the compile unit; chat targets published agents):
+ *   1. agent publish → real compile + eve build → tarball in Garage (quick
+ *      preset → deepseek/deepseek-v4-flash, reasoning low).
+ *   2. create chat session "ping" → the run streams REAL model tokens
  *      (message.appended deltas over SSE), completes, and the final
  *      message.completed contains "pong".
  *   3. a follow-up asking for the random codeword planted in the first
@@ -27,7 +28,7 @@
  *      failed run_status frame on the SSE stream.
  *
  * COST DISCIPLINE: everything runs on deepseek/deepseek-v4-flash (quick
- * preset) with reasoning "low" and one-line prompts; a full green run is a
+ * preset) with reasoning "low" and one-line personas; a full green run is a
  * handful of tiny completions.
  *
  * Gated on KEYED=1 + OPENROUTER_API_KEY + TEST_DATABASE_URL (+ mise + docker)
@@ -56,13 +57,13 @@ import {
   isRunStreamTerminalStatus,
   parseMasterKey,
   generateMasterKeyBase64,
+  type AgentDefinitionInput,
   type CreateSessionResponse,
   type EveInputRequestedEvent,
   type PostMessageResponse,
-  type PublishWorkflowResponse,
+  type PublishAgentResponse,
   type RunEventFrame,
   type RunStatusFrame,
-  type WorkflowDefinitionInput,
 } from "@invisible-string/shared";
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
@@ -332,7 +333,7 @@ async function until<T>(
 
 // ── the suite ───────────────────────────────────────────────────────────────
 
-describe.skipIf(!GATE)("keyed acceptance — real model through the full stack", () => {
+describe.skipIf(!GATE)("keyed acceptance — real model through the full stack (agents-first)", () => {
   const mcp = GATE ? startStubMcp() : null!;
   const node24Bin = GATE ? resolveNode24Bin() : null;
 
@@ -344,12 +345,11 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
 
   let cookie: string;
   let orgId: string;
-  let agentPresetId: string;
   let connectionId: string;
 
-  let pongWorkflowId: string;
-  let hitlWorkflowId: string;
-  let errorWorkflowId: string;
+  let pongAgentId: string;
+  let hitlAgentId: string;
+  let errorAgentId: string;
 
   let sessionId: string;
   let eveSessionId: string;
@@ -375,21 +375,21 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
     });
   }
 
-  async function createWorkflow(name: string, definition: WorkflowDefinitionInput): Promise<string> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows`, {
-      body: { name, draft: definition },
+  async function createAgent(name: string, draft: AgentDefinitionInput): Promise<string> {
+    const res = await api("POST", `/workspaces/${orgId}/agents`, {
+      body: { name, draft },
     });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { workflow: { id: string } };
-    return body.workflow.id;
+    const body = (await res.json()) as { agent: { id: string } };
+    return body.agent.id;
   }
 
   /** Publish, wait for the REAL eve build, then delete the build dir so the
    *  worker must boot from the Garage tarball. */
-  async function publishAndBuild(workflowId: string): Promise<PublishWorkflowResponse> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`);
+  async function publishAndBuild(agentId: string): Promise<PublishAgentResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as PublishWorkflowResponse;
+    const body = (await res.json()) as PublishAgentResponse;
     await stack.runtime!.buildService.waitFor(body.contentHash);
     await until(
       async () => {
@@ -403,6 +403,15 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
     );
     rmSync(join(AGENT_ROOT, body.contentHash), { recursive: true, force: true });
     return body;
+  }
+
+  /** Start a chat session against a published agent. */
+  async function chat(agentId: string, message: string): Promise<CreateSessionResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/sessions`, {
+      body: { message },
+    });
+    expect(res.status).toBe(201);
+    return (await res.json()) as CreateSessionResponse;
   }
 
   async function runRow(runId: string): Promise<{ status: string; error: string | null } | undefined> {
@@ -525,6 +534,10 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
     );
 
     // ── workspace: user + org + seeds ──────────────────────────────────────
+    // NOTE: org creation fires the onboarding kick — a background publish
+    // (+ real eve build) of the seeded "General Purpose" agent. Deliberately
+    // NOT awaited here: the seed agent uses the balanced preset and this
+    // suite never chats with it, so it costs one build, zero API spend.
     const email = `keyed-${randomUUID()}@example.com`;
     const signUp = await fetch(`${baseUrl}/api/auth/sign-up/email`, {
       method: "POST",
@@ -545,13 +558,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
     });
     await seedWorkspace(db, orgId);
 
-    const agents = await db
-      .select({ id: schema.agents.id })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agents[0]!.id;
-
-    // Approval-gated MCP connection → the stub server (HITL workflow).
+    // Approval-gated MCP connection → the stub server (HITL agent).
     const conn = await db
       .insert(schema.mcpConnections)
       .values({
@@ -579,27 +586,21 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
 
     // quick preset → deepseek/deepseek-v4-flash (packages/db seed); reasoning
     // low keeps the (reasoning) model's token spend minimal.
-    const agent = { agentPresetId, modelPreset: "quick" as const, reasoning: "low" as const };
+    const model = { preset: "quick" as const, reasoning: "low" as const };
 
-    pongWorkflowId = await createWorkflow("Keyed Pong", {
-      trigger: { type: "manual" },
+    pongAgentId = await createAgent("Keyed Pong", {
+      persona:
+        'When the user says "ping", reply with exactly: pong\n' +
+        "For any other message, answer it directly and truthfully in as few words as possible.",
+      model,
       context: { mcpConnectionIds: [], skillIds: [] },
-      agent,
-      instructions: {
-        markdown:
-          'When the user says "ping", reply with exactly: pong\n' +
-          "For any other message, answer it directly and truthfully in as few words as possible.",
-      },
     });
-    hitlWorkflowId = await createWorkflow("Keyed HITL", {
-      trigger: { type: "manual" },
+    hitlAgentId = await createAgent("Keyed HITL", {
+      persona:
+        "When asked to save a note, call the save_note tool on @notes with the exact text requested. " +
+        "Never ask clarifying questions. After the tool succeeds, reply with exactly: saved",
+      model,
       context: { mcpConnectionIds: [connectionId], skillIds: [] },
-      agent,
-      instructions: {
-        markdown:
-          "When asked to save a note, call the save_note tool on @notes with the exact text requested. " +
-          "Never ask clarifying questions. After the tool succeeds, reply with exactly: saved",
-      },
     });
   }, 180_000);
 
@@ -617,9 +618,9 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
   }, 90_000);
 
   test(
-    "publish (quick preset → deepseek/deepseek-v4-flash) → real eve build → tarball in Garage",
+    "agent publish (quick preset → deepseek/deepseek-v4-flash) → real eve build → tarball in Garage",
     async () => {
-      const body = await publishAndBuild(pongWorkflowId);
+      const body = await publishAndBuild(pongAgentId);
       expect(body.contentHash).toHaveLength(64);
 
       const artifactUrl = stack.runtime!.artifacts.presignGetUrl(
@@ -631,9 +632,10 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
 
       const versions = await db
         .select()
-        .from(schema.workflowVersions)
-        .where(eq(schema.workflowVersions.id, body.versionId));
+        .from(schema.agentVersions)
+        .where(eq(schema.agentVersions.id, body.versionId));
       expect(versions[0]).toMatchObject({
+        agentId: pongAgentId,
         contentHash: body.contentHash,
         modelProvider: "openrouter",
         modelId: "deepseek/deepseek-v4-flash",
@@ -646,17 +648,15 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
   test(
     '"ping" → REAL model tokens stream (message.appended deltas over SSE) and the reply is "pong"',
     async () => {
-      const res = await api(
-        "POST",
-        `/workspaces/${orgId}/workflows/${pongWorkflowId}/sessions`,
-        { body: { message: `ping (remember this codeword: ${codeword})` } },
+      const body = await chat(
+        pongAgentId,
+        `ping (remember this codeword: ${codeword})`,
       );
-      expect(res.status).toBe(201);
-      const body = (await res.json()) as CreateSessionResponse;
       sessionId = body.session.id;
       firstRunId = body.run.id;
       eveSessionId = body.session.eveSessionId!;
       expect(eveSessionId).toBeTruthy();
+      expect(body.session.workflowId).toBeNull(); // chat targets the agent directly
 
       // Live SSE tail to the TERMINAL run_status frame (the stream opens
       // with a snapshot run_status frame — "running" is not the end).
@@ -730,15 +730,12 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
   test(
     "HITL: approval-gated MCP tool parks the run; POST /runs/:id/input approves; tool executes; run completes",
     async () => {
-      await publishAndBuild(hitlWorkflowId);
+      await publishAndBuild(hitlAgentId);
 
-      const res = await api(
-        "POST",
-        `/workspaces/${orgId}/workflows/${hitlWorkflowId}/sessions`,
-        { body: { message: "Save a note with the exact text: keyed-hitl-proof" } },
+      const body = await chat(
+        hitlAgentId,
+        "Save a note with the exact text: keyed-hitl-proof",
       );
-      expect(res.status).toBe(201);
-      const body = (await res.json()) as CreateSessionResponse;
 
       // The REAL model must decide to call notes__save_note; the approval
       // policy parks the run `waiting` with an approve/deny input request.
@@ -793,21 +790,14 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack",
         modelId: bogusModelId,
         enabled: true,
       });
-      errorWorkflowId = await createWorkflow("Keyed Error Surface", {
-        trigger: { type: "manual" },
+      errorAgentId = await createAgent("Keyed Error Surface", {
+        persona: "Reply with exactly: unreachable",
+        model: { modelId: bogusModelId, reasoning: "low" },
         context: { mcpConnectionIds: [], skillIds: [] },
-        agent: { agentPresetId, modelId: bogusModelId },
-        instructions: { markdown: "Reply with exactly: unreachable" },
       });
-      await publishAndBuild(errorWorkflowId);
+      await publishAndBuild(errorAgentId);
 
-      const res = await api(
-        "POST",
-        `/workspaces/${orgId}/workflows/${errorWorkflowId}/sessions`,
-        { body: { message: "ping" } },
-      );
-      expect(res.status).toBe(201);
-      const body = (await res.json()) as CreateSessionResponse;
+      const body = await chat(errorAgentId, "ping");
 
       // VISIBLE failure: run → failed with a populated error…
       await awaitRunStatus(body.run.id, "failed", 5 * 60_000);

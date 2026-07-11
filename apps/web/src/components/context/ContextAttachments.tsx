@@ -400,51 +400,60 @@ function ResourcePicker({
         </Button>
       }
     >
-      <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2 rounded-capsule border border-black/10 bg-white/60 px-3">
-          <Search size={14} className="text-ink-4" aria-hidden="true" />
-          <input
-            value={query}
-            autoFocus
-            onChange={noopChange}
-            onInput={(event) => setQuery((event.target as HTMLInputElement).value)}
-            placeholder={`Search ${kind}s`}
-            aria-label={`Search ${kind}s`}
-            className="h-8 flex-1 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-4"
-          />
-        </div>
-        <ul className="thin-scroll flex max-h-64 flex-col gap-0.5 overflow-y-auto">
-          {available.length === 0 ? (
-            <li className="px-2 py-6 text-center text-[12.5px] text-ink-4">
-              {options.length === 0
-                ? `No ${kind}s in this workspace yet.`
-                : "Nothing matches."}
-            </li>
-          ) : (
-            available.map((option) => (
-              <li key={option.id}>
-                <button
-                  type="button"
-                  onClick={() => onPick(option.id)}
-                  className="lift flex w-full flex-col gap-0.5 rounded-card px-2.5 py-2 text-left hover:bg-black/[0.04]"
-                >
-                  <span className="flex items-center gap-2">
-                    <span className="truncate text-[13px] font-medium text-ink">
-                      {option.name}
-                    </span>
-                    <ScopeTag scope={option.resourceScope} />
-                  </span>
-                  {option.description ? (
-                    <span className="line-clamp-2 text-[11.5px] text-ink-3">
-                      {option.description}
-                    </span>
-                  ) : null}
-                </button>
+      {({ close }) => (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2 rounded-capsule border border-black/10 bg-white/60 px-3">
+            <Search size={14} className="text-ink-4" aria-hidden="true" />
+            <input
+              value={query}
+              autoFocus
+              onChange={noopChange}
+              onInput={(event) => setQuery((event.target as HTMLInputElement).value)}
+              placeholder={`Search ${kind}s`}
+              aria-label={`Search ${kind}s`}
+              className="h-8 flex-1 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-4"
+            />
+          </div>
+          <ul className="thin-scroll flex max-h-64 flex-col gap-0.5 overflow-y-auto">
+            {available.length === 0 ? (
+              <li className="px-2 py-6 text-center text-[12.5px] text-ink-4">
+                {options.length === 0
+                  ? `No ${kind}s in this workspace yet.`
+                  : "Nothing matches."}
               </li>
-            ))
-          )}
-        </ul>
-      </div>
+            ) : (
+              available.map((option) => (
+                <li key={option.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onPick(option.id);
+                      // One pick per open: dismiss so the popover never lingers
+                      // over the attached rows' controls, and reset the query
+                      // for the next open.
+                      setQuery("");
+                      close();
+                    }}
+                    className="lift flex w-full flex-col gap-0.5 rounded-card px-2.5 py-2 text-left hover:bg-black/[0.04]"
+                  >
+                    <span className="flex items-center gap-2">
+                      <span className="truncate text-[13px] font-medium text-ink">
+                        {option.name}
+                      </span>
+                      <ScopeTag scope={option.resourceScope} />
+                    </span>
+                    {option.description ? (
+                      <span className="line-clamp-2 text-[11.5px] text-ink-3">
+                        {option.description}
+                      </span>
+                    ) : null}
+                  </button>
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+      )}
     </Popover>
   );
 }

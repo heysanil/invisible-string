@@ -1,6 +1,8 @@
 /**
  * Copilot-dock driving helpers shared by the copilot acceptance spec and the
- * screenshot-capture spec.
+ * screenshot-capture spec, plus section locators for asserting where applied
+ * suggestions land (the workflow editor flashes the target SECTION; the agent
+ * editor flashes its rail card).
  */
 import { expect, type Locator, type Page } from "@playwright/test";
 
@@ -27,12 +29,37 @@ export async function openCopilotAndSend(
   }).toPass({ timeout: 20_000 });
 }
 
-/** The pillar rail card (live summary) for a pillar. */
-export function railCard(
+/** A workflow-editor section (`<section>` labelled by its heading). */
+export function workflowSection(
   page: Page,
-  pillar: "Trigger" | "Context" | "Agent" | "Instructions",
+  section: "trigger" | "agent" | "instructions",
+): Locator {
+  return page.locator(`section[aria-labelledby="workflow-section-${section}"]`);
+}
+
+/**
+ * Assert the flash treatment an applied copilot suggestion paints on its
+ * workflow section (replaces the old pillar-rail live-summary assertions —
+ * the section itself is the live surface now). The flash is ~900 ms, so this
+ * must run right after Apply.
+ */
+export async function expectWorkflowSectionFlash(
+  page: Page,
+  section: "trigger" | "agent" | "instructions",
+): Promise<void> {
+  await expect(
+    page.locator(
+      `section.pillar-flash[aria-labelledby="workflow-section-${section}"]`,
+    ),
+  ).toBeVisible({ timeout: 2_000 });
+}
+
+/** The agent editor's rail card (live summary) for a section. */
+export function agentRailCard(
+  page: Page,
+  section: "Persona" | "Model" | "Context" | "Access",
 ): Locator {
   return page
-    .getByRole("navigation", { name: "Workflow pillars" })
-    .getByRole("button", { name: new RegExp(`^${pillar}`) });
+    .getByRole("navigation", { name: "Agent sections" })
+    .getByRole("button", { name: new RegExp(`^${section}`) });
 }

@@ -17,8 +17,9 @@
  *   since the last user turn), so any number of sockets/turns/spec retries
  *   replay deterministically from one env var. Supports placeholders that a
  *   real model would resolve by reading the system prompt's inventory:
- *   `{{connectionId:<slug>}}`, `{{skillId:<slug>}}` in tool inputs, and
- *   `{{toolResults}}` in step text (echoes the outcomes the model was told).
+ *   `{{connectionId:<slug>}}`, `{{skillId:<slug>}}`, `{{agentId:<name>}}` in
+ *   tool inputs, and `{{toolResults}}` in step text (echoes the outcomes the
+ *   model was told).
  */
 import { jsonSchema, streamText, tool, type ModelMessage } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -233,25 +234,34 @@ function lastToolResultsSummary(messages: ModelMessage[]): string {
 }
 
 /**
- * Resolve `{{connectionId:<slug>}}` / `{{skillId:<slug>}}` placeholders in a
- * tool input against the inventory lines of the system prompt (exactly the
- * data a real model reads: `- id=<uuid> name="…" ref=@<slug>` /
- * `ref=@skill.<slug>`). Unresolvable placeholders are left as-is so schema
- * validation rejects them loudly (a script bug, never a silent pass).
+ * Resolve `{{connectionId:<slug>}}` / `{{skillId:<slug>}}` /
+ * `{{agentId:<name>}}` placeholders in a tool input against the inventory
+ * lines of the system prompt (exactly the data a real model reads:
+ * `- id=<uuid> name="…" ref=@<slug>` / `ref=@skill.<slug>` for context, and
+ * `- id=<uuid> name="<name>" …` for the workflow surface's agent inventory,
+ * which carries no ref slug — agents are matched by exact name).
+ * Unresolvable placeholders are left as-is so schema validation rejects them
+ * loudly (a script bug, never a silent pass).
  */
 function substituteInventoryIds(input: unknown, system: string): unknown {
   const raw = JSON.stringify(input);
   if (!raw.includes("{{")) return input;
-  const substituted = raw.replace(
-    /\{\{(connectionId|skillId):([A-Za-z0-9_-]+)\}\}/g,
-    (whole, kind: string, slug: string) => {
-      const ref = kind === "connectionId" ? `@${slug}` : `@skill.${slug}`;
-      const line = new RegExp(
-        `- id=(\\S+) name="[^"]*" ref=${ref.replace(/[.$]/g, "\\$&")}(?![A-Za-z0-9_.-])`,
-      ).exec(system);
+  const substituted = raw
+    .replace(
+      /\{\{(connectionId|skillId):([A-Za-z0-9_-]+)\}\}/g,
+      (whole, kind: string, slug: string) => {
+        const ref = kind === "connectionId" ? `@${slug}` : `@skill.${slug}`;
+        const line = new RegExp(
+          `- id=(\\S+) name="[^"]*" ref=${ref.replace(/[.$]/g, "\\$&")}(?![A-Za-z0-9_.-])`,
+        ).exec(system);
+        return line?.[1] ?? whole;
+      },
+    )
+    .replace(/\{\{agentId:([^{}"]+)\}\}/g, (whole, name: string) => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const line = new RegExp(`- id=(\\S+) name="${escaped}"`).exec(system);
       return line?.[1] ?? whole;
-    },
-  );
+    });
   return JSON.parse(substituted);
 }
 

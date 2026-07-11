@@ -1,39 +1,56 @@
 /**
- * PHASE-3 ACCEPTANCE (docs/PLAN.md Phase 3 §Acceptance) — the worker pool,
- * every trigger type, HITL, Slack thread continuity, dead-worker failover, and
- * graceful drain, all against the REAL stack: a real control plane, TWO real
- * `apps/worker` processes, real `@invisible-string/compiler` + `eve build`
- * agents booted from Garage tarballs, and eve's mock-model harness serving the
- * turns (EVE_MOCK_AUTHORED_MODELS — no provider key). External services are
- * stubbed: a local MCP server and a local Slack Web API server. NOTHING between
- * the platform API and a live compiled agent is faked.
+ * PHASE-3 ACCEPTANCE (docs/PLAN.md Phase 3 §Acceptance, re-keyed for the
+ * agents-first redesign) — the worker pool, every trigger surface, HITL,
+ * Slack thread continuity + control-plane reply delivery, the schedule
+ * ticker, dead-worker failover, and graceful drain, all against the REAL
+ * stack: a real control plane, TWO real `apps/worker` processes, real
+ * `@invisible-string/compiler` v3 agents (`eve build`) booted from Garage
+ * tarballs, and eve's mock-model harness serving the turns
+ * (EVE_MOCK_AUTHORED_MODELS — no provider key). External services are
+ * stubbed: a local MCP server and a local Slack Web API server. NOTHING
+ * between the platform API and a live compiled agent is faked.
+ *
+ * AGENTS-FIRST SHAPE: the AGENT is the compile unit — TWO agents (two hashes,
+ * two builds); the workflows all delegate to one of them and compile NOTHING
+ * (publish is instant). Dispatch renders each workflow's instructions into
+ * the task message; agent env is identical across every path (no per-trigger
+ * env — no SLACK_BOT_TOKEN ever reaches an agent).
  *
  * The proofs (each an assertion polled off real DB/stub state — no sleeps):
  *   1. SPREAD    — sessions land on ≥2 distinct workers
- *      (`agent_sessions.affinity_worker_id` spans both). Forced deterministically
- *      by the real "scheduler only routes to LIVE workers" rule (park one worker
- *      `draining` for the second dispatch — the same mechanism graceful drain uses).
- *   2. TRIGGERS  — manual (chat), form (`POST /t/:token`), webhook (`POST /t/:token`)
- *      and slack (`POST /integrations/slack/events`, signed) each start a run.
- *   3. SLACK     — an app_mention creates a session AND our stub Slack API receives
- *      a THREADED chat.postMessage; a follow-up in the SAME thread_ts continues the
- *      SAME agent_session (one session row, two runs, same eve session id).
- *   4. HITL      — an ask_question tool call parks the run (`waiting`); answering via
- *      `POST /runs/:id/input` resumes it to `succeeded`.
- *   5. FAILOVER  — a parked run on worker A survives `SIGKILL A`: the sweeper marks A
- *      dead and CLEARS the session affinity, then the parked approval reschedules and
- *      the durable eve turn RESUMES on worker B and finishes.
- *   6. DRAIN     — `SIGTERM` worker A mid-idle with an agent loaded: it deregisters,
- *      new sessions route to worker B, and A exits 0.
+ *      (`agent_sessions.affinity_worker_id` spans both). Two AGENT HASHES are
+ *      used (single-writer-per-hash fencing pins one hash to one worker);
+ *      determinism comes from the real "scheduler only routes to LIVE
+ *      workers" rule (park one worker `draining` for the second dispatch —
+ *      the same mechanism graceful drain uses).
+ *   2. TRIGGERS  — manual "Run now" (`POST /workspaces/:id/workflows/:wfId/run`),
+ *      form (`POST /t/:token`) and webhook (`POST /t/:token`) each start a
+ *      run whose persisted task message carries the `<workflow-task>` wrapper.
+ *   3. SLACK     — an app_mention creates a session AND the CONTROL PLANE
+ *      delivers a THREADED chat.postMessage to the stub Slack API off the
+ *      run's terminal event (runs.delivery_status settles `delivered` — the
+ *      compiled artifact has no Slack code path at all in compiler v3); a
+ *      follow-up in the SAME thread_ts continues the SAME agent_session (one
+ *      session row, two runs, same eve session id, both replies delivered).
+ *   4. SCHEDULE  — a published cron workflow with a DUE `next_fire_at` is
+ *      claimed and dispatched by the control-plane schedule ticker (short
+ *      SCHEDULE_TICK_MS): the session's origin is `schedule`, the cursor
+ *      advances (no backfill), and disabling the workflow disarms it.
+ *   5. HITL      — an ask_question tool call parks the run (`waiting`);
+ *      answering via `POST /runs/:id/input` resumes it to `succeeded`.
+ *   6. FAILOVER  — a parked run on worker A survives `SIGKILL A`: the sweeper
+ *      marks A dead and CLEARS the session affinity, then the parked approval
+ *      reschedules and the durable eve turn RESUMES on worker B and finishes.
+ *   7. DRAIN     — `SIGTERM` worker A mid-idle with an agent loaded: it
+ *      deregisters, new sessions route to worker B, and A exits 0.
  *
  * Gated on TEST_DATABASE_URL (+ mise + docker). Infra: the docker-compose
- * postgres/garage services, brought up on demand when unreachable. The first run
- * cold-installs the generated agents' npm deps (minutes) — NPM_CACHE_DIR keeps
- * reruns warm. Four distinct trigger workflows compile to four hashes → four
- * `eve build`s; the manual workflow is reused across SPREAD/HITL/FAILOVER/DRAIN.
+ * postgres/garage services, brought up on demand when unreachable. The first
+ * run cold-installs the generated agents' npm deps (minutes) — NPM_CACHE_DIR
+ * keeps reruns warm.
  *
  *   POSTGRES_PORT=5444 docker compose -p p3acceptance up -d --wait postgres garage
- *   TEST_DATABASE_URL=postgres://dev:dev@localhost:5444/product bun test tests/integration/phase3-acceptance.test.ts
+ *   TEST_DATABASE_URL=postgres://dev:dev@localhost:5444/product PHASE3_AGENT_ROOT=/tmp/invisible-string-p3-agents bun test tests/integration/phase3-acceptance.test.ts
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -51,18 +68,24 @@ import {
   generateMasterKeyBase64,
   SLACK_SIGNATURE_HEADER,
   SLACK_TIMESTAMP_HEADER,
+  type AgentDefinitionInput,
   type CreateSessionResponse,
   type CreateWebhookTokenResponse,
+  type PublishAgentResponse,
   type PublishWorkflowResponse,
   type SlackInnerEvent,
   type SlackIntegrationMetadata,
   type TriggerIngressResponse,
-  type WorkflowDefinitionInput,
+  type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
 import { runMigrations } from "../../apps/control-plane/src/migrate";
 import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-env";
+import {
+  createScheduleTicker,
+  type ScheduleTicker,
+} from "../../apps/control-plane/src/runtime/schedule-ticker";
 import { createWorkerSweeper } from "../../apps/control-plane/src/runtime/worker-sweeper";
 import { computeSlackSignature } from "../../apps/control-plane/src/integrations/slack-verify";
 import { encryptIntegrationCredentials } from "../../apps/control-plane/src/integrations/crypto";
@@ -96,10 +119,12 @@ const NPM_CACHE_DIR = process.env.NPM_CACHE_DIR ?? join(homedir(), ".npm");
 
 // Worker liveness tuned tight so a SIGKILLed worker is swept dead within
 // seconds (failover) without being flaky under load: TTL 4s, sweep every 1s,
-// heartbeat every 1s.
+// heartbeat every 1s. The schedule ticker scans every 500ms so a forced-due
+// trigger fires within one poll interval.
 const WORKER_HEARTBEAT_TTL_MS = "4000";
 const WORKER_SWEEP_INTERVAL_MS = "1000";
 const HEARTBEAT_INTERVAL_MS = "1000";
+const SCHEDULE_TICK_MS = "500";
 
 const GATE_PROBLEMS: string[] = [];
 if (!TEST_DATABASE_URL) GATE_PROBLEMS.push("TEST_DATABASE_URL not set");
@@ -246,7 +271,7 @@ function startStubMcp(): { url: string; stop(): void } {
   return { url: `http://127.0.0.1:${server.port}/mcp`, stop: () => server.stop(true) };
 }
 
-// ── local stub Slack Web API server (receives chat.postMessage from the agent) ──
+// ── local stub Slack Web API server (receives the CONTROL PLANE's replies) ──
 
 interface SlackPostedMessage {
   channel: string;
@@ -319,13 +344,14 @@ interface ManagedWorker {
   proc: ReturnType<typeof Bun.spawn>;
 }
 
-describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", () => {
+describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery + HITL", () => {
   const mcp = GATE ? startStubMcp() : null!;
   const slack = GATE ? startStubSlack() : null!;
   const node24Bin = GATE ? resolveNode24Bin() : null;
 
   let stack: AppStack;
   let sweeper: ReturnType<typeof createWorkerSweeper>;
+  let ticker: ScheduleTicker;
   let db: AppStack["dbHandle"]["db"];
   let baseUrl: string;
   const workers: ManagedWorker[] = [];
@@ -333,9 +359,14 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
 
   let cookie: string;
   let orgId: string;
-  let agentPresetId: string;
 
-  // Published workflows (one hash / build each).
+  // Two published agents = two hashes = two builds. Every workflow delegates
+  // to Alpha; Beta exists so SPREAD can span two workers without fighting the
+  // single-writer-per-hash fence.
+  let agentAlphaId: string;
+  let agentBetaId: string;
+
+  // Delegation workflows (published instantly — no builds).
   let manualWorkflowId: string;
   let formWorkflowId: string;
   let webhookWorkflowId: string;
@@ -421,31 +452,61 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
     return worker.proc.exitCode;
   }
 
-  async function publish(workflowId: string): Promise<PublishWorkflowResponse> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as PublishWorkflowResponse;
-    await stack.runtime!.buildService.waitFor(body.contentHash);
+  async function createAgent(name: string, draft: AgentDefinitionInput): Promise<string> {
+    const res = await api("POST", `/workspaces/${orgId}/agents`, {
+      body: { name, draft },
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { agent: { id: string } };
+    return body.agent.id;
+  }
+
+  async function awaitBuild(contentHash: string): Promise<void> {
+    await stack.runtime!.buildService.waitFor(contentHash);
     await until(
       async () => {
-        const row = await stack.runtime!.buildStore.get(body.contentHash);
+        const row = await stack.runtime!.buildStore.get(contentHash);
         if (row?.status === "failed") throw new Error(`build failed:\n${row.errorLog ?? "(no log)"}`);
         return row?.status === "succeeded" || undefined;
       },
-      `build of ${body.contentHash.slice(0, 12)}`,
+      `build of ${contentHash.slice(0, 12)}`,
       15 * 60_000,
       1_000,
     );
+  }
+
+  /** Publish an agent and wait for its REAL eve build. */
+  async function publishAgentAndBuild(agentId: string): Promise<PublishAgentResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as PublishAgentResponse;
+    await awaitBuild(body.contentHash);
     return body;
   }
 
-  async function createWorkflow(name: string, definition: WorkflowDefinitionInput): Promise<string> {
+  async function createWorkflow(name: string, draft: WorkflowConfigInput): Promise<string> {
     const res = await api("POST", `/workspaces/${orgId}/workflows`, {
-      body: { name, draft: definition },
+      body: { name, draft },
     });
     expect(res.status).toBe(201);
     const body = (await res.json()) as { workflow: { id: string } };
     return body.workflow.id;
+  }
+
+  /** Workflow publish is INSTANT (validate + snapshot + trigger sync, no build). */
+  async function publishWorkflow(workflowId: string): Promise<PublishWorkflowResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`);
+    expect(res.status).toBe(200);
+    return (await res.json()) as PublishWorkflowResponse;
+  }
+
+  /** Start a chat session against a published agent. */
+  async function chat(agentId: string, message: string): Promise<CreateSessionResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/sessions`, {
+      body: { message },
+    });
+    expect(res.status).toBe(201);
+    return (await res.json()) as CreateSessionResponse;
   }
 
   async function runStatus(runId: string): Promise<string | undefined> {
@@ -491,6 +552,27 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       .from(schema.agentSessions)
       .where(eq(schema.agentSessions.id, sessionId));
     return rows[0]?.affinity;
+  }
+
+  async function sessionRow(sessionId: string) {
+    const rows = await db
+      .select()
+      .from(schema.agentSessions)
+      .where(eq(schema.agentSessions.id, sessionId));
+    return rows[0];
+  }
+
+  async function runRow(runId: string) {
+    const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+    return rows[0];
+  }
+
+  async function triggerRowOf(workflowId: string) {
+    const rows = await db
+      .select()
+      .from(schema.triggers)
+      .where(eq(schema.triggers.workflowId, workflowId));
+    return rows[0];
   }
 
   function slackHeaders(rawBody: string): Record<string, string> {
@@ -558,7 +640,9 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       SSE_HEARTBEAT_MS: "500",
       WORKER_HEARTBEAT_TTL_MS,
       WORKER_SWEEP_INTERVAL_MS,
-      // Slack app configured; outbound agent replies + the platform client hit the stub.
+      SCHEDULE_TICK_MS,
+      // Slack app configured; ingress verification + the control-plane
+      // DeliveryService's chat.postMessage both hit the local stub.
       SLACK_CLIENT_ID,
       SLACK_CLIENT_SECRET,
       SLACK_SIGNING_SECRET,
@@ -567,10 +651,15 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
     expect(stack.runtime).not.toBeNull();
     db = stack.dbHandle.db;
     stack.app.listen(controlPort);
-    // The sweeper only auto-starts in the CLI entrypoint (import.meta.main); an
-    // in-process stack must start it itself — failover depends on it.
+    // The sweeper + schedule ticker only auto-start in the CLI entrypoint
+    // (import.meta.main); an in-process stack starts them itself — failover
+    // depends on the sweeper, the SCHEDULE proof on the ticker.
     sweeper = createWorkerSweeper(stack.runtime!, { log: () => {} });
     sweeper.start();
+    ticker = createScheduleTicker(stack.runtime!, {
+      tickMs: stack.runtime!.runtime.scheduleTickMs,
+    });
+    ticker.start();
 
     // Two real workers.
     await spawnWorker();
@@ -592,16 +681,10 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
     });
     orgId = org!.id;
     await stack.auth.api.setActiveOrganization({ body: { organizationId: orgId }, headers: authHeaders });
-    await seedWorkspace(db, orgId);
+    await seedWorkspace(db, orgId); // idempotent (afterCreateOrganization already ran)
 
-    const agents = await db
-      .select({ id: schema.agents.id })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agents[0]!.id;
-
-    // One MCP connection → the stub server (present on every workflow; proves
-    // the CONTEXT pillar boots against a real MCP server across trigger types).
+    // One MCP connection → the stub server (equipped on agent Alpha; proves
+    // agent CONTEXT boots against a real MCP server across trigger surfaces).
     const conn = await db
       .insert(schema.mcpConnections)
       .values({ scope: "workspace", organizationId: orgId, name: "notes", source: "custom", url: mcp.url })
@@ -620,18 +703,34 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       })
       .where(eq(schema.mcpConnections.id, connectionId));
 
-    const context = { mcpConnectionIds: [connectionId], skillIds: [] as string[] };
-    const agent = { agentPresetId, modelPreset: "balanced" as const };
+    const persona =
+      "You are a helpful assistant. Do exactly what the incoming message asks. " +
+      "The message may be wrapped in <workflow-task> or <trigger-context> blocks; " +
+      "obey the instruction inside them.";
+
+    // TWO agents → two hashes → two eve builds (name feeds the hash via its
+    // slug, so even an identical definition compiles to a distinct artifact).
+    agentAlphaId = await createAgent("P3 Alpha", {
+      persona,
+      model: { preset: "balanced" },
+      context: { mcpConnectionIds: [connectionId], skillIds: [] },
+    });
+    agentBetaId = await createAgent("P3 Beta", {
+      persona,
+      model: { preset: "balanced" },
+      context: { mcpConnectionIds: [], skillIds: [] },
+    });
+    await publishAgentAndBuild(agentAlphaId);
+    await publishAgentAndBuild(agentBetaId);
+
+    // Delegation workflows — all handled by Alpha; publish is instant.
     const instructions = {
       markdown:
-        "You are a helpful assistant. Do exactly what the incoming message asks. " +
-        "The message may be wrapped in a <trigger-context> block; obey the instruction inside it.",
+        "Do exactly what the incoming request in the trigger context asks.",
     };
-
     manualWorkflowId = await createWorkflow("P3 Manual", {
       trigger: { type: "manual" },
-      context,
-      agent,
+      agentId: agentAlphaId,
       instructions,
     });
     formWorkflowId = await createWorkflow("P3 Form", {
@@ -642,25 +741,28 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
           { key: "topic", label: "Topic", type: "text", required: false },
         ],
       },
-      context,
-      agent,
+      agentId: agentAlphaId,
       instructions,
     });
     webhookWorkflowId = await createWorkflow("P3 Webhook", {
       trigger: { type: "webhook" },
-      context,
-      agent,
+      agentId: agentAlphaId,
       instructions,
     });
     slackWorkflowId = await createWorkflow("P3 Slack", {
       trigger: { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } },
-      context,
-      agent,
+      agentId: agentAlphaId,
       instructions,
     });
+    await publishWorkflow(manualWorkflowId);
+    await publishWorkflow(formWorkflowId);
+    await publishWorkflow(webhookWorkflowId);
+    await publishWorkflow(slackWorkflowId);
 
-    // Seed the Slack integration + bind it to the Slack workflow (the OAuth
-    // install flow is tested elsewhere; here we drive inbound events directly).
+    // Seed the Slack integration + point the Slack workflow's trigger at it
+    // (the OAuth install flow is tested elsewhere; here we drive inbound
+    // events directly). Publish created the trigger row; binding the team is
+    // the user-managed step (PUT …/triggers/slack does the same).
     const metadata: SlackIntegrationMetadata = {
       teamName: "P3 Team",
       botUserId: SLACK_BOT_USER_ID,
@@ -683,14 +785,30 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       includeDirectMessages: false,
     });
 
-    // Build all four agents up front (four hashes → four eve builds).
-    await publish(manualWorkflowId);
-    await publish(formWorkflowId);
-    await publish(webhookWorkflowId);
-    await publish(slackWorkflowId);
+    // The onboarding kick fired a background publish (+ eve build) of the
+    // seeded "General Purpose" agent at org creation. Await it so the suite
+    // never exits with a build subprocess in flight (it runs concurrently
+    // with the two agent builds above, so this is cheap by now).
+    const seedVersionId = await until(
+      async () => {
+        const rows = await db
+          .select({ publishedVersionId: schema.agents.publishedVersionId })
+          .from(schema.agents)
+          .where(and(eq(schema.agents.organizationId, orgId), eq(schema.agents.name, "General Purpose")));
+        return rows[0]?.publishedVersionId ?? undefined;
+      },
+      "seed-agent publish kick",
+      60_000,
+    );
+    const seedVersions = await db
+      .select({ contentHash: schema.agentVersions.contentHash })
+      .from(schema.agentVersions)
+      .where(eq(schema.agentVersions.id, seedVersionId));
+    await awaitBuild(seedVersions[0]!.contentHash);
   }, 30 * 60_000);
 
   afterAll(async () => {
+    await ticker?.stop();
     sweeper?.stop();
     for (const worker of [...workers]) {
       await stopWorker(worker, "SIGTERM").catch(() => {});
@@ -705,33 +823,26 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
   // ── 1. SPREAD ──────────────────────────────────────────────────────────────
 
   test(
-    "runs spread across ≥2 workers (affinity_worker_id spans both)",
+    "runs spread across ≥2 workers (two agent hashes; affinity_worker_id spans both)",
     async () => {
-      // Session 1 lands on whichever worker the cold scheduler picks.
-      const r1 = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
-        body: { message: "Reply with exactly: spread-1" },
-      });
-      expect(r1.status).toBe(201);
-      const s1 = (await r1.json()) as CreateSessionResponse;
+      // Session 1 (agent Alpha) lands on whichever worker the cold scheduler picks.
+      const s1 = await chat(agentAlphaId, "Reply with exactly: spread-1");
       const workerA = await until(
         async () => (await sessionAffinity(s1.session.id)) ?? undefined,
         "session 1 affinity",
       );
       await awaitRunStatus(s1.run.id, "succeeded");
 
-      // Force session 2 onto the OTHER worker: park worker A `draining` so the
-      // scheduler (which only routes to LIVE workers) must pick the other one.
-      // This is the exact rule graceful drain relies on. The worker's own
-      // heartbeats never revive the status (the handler only touches
-      // lastHeartbeatAt), so the toggle holds until we restore it.
+      // Force session 2 (agent Beta — a DIFFERENT hash, so the single-writer
+      // fence never contends) onto the OTHER worker: park worker A `draining`
+      // so the scheduler (which only routes to LIVE workers) must pick the
+      // other one. This is the exact rule graceful drain relies on. The
+      // worker's own heartbeats never revive the status (the handler only
+      // touches lastHeartbeatAt), so the toggle holds until we restore it.
       await db.update(schema.workers).set({ status: "draining" }).where(eq(schema.workers.id, workerA));
       let s2: CreateSessionResponse;
       try {
-        const r2 = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
-          body: { message: "Reply with exactly: spread-2" },
-        });
-        expect(r2.status).toBe(201);
-        s2 = (await r2.json()) as CreateSessionResponse;
+        s2 = await chat(agentBetaId, "Reply with exactly: spread-2");
       } finally {
         await db.update(schema.workers).set({ status: "live" }).where(eq(schema.workers.id, workerA));
       }
@@ -752,16 +863,21 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
     10 * 60_000,
   );
 
-  // ── 2. TRIGGERS: manual + form + webhook + slack each start a run ────────────
+  // ── 2. TRIGGERS: manual "Run now" + form + webhook each start a run ─────────
 
   test(
-    "manual trigger (chat) starts a run",
+    'manual "Run now" (POST /workflows/:wfId/run) dispatches the published snapshot',
     async () => {
-      const res = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
+      const res = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/run`, {
         body: { message: "Reply with exactly: manual-hello" },
       });
       expect(res.status).toBe(201);
       const body = (await res.json()) as CreateSessionResponse;
+      // Workflow provenance + the rendered task message ride the rows.
+      expect(body.session.workflowId).toBe(manualWorkflowId);
+      expect(body.run.taskMessage).not.toBeNull();
+      expect(body.run.taskMessage!).toContain("<workflow-task>");
+      expect(body.run.taskMessage!).toContain("Reply with exactly: manual-hello");
       await awaitRunStatus(body.run.id, "succeeded");
       expect((await runMessages(body.run.id)).some((m) => m.includes("manual-hello"))).toBeTrue();
     },
@@ -786,8 +902,10 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       expect(res.status).toBe(202);
       const body = (await res.json()) as TriggerIngressResponse;
       expect(body.accepted).toBeTrue();
-      await awaitRunStatus(body.runId!, "succeeded");
-      expect((await runMessages(body.runId!)).some((m) => m.includes("form-hello"))).toBeTrue();
+      await awaitRunStatus(body.runId, "succeeded");
+      expect((await runMessages(body.runId)).some((m) => m.includes("form-hello"))).toBeTrue();
+      const session = await sessionRow(body.sessionId);
+      expect(session).toMatchObject({ origin: "form", workflowId: formWorkflowId });
     },
     5 * 60_000,
   );
@@ -810,16 +928,18 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       expect(res.status).toBe(202);
       const body = (await res.json()) as TriggerIngressResponse;
       expect(body.accepted).toBeTrue();
-      await awaitRunStatus(body.runId!, "succeeded");
-      expect((await runMessages(body.runId!)).some((m) => m.includes("webhook-hello"))).toBeTrue();
+      await awaitRunStatus(body.runId, "succeeded");
+      expect((await runMessages(body.runId)).some((m) => m.includes("webhook-hello"))).toBeTrue();
+      const session = await sessionRow(body.sessionId);
+      expect(session).toMatchObject({ origin: "webhook", workflowId: webhookWorkflowId });
     },
     5 * 60_000,
   );
 
-  // ── 3. SLACK: mention → threaded reply; thread reply continues the session ──
+  // ── 3. SLACK: mention → CONTROL-PLANE threaded reply; thread continues session ──
 
   test(
-    "slack mention creates a session AND the stub Slack API receives a threaded reply",
+    "slack mention creates a session AND the control plane delivers a threaded reply (delivery_status ledger)",
     async () => {
       const mentionTs = `${Math.floor(Date.now() / 1000)}.000100`;
       const before = slack.posted.length;
@@ -854,7 +974,9 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
         4 * 60_000,
       );
 
-      // …and the compiled agent posts a THREADED reply to the stub Slack API.
+      // …and the CONTROL PLANE posts a THREADED reply to the stub Slack API
+      // off the run's terminal event. (Compiler v3 artifacts have no Slack
+      // code path and never see a bot token — runs/delivery.ts owns this.)
       const reply = await until(
         async () => slack.posted.slice(before).find((m) => m.text.includes("slack-hello")) ?? undefined,
         "threaded chat.postMessage at the stub Slack API",
@@ -863,6 +985,25 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       expect(reply.channel).toBe(SLACK_CHANNEL);
       expect(reply.threadTs).toBe(mentionTs); // threaded under the mention
       expect(reply.authorization).toBe(`Bearer ${SLACK_BOT_TOKEN}`);
+
+      // The delivery LEDGER settles: slack-origin runs are born owing a reply
+      // (pending at dispatch) and flip to `delivered` after the post.
+      const mentionRun = await until(
+        async () => {
+          const rows = await db
+            .select({ id: schema.runs.id, deliveryStatus: schema.runs.deliveryStatus })
+            .from(schema.runs)
+            .where(eq(schema.runs.agentSessionId, slackSession.id));
+          return rows.find((r) => r.deliveryStatus === "delivered") ?? undefined;
+        },
+        "runs.delivery_status → delivered",
+        60_000,
+      );
+      expect(mentionRun.deliveryStatus).toBe("delivered");
+      // The task message (rendered instructions) is provenance on the run.
+      const mentionRunRow = await runRow(mentionRun.id);
+      expect(mentionRunRow!.taskMessage).not.toBeNull();
+      expect(mentionRunRow!.taskMessage!).toContain("<workflow-task>");
 
       // ── follow-up in the SAME thread continues the SAME session ──
       // Wait for the mention's run to fully finish first: a thread reply that
@@ -902,8 +1043,9 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       );
       expect(followReply.threadTs).toBe(mentionTs);
 
-      // Continuity: still exactly ONE slack session for this workflow, now with
-      // TWO runs (same eve session id) — the thread reply reused the session.
+      // Continuity: still exactly ONE slack session for this workflow, now
+      // with TWO runs (same eve session id) — the thread reply rode eve's
+      // native session continuation, no custom channel involved.
       const sessions = await db
         .select({ id: schema.agentSessions.id, eveSessionId: schema.agentSessions.eveSessionId })
         .from(schema.agentSessions)
@@ -916,15 +1058,120 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       expect(sessions).toHaveLength(1);
       expect(sessions[0]!.id).toBe(slackSession.id);
       const runs = await db
-        .select({ id: schema.runs.id })
+        .select({ id: schema.runs.id, deliveryStatus: schema.runs.deliveryStatus })
         .from(schema.runs)
         .where(eq(schema.runs.agentSessionId, slackSession.id));
       expect(runs.length).toBe(2);
+      // Both replies were control-plane-delivered.
+      await until(
+        async () => {
+          const rows = await db
+            .select({ deliveryStatus: schema.runs.deliveryStatus })
+            .from(schema.runs)
+            .where(eq(schema.runs.agentSessionId, slackSession.id));
+          return rows.every((r) => r.deliveryStatus === "delivered") || undefined;
+        },
+        "both slack runs delivered",
+        60_000,
+      );
     },
     10 * 60_000,
   );
 
-  // ── 4. HITL: ask_question parks → POST /runs/:id/input resumes ──────────────
+  // ── 4. SCHEDULE: a due next_fire_at fires through the control-plane ticker ──
+
+  test(
+    "schedule trigger: due next_fire_at → ticker claims + dispatches (origin schedule); cursor advances; disable disarms",
+    async () => {
+      // Created here (not beforeAll) so the live ticker cannot fire it on a
+      // natural minute boundary during earlier proofs.
+      const scheduleWorkflowId = await createWorkflow("P3 Schedule", {
+        trigger: { type: "schedule", cron: "* * * * *" },
+        agentId: agentAlphaId,
+        // Schedules dispatch with an EMPTY ingress message — the instructions
+        // themselves carry the task (mock fixture directive included).
+        instructions: { markdown: "Reply with exactly: schedule-hello" },
+      });
+      try {
+        const beforePublish = Date.now();
+        await publishWorkflow(scheduleWorkflowId);
+
+        // Publish synced the trigger row: cron + an armed next_fire_at cursor
+        // (strictly after the publish instant — never a backfill).
+        const armed = await triggerRowOf(scheduleWorkflowId);
+        expect(armed).toMatchObject({ type: "schedule", cron: "* * * * *", enabled: true });
+        expect(armed!.nextFireAt).not.toBeNull();
+        expect(armed!.nextFireAt!.getTime()).toBeGreaterThan(beforePublish);
+
+        // Make it DUE — the running ticker (SCHEDULE_TICK_MS=500) must claim
+        // it under the advisory lock and dispatch through the ordinary path.
+        const forcedDue = new Date(Date.now() - 1_000);
+        await db
+          .update(schema.triggers)
+          .set({ nextFireAt: forcedDue })
+          .where(eq(schema.triggers.id, armed!.id));
+
+        const session = await until(
+          async () => {
+            const rows = await db
+              .select()
+              .from(schema.agentSessions)
+              .where(eq(schema.agentSessions.workflowId, scheduleWorkflowId));
+            return rows[0] ?? undefined;
+          },
+          "schedule-fired session",
+          60_000,
+        );
+        expect(session.origin).toBe("schedule");
+        expect(session.agentId).toBe(agentAlphaId);
+
+        const run = await until(
+          async () => {
+            const rows = await db
+              .select()
+              .from(schema.runs)
+              .where(eq(schema.runs.agentSessionId, session.id));
+            return rows[0] ?? undefined;
+          },
+          "schedule-fired run",
+          30_000,
+        );
+        await awaitRunStatus(run.id, "succeeded", 4 * 60_000);
+        expect((await runMessages(run.id)).some((m) => m.includes("schedule-hello"))).toBeTrue();
+
+        // The rendered task message carried the instructions; the provenance
+        // envelope carries the fired window.
+        const fired = await runRow(run.id);
+        expect(fired!.taskMessage).not.toBeNull();
+        expect(fired!.taskMessage!).toContain("<workflow-task>");
+        expect(fired!.taskMessage!).toContain("Reply with exactly: schedule-hello");
+        const event = fired!.triggerEvent as { triggerType?: string; data?: { scheduledFor?: unknown } };
+        expect(event.triggerType).toBe("schedule");
+        expect(typeof event.data?.scheduledFor).toBe("string");
+
+        // Cursor advanced BEFORE dispatch (no backfill): strictly after the
+        // forced-due time, into the future relative to the claim.
+        const advanced = await triggerRowOf(scheduleWorkflowId);
+        expect(advanced!.nextFireAt).not.toBeNull();
+        expect(advanced!.nextFireAt!.getTime()).toBeGreaterThan(forcedDue.getTime());
+      } finally {
+        // Disarm: the master switch clears next_fire_at so the live ticker
+        // cannot re-fire this workflow during the remaining proofs.
+        const disabled = await api(
+          "PATCH",
+          `/workspaces/${orgId}/workflows/${scheduleWorkflowId}`,
+          { body: { enabled: false } },
+        );
+        expect(disabled.status).toBe(200);
+      }
+      const disarmed = await triggerRowOf(scheduleWorkflowId);
+      expect(disarmed!.enabled).toBeFalse();
+      expect(disarmed!.nextFireAt).toBeNull();
+    },
+    8 * 60_000,
+  );
+
+  // ── 5. HITL: ask_question parks → POST /runs/:id/input resumes ──────────────
 
   test(
     "an approval-gated tool pauses the run (waiting) → resolve via /runs/:id/input → completes",
@@ -944,26 +1191,22 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
   );
 
   /**
-   * Start a manual chat run that calls eve's built-in `ask_question` tool — the
-   * mock model invokes it directly (top-level framework tool), which surfaces
-   * `input.requested` and parks the run `waiting`. Returns once the run is
-   * parked. Used by HITL and FAILOVER.
+   * Start a chat run (agent Alpha) that calls eve's built-in `ask_question`
+   * tool — the mock model invokes it directly (top-level framework tool),
+   * which surfaces `input.requested` and parks the run `waiting`. Returns
+   * once the run is parked. Used by HITL and FAILOVER.
    */
   async function parkApprovalRun(marker: string): Promise<{ sessionId: string; runId: string }> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
-      body: {
-        message:
-          `Use the ask_question tool to ask me to approve step ${marker}. ` +
-          `Offer one option with id: "approve", label: "Approve".`,
-      },
-    });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as CreateSessionResponse;
+    const body = await chat(
+      agentAlphaId,
+      `Use the ask_question tool to ask me to approve step ${marker}. ` +
+        `Offer one option with id: "approve", label: "Approve".`,
+    );
     await awaitRunStatus(body.run.id, "waiting", 4 * 60_000);
     return { sessionId: body.session.id, runId: body.run.id };
   }
 
-  // ── 5. FAILOVER: park on A → SIGKILL A → resume on B → finish ───────────────
+  // ── 6. FAILOVER: park on A → SIGKILL A → resume on B → finish ───────────────
 
   test(
     "parked run survives SIGKILL of its worker and resumes on another worker",
@@ -1019,18 +1262,14 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
     12 * 60_000,
   );
 
-  // ── 6. DRAIN: SIGTERM a worker mid-idle → reroute + clean exit 0 ────────────
+  // ── 7. DRAIN: SIGTERM a worker mid-idle → reroute + clean exit 0 ────────────
 
   test(
     "SIGTERM drains a worker cleanly (exit 0); new sessions route to the survivor",
     async () => {
       expect(workers.length).toBeGreaterThanOrEqual(2);
       // Load an agent on the worker we will drain (idle, but warm).
-      const warm = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
-        body: { message: "Reply with exactly: drain-warmup" },
-      });
-      expect(warm.status).toBe(201);
-      const warmBody = (await warm.json()) as CreateSessionResponse;
+      const warmBody = await chat(agentAlphaId, "Reply with exactly: drain-warmup");
       const drainWorkerId = await until(
         async () => (await sessionAffinity(warmBody.session.id)) ?? undefined,
         "warmup session affinity",
@@ -1054,11 +1293,7 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + HITL", (
       );
 
       // New sessions route to the surviving worker.
-      const after = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/sessions`, {
-        body: { message: "Reply with exactly: drain-reroute" },
-      });
-      expect(after.status).toBe(201);
-      const afterBody = (await after.json()) as CreateSessionResponse;
+      const afterBody = await chat(agentAlphaId, "Reply with exactly: drain-reroute");
       const rerouted = await until(
         async () => (await sessionAffinity(afterBody.session.id)) ?? undefined,
         "rerouted session affinity",

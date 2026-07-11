@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "playwright test",
-    "test:acceptance": "playwright test workflow-form",
+    "test:acceptance": "playwright test agent-workflow",
     "report": "playwright show-report",
     "install:browser": "playwright install chromium",
     "typecheck": "tsc --noEmit"

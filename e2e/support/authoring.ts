@@ -10,7 +10,7 @@ import { STUB_MCP_URL } from "../config.ts";
 /** Click a primary-dock section by its accessible name. */
 export async function gotoSection(
   page: Page,
-  name: "Chat" | "Workflows" | "Context" | "Settings",
+  name: "Chat" | "Agents" | "Workflows" | "Context" | "Settings",
 ): Promise<void> {
   await page
     .getByRole("navigation", { name: "Primary" })

@@ -1,5 +1,6 @@
 import {
   cloneElement,
+  useCallback,
   useEffect,
   useId,
   useRef,
@@ -10,6 +11,12 @@ import {
 
 import { cn } from "../../lib/cn";
 
+/** Imperative controls handed to function children. */
+export interface PopoverControls {
+  /** Close the popover and return focus to the trigger (like Escape). */
+  close: () => void;
+}
+
 export interface PopoverProps {
   /** The trigger — must forward props (a Button works). */
   trigger: ReactElement<{
@@ -17,7 +24,11 @@ export interface PopoverProps {
     "aria-expanded"?: boolean;
     "aria-haspopup"?: boolean | "dialog";
   }>;
-  children: ReactNode;
+  /**
+   * Content, or a render function receiving `{ close }` so pick-style
+   * popovers can dismiss themselves after a selection.
+   */
+  children: ReactNode | ((controls: PopoverControls) => ReactNode);
   /** Accessible name for the popover surface. */
   label: string;
   align?: "start" | "end";
@@ -40,6 +51,11 @@ export function Popover({
   const id = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLElement | null>(null);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -89,7 +105,7 @@ export function Popover({
             className,
           )}
         >
-          {children}
+          {typeof children === "function" ? children({ close }) : children}
         </div>
       ) : null}
     </div>

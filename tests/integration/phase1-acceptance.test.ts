@@ -1,19 +1,35 @@
 /**
- * PHASE-1 ACCEPTANCE (docs/PLAN.md Phase 1 §Acceptance) — the full spine,
- * nothing faked between the REST API and a REAL compiled eve agent:
+ * PHASE-1 ACCEPTANCE (docs/PLAN.md Phase 1 §Acceptance, re-keyed for the
+ * agents-first redesign) — the full compiler→build→run spine, nothing faked
+ * between the REST API and a REAL compiled eve agent. The AGENT is the
+ * compile unit; workflows compile nothing.
  *
- *   REST-create workflow (manual trigger, 1 MCP connection → local stub MCP
- *   server, 1 authored skill, balanced preset)
+ * The agent spine:
+ *   REST-create an Agent (persona + 1 MCP connection → local stub MCP server,
+ *   1 authored skill, balanced preset)
  *   → publish → REAL @invisible-string/compiler compile → mise-node24
  *     npm install → `eve build` → tar.gz → Garage
- *   → create session with a message (eve's mock-model harness — the spike's
- *     EVE_MOCK_AUTHORED_MODELS pattern; "Reply with exactly: X" fixtures)
+ *   → create a chat session against the agent (eve's mock-model harness —
+ *     the spike's EVE_MOCK_AUTHORED_MODELS pattern; "Reply with exactly: X"
+ *     fixtures); the session pins the published agent version
  *   → real eve NDJSON events (session/turn/step/message.*) land in
  *     run_events and stream over SSE (incl. a Last-Event-ID resume)
  *   → follow-up message continues the SAME eve session (event continuity:
  *     same eve session id, no second session.started)
- *   → republish with changed instructions → NEW session uses the new
+ *   → republish with a changed persona → a NEW chat session pins the new
  *     version hash, the OLD session stays pinned to the old one.
+ *
+ * The workflow leg (delegation, NO build):
+ *   create a workflow (webhook trigger → that agent + instructions carrying
+ *   `@trigger.<path>` and an `@connection` ref) → publish returns `{workflow}`
+ *   instantly (no contentHash, zero new `builds` rows) → POST /t/:token →
+ *   the run's persisted task message carries the `<workflow-task>` wrapper
+ *   with the trigger value RESOLVED and the connection ref rewritten to a
+ *   prose literal → events flow over the normal run SSE surface.
+ *
+ * Plus the onboarding kick: creating the workspace auto-publishes the seeded
+ * "General Purpose" agent in the background (design §5.8) — asserted (and
+ * awaited, so the suite never exits with an eve build still in flight).
  *
  * Gated on TEST_DATABASE_URL (+ mise + docker). Infra: the docker-compose
  * postgres/garage/dex services — brought up on demand when unreachable:
@@ -30,24 +46,28 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { eq } from "drizzle-orm";
+import { count, eq } from "drizzle-orm";
 import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   encryptSecret,
   parseMasterKey,
   generateMasterKeyBase64,
+  type AgentDefinitionInput,
   type CreateSessionResponse,
+  type CreateWebhookTokenResponse,
   type GetSessionResponse,
   type PostMessageResponse,
+  type PublishAgentResponse,
   type PublishWorkflowResponse,
   type RunEventFrame,
   type RunStatusFrame,
-  type WorkflowDefinitionInput,
+  type TriggerIngressResponse,
+  type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
@@ -65,7 +85,7 @@ const WORKER_SHARED_SECRET = "p1a-worker-shared-secret-00000000";
 /** Canonical agent root — MUST be identical for build service and worker. */
 const AGENT_ROOT =
   process.env.PHASE1_AGENT_ROOT ?? "/tmp/invisible-string-p1-agents";
-/** Warm npm cache (spike + CI actions/cache both land here by default). */
+/** Warm npm cache (spike + CI cache volume both land here by default). */
 const NPM_CACHE_DIR = process.env.NPM_CACHE_DIR ?? join(homedir(), ".npm");
 
 const GATE_PROBLEMS: string[] = [];
@@ -316,7 +336,7 @@ async function until<T>(
 
 // ── the suite ───────────────────────────────────────────────────────────────
 
-describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", () => {
+describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (agents-first)", () => {
   const mcp = GATE ? startStubMcp() : null!;
   let stack: AppStack;
   let db: AppStack["dbHandle"]["db"];
@@ -326,16 +346,20 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
 
   let cookie: string;
   let orgId: string;
-  let workflowId: string;
-  let agentPresetId: string;
-  let definition: WorkflowDefinitionInput;
+  let agentId: string;
+  let connectionId: string;
+  let skillId: string;
+  let definition: AgentDefinitionInput;
 
   let hashV1: string;
   let versionIdV1: string;
+  let versionIdV2: string;
   let sessionId: string;
   let eveSessionIdV1: string;
   let firstRunId: string;
   let firstRunSeqs: number[] = [];
+
+  let workflowId: string;
 
   async function api(
     method: string,
@@ -353,10 +377,10 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
     });
   }
 
-  async function publish(): Promise<PublishWorkflowResponse> {
-    const res = await api("POST", `/workspaces/${orgId}/workflows/${workflowId}/publish`);
+  async function publishAgent(): Promise<PublishAgentResponse> {
+    const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`);
     expect(res.status).toBe(200);
-    return (await res.json()) as PublishWorkflowResponse;
+    return (await res.json()) as PublishAgentResponse;
   }
 
   /** Wait for the (real) build, then delete the build dir so the worker MUST
@@ -377,6 +401,28 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
     );
     expect(record.artifactKey).toBe(`artifacts/${contentHash}.tar.gz`);
     rmSync(join(AGENT_ROOT, contentHash), { recursive: true, force: true });
+  }
+
+  async function awaitRunSucceeded(runId: string, what: string): Promise<void> {
+    await until(
+      async () => {
+        const rows = await db
+          .select({ status: schema.runs.status, error: schema.runs.error })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, runId));
+        if (rows[0]?.status === "failed") {
+          throw new Error(`${what} failed: ${rows[0].error ?? "(no error)"}`);
+        }
+        return rows[0]?.status === "succeeded" || undefined;
+      },
+      `${what} to succeed`,
+      120_000,
+    );
+  }
+
+  async function buildsRowCount(): Promise<number> {
+    const rows = await db.select({ value: count() }).from(schema.builds);
+    return rows[0]?.value ?? 0;
   }
 
   beforeAll(async () => {
@@ -458,6 +504,9 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
     );
 
     // ── workspace: user + org + seeds + context rows ───────────────────────
+    // NOTE: creating the organization also fires the onboarding kick — a
+    // background publish (+ real eve build) of the seeded "General Purpose"
+    // agent. The last test asserts and awaits it.
     const email = `p1a-${randomUUID()}@example.com`;
     const signUp = await fetch(`${baseUrl}/api/auth/sign-up/email`, {
       method: "POST",
@@ -479,13 +528,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       body: { organizationId: orgId },
       headers: authHeaders,
     });
-    await seedWorkspace(db, orgId);
-
-    const agents = await db
-      .select({ id: schema.agents.id, name: schema.agents.name })
-      .from(schema.agents)
-      .where(eq(schema.agents.organizationId, orgId));
-    agentPresetId = agents[0]!.id;
+    await seedWorkspace(db, orgId); // idempotent (afterCreateOrganization already ran)
 
     // 1 MCP connection → the local stub server, bearer-token auth.
     const conn = await db
@@ -498,7 +541,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
         url: mcp.url,
       })
       .returning({ id: schema.mcpConnections.id });
-    const connectionId = conn[0]!.id;
+    connectionId = conn[0]!.id;
     const envelope = encryptSecret(
       JSON.stringify({ token: "stub-notes-token" }),
       parseMasterKey(MASTER_KEY_B64),
@@ -520,15 +563,16 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
         content: "# Summary style\n\nAlways answer in at most two sentences.",
       })
       .returning({ id: schema.skills.id });
+    skillId = skill[0]!.id;
 
+    // Persona `@references` validate against the agent's OWN context at
+    // compile time (connection "notes" → @notes; skill "Summary Style" →
+    // @skill.summary-style).
     definition = {
-      trigger: { type: "manual" },
-      context: { mcpConnectionIds: [connectionId], skillIds: [skill[0]!.id] },
-      agent: { agentPresetId, modelPreset: "balanced" },
-      instructions: {
-        markdown:
-          "Answer questions directly. Use @notes to store anything the user asks you to remember, and follow @skill.summary-style when summarizing.",
-      },
+      persona:
+        "Answer questions directly. Use @notes to store anything the user asks you to remember, and follow @skill.summary-style when summarizing.",
+      model: { preset: "balanced" },
+      context: { mcpConnectionIds: [connectionId], skillIds: [skillId] },
     };
   }, 120_000);
 
@@ -548,20 +592,25 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
     mcp?.stop();
   }, 90_000);
 
-  test("REST-create workflow (manual trigger, 1 MCP, 1 skill, balanced preset)", async () => {
-    const res = await api("POST", `/workspaces/${orgId}/workflows`, {
-      body: { name: "P1 Acceptance Workflow", draft: definition },
+  test("REST-create agent (persona, 1 MCP connection, 1 skill, balanced preset)", async () => {
+    const res = await api("POST", `/workspaces/${orgId}/agents`, {
+      body: {
+        name: "P1 Acceptance Agent",
+        description: "The phase-1 spine agent.",
+        draft: definition,
+      },
     });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { workflow: { id: string; name: string } };
-    workflowId = body.workflow.id;
-    expect(body.workflow.name).toBe("P1 Acceptance Workflow");
+    const body = (await res.json()) as { agent: { id: string; name: string } };
+    agentId = body.agent.id;
+    expect(body.agent.name).toBe("P1 Acceptance Agent");
   });
 
   test(
     "publish → REAL compile + npm install + eve build → tarball in Garage",
     async () => {
-      const body = await publish();
+      const body = await publishAgent();
+      expect(body.agentId).toBe(agentId);
       expect(body.contentHash).toHaveLength(64);
       hashV1 = body.contentHash;
       versionIdV1 = body.versionId;
@@ -579,23 +628,31 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
 
       const versions = await db
         .select()
-        .from(schema.workflowVersions)
-        .where(eq(schema.workflowVersions.id, versionIdV1));
+        .from(schema.agentVersions)
+        .where(eq(schema.agentVersions.id, versionIdV1));
       expect(versions[0]).toMatchObject({
+        agentId,
         contentHash: hashV1,
         modelProvider: "openrouter",
         buildStatus: "succeeded",
       });
+
+      // The agent row now points at the published version.
+      const agents = await db
+        .select({ publishedVersionId: schema.agents.publishedVersionId })
+        .from(schema.agents)
+        .where(eq(schema.agents.id, agentId));
+      expect(agents[0]!.publishedVersionId).toBe(versionIdV1);
     },
     15 * 60_000,
   );
 
   test(
-    "create session → real agent boots from the Garage tarball → real eve NDJSON events land in run_events",
+    "create chat session → real agent boots from the Garage tarball → real eve NDJSON events land in run_events",
     async () => {
       const res = await api(
         "POST",
-        `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+        `/workspaces/${orgId}/agents/${agentId}/sessions`,
         { body: { message: "Reply with exactly: acceptance-alpha" } },
       );
       expect(res.status).toBe(201);
@@ -604,22 +661,14 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       firstRunId = body.run.id;
       eveSessionIdV1 = body.session.eveSessionId!;
       expect(eveSessionIdV1).toBeTruthy();
-      expect(body.session.workflowVersionId).toBe(versionIdV1);
+      // Chat pins the published agent version; no workflow is involved.
+      expect(body.session.agentId).toBe(agentId);
+      expect(body.session.agentVersionId).toBe(versionIdV1);
+      expect(body.session.workflowId).toBeNull();
+      // Chat messages go through verbatim — no rendered task message.
+      expect(body.run.taskMessage).toBeNull();
 
-      await until(
-        async () => {
-          const rows = await db
-            .select({ status: schema.runs.status, error: schema.runs.error })
-            .from(schema.runs)
-            .where(eq(schema.runs.id, firstRunId));
-          if (rows[0]?.status === "failed") {
-            throw new Error(`run failed: ${rows[0].error ?? "(no error)"}`);
-          }
-          return rows[0]?.status === "succeeded" || undefined;
-        },
-        "first run to succeed",
-        120_000,
-      );
+      await awaitRunSucceeded(firstRunId, "first run");
 
       const events = await db
         .select({ seq: schema.runEvents.seq, event: schema.runEvents.event })
@@ -681,20 +730,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       const body = (await res.json()) as PostMessageResponse;
       expect(body.run.id).not.toBe(firstRunId);
 
-      await until(
-        async () => {
-          const rows = await db
-            .select({ status: schema.runs.status, error: schema.runs.error })
-            .from(schema.runs)
-            .where(eq(schema.runs.id, body.run.id));
-          if (rows[0]?.status === "failed") {
-            throw new Error(`follow-up run failed: ${rows[0].error ?? "(no error)"}`);
-          }
-          return rows[0]?.status === "succeeded" || undefined;
-        },
-        "follow-up run to succeed",
-        120_000,
-      );
+      await awaitRunSucceeded(body.run.id, "follow-up run");
 
       // Same eve session id on the row…
       const sessions = await db
@@ -722,52 +758,38 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
   );
 
   test(
-    "republish with changed instructions → new session uses the new version, old session keeps the old",
+    "republish with a changed persona → new chat session pins the new version, old session keeps the old",
     async () => {
-      const changed = {
+      const changed: AgentDefinitionInput = {
         ...definition,
-        instructions: {
-          markdown:
-            "You are the v2 agent. Answer tersely. Use @notes for storage and @skill.summary-style for summaries.",
-        },
+        persona:
+          "You are the v2 agent. Answer tersely. Use @notes for storage and @skill.summary-style for summaries.",
       };
-      await db
-        .update(schema.workflows)
-        .set({ draft: changed as unknown as Record<string, unknown> })
-        .where(eq(schema.workflows.id, workflowId));
+      const patched = await api("PATCH", `/workspaces/${orgId}/agents/${agentId}`, {
+        body: { draft: changed },
+      });
+      expect(patched.status).toBe(200);
 
-      const body = await publish();
+      const body = await publishAgent();
       expect(body.contentHash).not.toBe(hashV1);
       expect(body.versionId).not.toBe(versionIdV1);
       const hashV2 = body.contentHash;
+      versionIdV2 = body.versionId;
 
       await awaitBuildAndStripDir(hashV2);
 
-      // New session → new version hash.
+      // New chat session → pins the NEW version hash.
       const created = await api(
         "POST",
-        `/workspaces/${orgId}/workflows/${workflowId}/sessions`,
+        `/workspaces/${orgId}/agents/${agentId}/sessions`,
         { body: { message: "Reply with exactly: acceptance-v2" } },
       );
       expect(created.status).toBe(201);
       const v2 = (await created.json()) as CreateSessionResponse;
-      expect(v2.session.workflowVersionId).toBe(body.versionId);
+      expect(v2.session.agentVersionId).toBe(versionIdV2);
       expect(v2.session.eveSessionId).not.toBe(eveSessionIdV1);
 
-      await until(
-        async () => {
-          const rows = await db
-            .select({ status: schema.runs.status, error: schema.runs.error })
-            .from(schema.runs)
-            .where(eq(schema.runs.id, v2.run.id));
-          if (rows[0]?.status === "failed") {
-            throw new Error(`v2 run failed: ${rows[0].error ?? "(no error)"}`);
-          }
-          return rows[0]?.status === "succeeded" || undefined;
-        },
-        "v2 run to succeed",
-        120_000,
-      );
+      await awaitRunSucceeded(v2.run.id, "v2 run");
 
       // Old session stays pinned to the old version AND still works.
       const followUp = await api("POST", `/sessions/${sessionId}/messages`, {
@@ -775,25 +797,186 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine", ()
       });
       expect(followUp.status).toBe(201);
       const oldRun = (await followUp.json()) as PostMessageResponse;
-      await until(
-        async () => {
-          const rows = await db
-            .select({ status: schema.runs.status, error: schema.runs.error })
-            .from(schema.runs)
-            .where(eq(schema.runs.id, oldRun.run.id));
-          if (rows[0]?.status === "failed") {
-            throw new Error(`old-session run failed: ${rows[0].error ?? "(no error)"}`);
-          }
-          return rows[0]?.status === "succeeded" || undefined;
-        },
-        "old-session follow-up to succeed",
-        120_000,
-      );
+      await awaitRunSucceeded(oldRun.run.id, "old-session follow-up");
       const detail = await api("GET", `/sessions/${sessionId}`);
       const detailBody = (await detail.json()) as GetSessionResponse;
-      expect(detailBody.session.workflowVersionId).toBe(versionIdV1);
+      expect(detailBody.session.agentVersionId).toBe(versionIdV1);
       expect(detailBody.session.eveSessionId).toBe(eveSessionIdV1);
     },
     20 * 60_000,
+  );
+
+  // ── the workflow leg: delegation with NO build ─────────────────────────────
+
+  test("create workflow (webhook trigger → agent + @referenced instructions) → publish instantly with NO build", async () => {
+    const draft: WorkflowConfigInput = {
+      trigger: { type: "webhook" },
+      agentId,
+      instructions: {
+        markdown:
+          "Handle the incoming event for the customer at @trigger.customer.email. " +
+          "Use @notes to store anything important, then do exactly what the trigger context asks.",
+      },
+    };
+    const created = await api("POST", `/workspaces/${orgId}/workflows`, {
+      body: { name: "P1 Webhook Delegation", draft },
+    });
+    expect(created.status).toBe(201);
+    const createdBody = (await created.json()) as { workflow: { id: string } };
+    workflowId = createdBody.workflow.id;
+
+    const buildsBefore = await buildsRowCount();
+    const versionsBefore = await db.select({ value: count() }).from(schema.agentVersions);
+
+    const published = await api(
+      "POST",
+      `/workspaces/${orgId}/workflows/${workflowId}/publish`,
+    );
+    expect(published.status).toBe(200);
+    const body = (await published.json()) as PublishWorkflowResponse;
+    // The response is the row — no contentHash/versionId/build fields exist.
+    expect(body.workflow.id).toBe(workflowId);
+    expect(body.workflow.published).not.toBeNull();
+    expect(body.workflow.publishedAt).not.toBeNull();
+    expect("contentHash" in body).toBeFalse();
+    expect("versionId" in body).toBeFalse();
+
+    // Zero new builds AND zero new agent versions — workflows compile nothing.
+    expect(await buildsRowCount()).toBe(buildsBefore);
+    const versionsAfter = await db.select({ value: count() }).from(schema.agentVersions);
+    expect(versionsAfter[0]!.value).toBe(versionsBefore[0]!.value);
+
+    // The snapshot is denormalized for the delete guard.
+    const rows = await db
+      .select({ publishedAgentId: schema.workflows.publishedAgentId })
+      .from(schema.workflows)
+      .where(eq(schema.workflows.id, workflowId));
+    expect(rows[0]!.publishedAgentId).toBe(agentId);
+  });
+
+  test(
+    "POST /t/:token → dispatch renders the task message (resolved @trigger value, <workflow-task> wrapper) → events flow to SSE",
+    async () => {
+      const mint = await api(
+        "POST",
+        `/workspaces/${orgId}/workflows/${workflowId}/triggers/webhook-token`,
+      );
+      expect(mint.status).toBe(201);
+      const { token } = (await mint.json()) as CreateWebhookTokenResponse;
+
+      const res = await fetch(`${baseUrl}/t/${token}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message: "Reply with exactly: acceptance-webhook",
+          customer: { email: "ada@example.com" },
+        }),
+      });
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as TriggerIngressResponse;
+      expect(body.accepted).toBeTrue();
+
+      await awaitRunSucceeded(body.runId, "webhook-dispatched run");
+
+      // The persisted task message IS what the agent received: instructions
+      // with @trigger.customer.email RESOLVED and @notes rewritten to a prose
+      // literal, wrapped in <workflow-task>, with the ingress message riding
+      // in <trigger-context>. The TriggerEvent envelope never crossed the wire.
+      const runs = await db
+        .select({ taskMessage: schema.runs.taskMessage, triggerEvent: schema.runs.triggerEvent })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, body.runId));
+      const taskMessage = runs[0]!.taskMessage;
+      expect(taskMessage).not.toBeNull();
+      expect(taskMessage!).toContain("<workflow-task>");
+      expect(taskMessage!).toContain("</workflow-task>");
+      expect(taskMessage!).toContain("ada@example.com"); // resolved @trigger value
+      expect(taskMessage!).not.toContain("@trigger.customer.email"); // ref rewritten
+      expect(taskMessage!).toContain('the "notes" connection'); // @connection → prose
+      expect(taskMessage!).toContain("<trigger-context>");
+      expect(taskMessage!).toContain("Reply with exactly: acceptance-webhook");
+      // Provenance envelope on the run (storage-only).
+      expect((runs[0]!.triggerEvent as { workflowId?: string }).workflowId).toBe(workflowId);
+
+      // The session carries workflow provenance + pins the agent's CURRENT
+      // published version (floating binding resolved at dispatch).
+      const sessions = await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, body.sessionId));
+      expect(sessions[0]).toMatchObject({
+        agentId,
+        agentVersionId: versionIdV2,
+        workflowId,
+        origin: "webhook",
+      });
+
+      // The mock reply proves a full model turn ran against the task message…
+      const events = await db
+        .select({ event: schema.runEvents.event })
+        .from(schema.runEvents)
+        .where(eq(schema.runEvents.runId, body.runId));
+      const completed = events
+        .map((e) => e.event as { type: string; data?: { message?: string | null } })
+        .filter((e) => e.type === "message.completed")
+        .map((e) => e.data?.message ?? "");
+      expect(completed.some((m) => m.includes("acceptance-webhook"))).toBeTrue();
+
+      // …and the run streams over the SAME resumable SSE surface as chat.
+      const frames = await readSse(await api("GET", `/runs/${body.runId}/stream`), {
+        until: (frame) => frame.event === "run_status",
+      });
+      const streamedTypes = frames
+        .filter((f) => f.event === "run_event")
+        .map((f) => (f.data as RunEventFrame).event.type);
+      expect(streamedTypes).toContain("turn.started");
+      expect(streamedTypes).toContain("message.completed");
+      expect((frames.at(-1)!.data as RunStatusFrame).status).toBe("succeeded");
+    },
+    5 * 60_000,
+  );
+
+  test(
+    "onboarding kick auto-published the seeded General Purpose agent (background build finishes)",
+    async () => {
+      // The kick fired at workspace creation (fire-and-forget). The version
+      // row appears as soon as the in-process compile lands…
+      const seedVersionId = await until(
+        async () => {
+          const seeded = await db
+            .select({ publishedVersionId: schema.agents.publishedVersionId })
+            .from(schema.agents)
+            .where(eq(schema.agents.name, "General Purpose"));
+          return (
+            seeded.find((row) => row.publishedVersionId !== null)?.publishedVersionId ??
+            undefined
+          );
+        },
+        'the seeded "General Purpose" agent to auto-publish',
+        60_000,
+      );
+
+      // …and its REAL eve build completes (also keeps the suite from exiting
+      // with a build subprocess still in flight).
+      const versions = await db
+        .select({ contentHash: schema.agentVersions.contentHash })
+        .from(schema.agentVersions)
+        .where(eq(schema.agentVersions.id, seedVersionId));
+      const seedHash = versions[0]!.contentHash;
+      await stack.runtime!.buildService.waitFor(seedHash);
+      await until(
+        async () => {
+          const row = await stack.runtime!.buildStore.get(seedHash);
+          if (row?.status === "failed") {
+            throw new Error(`seed-agent build failed:\n${row.errorLog ?? "(no log)"}`);
+          }
+          return row?.status === "succeeded" || undefined;
+        },
+        "seed-agent build to succeed",
+        15 * 60_000,
+        1_000,
+      );
+    },
+    16 * 60_000,
   );
 });

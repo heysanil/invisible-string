@@ -2,11 +2,12 @@
 
 # 🪢 invisible-string
 
-**A multi-tenant cloud platform for agent workflows — assemble, compile, run.**
+**A multi-tenant cloud platform for AI agents — hire, equip, delegate.**
 
-Describe a workflow in four pillars, and it compiles into a self-hosted
-[eve](https://eve.dev) agent running on a durable, Postgres-backed worker pool —
-fired from chat, webhooks, forms, or Slack.
+Hire an Agent — a persona, a model, and the tools it can use — and it compiles
+into a self-hosted [eve](https://eve.dev) agent on a durable, Postgres-backed
+worker pool. Chat with it directly, or delegate standing work with workflows
+fired from webhooks, forms, Slack, or a schedule.
 
 [![CI](https://github.com/heysanil/invisible-string/actions/workflows/ci.yml/badge.svg)](https://github.com/heysanil/invisible-string/actions/workflows/ci.yml)
 ![Runtime: Bun 1.3+](https://img.shields.io/badge/runtime-Bun%201.3%2B-14151a?logo=bun&logoColor=white)
@@ -14,7 +15,7 @@ fired from chat, webhooks, forms, or Slack.
 ![eve 0.19.0](https://img.shields.io/badge/eve-0.19.0-6e56cf)
 ![Agents on Node 24](https://img.shields.io/badge/agents-Node%2024-5fa04e?logo=node.js&logoColor=white)
 
-[Quickstart](#quickstart) · [How it works](#how-it-works) · [Product tour](#product-tour) · [Copilot](#copilot-the-builder-assistant) · [Development](#development) · [Docs](#documentation)
+[Quickstart](#quickstart) · [How it works](#how-it-works) · [Product tour](#product-tour) · [Copilot](#copilot-the-editor-assistant) · [Development](#development) · [Docs](#documentation)
 
 </div>
 
@@ -23,23 +24,38 @@ fired from chat, webhooks, forms, or Slack.
 ## What is this?
 
 **invisible-string** is "Claude Code / Cowork in the cloud": a chat-centric web
-app where users assemble **workflows** from four pillars —
+app where you hire **Agents** — like employees — and put them to work.
+
+**An Agent is someone you hire:**
 
 <div align="center">
 
-| ⚡ TRIGGER | 📚 CONTEXT | 🤖 AGENT | 📝 INSTRUCTIONS |
-|:---:|:---:|:---:|:---:|
-| chat, webhook, form, or Slack event that fires the run | MCP connections & skills the agent can reach | model preset + agent preset | the prompt, with `@`-references into context |
+| 🎭 PERSONA | 🧠 MODEL | 📚 CONTEXT |
+|:---:|:---:|:---:|
+| who it is and how it works | powerful / balanced / quick, within the workspace allowlist | the MCP connections & skills it's equipped with |
 
 </div>
 
-— and every published workflow **compiles to a real, self-hosted
-[eve](https://eve.dev) agent** (`packages/compiler` → `eve build` → tarball in
-object storage). Compiled agents run on a stateless worker pool with
-Postgres-backed durability (`@workflow/world-postgres`), so runs survive worker
-death and stream back to the browser over resumable SSE. Multi-tenancy rides on
-Better Auth organizations (email/password + OIDC SSO), and an AI copilot lives
-inside the builder.
+You **chat with Agents directly**. For standing work, delegate with a
+**Workflow**:
+
+<div align="center">
+
+| ⚡ TRIGGER | → 🤖 AGENT → | 📝 INSTRUCTIONS |
+|:---:|:---:|:---:|
+| webhook, form, Slack event, or schedule | which Agent handles it | what to do when it fires, with `@trigger` references |
+
+</div>
+
+Every **published Agent** compiles to a real, self-hosted
+[eve](https://eve.dev) agent (`packages/compiler` → `eve build` → tarball in
+object storage). A workflow builds nothing of its own — when it fires, the
+platform renders the trigger event *and its instructions* into the task
+message for the bound agent version. Compiled agents run on a stateless worker
+pool with Postgres-backed durability (`@workflow/world-postgres`), so runs
+survive worker death and stream back to the browser over resumable SSE.
+Multi-tenancy rides on Better Auth organizations (email/password + OIDC SSO),
+and an AI copilot lives inside both editors.
 
 ## How it works
 
@@ -153,70 +169,91 @@ The spike's keyed tests (real model calls) additionally require
 
 The SPA (`apps/web`, Vite + React + TanStack Router) is the whole product
 surface, built on the **E1 design system** — monochrome ink × liquid glass,
-color only as meaning (`packages/design-tokens/tokens.css` + `src/components/ui`). Four
-sections:
+color only as meaning (`packages/design-tokens/tokens.css` + `src/components/ui`). Five
+sections, in sidebar order:
 
 **Onboarding:** a fresh account lands on a first-run screen to name its
-workspace (creation seeds model presets, allowlist, and agent presets via the
-org-creation hook). Teammates join through invite links from Settings →
-Members (`/accept-invitation/:id`) — signed-out recipients round-trip through
+workspace (creation seeds model presets, the model allowlist, and three
+starter Agents via the org-creation hook — and auto-publishes "General
+Purpose" in the background, so first chat needs no manual publish step).
+Teammates join through invite links from Settings → Members
+(`/accept-invitation/:id`) — signed-out recipients round-trip through
 login/signup and land back on the invitation.
 
 ![First-run onboarding](docs/screenshots/onboarding.png)
 
 ### 💬 Chat — `/chat`
-Start a session with a published workflow and watch its runs stream live:
-working blocks, streamed reply, inline human-in-the-loop approvals. Resumable
-SSE per run with `Last-Event-ID`; one active run per session (`session_busy`
-handled inline). "Edit workflow ↗" deep-links into the builder.
+Pick a published Agent in the "New chat" picker and talk to it: working
+blocks, streamed reply, inline human-in-the-loop approvals. Resumable SSE per
+run with `Last-Event-ID`; one active run per session (`session_busy` handled
+inline). Workflow-fired runs land here too, wearing origin +
+workflow-provenance chips; "Edit agent ↗" deep-links into the agent editor.
 
 ![Chat surface](docs/screenshots/chat.png)
 
-### 🛠 Workflows — `/workflows`, `/workflows/:id`
-The hybrid builder: a pillar rail (TRIGGER · CONTEXT · AGENT · INSTRUCTIONS)
-with focused editors, `@`-reference autocomplete in the instructions
-(CodeMirror 6), debounced autosave → dry-run compile with diagnostics routed
-onto the pillar cards, and Publish / Run-draft (Run draft publishes then opens
-a new chat via `/chat?workflow=<id>`).
+### 🤖 Agents — `/agents`, `/agents/:id`
+Where you hire. A card grid of your Agents links into the agent editor — the
+flagship surface: the persona document in a markdown editor, the Model
+section (Powerful / Balanced / Quick preset, or a specific allowlisted model
+plus reasoning effort), Context (equip MCP connections & skills, each with an
+approval policy), and Access (which member's credentials it runs as) — with a
+left rail of live section cards and lifecycle chips. **Publish** compiles the
+Agent (the real `eve build` — Agents are the compile unit), and "Chat with
+agent" drops you straight into `/chat`.
 
-![Workflow builder](docs/screenshots/builder.png)
+![Agent editor](docs/screenshots/agents.png)
+
+### ⚡ Workflows — `/workflows`, `/workflows/:id`
+Standing delegations: **trigger → Agent → instructions**. One focused column
+with three sections — Trigger ("When this runs": webhook, form, Slack, or
+schedule), Agent ("Who does the work": a published Agent), Instructions
+("What they should do": CodeMirror with `@trigger.*` and the bound Agent's
+`@skill.*` autocomplete). Publishing is **instant** — validate + snapshot, no
+build (blocking diagnostics answer 422 and route onto the section cards) —
+and the header's Run popover fires the published snapshot through the real
+trigger-dispatch path.
+
+![Workflow editor](docs/screenshots/workflow.png)
 
 ### 🔌 Context — `/context`
-MCP connections (workspace + personal), the MCP registry browser + install
-(write-once encrypted secrets), and skills authoring with drag-drop
-attachments — packaged straight into the compiled agent.
+The library your Agents draw from: MCP connections (workspace + personal),
+the MCP registry browser + install (write-once encrypted secrets), and skills
+authoring with drag-drop attachments — equipped onto Agents in the agent
+editor and packaged straight into the compiled agent.
 
 ![Context section](docs/screenshots/context.png)
 
 ### ⚙️ Settings — `/settings`
-Model presets, provider/model allowlist, agent presets, members (Better Auth
-organization roles), workspace rename, and **Integrations** (connect the
-platform Slack app, per-team bot tokens — app setup: [`docs/SLACK.md`](docs/SLACK.md)).
+Model presets, provider/model allowlist, members (Better Auth organization
+roles), workspace rename, and **Integrations** (connect the platform Slack
+app, per-team bot tokens — app setup: [`docs/SLACK.md`](docs/SLACK.md)).
 
 ![Settings — model presets](docs/screenshots/settings.png)
 
 All screenshots are captured from the real product by a gated Playwright spec
 — regenerate them with one command (see [`docs/screenshots/`](docs/screenshots/)).
 
-## Copilot (the builder assistant)
+## Copilot (the editor assistant)
 
-The builder's docked right rail is an AI copilot: it reads the current draft
-definition plus the workspace inventory (MCP connections, skills, agent
-presets, model presets, allowlist) and proposes edits as **typed mutations** —
-`setTrigger`, `addContext`, `removeContext`, `setAgent`, `setModelPreset`,
-`setInstructions` — streamed over `WS /workspaces/:workspaceId/copilot`
-(shared frame protocol in `packages/shared/src/copilot.ts`).
+Both editors dock the same AI copilot on their right rail — one socket, two
+surfaces. It reads the current draft (the Agent or the workflow) plus the
+workspace inventory (published Agents, MCP connections, skills, model presets,
+allowlist) and proposes edits as **typed mutations** — `setPersona`,
+`setModel`, `addContext`, `removeContext` on the agent surface; `setTrigger`,
+`setAgent`, `setInstructions` on the workflow surface — streamed over
+`WS /workspaces/:workspaceId/copilot` (shared frame protocol in
+`packages/shared/src/copilot.ts`; each turn names its surface).
 
-![Builder copilot — suggestion cards with inline diff preview](docs/screenshots/copilot.png)
+![Copilot dock in the workflow editor — suggestion cards with inline diff preview](docs/screenshots/copilot.png)
 
 Every proposal renders as a structured **Apply / Dismiss** card with a preview
-(inline diff for instructions, before→after otherwise). The server **never**
-mutates the draft — accepted mutations are applied client-side through the
-builder controller (the same reducer manual edits use, so
+(inline diff for instructions and persona, before→after otherwise). The server
+**never** mutates the draft — accepted mutations are applied client-side
+through the editor controller (the same reducer manual edits use, so
 autosave/dry-run/diagnostics just work), and each accept/reject is fed back
-into the model's tool loop. Invalid tool calls (unknown ids, non-allowlisted
-models, dangling `@references`) bounce back to the model server-side and never
-reach the UI.
+into the model's tool loop. Invalid tool calls (unknown inventory ids,
+non-allowlisted models, out-of-scope `@` references) bounce back to the model
+server-side and never reach the UI.
 
 The copilot runs a Claude model via **OpenRouter on the platform key**
 (`COPILOT_PROVIDER=openrouter`, default model `anthropic/claude-sonnet-5`); a
@@ -254,8 +291,9 @@ and the empirically-learned eve gotchas — lives in **[`AGENTS.md`](AGENTS.md)*
 | Browser E2E | `cd e2e && bunx playwright test` |
 
 CI runs typecheck + unit + web build + site build, the gated integration lane
-(including the eve spike), both acceptance suites, and Playwright E2E. Keyed
-lanes (real model calls) are deliberately not in CI.
+(including the eve spike), both acceptance suites, Playwright E2E, and the
+prod-compose publish smoke. Keyed lanes (real model calls) are deliberately
+not in CI.
 
 The marketing/docs site (`apps/site`) is standalone — no infra needed, run it
 with `bun run --cwd apps/site dev`.
@@ -277,26 +315,29 @@ on pull requests.
 
 ```
 apps/
-  control-plane/   Bun + Elysia API host: auth, CRUD, compiler invocation,
-                   eve build + artifact upload, affinity/warm scheduler with
-                   dead-worker failover, trigger ingress (webhook/form/Slack)
-                   + dispatcher, SSE, /internal/metrics + deep health
+  control-plane/   Bun + Elysia API host: auth, agent + workflow CRUD,
+                   compiler invocation, eve build + artifact upload,
+                   affinity/warm scheduler with dead-worker failover,
+                   trigger ingress (webhook/form/Slack) + schedule ticker
+                   + dispatcher, outbound Slack delivery, SSE,
+                   /internal/metrics + deep health
   worker/          Stateless worker: supervisor (boots compiled agents under
                    Node 24), reverse proxy, idle + sandbox reapers,
                    per-worker token identity
-  web/             Vite + React SPA (chat, builder, context, settings)
+  web/             Vite + React SPA (chat, agents, workflows, context, settings)
   site/            Standalone Vite + React landing + docs site (MDX docs,
                    E1 tokens), deployed to Cloudflare Workers — no server
 packages/
-  compiler/        Pure WorkflowDefinition -> eve project codegen
+  compiler/        Pure AgentDefinition -> eve project codegen
   db/              Drizzle schema, migrations, seeds (product DB)
-  shared/          TriggerEvent, pillar schemas, eve event types, API contracts
+  shared/          TriggerEvent, agent + workflow schemas, eve event types,
+                   API contracts
   design-tokens/   Shared E1 tokens.css consumed by apps/web and apps/site
 spike/             Standalone eve testbed — empirical findings in REPORT.md
 e2e/               Playwright browser harness (self-manages its stack)
 infra/             docker-compose init scripts + Dex IdP config
-docs/              Design spec, master plan, runtime contract (+ screenshots/)
-.github/           CI: unit · integration · acceptance · phase3 · e2e
+docs/              Design specs, master plan, runtime contract (+ screenshots/)
+.github/           CI: unit · integration · acceptance · phase3 · e2e · prod-compose
 ```
 
 ## Documentation
@@ -304,6 +345,7 @@ docs/              Design spec, master plan, runtime contract (+ screenshots/)
 | Document | What it covers |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Operational contract: commands, test lanes, conventions, constraints |
+| [`docs/superpowers/specs/2026-07-10-agents-first-redesign.md`](docs/superpowers/specs/2026-07-10-agents-first-redesign.md) | Agents-first redesign: concept model, IA, technical decisions, supersessions, vocabulary standard |
 | [`docs/PLAN.md`](docs/PLAN.md) | Master phase plan |
 | [`docs/runtime-worker-contract.md`](docs/runtime-worker-contract.md) | Control-plane ↔ worker protocol |
 | [`packages/compiler/README.md`](packages/compiler/README.md) | Codegen contract & versioning discipline |

@@ -1,20 +1,25 @@
 ---
 title: Triggers
 section: Building
-order: 32
+order: 33
 ---
 
 import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Triggers
 
-A trigger decides how a workflow fires. invisible-string supports four kinds,
-and the compiled agent exposes exactly the channels its trigger needs.
+A trigger decides when a workflow fires. invisible-string supports five kinds,
+and every kind lands the same way: the platform authenticates the event,
+normalises it, and dispatches the run — delivering the event's data and the
+workflow's instructions to the bound agent version as its task. Compiled agents
+carry no per-trigger channels; the trigger surface lives entirely in the
+platform.
 
 ## Chat
 
-The default `manual` trigger. Start a session and drive the workflow
-conversationally from the chat surface.
+The default `manual` trigger: fire the workflow by hand — **Run now** in the
+workflow editor — and follow the run in chat. (For conversational work you
+don't need a workflow at all; chat targets your published Agents directly.)
 
 ## Webhook
 
@@ -31,7 +36,14 @@ data is always well-formed.
 ## Slack
 
 Slack events route through the connected platform Slack app. Incoming requests
-are verified by signature within a replay window, and the workspace and workflow
-are resolved from the team id and the trigger's binding.
+are verified by signature within a replay window, and the workspace and
+workflow are resolved from the team id and the trigger's binding. Replies post
+back into the originating thread.
+
+## Schedule
+
+A cron expression fires the workflow on a schedule, evaluated in UTC by the
+platform. Ticks missed while the platform is down are skipped, not backfilled —
+a schedule never queues a burst of stale runs on recovery.
 
 <UnderConstruction />

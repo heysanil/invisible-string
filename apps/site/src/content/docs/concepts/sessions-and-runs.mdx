@@ -8,10 +8,11 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Sessions & runs
 
-A **session** is a conversation with a published workflow; a **run** is a single
-execution within it. Starting a session pins the compiled agent version it will
-use, and each run streams its progress back to the browser live: working blocks,
-the streamed reply, and any inline human-in-the-loop approvals.
+A **session** is a conversation with a published Agent; a **run** is a single
+execution within it. Whether you open it from chat or a workflow trigger starts
+it, a session pins the agent version it began with, and each run streams its
+progress back to the browser live: working blocks, the streamed reply, and any
+inline human-in-the-loop approvals.
 
 Runs stream over **resumable SSE** — reconnecting with a `Last-Event-ID` replays
 missed events rather than restarting — so a dropped connection never loses run

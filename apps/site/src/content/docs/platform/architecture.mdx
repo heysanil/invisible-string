@@ -12,9 +12,10 @@ invisible-string is three services over Postgres and an object store.
 
 ## Control plane
 
-The API host (Bun + Elysia): authentication and organizations, pillar CRUD,
-compiler invocation with `eve build` and artifact upload, the scheduler, trigger
-ingress and dispatch, the SSE tailer, and the copilot WebSocket loop. The
+The API host (Bun + Elysia): authentication and organizations, agent and
+workflow CRUD, compiler invocation with `eve build` and artifact upload, the
+scheduler, trigger ingress and dispatch, the SSE tailer, and the copilot
+WebSocket loop. The
 scheduler routes work by session affinity first, then to an artifact-warm
 worker, then to any live worker, with a dead-worker sweep and fencing.
 
@@ -27,7 +28,7 @@ workers hold no durable state, any of them can pick up a run.
 
 ## Compiler
 
-A pure function from a workflow definition to an eve project. It is
+A pure function from an agent definition to an eve project. It is
 golden-digest-guarded and versioned, so any change to the emitted bytes is
 caught in CI and folded into the artifact content hash.
 

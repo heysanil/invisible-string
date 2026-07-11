@@ -8,10 +8,11 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Workspaces
 
-Every workflow, session, connection, and secret belongs to a **workspace**.
-Multi-tenancy rides on Better Auth organizations, and a fresh account lands on a
-first-run screen to name its workspace — creating it seeds the default model
-presets, the provider/model allowlist, and agent presets.
+Every Agent, workflow, session, connection, and secret belongs to a
+**workspace**. Multi-tenancy rides on Better Auth organizations, and a fresh
+account lands on a first-run screen to name its workspace — creating it seeds
+the default model presets, the provider/model allowlist, and a set of starter
+Agents.
 
 Membership carries a role — `owner`, `admin`, or `member` — and every route is
 scoped to the active workspace, verifying both membership and row ownership.

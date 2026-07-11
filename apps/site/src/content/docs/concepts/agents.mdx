@@ -1,0 +1,52 @@
+---
+title: Agents
+section: Concepts
+order: 20
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Agents
+
+An Agent is someone you hire. Like an employee, it's fully described by who it
+is, how it thinks, and what it's equipped with — three decisions, each a
+focused section of the agent editor. You chat with a published Agent directly,
+or put it on standing duty with a [workflow](/docs/concepts/workflows).
+
+## Persona
+
+Who the Agent is and how it works: the natural-language description of its
+role, judgment, and working style — "Pragmatic senior engineer. Reads before it
+writes." The persona is the durable part of the hire; it travels with every
+version the Agent publishes.
+
+## Model
+
+How the Agent thinks. You pick a preset — `powerful`, `balanced`, or `quick` —
+resolved against the workspace's provider and model allowlist, so an Agent can
+never reference a model the workspace hasn't sanctioned.
+
+## Context
+
+What the Agent is equipped with: MCP connections (workspace or personal) and
+authored skills, drawn from the workspace's
+[Context library](/docs/building/context-mcp). Equipment is packaged straight
+into the compiled agent, so a published Agent carries its tools and knowledge
+with it.
+
+## Publishing and versions
+
+Publishing an Agent compiles its definition — persona, model, context — into a
+real [eve](https://eve.dev) agent project, runs the build, and uploads the
+resulting artifact to object storage. The artifact is cached by a **content
+hash** — a digest of the definition, its resolved dependencies, the compiler
+version, the pinned eve version, and the build environment — so an identical
+definition never rebuilds.
+
+Each published **agent version** is immutable and independently addressable on
+the worker pool. Versions matter because runs are bound to them: a session pins
+the exact agent version it started with, so editing and re-publishing an Agent
+never changes the behaviour of conversations already in flight — new versions
+apply to new sessions.
+
+<UnderConstruction />

@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "motion/react";
-import { Bot, Check, FileText, Plug, Rocket, Zap } from "lucide-react";
+import { Check, Gauge, Plug, Rocket, UserRound } from "lucide-react";
 import type { ComponentType, ReactNode } from "react";
 
 import { cn } from "../../lib/cn";
@@ -8,21 +8,22 @@ import { EASE } from "./parts";
 import { useLoopPhase } from "./useLoopPhase";
 
 /*
- * Hero centerpiece — a hand-built, vector-sharp miniature of the real builder,
- * looping autonomously (~13s, calm): a workflow comes together as the four
- * pillar cards fill in one by one and flip to a green ✓, "Publish" presses
- * itself → "Published and built." → a chat panel streams a working block that
- * folds to a "Worked for 6s · 4 steps" receipt. Built entirely from E1
- * primitives — no screenshots.
+ * Hero centerpiece — a hand-built, vector-sharp miniature of the real agent
+ * editor, looping autonomously (~12s, calm): an agent is hired as its three
+ * definition cards (Persona · Model · Context) fill in one by one and flip to
+ * a green ✓, "Publish" presses itself → "Published and built." → the agent
+ * goes on duty and a chat panel streams a working block that folds to a
+ * "Worked for 6s · 4 steps" receipt. Built entirely from E1 primitives — no
+ * screenshots.
  */
 
 // Phase timeline (ms). Parked on the last phase under reduced motion.
-const PHASES = [900, 900, 900, 900, 1100, 1400, 1500, 2200, 2600] as const;
+const PHASES = [900, 1000, 1000, 1100, 1400, 1500, 2200, 2600] as const;
 
-type PillarKey = "trigger" | "context" | "agent" | "instructions";
+type SectionKey = "persona" | "model" | "context";
 
-const PILLARS: ReadonlyArray<{
-  key: PillarKey;
+const SECTIONS: ReadonlyArray<{
+  key: SectionKey;
   label: string;
   icon: ComponentType<{ size?: number }>;
   /** phase at which this card fills in */
@@ -30,14 +31,25 @@ const PILLARS: ReadonlyArray<{
   summary: ReactNode;
 }> = [
   {
-    key: "trigger",
-    label: "Trigger",
-    icon: Zap,
+    key: "persona",
+    label: "Persona",
+    icon: UserRound,
     fillAt: 1,
     summary: (
-      <span className="flex items-center gap-1.5">
-        <StatusChip tone="ink">Slack</StatusChip>
-        <span className="truncate text-ink-3">mentions &amp; messages</span>
+      <span className="block truncate text-ink-3">
+        Pragmatic senior engineer. Reads before it writes.
+      </span>
+    ),
+  },
+  {
+    key: "model",
+    label: "Model",
+    icon: Gauge,
+    fillAt: 2,
+    summary: (
+      <span className="flex flex-col gap-0.5">
+        <span className="font-medium text-ink-2">Balanced</span>
+        <span className="text-[11px] text-ink-3">good for everyday work</span>
       </span>
     ),
   },
@@ -45,7 +57,7 @@ const PILLARS: ReadonlyArray<{
     key: "context",
     label: "Context",
     icon: Plug,
-    fillAt: 2,
+    fillAt: 3,
     summary: (
       <span className="flex flex-wrap gap-1">
         <span className="rounded-capsule bg-black/[0.06] px-1.5 py-0.5 text-[11px] text-ink">
@@ -57,55 +69,33 @@ const PILLARS: ReadonlyArray<{
       </span>
     ),
   },
-  {
-    key: "agent",
-    label: "Agent",
-    icon: Bot,
-    fillAt: 3,
-    summary: (
-      <span className="flex flex-col gap-0.5">
-        <span className="font-medium text-ink-2">Balanced</span>
-        <span className="text-[11px] text-ink-3">good for everyday work</span>
-      </span>
-    ),
-  },
-  {
-    key: "instructions",
-    label: "Instructions",
-    icon: FileText,
-    fillAt: 4,
-    summary: (
-      <span className="flex flex-col gap-0.5">
-        <span className="truncate text-ink-3">Triage the issue, reply in-thread.</span>
-        <span className="text-[11px] text-ink-4">3 lines · 1 @ref</span>
-      </span>
-    ),
-  },
 ];
 
-export function BuilderVignette() {
+export function AgentVignette() {
   const phase = useLoopPhase(PHASES);
 
-  const publishReady = phase >= 4;
-  const building = phase === 5;
-  const published = phase >= 6;
-  const streaming = phase === 7;
-  const worked = phase >= 8;
+  const publishReady = phase >= 3;
+  const building = phase === 4;
+  const published = phase >= 5;
+  const streaming = phase === 6;
+  const worked = phase >= 7;
 
   return (
     <div className="grid gap-3 p-3 sm:p-4 md:grid-cols-[minmax(0,1fr)_minmax(0,0.9fr)]">
-      {/* Left: pillar rail + publish */}
+      {/* Left: agent editor rail + publish */}
       <div className="glass-panel flex flex-col gap-2 rounded-panel-sm bg-white/45 p-3">
         <div className="flex items-center justify-between px-1 pb-1">
-          <span className="text-[13px] font-semibold text-ink">Issue triage</span>
+          <span className="text-[13px] font-semibold text-ink">
+            Software engineer
+          </span>
           <StatusChip tone={published ? "ok" : "neutral"} dot>
             {published ? "Published" : "Draft"}
           </StatusChip>
         </div>
 
         <div className="flex flex-col gap-2">
-          {PILLARS.map((p) => (
-            <PillarCard key={p.key} pillar={p} filled={phase >= p.fillAt} />
+          {SECTIONS.map((s) => (
+            <SectionCard key={s.key} section={s} filled={phase >= s.fillAt} />
           ))}
         </div>
 
@@ -114,7 +104,19 @@ export function BuilderVignette() {
 
       {/* Right: chat / run stream */}
       <div className="glass-panel flex flex-col gap-2.5 rounded-panel-sm bg-white/45 p-3">
-        <div className="px-1 text-[12px] font-medium text-ink-3">Chat</div>
+        <div className="flex items-center justify-between px-1">
+          <span className="text-[12px] font-medium text-ink-3">Chat</span>
+          {/* Always mounted (opacity fade) so the agent going on duty never
+              reflows the header row. */}
+          <motion.span
+            animate={{ opacity: published ? 1 : 0 }}
+            transition={{ duration: 0.28, ease: EASE }}
+          >
+            <StatusChip tone="ok" dot>
+              On duty
+            </StatusChip>
+          </motion.span>
+        </div>
 
         <div className="ml-auto max-w-[85%] rounded-card rounded-br-sm bg-ink px-3 py-1.5 text-[12.5px] text-white">
           A GitHub issue came in — triage it.
@@ -155,7 +157,7 @@ export function BuilderVignette() {
             animate={{ opacity: streaming || worked ? 0 : 1 }}
             className="col-start-1 row-start-1 flex items-start px-1 pt-1 text-[12px] text-ink-4"
           >
-            Describing the workflow…
+            Hiring the agent…
           </motion.div>
         </div>
       </div>
@@ -163,14 +165,14 @@ export function BuilderVignette() {
   );
 }
 
-function PillarCard({
-  pillar,
+function SectionCard({
+  section,
   filled,
 }: {
-  pillar: (typeof PILLARS)[number];
+  section: (typeof SECTIONS)[number];
   filled: boolean;
 }) {
-  const Icon = pillar.icon;
+  const Icon = section.icon;
   return (
     <div
       className={cn(
@@ -183,7 +185,7 @@ function PillarCard({
       <div className="flex items-center gap-2">
         <Icon size={14} aria-hidden />
         <span className="flex-1 text-[12.5px] font-semibold text-ink">
-          {pillar.label}
+          {section.label}
         </span>
         <AnimatePresence mode="wait">
           {filled ? (
@@ -213,7 +215,7 @@ function PillarCard({
         transition={{ duration: 0.28, ease: EASE }}
         className="pt-1.5 text-[11.5px] leading-snug text-ink-3"
       >
-        {pillar.summary}
+        {section.summary}
       </motion.div>
     </div>
   );

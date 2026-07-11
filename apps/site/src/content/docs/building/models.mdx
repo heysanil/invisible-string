@@ -1,22 +1,22 @@
 ---
 title: Models
 section: Building
-order: 34
+order: 35
 ---
 
 import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Models
 
-Rather than pick a raw model per workflow, you choose a **preset**. Each
-workspace defines three — `powerful`, `balanced`, and `quick` — and the Agent
-pillar selects among them. Presets are resolved against the workspace's
-provider and model **allowlist**, so a workflow can only ever reference a model
+Rather than pick a raw model per Agent, you choose a **preset**. Each workspace
+defines three — `powerful`, `balanced`, and `quick` — and each Agent's Model
+section selects among them. Presets are resolved against the workspace's
+provider and model **allowlist**, so an Agent can only ever reference a model
 the workspace has sanctioned.
 
-Presets, the allowlist, and agent presets are seeded when a workspace is created
-and managed under Settings. Model routing itself is baked into the compiled
-artifact at build time, giving each published version a stable, pinned model
+Presets and the allowlist are seeded when a workspace is created and managed
+under Settings. Model routing itself is baked into the compiled artifact at
+build time, giving each published agent version a stable, pinned model
 configuration.
 
 <UnderConstruction />

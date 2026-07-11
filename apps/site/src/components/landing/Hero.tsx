@@ -3,7 +3,7 @@ import { motion } from "motion/react";
 import { ArrowRight } from "lucide-react";
 
 import { LogoMark } from "../LogoMark";
-import { BuilderVignette } from "./BuilderVignette";
+import { AgentVignette } from "./AgentVignette";
 import { btnGhostLg, btnPrimaryLg, EASE, GithubGlyph, Vignette } from "./parts";
 
 const GITHUB_URL = "https://github.com/heysanil/invisible-string";
@@ -45,7 +45,7 @@ export function Hero() {
         className="text-display-1 text-balance"
       >
         <motion.span variants={line} className="block">
-          Describe the work,
+          Hire an agent,
         </motion.span>
         <motion.span variants={line} className="block">
           consider it done.
@@ -58,9 +58,9 @@ export function Hero() {
         transition={{ duration: 0.4, ease: EASE, delay: 0.28 }}
         className="mt-6 max-w-2xl text-lede text-ink-2"
       >
-        Describe what you want done, in plain language. It becomes a workflow
-        that runs from chat, Slack, forms, or a schedule — live, reliable, and
-        yours to approve.
+        Give an agent a job, a model, and the tools it needs. Chat with it like
+        a teammate — or put it on standing duty from Slack, forms, webhooks, or
+        a schedule. Live, reliable, and yours to approve.
       </motion.p>
 
       <motion.div
@@ -87,10 +87,10 @@ export function Hero() {
         className="mt-16 w-full max-w-4xl sm:mt-20"
       >
         <Vignette
-          label="A workflow comes together — trigger, context, agent, instructions — is published, then handles a request in chat in six seconds."
+          label="An agent is hired — persona, model, tools — published, then handles a request in chat in six seconds."
           className="p-0"
         >
-          <BuilderVignette />
+          <AgentVignette />
         </Vignette>
       </motion.div>
     </section>

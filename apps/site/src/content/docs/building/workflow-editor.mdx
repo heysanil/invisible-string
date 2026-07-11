@@ -1,0 +1,23 @@
+---
+title: The workflow editor
+section: Building
+order: 31
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# The workflow editor
+
+The workflow editor is a single focused column that reads like a delegation
+memo, top to bottom: *when it happens* — the trigger; *who handles it* — a
+picker of the workspace's published Agents; and *what they should do* — the
+instructions, with `@` autocomplete sourced from the selected Agent's context
+and the trigger's data.
+
+Because a workflow builds nothing, the header offers **Run now** to fire it
+manually and an instant **Publish** — no build progress, no waiting; edits go
+live the moment you publish them. If the bound Agent is republished without
+something the instructions reference, the editor surfaces a staleness
+diagnostic on the workflow rather than letting a dispatch fail silently.
+
+<UnderConstruction />

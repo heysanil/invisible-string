@@ -70,7 +70,7 @@ lockfile covers all workspaces, so it would inflate every prod Docker image's
 
 `not_found_handling: "single-page-application"` in `wrangler.jsonc` serves
 the app shell with an HTTP **200** for any path that doesn't match a static
-asset, so deep links like `/docs/concepts/pillars` work for humans *and*
+asset, so deep links like `/docs/concepts/agents` work for humans *and*
 status-code-checking crawlers. This replaces (and improves on) the old
 GitHub Pages `404.html` copy hack, which served the shell with a 404 status.
 

@@ -6,15 +6,15 @@ import { LogoMark } from "../LogoMark";
 import { EASE, Reveal, SectionHeading } from "./parts";
 
 /* "Starts where you work." Five trigger chips fan in along hairline wires that
-   converge on the workflow node; a single ink pulse sweeps each wire — one
-   workflow answering on every door it's wired to. */
+   converge on the agent node; a single ink pulse sweeps each wire — one agent
+   answering on every door it's wired to. */
 
 const TRIGGERS: ReadonlyArray<{
   label: string;
   sub: string;
   icon: ComponentType<{ size?: number }>;
 }> = [
-  { label: "Chat", sub: "Ask for a run in chat, any time.", icon: MessageCircle },
+  { label: "Chat", sub: "Ask it directly, any time.", icon: MessageCircle },
   { label: "Webhook", sub: "Anything that can send a request can start a run.", icon: Webhook },
   { label: "Form", sub: "Share a form — every submission starts a run.", icon: SquarePen },
   { label: "Slack", sub: "Mention it, or message it directly.", icon: Hash },
@@ -35,7 +35,7 @@ export function Triggers() {
       <SectionHeading
         eyebrow="Triggers"
         title="Starts where you work."
-        lede="One workflow, five doors. Run it from chat, Slack, a form, a webhook, or a schedule — wire up as many as you like."
+        lede="One agent, five doors. Reach it from chat, Slack, a form, a webhook, or a schedule — wire up as many as you like."
       />
 
       <div className="mt-12 grid items-center gap-4 md:grid-cols-[minmax(0,22rem)_1fr_auto] md:gap-0">
@@ -65,7 +65,7 @@ export function Triggers() {
             <span className="flex size-11 items-center justify-center rounded-panel-sm bg-ink text-white">
               <LogoMark size={22} />
             </span>
-            <span className="text-[13px] font-semibold text-ink">Workflow</span>
+            <span className="text-[13px] font-semibold text-ink">Agent</span>
             <span className="text-[11.5px] text-ink-4">answers on every door</span>
           </div>
         </Reveal>

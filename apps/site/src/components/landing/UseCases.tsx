@@ -1,8 +1,8 @@
 import { GlassPanel, StatusChip } from "../ui";
 import { Reveal, SectionHeading } from "./parts";
 
-/* "What would I hand off?" — three concrete workflows you could describe this
-   afternoon, each a trigger chip + a plain-language sketch of what it does.
+/* "What would I hand off?" — three agents you could hire this afternoon, each
+   a trigger chip + a plain-language sketch of the standing work it handles.
    FeatureGrid's card DNA (glass panel, .lift, Reveal stagger); the icon square
    is swapped for a StatusChip trigger chip. No new animation machinery. */
 
@@ -14,17 +14,17 @@ const USE_CASES: ReadonlyArray<{
   {
     chip: "Slack",
     title: "Issue triage",
-    copy: "A GitHub issue lands — the workflow reads it, checks the repo, replies in-thread, and labels it.",
+    copy: "A GitHub issue lands — the agent reads it, checks the repo, replies in-thread, and labels it.",
   },
   {
     chip: "Schedule",
     title: "Monday digest",
-    copy: "Every Monday at 9, it searches the week's activity and posts a summary where the team will see it.",
+    copy: "Every Monday at 9, your agent searches the week's activity and posts a summary where the team will see it.",
   },
   {
     chip: "Form",
     title: "Request intake",
-    copy: "A shared form takes requests; the workflow sorts and answers each one — and waits for your sign-off before anything big.",
+    copy: "A shared form takes requests; the agent sorts and answers each one — and waits for your sign-off before anything big.",
   },
 ];
 
@@ -34,7 +34,7 @@ export function UseCases() {
       <SectionHeading
         eyebrow="Use cases"
         title="What will you hand off first?"
-        lede="Workflows you could describe this afternoon — each one a trigger, a few tools, and plain instructions."
+        lede="Agents you could hire this afternoon — equip one once, then delegate."
       />
       <div className="mt-12 grid gap-4 md:grid-cols-3">
         {USE_CASES.map((u, i) => (

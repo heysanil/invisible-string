@@ -24,12 +24,12 @@ const FEATURES: ReadonlyArray<{
   },
   {
     title: "Private credentials",
-    copy: "The accounts and keys your workflows use are encrypted at rest and never shown again — not in logs, not to the model.",
+    copy: "The accounts and keys your agents use are encrypted at rest and never shown again — not in logs, not to the model.",
     icon: ShieldCheck,
   },
   {
     title: "No surprise changes",
-    copy: "A running session keeps the exact version of the workflow it started with. Publishing an update never breaks a run in flight.",
+    copy: "A running session keeps the exact version of the agent it started with. Publishing an update never breaks a run in flight.",
     icon: GitBranch,
   },
   {
@@ -39,7 +39,7 @@ const FEATURES: ReadonlyArray<{
   },
   {
     title: "Your models, your rules",
-    copy: "Powerful, balanced, or quick per workflow — chosen from the models your workspace has approved.",
+    copy: "Powerful, balanced, or quick per agent — chosen from the models your workspace has approved.",
     icon: SlidersHorizontal,
   },
   {
@@ -79,8 +79,8 @@ export function FeatureGrid() {
       <Reveal className="mt-8 flex justify-center">
         <p className="glass-panel rounded-capsule flex max-w-full flex-wrap items-center justify-center gap-x-1.5 gap-y-1 px-5 py-2.5 text-center text-[13px] text-ink-3">
           <span>
-            Under the hood: every workflow compiles into its own versioned agent
-            on a durable worker pool.
+            Under the hood: every agent you publish compiles into its own
+            versioned, self-hosted process on a durable worker pool.
           </span>
           <Link
             to="/docs/$"

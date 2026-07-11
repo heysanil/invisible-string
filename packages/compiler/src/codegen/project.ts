@@ -16,7 +16,7 @@ function sortedRecord(record: Record<string, string>): Record<string, string> {
 }
 
 export function emitPackageJson(deps: CompileDeps): string {
-  const { versions, resolvedModel, workspaceSlug, workflowSlug } = deps;
+  const { versions, resolvedModel, workspaceSlug, agentSlug } = deps;
   const dependencies: Record<string, string> = {
     "@workflow/world-postgres": versions.worldPostgres,
     ai: versions.ai,
@@ -29,7 +29,7 @@ export function emitPackageJson(deps: CompileDeps): string {
     dependencies["@ai-sdk/anthropic"] = versions.anthropicProvider;
   }
   const manifest = {
-    name: `agent--${workspaceSlug}--${workflowSlug}`,
+    name: `agent--${workspaceSlug}--${agentSlug}`,
     private: true,
     type: "module",
     engines: { node: "24.x" },

@@ -1,12 +1,13 @@
 # World isolation — verified contract (design correction #10)
 
-**Contract: ONE WORLD POSTGRES *DATABASE* PER WORKFLOW VERSION.**
+**Contract: ONE WORLD POSTGRES *DATABASE* PER AGENT VERSION.**
 The generated project reads `WORKFLOW_POSTGRES_URL` **as-is**; the control
 plane provisions a dedicated database `ws_v_<hash12>` (first 12 hex chars
-of the workflow-version hash) on the world Postgres server, runs the
-world-postgres bootstrap against it once, and passes a URL whose *database
-name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is set for
-observability only — it does **not** isolate.
+of the agent-version hash; the prefix renames to `ag_v_` with the
+control-plane stage of the agents-first pivot) on the world Postgres
+server, runs the world-postgres bootstrap against it once, and passes a URL
+whose *database name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is
+set for observability only — it does **not** isolate.
 
 ## Why not schema-per-version via `search_path`? (verified — it does NOT work)
 
@@ -30,7 +31,7 @@ world-postgres does not honor it:
    schema option. graphile-worker likewise runs in its fixed
    `graphile_worker` schema.
 4. The **gated test proves it live** (`src/world-isolation.test.ts`, part 1):
-   bootstrapping with `?options=-csearch_path=ws_v_…,public` still creates
+   bootstrapping with `?options=-csearch_path=ag_v_…,public` still creates
    every table in `workflow` and leaves the pinned schema empty. (Pinning
    the schema WITHOUT `public` fails harder: bootstrap crashes on the
    migration's unqualified `"status"` enum reference — the enum types live

@@ -1,6 +1,6 @@
 /**
  * Generated `agent/connections/<slug>.ts` — one `defineMcpClientConnection`
- * per resolved CONTEXT connection.
+ * per resolved context connection.
  *
  * - URL and description are literals; SECRETS NEVER ARE. Bearer auth reads
  *   `MCP_<SLUG_UPPER>_TOKEN` via a lazy `getToken`; header auth reads each
@@ -112,7 +112,7 @@ ${entries.join("\n")}
 
   return `${approvalImport}import { defineMcpClientConnection } from "eve/connections";
 ${envImport}${approvalHeader}
-/** MCP connection "${slug}" (workflow CONTEXT pillar). */
+/** MCP connection "${slug}" (agent context). */
 export default defineMcpClientConnection({
   url: ${tsString(connection.url)},
   description: ${tsString(connection.description)},${authProperty}${toolsProperty}

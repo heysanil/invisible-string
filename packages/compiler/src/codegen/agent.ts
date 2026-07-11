@@ -19,8 +19,8 @@ import type { ReasoningEffort } from "@invisible-string/shared";
 import type { CompileDeps } from "../types";
 import { tsString } from "./strings";
 
-function reasoningLine(effort: ReasoningEffort | undefined): string {
-  return effort === undefined ? "" : `\n  reasoning: ${tsString(effort)},`;
+function reasoningLine(effort: ReasoningEffort): string {
+  return `\n  reasoning: ${tsString(effort)},`;
 }
 
 /**
@@ -47,7 +47,7 @@ function openrouterContextWindowTokens(modelId: string): number {
 const WORLD_BLOCK = `  experimental: {
     workflow: {
       // Durability: all session/run state lives in Postgres, not local disk.
-      // WORKFLOW_POSTGRES_URL is read AS-IS and must point at this workflow
+      // WORKFLOW_POSTGRES_URL is read AS-IS and must point at this agent
       // version's DEDICATED world database — the job prefix does NOT isolate
       // agents sharing a world DB (see packages/compiler/WORLD-ISOLATION.md).
       world: "@workflow/world-postgres",
@@ -56,7 +56,7 @@ const WORLD_BLOCK = `  experimental: {
 
 export function emitAgentTs(
   deps: CompileDeps,
-  reasoning: ReasoningEffort | undefined,
+  reasoning: ReasoningEffort,
 ): string {
   const { resolvedModel } = deps;
   if (resolvedModel.provider === "anthropic") {

@@ -7,9 +7,9 @@ import {
   RUNTIME_VERSIONS,
   compile,
   connectionTokenEnvVar,
-  triggerRoutePath,
+  platformJwtAudienceForHash,
 } from "./index";
-import { manualOnlyFixture } from "./test-fixtures";
+import { basicFixture } from "./test-fixtures";
 
 test("public surface: compile + versions + platform constants", () => {
   expect(typeof compile).toBe("function");
@@ -20,16 +20,16 @@ test("public surface: compile + versions + platform constants", () => {
   expect(RUNTIME_VERSIONS.worldPostgres).toBe("5.0.0-beta.20");
   expect(RUNTIME_VERSIONS.openrouterProvider).toBe("6.0.0-alpha.1");
   expect(RUNTIME_VERSIONS.anthropicProvider).toBe("4.0.7");
-  // Constants baked into generated channels; the dispatcher must mint
+  // Constants baked into the generated channel; the dispatcher must mint
   // matching claims (mirrors spike/agent-project/agent/lib/platform-auth.ts).
   expect(PLATFORM_JWT_ISSUER).toBe("invisible-string");
-  expect(PLATFORM_JWT_AUDIENCE).toBe("workflow-agent");
-  expect(triggerRoutePath("form")).toBe("/eve/v1/platform/form");
+  expect(PLATFORM_JWT_AUDIENCE).toBe("agent-version");
+  expect(platformJwtAudienceForHash("deadbeef")).toBe("agent-version:deadbeef");
   expect(connectionTokenEnvVar("my-conn")).toBe("MCP_MY_CONN_TOKEN");
 });
 
 test("generated projects never import workspace packages", () => {
-  const { files } = compile(manualOnlyFixture.definition, manualOnlyFixture.deps);
+  const { files } = compile(basicFixture.definition, basicFixture.deps);
   for (const [path, content] of files) {
     expect(content, path).not.toContain("@invisible-string/");
   }

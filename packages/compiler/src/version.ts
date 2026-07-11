@@ -13,5 +13,13 @@
  * - patch: comment/formatting-only changes to generated files
  * - minor: new emitted files or new optional behavior
  * - major: changed generated-code semantics or env contract
+ *
+ * 3.0.0 — MAJOR: the agent is the compile unit. compile() takes an
+ * AgentDefinition (persona · model · context) instead of a four-pillar
+ * WorkflowDefinition; artifacts emit ONLY the default eve channel (trigger
+ * channels, schedules, and the Slack/callback outbound libs are gone —
+ * `@trigger.*` resolution and outbound delivery moved to the control-plane
+ * dispatcher); the JWT audience is `agent-version:<hash>` and the hash
+ * inputs re-keyed, so EVERY version hash changes.
  */
-export const COMPILER_VERSION = "2.2.0";
+export const COMPILER_VERSION = "3.0.0";

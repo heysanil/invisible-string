@@ -2,7 +2,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { LanguageModel } from "ai";
 import { defineAgent } from "eve";
 
-const MODEL_ID = "deepseek/deepseek-v4-pro";
+const MODEL_ID = "deepseek/deepseek-v4-flash";
 
 /**
  * Explicit platform-resolved model. With OPENROUTER_API_KEY set the agent
@@ -35,7 +35,7 @@ export default defineAgent({
   // way "does not have known AI Gateway context window metadata" fails the
   // build (spike/agent-project documented this escape hatch).
   modelContextWindowTokens: 1048576,
-  reasoning: "medium",
+  reasoning: "high",
   experimental: {
     workflow: {
       // Durability: all session/run state lives in Postgres, not local disk.

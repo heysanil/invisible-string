@@ -1,6 +1,6 @@
 /**
  * Gated proof of the world-isolation contract (design correction #10 /
- * WORLD-ISOLATION.md): ONE WORLD POSTGRES **DATABASE** PER WORKFLOW VERSION.
+ * WORLD-ISOLATION.md): ONE WORLD POSTGRES **DATABASE** PER AGENT VERSION.
  *
  * @workflow/world-postgres@5.0.0-beta.20 hard-qualifies every identifier to
  * the `workflow` schema (drizzle `pgSchema("workflow")`; migrations run
@@ -116,7 +116,10 @@ describe.skipIf(!GATE)("world isolation (gated)", () => {
       // crashes outright on the migration's unqualified enum-type reference,
       // which already disproves search_path isolation; including public lets
       // it finish so we can show where the tables actually land.)
-      const pinnedSchema = "ws_v_deadbeef0000";
+      // Arbitrary would-be per-version schema name (the control plane's
+      // world prefix — ws_v_ today, ag_v_ once the control-plane stage of
+      // the agents-first rename lands — is irrelevant to this proof).
+      const pinnedSchema = "ag_v_deadbeef0000";
       await querySql(dbUrl(DB_A), `create schema "${pinnedSchema}"`);
       await bootstrapWorld(
         dbUrl(

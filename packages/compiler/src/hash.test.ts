@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import { compile } from "./compile";
-import { canonicalJson, computeWorkflowHash } from "./hash";
+import { canonicalJson, computeAgentHash } from "./hash";
 import {
-  formMcpSkillFixture,
-  manualOnlyFixture,
+  anthropicModelFixture,
+  basicFixture,
   customApprovalFixture,
+  mcpSkillFixture,
 } from "./test-fixtures";
 import type { CompileDeps } from "./types";
 
@@ -31,11 +32,11 @@ describe("canonicalJson", () => {
   });
 });
 
-describe("workflow hash properties", () => {
-  const { definition, deps } = formMcpSkillFixture;
+describe("agent hash properties", () => {
+  const { definition, deps } = mcpSkillFixture;
 
   test("is a sha256 hex string", () => {
-    expect(computeWorkflowHash(definition, deps)).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeAgentHash(definition, deps)).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test("same input → same hash, same files (compile is deterministic)", () => {
@@ -52,13 +53,12 @@ describe("workflow hash properties", () => {
     const reordered = JSON.parse(JSON.stringify(definition)) as typeof definition;
     // Rebuild with reversed key insertion order at several depths.
     const shuffledDefinition = {
-      instructions: reordered.instructions,
-      agent: { reasoning: reordered.agent.reasoning, agentPresetId: reordered.agent.agentPresetId },
       context: { skillIds: reordered.context.skillIds, mcpConnectionIds: reordered.context.mcpConnectionIds },
-      trigger: reordered.trigger,
+      model: { reasoning: reordered.model.reasoning, preset: reordered.model.preset },
+      persona: reordered.persona,
     } as typeof definition;
-    expect(computeWorkflowHash(shuffledDefinition, deps)).toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(shuffledDefinition, deps)).toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
@@ -68,8 +68,8 @@ describe("workflow hash properties", () => {
       ...multiDeps,
       connections: [...multiDeps.connections].reverse(),
     };
-    expect(computeWorkflowHash(def, reversed)).toBe(
-      computeWorkflowHash(def, multiDeps),
+    expect(computeAgentHash(def, reversed)).toBe(
+      computeAgentHash(def, multiDeps),
     );
     expect(compile(def, reversed).hash).toBe(compile(def, multiDeps).hash);
   });
@@ -77,11 +77,22 @@ describe("workflow hash properties", () => {
   test("changing the definition changes the hash", () => {
     const changed = {
       ...definition,
-      instructions: { markdown: `${definition.instructions.markdown} Tweaked.` },
+      persona: `${definition.persona} Tweaked.`,
     };
-    expect(computeWorkflowHash(changed, deps)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(changed, deps)).not.toBe(
+      computeAgentHash(definition, deps),
     );
+  });
+
+  test("agentSlug and workspaceSlug both change the hash (tenant isolation)", () => {
+    expect(
+      computeAgentHash(definition, { ...deps, agentSlug: "renamed-agent" }),
+    ).not.toBe(computeAgentHash(definition, deps));
+    // Identical agent configs in two workspaces must never share an
+    // artifact, world database, or JWT audience.
+    expect(
+      computeAgentHash(definition, { ...deps, workspaceSlug: "other-tenant" }),
+    ).not.toBe(computeAgentHash(definition, deps));
   });
 
   test("changing versions.json content changes the hash", () => {
@@ -89,46 +100,46 @@ describe("workflow hash properties", () => {
       ...deps,
       versions: { ...deps.versions, eve: "0.19.1" },
     };
-    expect(computeWorkflowHash(definition, bumped)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, bumped)).not.toBe(
+      computeAgentHash(definition, deps),
     );
     // Even a note-only change counts: the hash covers the CONTENT.
     const noted: CompileDeps = {
       ...deps,
       versions: { ...deps.versions, notes: ["changed"] },
     };
-    expect(computeWorkflowHash(definition, noted)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, noted)).not.toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
   test("changing COMPILER_VERSION changes the hash", () => {
-    expect(computeWorkflowHash(definition, deps, "999.0.0")).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, deps, "999.0.0")).not.toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
   test("buildEnvEpoch changes the hash; undefined keeps historical hashes (build-env changes must re-key cached artifacts)", () => {
     const epoch1: CompileDeps = { ...deps, buildEnvEpoch: 1 };
     const epoch2: CompileDeps = { ...deps, buildEnvEpoch: 2 };
-    expect(computeWorkflowHash(definition, epoch1)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, epoch1)).not.toBe(
+      computeAgentHash(definition, deps),
     );
-    expect(computeWorkflowHash(definition, epoch2)).not.toBe(
-      computeWorkflowHash(definition, epoch1),
+    expect(computeAgentHash(definition, epoch2)).not.toBe(
+      computeAgentHash(definition, epoch1),
     );
-    expect(computeWorkflowHash(definition, epoch1)).toBe(
-      computeWorkflowHash(definition, { ...deps, buildEnvEpoch: 1 }),
+    expect(computeAgentHash(definition, epoch1)).toBe(
+      computeAgentHash(definition, { ...deps, buildEnvEpoch: 1 }),
     );
-    expect(computeWorkflowHash(definition, { ...deps, buildEnvEpoch: undefined })).toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, { ...deps, buildEnvEpoch: undefined })).toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
   test("dev flag changes the hash (dev artifacts never cache-hit prod)", () => {
     const dev: CompileDeps = { ...deps, options: { dev: true } };
-    expect(computeWorkflowHash(definition, dev)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, dev)).not.toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
@@ -140,20 +151,27 @@ describe("workflow hash properties", () => {
         markdown: `${skill.markdown}\nEdited.`,
       })),
     };
-    expect(computeWorkflowHash(definition, editedSkill)).not.toBe(
-      computeWorkflowHash(definition, deps),
+    expect(computeAgentHash(definition, editedSkill)).not.toBe(
+      computeAgentHash(definition, deps),
     );
   });
 
   test("provider flip changes the hash", () => {
     const flipped: CompileDeps = {
-      ...manualOnlyFixture.deps,
+      ...basicFixture.deps,
       resolvedModel: { provider: "anthropic", modelId: "claude-opus-4-8" },
     };
     expect(
-      computeWorkflowHash(manualOnlyFixture.definition, flipped),
+      computeAgentHash(basicFixture.definition, flipped),
     ).not.toBe(
-      computeWorkflowHash(manualOnlyFixture.definition, manualOnlyFixture.deps),
+      computeAgentHash(basicFixture.definition, basicFixture.deps),
+    );
+  });
+
+  test("hash and baked audience agree across fixtures", () => {
+    const { hash } = compile(anthropicModelFixture.definition, anthropicModelFixture.deps);
+    expect(hash).toBe(
+      computeAgentHash(anthropicModelFixture.definition, anthropicModelFixture.deps),
     );
   });
 });

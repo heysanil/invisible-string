@@ -11,7 +11,7 @@ export default eveChannel({
   auth: platformAuth(),
   onMessage(ctx) {
     const caller = ctx.eve.caller;
-    const context = ["Platform agent \"cms-sync\" in workspace \"acme\" (invisible-string)."];
+    const context = ["Platform agent \"support-triage\" in workspace \"acme\" (invisible-string)."];
     if (caller !== null) {
       context.push(
         `Caller principal: ${caller.principalId} (${caller.principalType}).`,

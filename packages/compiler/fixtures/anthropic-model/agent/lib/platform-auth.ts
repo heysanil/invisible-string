@@ -1,5 +1,6 @@
 import {
   extractBearerToken,
+  localDev,
   verifyJwtHmac,
   type AuthFn,
 } from "eve/channels/auth";
@@ -10,9 +11,11 @@ import {
  * minted by the control-plane dispatcher. The audience is bound to THIS
  * agent version's hash, so tokens minted for other versions are rejected.
  * Claim constants mirror the platform contract (packages/shared).
+ * DEV BUILD: localDev() admits loopback traffic so local tooling can
+ * reach the agent. Production artifacts omit it (spike/REPORT.md finding 16).
  */
 export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "agent-version:b75863d7fcc98182a99e2c26376a80707dfba24d316e7b6133759baad93b55c8";
+export const PLATFORM_JWT_AUDIENCE = "agent-version:7926de351e5565a9d985b3898c10d2596966ab2736a813bd444aca98a330ba10";
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {
@@ -31,5 +34,5 @@ export function platformJwt(): AuthFn<Request> {
 
 /** Ordered route-auth chain for every platform-facing channel route. */
 export function platformAuth(): AuthFn<Request>[] {
-  return [platformJwt()];
+  return [platformJwt(), localDev()];
 }

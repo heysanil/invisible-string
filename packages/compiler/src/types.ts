@@ -2,7 +2,7 @@
  * Inputs and outputs of the pure `compile()` function.
  *
  * The control plane resolves everything referenced by UUID in the
- * WorkflowDefinition (agent preset, MCP connections, skills) and the model
+ * AgentDefinition (MCP connections, skills) and the model
  * (preset → allowlist → provider+id) BEFORE calling compile. compile()
  * receives only plain data, performs no I/O, and is deterministic:
  * identical inputs always produce identical `files` and `hash`.
@@ -12,7 +12,6 @@
  * (`MCP_<SLUG>_TOKEN`, header env names); the worker supervisor injects the
  * decrypted values at spawn.
  */
-import type { ReasoningEffort } from "@invisible-string/shared";
 
 /**
  * Exact runtime version matrix — the shape of `packages/compiler/versions.json`
@@ -44,17 +43,6 @@ export type ModelProvider = "openrouter" | "anthropic";
 export interface ResolvedModel {
   readonly provider: ModelProvider;
   readonly modelId: string;
-}
-
-/** The `agents` row (agent preset) referenced by the AGENT pillar. */
-export interface ResolvedAgentPreset {
-  /** Must equal `definition.agent.agentPresetId`. */
-  readonly id: string;
-  readonly name: string;
-  /** Persona block prepended to instructions.md. */
-  readonly persona: string;
-  /** Preset default; `definition.agent.reasoning` overrides it. */
-  readonly defaultReasoning?: ReasoningEffort;
 }
 
 /**
@@ -100,7 +88,7 @@ export type ToolFilterSpec =
   | { readonly allow: readonly string[]; readonly block?: undefined }
   | { readonly block: readonly string[]; readonly allow?: undefined };
 
-/** One `mcp_connections` row resolved for this workflow's CONTEXT pillar. */
+/** One `mcp_connections` row resolved for this agent's context. */
 export interface ResolvedMcpConnection {
   /** Matches an entry of `definition.context.mcpConnectionIds`. */
   readonly id: string;
@@ -115,7 +103,7 @@ export interface ResolvedMcpConnection {
   readonly approval: ApprovalSpec;
 }
 
-/** One `skills` row resolved for this workflow's CONTEXT pillar. */
+/** One `skills` row resolved for this agent's context. */
 export interface ResolvedSkill {
   /** Matches an entry of `definition.context.skillIds`. */
   readonly id: string;
@@ -138,13 +126,17 @@ export interface CompileOptions {
   readonly dev?: boolean;
 }
 
-/** Everything compile() needs beyond the WorkflowDefinition. */
+/** Everything compile() needs beyond the AgentDefinition. */
 export interface CompileDeps {
   readonly versions: RuntimeVersions;
   readonly resolvedModel: ResolvedModel;
+  /**
+   * Participates in the hash DELIBERATELY (tenant isolation): identical
+   * agent configs in two workspaces must never share an artifact, world
+   * database, or JWT audience.
+   */
   readonly workspaceSlug: string;
-  readonly workflowSlug: string;
-  readonly agentPreset: ResolvedAgentPreset;
+  readonly agentSlug: string;
   readonly connections: readonly ResolvedMcpConnection[];
   readonly skills: readonly ResolvedSkill[];
   readonly options?: CompileOptions;
@@ -154,11 +146,11 @@ export interface CompileDeps {
    * INPUT; this covers the build steps that turn the emitted files into an
    * artifact — `eve build` bakes env-dependent state (model routing) into
    * artifact bytes, so a build-env change must re-key cached artifacts.
-   * Participates in computeWorkflowHash; MUST flow through compile() (not be
+   * Participates in computeAgentHash; MUST flow through compile() (not be
    * appended afterwards) because the emitted platform-auth lib bakes the JWT
-   * audience `agent:<hash>` — an outward hash that differs from the baked
-   * one would 401 every platform-minted token. `undefined` keeps historical
-   * hashes.
+   * audience `agent-version:<hash>` — an outward hash that differs from the
+   * baked one would 401 every platform-minted token. `undefined` keeps
+   * historical hashes.
    */
   readonly buildEnvEpoch?: number;
 }

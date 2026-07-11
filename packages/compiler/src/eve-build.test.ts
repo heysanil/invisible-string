@@ -1,12 +1,15 @@
 /**
  * Gated slow test (SPIKE_EVE_BUILD=1): proves the emitted templates COMPILE.
  *
- * EVERY fixture (manual, form+MCP+skill, slack stateful channel, schedule,
- * custom approval policy) is rendered to a temp dir, npm-installed with
+ * EVERY fixture (basic persona-only, MCP+packaged-skill, custom approval
+ * policy, anthropic model) is rendered to a temp dir, npm-installed with
  * Node 24 (mise) against a shared npm cache, and strict-typechecked with
- * `tsc --noEmit` against the real eve types. The form fixture additionally
- * runs the full `eve build` to a servable .output bundle (representative:
- * trigger channel + connection + skill + platform auth).
+ * `tsc --noEmit` against the real eve types. Two fixtures additionally run
+ * the full `eve build` to a servable `.output` bundle:
+ * - basic — the ONLY-default-eve-channel project (the agents-first
+ *   artifact shape: no custom channels at all — the critical de-risk);
+ * - mcp-skill — connection + packaged skill (SKILL.md + references/ file),
+ *   the control-plane skill-attachment path in fixture form.
  *
  *   SPIKE_EVE_BUILD=1 bun test packages/compiler/src/eve-build.test.ts
  *
@@ -22,8 +25,9 @@ import { dirname, join, resolve } from "node:path";
 import { compile } from "./compile";
 import {
   ALL_FIXTURES,
-  formMcpSkillFixture,
-  skillWithFilesFixture,
+  basicFixture,
+  mcpSkillFixture,
+  type CompilerFixture,
 } from "./test-fixtures";
 
 const GATE = process.env.SPIKE_EVE_BUILD === "1";
@@ -69,7 +73,7 @@ async function run(
   return { exitCode, output: `${stdout}\n${stderr}` };
 }
 
-function renderFixtureTo(dir: string, fixture: (typeof ALL_FIXTURES)[number]): void {
+function renderFixtureTo(dir: string, fixture: CompilerFixture): void {
   const { files } = compile(fixture.definition, fixture.deps);
   for (const [path, content] of files) {
     const target = join(dir, path);
@@ -95,25 +99,32 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
     ANTHROPIC_API_KEY: undefined,
   };
 
-  // ALL templates (incl. the stateful slack channel and the custom-approval
-  // policy) must typecheck strictly against the real eve@pinned types —
-  // review finding: previously only the form fixture was proven.
+  async function ensureInstalled(fixture: CompilerFixture): Promise<string> {
+    const projectDir = join(root, fixture.name);
+    if (!existsSync(join(projectDir, "package.json"))) {
+      mkdirSync(projectDir, { recursive: true });
+      renderFixtureTo(projectDir, fixture);
+    }
+    if (!existsSync(join(projectDir, "node_modules"))) {
+      const install = await run(
+        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+        projectDir,
+        env,
+        420_000,
+      );
+      expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
+    }
+    return projectDir;
+  }
+
+  // ALL templates (incl. the custom-approval policy and the anthropic
+  // provider branch) must typecheck strictly against the real eve@pinned
+  // types.
   for (const fixture of ALL_FIXTURES) {
     test(
       `${fixture.name}: rendered project installs and typechecks strictly`,
       async () => {
-        const projectDir = join(root, fixture.name);
-        mkdirSync(projectDir, { recursive: true });
-        renderFixtureTo(projectDir, fixture);
-
-        const install = await run(
-          ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
-          projectDir,
-          env,
-          420_000,
-        );
-        expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
-
+        const projectDir = await ensureInstalled(fixture);
         const typecheck = await run(
           [join(projectDir, "node_modules", ".bin", "tsc"), "--noEmit"],
           projectDir,
@@ -129,24 +140,13 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
     );
   }
 
+  // The agents-first artifact shape: agent/channels/eve.ts is the ONLY
+  // channel. Proving this project eve-builds keyless is the critical
+  // de-risk for the trigger-agnostic compile unit.
   test(
-    "form fixture eve-builds keyless to a servable .output bundle",
+    "basic fixture (default-eve-channel-only) eve-builds keyless to a servable .output bundle",
     async () => {
-      const projectDir = join(root, formMcpSkillFixture.name);
-      // Rendered + installed by the typecheck test above (bun runs tests in
-      // declaration order within a file); render defensively if missing.
-      if (!existsSync(join(projectDir, "package.json"))) {
-        mkdirSync(projectDir, { recursive: true });
-        renderFixtureTo(projectDir, formMcpSkillFixture);
-        const install = await run(
-          ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
-          projectDir,
-          env,
-          420_000,
-        );
-        expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
-      }
-
+      const projectDir = await ensureInstalled(basicFixture);
       const build = await run(
         [node24Bin(), join(projectDir, "node_modules", "eve", "bin", "eve.js"), "build"],
         projectDir,
@@ -155,25 +155,20 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
       );
       expect(build.exitCode, `eve build failed:\n${build.output.slice(-4000)}`).toBe(0);
       expect(existsSync(join(projectDir, ".output", "server", "index.mjs"))).toBe(true);
-
-      // The compiled manifest must register the form trigger channel route.
-      const manifestPath = join(projectDir, ".eve", "compile", "compiled-agent-manifest.json");
-      expect(existsSync(manifestPath)).toBe(true);
-      const manifest = await Bun.file(manifestPath).text();
-      expect(manifest).toContain("/eve/v1/platform/form");
+      expect(
+        existsSync(join(projectDir, ".eve", "compile", "compiled-agent-manifest.json")),
+      ).toBe(true);
     },
     1_200_000,
   );
 
-  // Proves the control-plane skill-attachment path end product: a workflow
+  // Proves the control-plane skill-attachment path end product: an agent
   // whose skill carries a `references/` file compiles to a PACKAGED skill
-  // directory and eve-builds keyless to a servable .output bundle.
+  // directory and eve-builds keyless alongside its MCP connection.
   test(
-    "skill-with-files fixture packages the attachment and eve-builds keyless",
+    "mcp-skill fixture packages the attachment and eve-builds keyless",
     async () => {
-      const projectDir = join(root, skillWithFilesFixture.name);
-      mkdirSync(projectDir, { recursive: true });
-      renderFixtureTo(projectDir, skillWithFilesFixture);
+      const projectDir = await ensureInstalled(mcpSkillFixture);
 
       // The compiler emitted a packaged skill (SKILL.md + the reference file).
       expect(
@@ -184,14 +179,6 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
           join(projectDir, "agent", "skills", "release-notes", "references", "rota.md"),
         ),
       ).toBe(true);
-
-      const install = await run(
-        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
-        projectDir,
-        env,
-        420_000,
-      );
-      expect(install.exitCode, `npm install failed:\n${install.output.slice(-4000)}`).toBe(0);
 
       const build = await run(
         [node24Bin(), join(projectDir, "node_modules", "eve", "bin", "eve.js"), "build"],

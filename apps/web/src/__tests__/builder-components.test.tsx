@@ -1,5 +1,5 @@
 /**
- * DOM smoke tests for the builder's plain-React editors and rail — they mount
+ * DOM smoke tests for the workflow editor's plain-React sections — they mount
  * without crashing and route user intent to the reducer. (The CodeMirror
  * instructions editor is exercised by its pure @-source tests instead; it is
  * flaky under happy-dom.)
@@ -7,56 +7,36 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
-import type {
-  AgentPresetDto,
-  ModelPresetDto,
-  WorkflowDefinition,
-} from "@invisible-string/shared";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import type { WorkflowConfig } from "@invisible-string/shared";
 
+import { AgentSection } from "../components/builder/AgentSection";
+import { SaveIndicator } from "../components/builder/SaveIndicator";
 import { TriggerEditor } from "../components/builder/TriggerEditor";
-import { AgentEditor } from "../components/builder/AgentEditor";
-import { PillarRail } from "../components/builder/PillarRail";
-import { emptyDiagnostics } from "../lib/builder/diagnostics";
-import { INITIAL_PUBLISH_STATE } from "../lib/builder/publish-machine";
+import {
+  FIXTURE_AGENTS,
+  FIXTURE_AGENT_IDS,
+  FIXTURE_DATA_ANALYST,
+  FIXTURE_EXEC_ASSISTANT,
+  FIXTURE_RELEASE_BOT,
+} from "../lib/agents/fixtures";
+import { renderWithRouter } from "../test/router";
 
 ensureDomForThisFile();
 afterEach(cleanup);
 
-const PRESET_ID = "a1111111-1111-4111-8111-111111111111";
+const AGENTS = FIXTURE_AGENTS.map((entry) => entry.summary);
 
-function definition(
-  overrides: Partial<WorkflowDefinition> = {},
-): WorkflowDefinition {
+function definition(overrides: Partial<WorkflowConfig> = {}): WorkflowConfig {
   return {
     trigger: { type: "manual" },
-    context: { mcpConnectionIds: [], skillIds: [] },
-    agent: { agentPresetId: PRESET_ID },
+    agentId: FIXTURE_AGENT_IDS.execAssistant,
     instructions: { markdown: "Hello" },
     ...overrides,
   };
 }
 
-const agentPreset: AgentPresetDto = {
-  id: PRESET_ID,
-  name: "General Purpose",
-  description: "A helpful generalist",
-  basePrompt: "You are helpful.",
-  reasoningEffort: "medium",
-  modelPreset: "balanced",
-  modelId: null,
-  createdAt: "2026-07-03T00:00:00.000Z",
-  updatedAt: "2026-07-03T00:00:00.000Z",
-};
-
-const modelPreset: ModelPresetDto = {
-  id: "b2222222-2222-4222-8222-222222222222",
-  slug: "balanced",
-  provider: "openrouter",
-  modelId: "deepseek/deepseek-v4-pro",
-  createdAt: "2026-07-03T00:00:00.000Z",
-  updatedAt: "2026-07-03T00:00:00.000Z",
-};
+// ── TriggerEditor ───────────────────────────────────────────────────────────
 
 test("TriggerEditor switches type and adds a form field via dispatch", () => {
   const dispatch = mock(() => {});
@@ -71,7 +51,7 @@ test("TriggerEditor switches type and adds a form field via dispatch", () => {
   });
 });
 
-test("TriggerEditor form view renders the field designer and cron preview", () => {
+test("TriggerEditor form view renders the field designer", () => {
   const dispatch = mock(() => {});
   const view = render(
     <TriggerEditor
@@ -90,88 +70,130 @@ test("TriggerEditor form view renders the field designer and cron preview", () =
   expect(dispatch).toHaveBeenCalledWith({ type: "addFormField" });
 });
 
-test("AgentEditor renders preset cards and dispatches model-preset changes", () => {
+// ── AgentSection ────────────────────────────────────────────────────────────
+
+test("AgentSection lists PUBLISHED agents as a radio group and dispatches setAgentId", async () => {
   const dispatch = mock(() => {});
-  const view = render(
-    <AgentEditor
-      definition={definition()}
+  const view = renderWithRouter(
+    <AgentSection
+      agents={AGENTS}
+      selectedAgentId={FIXTURE_AGENT_IDS.execAssistant}
       dispatch={dispatch}
-      presets={[agentPreset]}
-      modelPresets={[modelPreset]}
-      allowlist={[]}
-      members={[]}
-      runAsUserId="u1"
-      onChangeRunAs={() => {}}
     />,
   );
-  expect(view.getByRole("radio", { name: /General Purpose/ })).toBeTruthy();
 
-  fireEvent.click(view.getByRole("radio", { name: /^Quick$/ }));
+  // RouterProvider resolves its initial route asynchronously.
+  const group = await view.findByRole("radiogroup", { name: "Agent" });
+  const radios = within(group).getAllByRole("radio");
+  // Release bot has never been published — not offerable.
+  expect(radios).toHaveLength(3);
+  expect(within(group).queryByText("Release bot")).toBeNull();
+
+  const selected = within(group).getByRole("radio", {
+    name: /Executive assistant/,
+  });
+  expect(selected.getAttribute("aria-checked")).toBe("true");
+  // Only the selected card grows the edit affordance.
+  expect(within(group).getAllByRole("link", { name: /Edit agent/ })).toHaveLength(1);
+
+  fireEvent.click(within(group).getByRole("radio", { name: /Support triager/ }));
   expect(dispatch).toHaveBeenCalledWith({
-    type: "setModelPreset",
-    preset: "quick",
+    type: "setAgentId",
+    id: FIXTURE_AGENT_IDS.supportTriager,
   });
 });
 
-test("PillarRail lists the four pillars and fires focus + publish", () => {
-  const onFocusPillar = mock(() => {});
-  const onPublish = mock(() => {});
-  const view = render(
-    <PillarRail
-      name="My workflow"
-      publishedVersionId={null}
-      isDirty={false}
-      definition={definition()}
-      diagnostics={emptyDiagnostics()}
-      activePillar="trigger"
-      onFocusPillar={onFocusPillar}
-      connections={[]}
-      skills={[]}
-      agentPresets={[agentPreset]}
-      modelPresets={[modelPreset]}
-      publishState={INITIAL_PUBLISH_STATE}
-      onPublish={onPublish}
-      onRunDraft={() => {}}
-      runDraftPending={false}
-      canPublish={true}
-    />,
+test("AgentSection flags a build-failed published agent on its card", async () => {
+  const view = renderWithRouter(
+    <AgentSection agents={AGENTS} selectedAgentId={null} dispatch={() => {}} />,
   );
-
-  for (const label of ["Trigger", "Context", "Agent", "Instructions"]) {
-    expect(view.getByText(label)).toBeTruthy();
-  }
-
-  fireEvent.click(view.getByText("Agent"));
-  expect(onFocusPillar).toHaveBeenCalledWith("agent");
-
-  fireEvent.click(view.getByRole("button", { name: /Publish/ }));
-  expect(onPublish).toHaveBeenCalled();
+  const card = await view.findByRole("radio", { name: /Data analyst/ });
+  expect(card.textContent).toContain("Build failed");
+  expect(FIXTURE_DATA_ANALYST.summary.buildStatus).toBe("failed");
 });
 
-test("PillarRail shows a build error surface when publish failed", () => {
-  const view = render(
-    <PillarRail
-      name="My workflow"
-      publishedVersionId={null}
-      isDirty={false}
-      definition={definition()}
-      diagnostics={emptyDiagnostics()}
-      activePillar="trigger"
-      onFocusPillar={() => {}}
-      connections={[]}
-      skills={[]}
-      agentPresets={[agentPreset]}
-      modelPresets={[modelPreset]}
-      publishState={{
-        phase: "error",
-        result: null,
-        error: "tsc: type error in agent.ts",
-      }}
-      onPublish={() => {}}
-      onRunDraft={() => {}}
-      runDraftPending={false}
-      canPublish={true}
+test("AgentSection shows a dimmed warning card when the selection is unpublished", async () => {
+  const view = renderWithRouter(
+    <AgentSection
+      agents={AGENTS}
+      selectedAgentId={FIXTURE_RELEASE_BOT.summary.id}
+      dispatch={() => {}}
     />,
   );
-  expect(view.getByText(/type error in agent.ts/)).toBeTruthy();
+  const stale = await view.findByTestId("stale-agent-card");
+  expect(stale.textContent).toContain("Release bot");
+  expect(stale.textContent).toContain("Not published");
+  // The published inventory stays pickable underneath.
+  expect(view.getByRole("radiogroup", { name: "Agent" })).toBeTruthy();
+});
+
+test("AgentSection shows a missing card when the selected agent no longer exists", async () => {
+  const view = renderWithRouter(
+    <AgentSection
+      agents={AGENTS}
+      selectedAgentId="99999999-9999-4999-8999-999999999999"
+      dispatch={() => {}}
+    />,
+  );
+  const stale = await view.findByTestId("stale-agent-card");
+  expect(stale.textContent).toContain("Unknown agent");
+  expect(stale.textContent).toContain("Missing");
+});
+
+test("AgentSection empty state links to /agents when nothing is published", async () => {
+  const view = renderWithRouter(
+    <AgentSection
+      agents={[FIXTURE_RELEASE_BOT.summary]}
+      selectedAgentId={null}
+      dispatch={() => {}}
+    />,
+  );
+  expect(await view.findByText("No published agents yet")).toBeTruthy();
+  const link = view.getByRole("link", { name: /Open Agents/ });
+  expect(link.getAttribute("href")).toBe("/agents");
+  expect(view.queryByRole("radiogroup")).toBeNull();
+});
+
+test("AgentSection renders ghost cards while the inventory loads", async () => {
+  const view = renderWithRouter(
+    <AgentSection
+      agents={null}
+      selectedAgentId={FIXTURE_AGENT_IDS.execAssistant}
+      dispatch={() => {}}
+    />,
+  );
+  // Wait for the router to mount the subtree, then assert the ghost grid.
+  await waitFor(() => {
+    expect(view.container.querySelector("div[aria-hidden='true']")).toBeTruthy();
+  });
+  expect(view.queryByRole("radiogroup")).toBeNull();
+  expect(view.queryByTestId("stale-agent-card")).toBeNull();
+});
+
+// ── SaveIndicator ───────────────────────────────────────────────────────────
+
+test("SaveIndicator walks its states: saving → issues → clean → error", () => {
+  const view = render(
+    <SaveIndicator status="saving" issueCount={0} isDirty={true} />,
+  );
+  expect(view.container.textContent).toContain("Saving…");
+
+  view.rerender(<SaveIndicator status="saved" issueCount={2} isDirty={false} />);
+  expect(view.container.textContent).toContain("2 issues");
+
+  view.rerender(<SaveIndicator status="saved" issueCount={0} isDirty={false} />);
+  expect(view.container.textContent).toContain("Saved");
+
+  view.rerender(<SaveIndicator status="error" issueCount={0} isDirty={true} />);
+  expect(view.container.textContent).toContain("Save failed");
+
+  view.rerender(<SaveIndicator status="idle" issueCount={0} isDirty={false} />);
+  expect(view.container.textContent).toContain("All changes saved");
+});
+
+test("exercised fixture matrix matches the design's state coverage", () => {
+  // Published + published + published-failed + draft — the four states the
+  // section must present (design §3).
+  expect(FIXTURE_EXEC_ASSISTANT.summary.publishedVersionId).not.toBeNull();
+  expect(FIXTURE_RELEASE_BOT.summary.publishedVersionId).toBeNull();
 });

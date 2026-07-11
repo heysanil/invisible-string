@@ -1,9 +1,11 @@
 /**
- * Workflows CRUD + publish/dry-run hooks.
+ * Workflows CRUD + publish hooks.
  *
- * Endpoint contract: packages/shared/src/api.ts "Workflows CRUD" +
- * publish/dry-run sections. All mutations keep the detail cache warm with
- * the server's returned row and invalidate the list.
+ * Endpoint contract: packages/shared/src/api.ts "Workflows CRUD + publish".
+ * Workflows have no builds — publish validates + snapshots instantly, and
+ * validator diagnostics ride the GET/PATCH responses (no dry-run endpoint;
+ * that lives on agents). All mutations keep the detail cache warm with the
+ * server's returned row and invalidate the list.
  */
 import {
   useMutation,
@@ -12,15 +14,12 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import {
-  buildStatusResponseSchema,
   createWorkflowResponseSchema,
   deleteResourceResponseSchema,
-  dryRunCompileResponseSchema,
   getWorkflowResponseSchema,
   listWorkflowsResponseSchema,
   publishWorkflowResponseSchema,
   updateWorkflowResponseSchema,
-  type BuildStatusResponse,
   type CreateWorkflowRequest,
   type GetWorkflowResponse,
   type UpdateWorkflowRequest,
@@ -45,20 +44,6 @@ export function fetchWorkflow(
   return api.get(
     `${basePath(workspaceId)}/${workflowId}`,
     getWorkflowResponseSchema,
-    { signal },
-  );
-}
-
-/** One-shot build-status poll for a version (builder polls after publish). */
-export function fetchBuildStatus(
-  workspaceId: string,
-  workflowId: string,
-  versionId: string,
-  signal?: AbortSignal,
-): Promise<BuildStatusResponse> {
-  return api.get(
-    `${basePath(workspaceId)}/${workflowId}/versions/${versionId}/build`,
-    buildStatusResponseSchema,
     { signal },
   );
 }
@@ -156,7 +141,10 @@ export function useDeleteWorkflow(workspaceId: string) {
   });
 }
 
-/** Publish the current draft (idempotent by content hash). */
+/**
+ * Publish the current draft: instant validate + snapshot (no build). The
+ * response is the updated row with `published` freshly snapshotted.
+ */
 export function usePublishWorkflow(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -165,21 +153,12 @@ export function usePublishWorkflow(workspaceId: string) {
         `${basePath(workspaceId)}/${workflowId}/publish`,
         publishWorkflowResponseSchema,
       ),
-    onSuccess: () => invalidateWorkflows(queryClient, workspaceId),
-  });
-}
-
-/**
- * Dry-run compile of the SAVED draft (no rows written). Compile problems are
- * returned as `{ok: false, error}` payloads — the builder renders them
- * inline, they are not thrown.
- */
-export function useDryRunCompile(workspaceId: string) {
-  return useMutation({
-    mutationFn: (workflowId: string) =>
-      api.post(
-        `${basePath(workspaceId)}/${workflowId}/versions/dry-run-compile`,
-        dryRunCompileResponseSchema,
-      ),
+    onSuccess: async (data) => {
+      queryClient.setQueryData<GetWorkflowResponse>(
+        queryKeys.workflows.detail(workspaceId, data.workflow.id),
+        { workflow: data.workflow },
+      );
+      await invalidateWorkflows(queryClient, workspaceId);
+    },
   });
 }

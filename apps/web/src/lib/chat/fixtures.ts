@@ -4,7 +4,10 @@
  * every working-block / reply / approval / error state without a backend.
  *
  * Each run's frames use the SAME frozen EveStreamEvent shapes the live
- * stream delivers, so the reducer path is identical to production.
+ * stream delivers, so the reducer path is identical to production. Sessions
+ * bind to the fixture agents (lib/agents/fixtures.ts); one session is
+ * webhook-origin with workflow provenance so the origin + workflow chips
+ * render.
  */
 import type {
   AgentSessionSummaryDto,
@@ -15,16 +18,29 @@ import type {
   TriggerEvent,
 } from "@invisible-string/shared";
 
+import {
+  FIXTURE_DATA_ANALYST,
+  FIXTURE_EXEC_ASSISTANT,
+  FIXTURE_SUPPORT_TRIAGER,
+  type FixtureAgent,
+} from "../agents/fixtures";
+
 const WS = "org_fixture";
 const NOW = Date.now();
+
+/** The one webhook-origin session's workflow provenance. */
+export const FIXTURE_WORKFLOW_ID = "cccccccc-0001-4000-8000-000000000001";
+export const FIXTURE_WORKFLOW_NAME = "Nightly metrics digest";
 
 function iso(offsetSeconds: number): string {
   return new Date(NOW + offsetSeconds * 1000).toISOString();
 }
 
-function trigger(message: string): TriggerEvent {
+/** Direct-chat trigger envelope (no workflow provenance). */
+function chatTrigger(agent: FixtureAgent, message: string): TriggerEvent {
   return {
-    workflowId: "wf_fixture",
+    agentId: agent.agent.id,
+    workflowId: null,
     triggerType: "manual",
     message,
     data: {},
@@ -43,48 +59,104 @@ function framesFor(runId: string, events: EveStreamEvent[]): RunEventFrame[] {
 }
 
 export interface FixtureRun {
-  run: Pick<RunDto, "id" | "status" | "triggerEvent" | "error">;
+  run: Pick<RunDto, "id" | "status" | "triggerEvent" | "taskMessage" | "error">;
   frames: RunEventFrame[];
 }
 
 export interface FixtureSession {
+  /** Carries agent identity + origin + workflow provenance (or null). */
   summary: AgentSessionSummaryDto;
-  isChatOrigin: boolean;
-  workflowId: string;
-  workflowName: string;
+  /** Pinned agent version chip label. */
   versionLabel: string | null;
   runs: FixtureRun[];
 }
 
 function sessionSummary(
   id: string,
-  workflowName: string,
+  agent: FixtureAgent,
   status: AgentSessionSummaryDto["status"],
   lastRunStatus: RunStatus | null,
   ageSeconds: number,
+  provenance?: {
+    origin: AgentSessionSummaryDto["origin"];
+    workflowId: string;
+    workflowName: string;
+  },
 ): AgentSessionSummaryDto {
   return {
     id,
-    workflowId: "wf_fixture",
-    workflowVersionId: "wfv_fixture",
-    origin: "chat",
+    agentId: agent.agent.id,
+    agentVersionId:
+      agent.summary.publishedVersionId ?? agent.agent.id,
+    workflowId: provenance?.workflowId ?? null,
+    origin: provenance?.origin ?? "chat",
     status,
     eveSessionId: "eve_fixture",
     createdAt: iso(-ageSeconds - 600),
     updatedAt: iso(-ageSeconds),
-    workflowName,
+    agentName: agent.agent.name,
+    workflowName: provenance?.workflowName ?? null,
     lastRunStatus,
     lastActivityAt: iso(-ageSeconds),
   };
 }
 
-// ── Session 1: a completed run with a working block + markdown reply ────────
+// ── Session 1: a live streaming run (Executive assistant) ───────────────────
+
+const streamingRun: FixtureRun = {
+  run: {
+    id: "run_live",
+    status: "running",
+    triggerEvent: chatTrigger(FIXTURE_EXEC_ASSISTANT, "Draft a launch announcement."),
+    taskMessage: null,
+    error: null,
+  },
+  frames: framesFor("run_live", [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.19.0", modelId: "deepseek/deepseek-v4-pro" } }, meta: { at: iso(-1) } },
+    { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "message.received", data: { message: "Draft a launch announcement.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "reasoning.appended", data: { reasoningDelta: "Considering the tone", reasoningSoFar: "Considering the tone and audience for the announcement…", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
+    { type: "message.appended", data: { messageDelta: "We're excited", messageSoFar: "We're excited to announce", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
+  ]),
+};
+
+// ── Session 2: a run parked on an approval (HITL, Executive assistant) ──────
+
+const parkedRun: FixtureRun = {
+  run: {
+    id: "run_parked",
+    status: "waiting",
+    triggerEvent: chatTrigger(
+      FIXTURE_EXEC_ASSISTANT,
+      "Send the weekly report email to the team.",
+    ),
+    taskMessage: null,
+    error: null,
+  },
+  frames: framesFor("run_parked", [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.19.0", modelId: "z-ai/glm-5.2" } }, meta: { at: iso(-1) } },
+    { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "message.received", data: { message: "Send the weekly report email to the team.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "actions.requested", data: { actions: [{ callId: "c9", kind: "tool-call", toolName: "gmail_send", input: { to: "team@acme.com", subject: "Weekly report" } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
+    { type: "input.requested", data: { requests: [{ requestId: "req1", prompt: "Approve tool call: gmail_send", action: { callId: "c9", kind: "tool-call", toolName: "gmail_send", input: { to: "team@acme.com", subject: "Weekly report" } }, options: [{ id: "approve", label: "Approve", style: "primary" }, { id: "deny", label: "Deny", style: "danger" }], display: "confirmation", allowFreeform: false }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
+    { type: "turn.completed", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(2) } },
+    { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(2) } },
+  ]),
+};
+
+// ── Session 3: a completed run with a working block (Support triager) ───────
 
 const completedRun: FixtureRun = {
   run: {
     id: "run_done",
     status: "succeeded",
-    triggerEvent: trigger("Summarize the latest issues in the tracker."),
+    triggerEvent: chatTrigger(
+      FIXTURE_SUPPORT_TRIAGER,
+      "Summarize the latest issues in the tracker.",
+    ),
+    taskMessage: null,
     error: null,
   },
   frames: framesFor("run_done", [
@@ -102,59 +174,37 @@ const completedRun: FixtureRun = {
   ]),
 };
 
-// ── Session 2: a run parked on an approval (HITL) ───────────────────────────
+// ── Session 4: a failed WEBHOOK run (Data analyst via a workflow) ────────────
 
-const parkedRun: FixtureRun = {
-  run: {
-    id: "run_parked",
-    status: "waiting",
-    triggerEvent: trigger("Send the weekly report email to the team."),
-    error: null,
-  },
-  frames: framesFor("run_parked", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.19.0", modelId: "z-ai/glm-5.2" } }, meta: { at: iso(-1) } },
-    { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "message.received", data: { message: "Send the weekly report email to the team.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "actions.requested", data: { actions: [{ callId: "c9", kind: "tool-call", toolName: "gmail_send", input: { to: "team@acme.com", subject: "Weekly report" } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
-    { type: "input.requested", data: { requests: [{ requestId: "req1", prompt: "Approve tool call: gmail_send", action: { callId: "c9", kind: "tool-call", toolName: "gmail_send", input: { to: "team@acme.com", subject: "Weekly report" } }, options: [{ id: "approve", label: "Approve", style: "primary" }, { id: "deny", label: "Deny", style: "danger" }], display: "confirmation", allowFreeform: false }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
-    { type: "turn.completed", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(2) } },
-    { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(2) } },
-  ]),
-};
-
-// ── Session 3: a live streaming run ─────────────────────────────────────────
-
-const streamingRun: FixtureRun = {
-  run: {
-    id: "run_live",
-    status: "running",
-    triggerEvent: trigger("Draft a launch announcement."),
-    error: null,
-  },
-  frames: framesFor("run_live", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.19.0", modelId: "deepseek/deepseek-v4-pro" } }, meta: { at: iso(-1) } },
-    { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "message.received", data: { message: "Draft a launch announcement.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "reasoning.appended", data: { reasoningDelta: "Considering the tone", reasoningSoFar: "Considering the tone and audience for the announcement…", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
-    { type: "message.appended", data: { messageDelta: "We're excited", messageSoFar: "We're excited to announce", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
-  ]),
-};
-
-// ── Session 4: a failed run ─────────────────────────────────────────────────
+const webhookTaskMessage = [
+  "<workflow-task>",
+  "Investigate last night's metrics export and report what changed and why.",
+  "</workflow-task>",
+  "",
+  "<trigger-context>",
+  "trigger.report_date: 2026-07-09",
+  "</trigger-context>",
+].join("\n");
 
 const failedRun: FixtureRun = {
   run: {
     id: "run_failed",
     status: "failed",
-    triggerEvent: trigger("Deploy to production."),
+    triggerEvent: {
+      agentId: FIXTURE_DATA_ANALYST.agent.id,
+      workflowId: FIXTURE_WORKFLOW_ID,
+      triggerType: "webhook",
+      message: "Investigate last night's metrics export.",
+      data: { report_date: "2026-07-09" },
+      principal: { workspaceId: WS, source: "webhook" },
+    },
+    taskMessage: webhookTaskMessage,
     error: "Model provider returned 401 — credentials rejected.",
   },
   frames: framesFor("run_failed", [
     { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.19.0", modelId: "deepseek/deepseek-v4-flash" } }, meta: { at: iso(-1) } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "message.received", data: { message: "Deploy to production.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
+    { type: "message.received", data: { message: webhookTaskMessage, sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.failed", data: { code: "provider_error", message: "Model provider returned 401 — credentials rejected.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
     { type: "turn.failed", data: { code: "provider_error", message: "Model provider returned 401 — credentials rejected.", sequence: 0, turnId: "t0" }, meta: { at: iso(1) } },
@@ -163,34 +213,26 @@ const failedRun: FixtureRun = {
 
 export const FIXTURE_SESSIONS: FixtureSession[] = [
   {
-    summary: sessionSummary("s_live", "Marketing copilot", "active", "running", 30),
-    isChatOrigin: true,
-    workflowId: "wf_fixture",
-    workflowName: "Marketing copilot",
+    summary: sessionSummary("s_live", FIXTURE_EXEC_ASSISTANT, "active", "running", 30),
     versionLabel: "v_a1b2c3",
     runs: [streamingRun],
   },
   {
-    summary: sessionSummary("s_parked", "Ops assistant", "waiting", "waiting", 240),
-    isChatOrigin: true,
-    workflowId: "wf_fixture",
-    workflowName: "Ops assistant",
-    versionLabel: "v_d4e5f6",
+    summary: sessionSummary("s_parked", FIXTURE_EXEC_ASSISTANT, "waiting", "waiting", 240),
+    versionLabel: "v_a1b2c3",
     runs: [parkedRun],
   },
   {
-    summary: sessionSummary("s_done", "Issue triage", "active", "succeeded", 7200),
-    isChatOrigin: true,
-    workflowId: "wf_fixture",
-    workflowName: "Issue triage",
+    summary: sessionSummary("s_done", FIXTURE_SUPPORT_TRIAGER, "active", "succeeded", 7200),
     versionLabel: "v_9a8b7c",
     runs: [completedRun],
   },
   {
-    summary: sessionSummary("s_failed", "Release bot", "error", "failed", 172800),
-    isChatOrigin: true,
-    workflowId: "wf_fixture",
-    workflowName: "Release bot",
+    summary: sessionSummary("s_failed", FIXTURE_DATA_ANALYST, "error", "failed", 172800, {
+      origin: "webhook",
+      workflowId: FIXTURE_WORKFLOW_ID,
+      workflowName: FIXTURE_WORKFLOW_NAME,
+    }),
     versionLabel: "v_0f1e2d",
     runs: [failedRun],
   },

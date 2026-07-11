@@ -1,26 +1,44 @@
 /**
- * Pillar-card diagnostics mapping: local mirror checks + dry-run error
- * distribution route each problem to the correct pillar (or general bucket).
+ * Section-card diagnostics mapping: local mirror checks + server-finding
+ * distribution route each problem to the correct section (or general bucket).
  */
 import { expect, test } from "bun:test";
-import type { ApiErrorInfo, WorkflowDefinition } from "@invisible-string/shared";
+import type {
+  AgentSummaryDto,
+  WorkflowConfig,
+  WorkflowDiagnostics,
+} from "@invisible-string/shared";
 
 import {
   countIssues,
-  dryRunDiagnostics,
   localDiagnostics,
-  pillarIssueCount,
+  sectionIssueCount,
+  serverDiagnostics,
   type LocalCheckInputs,
 } from "../lib/builder/diagnostics";
 import type { ReferenceSources } from "../lib/builder/references";
 
-const PRESET = "a1111111-1111-4111-8111-111111111111";
+const AGENT_ID = "a1111111-1111-4111-8111-111111111111";
 
-function baseDefinition(): WorkflowDefinition {
+function agent(overrides: Partial<AgentSummaryDto> = {}): AgentSummaryDto {
+  return {
+    id: AGENT_ID,
+    name: "Executive assistant",
+    description: null,
+    runAsUserId: "user-1",
+    publishedVersionId: "v-1",
+    publishedAt: "2026-07-01T00:00:00.000Z",
+    buildStatus: "succeeded",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function baseDefinition(): WorkflowConfig {
   return {
     trigger: { type: "manual" },
-    context: { mcpConnectionIds: [], skillIds: [] },
-    agent: { agentPresetId: PRESET },
+    agentId: AGENT_ID,
     instructions: { markdown: "Do the thing." },
   };
 }
@@ -32,14 +50,14 @@ const sources: ReferenceSources = {
 };
 
 function inputs(
-  definition: WorkflowDefinition,
+  definition: WorkflowConfig,
   overrides: Partial<LocalCheckInputs> = {},
 ): LocalCheckInputs {
   return {
     definition,
     sources: overrides.sources ?? { ...sources, trigger: definition.trigger },
-    agentPresetIds: overrides.agentPresetIds ?? [PRESET],
-    allowedModelIds: overrides.allowedModelIds ?? [],
+    agents: "agents" in overrides ? (overrides.agents ?? null) : [agent()],
+    contextResolved: overrides.contextResolved ?? true,
   };
 }
 
@@ -50,46 +68,74 @@ test("a valid draft produces no local diagnostics", () => {
   expect(countIssues(diagnostics)).toBe(0);
 });
 
-test("empty instructions warn on the instructions pillar (saveable draft)", () => {
+test("empty instructions warn on the instructions section (saveable draft)", () => {
   const definition = { ...baseDefinition(), instructions: { markdown: "  " } };
   const diagnostics = localDiagnostics(inputs(definition));
-  expect(pillarIssueCount(diagnostics, "instructions")).toBe(1);
-  expect(diagnostics.pillars.instructions[0]!.severity).toBe("warning");
+  expect(sectionIssueCount(diagnostics, "instructions")).toBe(1);
+  expect(diagnostics.sections.instructions[0]!.severity).toBe("warning");
 });
 
-test("unknown agent preset flags the agent pillar", () => {
+test("no agent selected blocks publish with an agent-section error", () => {
+  const definition = { ...baseDefinition(), agentId: null };
+  const diagnostics = localDiagnostics(inputs(definition));
+  expect(sectionIssueCount(diagnostics, "agent")).toBe(1);
+  expect(diagnostics.sections.agent[0]!.severity).toBe("error");
+});
+
+test("a vanished agent flags the agent section", () => {
   const diagnostics = localDiagnostics(
-    inputs(baseDefinition(), { agentPresetIds: ["someone-else"] }),
+    inputs(baseDefinition(), { agents: [agent({ id: "someone-else" })] }),
   );
-  expect(pillarIssueCount(diagnostics, "agent")).toBe(1);
-  expect(diagnostics.pillars.agent[0]!.severity).toBe("error");
+  expect(sectionIssueCount(diagnostics, "agent")).toBe(1);
+  expect(diagnostics.sections.agent[0]!.severity).toBe("error");
+  expect(diagnostics.sections.agent[0]!.message).toContain("no longer exists");
 });
 
-test("a non-allowlisted model override flags the agent pillar", () => {
-  const definition: WorkflowDefinition = {
-    ...baseDefinition(),
-    agent: { agentPresetId: PRESET, modelId: "anthropic/claude-sonnet-5" },
-  };
+test("an unpublished agent flags the agent section by name", () => {
   const diagnostics = localDiagnostics(
-    inputs(definition, { allowedModelIds: ["z-ai/glm-5.2"] }),
+    inputs(baseDefinition(), {
+      agents: [agent({ publishedVersionId: null, publishedAt: null, buildStatus: null })],
+    }),
   );
-  expect(
-    diagnostics.pillars.agent.some((d) => d.message.includes("allowlist")),
-  ).toBe(true);
+  expect(sectionIssueCount(diagnostics, "agent")).toBe(1);
+  expect(diagnostics.sections.agent[0]!.severity).toBe("error");
+  expect(diagnostics.sections.agent[0]!.message).toContain("Executive assistant");
+  expect(diagnostics.sections.agent[0]!.message).toContain("publish");
 });
 
-test("unresolved @reference warns on the instructions pillar", () => {
-  const definition: WorkflowDefinition = {
+test("a loading agent inventory (null) skips agent existence checks", () => {
+  const diagnostics = localDiagnostics(
+    inputs(baseDefinition(), { agents: null }),
+  );
+  expect(sectionIssueCount(diagnostics, "agent")).toBe(0);
+});
+
+test("unresolved @connection reference warns on the instructions section", () => {
+  const definition: WorkflowConfig = {
     ...baseDefinition(),
     instructions: { markdown: "Ping @github about it." },
   };
   const diagnostics = localDiagnostics(inputs(definition));
-  expect(pillarIssueCount(diagnostics, "instructions")).toBe(1);
-  expect(diagnostics.pillars.instructions[0]!.message).toContain("@github");
+  expect(sectionIssueCount(diagnostics, "instructions")).toBe(1);
+  expect(diagnostics.sections.instructions[0]!.message).toContain("@github");
 });
 
-test("a duplicate form field key flags the trigger pillar once", () => {
-  const definition: WorkflowDefinition = {
+test("connection/skill ref checks pause while the agent context loads; @trigger refs do not", () => {
+  const definition: WorkflowConfig = {
+    ...baseDefinition(),
+    instructions: { markdown: "Ping @github with @trigger.email." },
+  };
+  const diagnostics = localDiagnostics(
+    inputs(definition, { contextResolved: false }),
+  );
+  // The manual trigger carries no dispatch data → @trigger.email still warns;
+  // @github is withheld until the selected agent's context resolves.
+  expect(sectionIssueCount(diagnostics, "instructions")).toBe(1);
+  expect(diagnostics.sections.instructions[0]!.message).toContain("@trigger.email");
+});
+
+test("a duplicate form field key flags the trigger section once", () => {
+  const definition: WorkflowConfig = {
     ...baseDefinition(),
     trigger: {
       type: "form",
@@ -104,72 +150,34 @@ test("a duplicate form field key flags the trigger pillar once", () => {
       sources: { ...sources, trigger: definition.trigger },
     }),
   );
-  expect(pillarIssueCount(diagnostics, "trigger")).toBeGreaterThanOrEqual(1);
+  expect(sectionIssueCount(diagnostics, "trigger")).toBeGreaterThanOrEqual(1);
 });
 
-test("loading resources (null lists) skips existence checks", () => {
-  const diagnostics = localDiagnostics(
-    inputs(baseDefinition(), {
-      agentPresetIds: null,
-      allowedModelIds: null,
-    }),
-  );
-  expect(pillarIssueCount(diagnostics, "agent")).toBe(0);
-});
+// ── server-finding distribution ──────────────────────────────────────────────
 
-// ── dry-run distribution ─────────────────────────────────────────────────────
-
-test("draft_invalid zod issues route by their pillar path head", () => {
-  const error: ApiErrorInfo = {
-    code: "draft_invalid",
-    message: "invalid",
-    details: [
-      { message: "Required", path: ["trigger", "fields"] },
-      { message: "too small", path: ["instructions", "markdown"] },
-    ],
-  };
-  const diagnostics = dryRunDiagnostics(error);
-  expect(pillarIssueCount(diagnostics, "trigger")).toBe(1);
-  expect(pillarIssueCount(diagnostics, "instructions")).toBe(1);
+test("server findings route by their config path head", () => {
+  const findings: WorkflowDiagnostics = [
+    { path: "agentId", message: "agent is not published", severity: "error" },
+    {
+      path: "instructions.markdown",
+      message: "@linear is not in the agent's context",
+      severity: "warning",
+    },
+    { path: "trigger.fields.0.key", message: "duplicate key", severity: "error" },
+  ];
+  const diagnostics = serverDiagnostics(findings);
+  expect(sectionIssueCount(diagnostics, "agent")).toBe(1);
+  expect(sectionIssueCount(diagnostics, "instructions")).toBe(1);
+  expect(sectionIssueCount(diagnostics, "trigger")).toBe(1);
   expect(diagnostics.general.length).toBe(0);
+  expect(diagnostics.sections.instructions[0]!.severity).toBe("warning");
 });
 
-test("compile_failed connection-path issues route to context", () => {
-  const error: ApiErrorInfo = {
-    code: "compile_failed",
-    message: "workflow failed to compile",
-    details: [
-      { path: "connections.linear.url", message: "no resolved URL" },
-      { message: "UNRESOLVED_REFERENCE: @github does not match" },
-    ],
-  };
-  const diagnostics = dryRunDiagnostics(error);
-  expect(pillarIssueCount(diagnostics, "context")).toBe(1);
-  expect(pillarIssueCount(diagnostics, "instructions")).toBe(1);
-});
-
-test("compile_failed EMPTY_INSTRUCTIONS routes to instructions", () => {
-  const error: ApiErrorInfo = {
-    code: "compile_failed",
-    message: "failed",
-    details: [{ message: "EMPTY_INSTRUCTIONS: instructions are empty" }],
-  };
-  const diagnostics = dryRunDiagnostics(error);
-  expect(pillarIssueCount(diagnostics, "instructions")).toBe(1);
-});
-
-test("model_not_allowlisted routes to agent", () => {
-  const error: ApiErrorInfo = {
-    code: "model_not_allowlisted",
-    message: 'model "x" is not on this workspace\'s model allowlist',
-  };
-  const diagnostics = dryRunDiagnostics(error);
-  expect(pillarIssueCount(diagnostics, "agent")).toBe(1);
-});
-
-test("an unknown error code falls into the general bucket", () => {
-  const error: ApiErrorInfo = { code: "teapot", message: "no coffee" };
-  const diagnostics = dryRunDiagnostics(error);
-  expect(diagnostics.general.length).toBe(1);
-  expect(countIssues(diagnostics)).toBe(1);
+test("an unrooted server finding falls into the general bucket", () => {
+  const diagnostics = serverDiagnostics([
+    { path: "", message: "draft is empty", severity: "error" },
+    { path: "somethingElse", message: "??", severity: "warning" },
+  ]);
+  expect(diagnostics.general.length).toBe(2);
+  expect(countIssues(diagnostics)).toBe(2);
 });

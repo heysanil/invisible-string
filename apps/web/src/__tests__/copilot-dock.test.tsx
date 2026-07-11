@@ -1,24 +1,23 @@
 /**
- * Copilot dock behavior against a scripted fake WebSocket: streamed thread,
- * proposal frame → card per mutation tool, Apply → controller action +
- * accepted mutation_result, Dismiss → rejected mutation_result, abort,
+ * Copilot dock behavior against a scripted fake WebSocket, driven through the
+ * WORKFLOW surface adapter: streamed thread, proposal frame → card per
+ * mutation tool, Apply → controller action + accepted mutation_result,
+ * Dismiss → rejected mutation_result, off-surface proposals, abort,
  * reconnect, a11y roles, and open-state persistence. Frames follow the
- * shared protocol in packages/shared/src/copilot.ts.
+ * shared protocol in packages/shared/src/copilot.ts (`user_message` names
+ * `surface` + `entityId`; the socket itself is per-workspace).
  */
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act } from "react";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
-import type {
-  AgentPresetDto,
-  CopilotProposal,
-  WorkflowDefinition,
-} from "@invisible-string/shared";
+import type { CopilotProposal, WorkflowConfig } from "@invisible-string/shared";
 
-import { CopilotDock } from "../components/builder/CopilotDock";
-import type { ContextResources } from "../lib/builder/resources";
+import { CopilotDock } from "../components/copilot/CopilotDock";
+import { workflowCopilotAdapter } from "../lib/copilot/mutations";
 import type { WebSocketLike } from "../lib/copilot/socket";
+import { FIXTURE_AGENTS, FIXTURE_AGENT_IDS } from "../lib/agents/fixtures";
 
 ensureDomForThisFile();
 
@@ -83,28 +82,14 @@ const q = () => within(document.body);
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
-const PRESET_ID = "a1111111-1111-4111-8111-111111111111";
-const CONN_ID = "b1111111-1111-4111-8111-111111111111";
+const AGENTS = FIXTURE_AGENTS.map((entry) => entry.summary);
+const EXEC_ID = FIXTURE_AGENT_IDS.execAssistant;
 
-const definition: WorkflowDefinition = {
+const definition: WorkflowConfig = {
   trigger: { type: "manual" },
-  context: { mcpConnectionIds: [], skillIds: [] },
-  agent: { agentPresetId: PRESET_ID },
+  agentId: EXEC_ID,
   instructions: { markdown: "Old line\nShared line" },
 };
-
-const resources = {
-  connections: [],
-  skills: [],
-  connectionById: new Map([[CONN_ID, { id: CONN_ID, name: "zendesk" }]]),
-  skillById: new Map(),
-  isPending: false,
-  isError: false,
-} as unknown as ContextResources;
-
-const agentPresets = [
-  { id: PRESET_ID, name: "General" },
-] as unknown as readonly AgentPresetDto[];
 
 function proposal(overrides: Partial<CopilotProposal> = {}): CopilotProposal {
   return {
@@ -125,24 +110,33 @@ function proposal(overrides: Partial<CopilotProposal> = {}): CopilotProposal {
   } as CopilotProposal;
 }
 
-function renderDock(overrides: Record<string, unknown> = {}) {
-  const dispatch = mock(() => {});
-  const onApplied = mock(() => {});
+function renderDock(
+  options: {
+    draft?: WorkflowConfig;
+    dispatch?: ReturnType<typeof mock>;
+    onApplied?: ReturnType<typeof mock>;
+  } = {},
+) {
+  const dispatch = options.dispatch ?? mock(() => {});
+  const onApplied = options.onApplied ?? mock(() => {});
+  // Mutable holder so tests can move the "live" draft under the adapter.
+  const draft = { current: options.draft ?? definition };
+  const adapter = workflowCopilotAdapter({
+    workflowId: "wf-1",
+    getDraft: () => draft.current,
+    dispatch,
+    agents: AGENTS,
+    onApplied,
+  });
   const view = render(
     <CopilotDock
       workspaceId="ws-1"
-      workflowId="wf-1"
-      definition={definition}
-      dispatch={dispatch}
-      resources={resources}
-      agentPresets={agentPresets}
-      modelPresets={[]}
+      adapter={adapter}
       createWebSocket={createWebSocket}
       backoffBaseMs={1}
-      {...overrides}
     />,
   );
-  return { view, dispatch, onApplied };
+  return { view, dispatch, onApplied, draft, adapter };
 }
 
 function lastSocket(): FakeWebSocket {
@@ -204,7 +198,7 @@ test("connects to the workspace-scoped copilot socket and sends nothing until as
   expect(socket.sent).toEqual([]);
 });
 
-test("user_message carries workflowId + live draft; deltas stream into one message; abort on stop", () => {
+test("user_message names the workflow surface + entity and carries the live draft; deltas stream; abort on stop", () => {
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
@@ -212,7 +206,8 @@ test("user_message carries workflowId + live draft; deltas stream into one messa
   const frame = sendUserMessage(socket);
   expect(frame).toEqual({
     type: "user_message",
-    workflowId: "wf-1",
+    surface: "workflow",
+    entityId: "wf-1",
     draft: definition,
     message: "Help me",
   });
@@ -239,8 +234,8 @@ test("user_message carries workflowId + live draft; deltas stream into one messa
 });
 
 test("empty-state chips are draft-aware and send a user_message", () => {
-  // The fixture draft has instructions + no context → refinement chips, not
-  // the scaffold ones (which would be destructive on a configured draft).
+  // The fixture draft has instructions → refinement chips, not the scaffold
+  // ones (which would be destructive on a configured draft).
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
@@ -256,12 +251,11 @@ test("empty-state chips are draft-aware and send a user_message", () => {
 
 test("a blank draft shows scaffold chips", () => {
   renderDock({
-    definition: {
+    draft: {
       trigger: { type: "manual" },
-      context: { mcpConnectionIds: [], skillIds: [] },
-      agent: { agentPresetId: PRESET_ID },
+      agentId: null,
       instructions: { markdown: "" },
-    } satisfies WorkflowDefinition,
+    } satisfies WorkflowConfig,
   });
   const socket = lastSocket();
   act(() => socket.open());
@@ -305,8 +299,10 @@ test("proposal frame renders a structured card; Apply routes through dispatch an
   expect(q().getByTestId("suggestion-receipt").textContent).toContain("Applied");
 });
 
-test("Dismiss reports rejected without applying", () => {
-  const { dispatch } = renderDock();
+test("setAgent proposal resolves the agent name; Dismiss reports rejected without applying", () => {
+  const { dispatch } = renderDock({
+    draft: { ...definition, agentId: null },
+  });
   const socket = lastSocket();
   act(() => socket.open());
   act(() =>
@@ -314,14 +310,16 @@ test("Dismiss reports rejected without applying", () => {
       type: "proposal",
       proposal: proposal({
         id: "prop-2",
-        tool: "addContext",
-        params: { kind: "connection", id: CONN_ID },
+        tool: "setAgent",
+        params: { agentId: EXEC_ID },
       }),
     }),
   );
-  expect(q().getByTestId("suggestion-card").textContent).toContain(
-    "Add connection: zendesk",
-  );
+  const card = q().getByTestId("suggestion-card");
+  expect(card.textContent).toContain("Set agent: Executive assistant");
+  // Compact preview: no agent → the named agent.
+  expect(q().getByTestId("before-after").textContent).toContain("No agent");
+
   fireEvent.click(q().getByRole("button", { name: "Dismiss" }));
   expect(dispatch).not.toHaveBeenCalled();
   expect(JSON.parse(socket.sent.at(-1)!)).toEqual({
@@ -357,8 +355,9 @@ test("setInstructions proposal renders an inline diff", () => {
   expect(diff.textContent).toContain("Shared line");
 });
 
-test("suggestion card is keyboard-operable (Enter applies)", () => {
-  const { dispatch } = renderDock();
+test("suggestion card is keyboard-operable (Enter applies) and flashes the section", () => {
+  const applied = mock(() => {});
+  const { dispatch } = renderDock({ onApplied: applied });
   const socket = lastSocket();
   act(() => socket.open());
   act(() =>
@@ -367,14 +366,44 @@ test("suggestion card is keyboard-operable (Enter applies)", () => {
       proposal: proposal({
         id: "prop-4",
         tool: "setAgent",
-        params: { agentPresetId: PRESET_ID },
+        params: { agentId: EXEC_ID },
       }),
     }),
   );
   const card = q().getByRole("group", { name: /Suggestion: Set agent/ });
   expect(card.getAttribute("tabindex")).toBe("0");
   fireEvent.keyDown(card, { key: "Enter" });
-  expect(dispatch).toHaveBeenCalledWith({ type: "setAgentPreset", id: PRESET_ID });
+  expect(dispatch).toHaveBeenCalledWith({ type: "setAgentId", id: EXEC_ID });
+  expect(applied).toHaveBeenCalledWith("agent");
+});
+
+test("an off-surface proposal renders as unsupported and applies as a no-op", () => {
+  const { dispatch, onApplied } = renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  act(() =>
+    socket.message({
+      type: "proposal",
+      // Agent-surface tool arriving on the workflow surface = server bug.
+      proposal: proposal({
+        id: "prop-5",
+        tool: "setPersona",
+        params: { markdown: "You are helpful." },
+      }),
+    }),
+  );
+  const card = q().getByTestId("suggestion-card");
+  expect(card.textContent).toContain("Unsupported suggestion (setPersona)");
+  fireEvent.click(q().getByRole("button", { name: /Apply/ }));
+  // The adapter ignores it — no reducer action, no section flash — but the
+  // decision is still reported so the server's tool loop can move on.
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(onApplied).not.toHaveBeenCalled();
+  expect(JSON.parse(socket.sent.at(-1)!)).toEqual({
+    type: "mutation_result",
+    proposalId: "prop-5",
+    outcome: "accepted",
+  });
 });
 
 test("error frames render as alerts and end the generating state", () => {
@@ -410,7 +439,8 @@ test("reconnects after a drop; the new socket can carry the next user_message", 
   const frame = sendUserMessage(second, "Still here?");
   expect(frame).toMatchObject({
     type: "user_message",
-    workflowId: "wf-1",
+    surface: "workflow",
+    entityId: "wf-1",
     message: "Still here?",
   });
 });
@@ -458,9 +488,7 @@ test("a mid-turn connection drop leaves a visible notice in the thread", async (
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
   });
-  expect(q().getByTestId("copilot-notice").textContent).toContain(
-    "cut short",
-  );
+  expect(q().getByTestId("copilot-notice").textContent).toContain("cut short");
 });
 
 test("thinking indicator shows between send and first token; pending proposal shows the follow-up hint", () => {
@@ -478,13 +506,12 @@ test("thinking indicator shows between send and first token; pending proposal sh
 });
 
 test("receipt description is frozen at decision time (no drift as the draft changes)", () => {
-  const emptyDefinition: WorkflowDefinition = {
+  const blank: WorkflowConfig = {
     trigger: { type: "manual" },
-    context: { mcpConnectionIds: [], skillIds: [] },
-    agent: { agentPresetId: PRESET_ID },
+    agentId: EXEC_ID,
     instructions: { markdown: "" },
   };
-  const { view } = renderDock({ definition: emptyDefinition });
+  const { view, draft } = renderDock({ draft: blank });
   const socket = lastSocket();
   act(() => socket.open());
   act(() =>
@@ -501,19 +528,21 @@ test("receipt description is frozen at decision time (no drift as the draft chan
     "Write instructions",
   );
   fireEvent.click(q().getByRole("button", { name: /Apply/ }));
-  // Simulate the applied draft flowing back down: instructions now non-empty.
+  // Simulate the applied draft flowing back down: the adapter now reads a
+  // non-empty instructions doc, which would retitle a live card "Rewrite".
+  draft.current = {
+    ...blank,
+    instructions: { markdown: "Fresh instructions" },
+  };
   view.rerender(
     <CopilotDock
       workspaceId="ws-1"
-      workflowId="wf-1"
-      definition={{
-        ...emptyDefinition,
-        instructions: { markdown: "Fresh instructions" },
-      }}
-      dispatch={mock(() => {})}
-      resources={resources}
-      agentPresets={agentPresets}
-      modelPresets={[]}
+      adapter={workflowCopilotAdapter({
+        workflowId: "wf-1",
+        getDraft: () => draft.current,
+        dispatch: mock(() => {}),
+        agents: AGENTS,
+      })}
       createWebSocket={createWebSocket}
       backoffBaseMs={1}
     />,

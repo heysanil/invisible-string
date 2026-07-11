@@ -32,7 +32,11 @@ export function fetchSessions(
   signal?: AbortSignal,
 ) {
   return api.get(`/workspaces/${workspaceId}/sessions`, listSessionsResponseSchema, {
-    query: { workflowId: filters.workflowId, status: filters.status },
+    query: {
+      agentId: filters.agentId,
+      workflowId: filters.workflowId,
+      status: filters.status,
+    },
     signal,
   });
 }
@@ -85,13 +89,13 @@ export function useSession(sessionId: string) {
 
 // ── mutations ───────────────────────────────────────────────────────────────
 
-/** Start a chat session on a workflow's published version (first run). */
+/** Start a chat session on an agent's published version (first run). */
 export function useCreateSession(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: { workflowId: string; message: string }) =>
+    mutationFn: (input: { agentId: string; message: string }) =>
       api.post(
-        `/workspaces/${workspaceId}/workflows/${input.workflowId}/sessions`,
+        `/workspaces/${workspaceId}/agents/${input.agentId}/sessions`,
         createSessionResponseSchema,
         { body: { message: input.message } },
       ),

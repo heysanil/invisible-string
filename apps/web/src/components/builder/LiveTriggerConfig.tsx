@@ -1,6 +1,6 @@
 /**
- * Live trigger configuration (Phase 3): the parts of a TRIGGER pillar that
- * talk to the server, rendered under the draft-only {@link TriggerEditor}.
+ * Live trigger configuration (Phase 3): the parts of a workflow's trigger
+ * that talk to the server, rendered under the draft-only {@link TriggerEditor}.
  *
  * - webhook/form: mint (once) / rotate the ingress token. The PLAINTEXT token
  *   is shown a SINGLE time in a copy-to-reveal card with "we store only a

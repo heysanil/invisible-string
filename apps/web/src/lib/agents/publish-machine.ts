@@ -1,12 +1,12 @@
 /**
- * Publish state machine — models the rail's Publish capsule progression
- * (compiling → building → ready) and its error surface, decoupled from React
- * so it can be unit-tested exhaustively.
+ * Publish state machine — models the agent rail's Publish capsule
+ * progression (compiling → building → ready) and its error surface,
+ * decoupled from React so it can be unit-tested exhaustively.
  *
- * The publish endpoint (`POST .../publish`) is a single call that snapshots +
- * compiles + builds, returning a {@link PublishWorkflowResponse}; we present
- * it as staged progress because a cache MISS runs a real `eve build` that
- * takes seconds. Transitions:
+ * The publish endpoint (`POST .../agents/:agentId/publish`) is a single call
+ * that snapshots + compiles + builds, returning a {@link PublishAgentResponse};
+ * we present it as staged progress because a cache MISS runs a real
+ * `eve build` that takes seconds. Transitions:
  *
  *   idle ──start──▶ compiling ──received(building)──▶ building ─┐
  *                        │                                      │
@@ -17,7 +17,7 @@
  */
 import type {
   BuildStatus,
-  PublishWorkflowResponse,
+  PublishAgentResponse,
 } from "@invisible-string/shared";
 
 export type PublishPhase =
@@ -30,7 +30,7 @@ export type PublishPhase =
 export interface PublishState {
   phase: PublishPhase;
   /** Populated in "ready". */
-  result: PublishWorkflowResponse | null;
+  result: PublishAgentResponse | null;
   /** Populated in "error". */
   error: string | null;
 }
@@ -43,7 +43,7 @@ export const INITIAL_PUBLISH_STATE: PublishState = {
 
 export type PublishEvent =
   | { type: "start" }
-  | { type: "received"; response: PublishWorkflowResponse }
+  | { type: "received"; response: PublishAgentResponse }
   | { type: "failed"; message: string }
   | { type: "reset" };
 
@@ -98,7 +98,7 @@ export function publishReducer(
           result: response,
           error:
             response.buildError?.trim() ||
-            "The build failed. Check the workflow configuration and try again.",
+            "The build failed. Check the agent configuration and try again.",
         };
       }
       const phase = phaseForBuildStatus(response.buildStatus);

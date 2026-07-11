@@ -1,9 +1,14 @@
 /**
- * Copilot dock — the docked right rail in the builder (spec §12). Streams a
- * message thread over the copilot WS, renders mutation proposals as
- * structured Apply/Dismiss suggestion cards, and applies accepted mutations
- * through the builder controller's dispatch (single writer). Open/closed
- * state persists per workspace in localStorage.
+ * Copilot dock — the docked right rail shared by the workflow and agent
+ * editors (spec §12). Streams a message thread over the per-workspace copilot
+ * WS, renders mutation proposals as structured Apply/Dismiss suggestion
+ * cards, and applies accepted mutations through the injected
+ * {@link CopilotSurfaceAdapter} (single writer — the surface controller's
+ * dispatch). Open/closed state persists per workspace in localStorage.
+ *
+ * Everything surface-specific — entity identity, live-draft reads, proposal
+ * application/presentation, empty-state copy, prompt chips — rides the
+ * adapter; this component owns only the surface-agnostic behavior below.
  *
  * Accessibility/interaction contract:
  * - the thread is a `role="log"`; announcements go through a dedicated
@@ -23,15 +28,8 @@ import {
   Square,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type {
-  AgentPresetDto,
-  ModelPresetDto,
-  WorkflowDefinition,
-} from "@invisible-string/shared";
 
-import type { BuilderAction, Pillar } from "../../lib/builder/model";
-import type { ContextResources } from "../../lib/builder/resources";
-import { pillarOfProposal, proposalToActions } from "../../lib/copilot/mutations";
+import type { CopilotSurfaceAdapter } from "../../lib/copilot/adapter";
 import type { WebSocketFactory } from "../../lib/copilot/socket";
 import { useCopilot, type CopilotThreadItem } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
@@ -44,18 +42,6 @@ const NARROW_VIEWPORT_QUERY = "(max-width: 1179px)";
 /** "At the bottom" tolerance for sticky auto-scroll. */
 const STICK_THRESHOLD_PX = 40;
 
-const SCAFFOLD_PROMPTS = [
-  "Set this up to triage Slack mentions",
-  "Tighten the instructions",
-  "Gate risky tools behind approval",
-] as const;
-
-const REFINE_PROMPTS = [
-  "Tighten the instructions",
-  "Explain this workflow's issues",
-  "Gate risky tools behind approval",
-] as const;
-
 export interface CopilotPrefill {
   id: number;
   text: string;
@@ -63,16 +49,13 @@ export interface CopilotPrefill {
 
 export interface CopilotDockProps {
   workspaceId: string;
-  workflowId: string;
-  definition: WorkflowDefinition;
-  dispatch: React.Dispatch<BuilderAction>;
-  resources: ContextResources;
-  agentPresets: readonly AgentPresetDto[];
-  modelPresets: readonly ModelPresetDto[];
+  /**
+   * The surface being edited. Rebuild it per render freely — the hook reads
+   * it through a live ref and it never re-keys the socket.
+   */
+  adapter: CopilotSurfaceAdapter;
   /** Set by "ask copilot to fix" affordances — opens + seeds the composer. */
   prefill?: CopilotPrefill | null;
-  /** Fired after an accepted mutation is applied (pillar flash in the rail). */
-  onApplied?: (pillar: Pillar) => void;
   /** Test seam — scripted fake WS. */
   createWebSocket?: WebSocketFactory;
   backoffBaseMs?: number;
@@ -93,19 +76,7 @@ function readStoredOpen(workspaceId: string): boolean {
 }
 
 export function CopilotDock(props: CopilotDockProps) {
-  const {
-    workspaceId,
-    workflowId,
-    definition,
-    dispatch,
-    resources,
-    agentPresets,
-    modelPresets,
-    prefill,
-    onApplied,
-    createWebSocket,
-    backoffBaseMs,
-  } = props;
+  const { workspaceId, adapter, prefill, createWebSocket, backoffBaseMs } = props;
 
   const [open, setOpen] = useState(() => readStoredOpen(workspaceId));
   const [composer, setComposer] = useState("");
@@ -129,19 +100,10 @@ export function CopilotDock(props: CopilotDockProps) {
     }
   }
 
-  // Live definition ref so getDraft always reads the current draft.
-  const definitionRef = useRef(definition);
-  definitionRef.current = definition;
-
   const copilot = useCopilot({
     workspaceId,
-    workflowId,
+    adapter,
     enabled: open,
-    getDraft: () => definitionRef.current,
-    applyProposal: (proposal) => {
-      for (const action of proposalToActions(proposal)) dispatch(action);
-      onApplied?.(pillarOfProposal(proposal));
-    },
     ...(createWebSocket ? { createWebSocket } : {}),
     ...(backoffBaseMs !== undefined ? { backoffBaseMs } : {}),
   });
@@ -154,7 +116,7 @@ export function CopilotDock(props: CopilotDockProps) {
     setComposer(prefill.text);
   }, [prefill?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-collapse when the viewport shrinks below the builder's comfortable
+  // Auto-collapse when the viewport shrinks below the editor's comfortable
   // three-panel width — the copilot must never out-size the editor it edits.
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
@@ -292,12 +254,8 @@ export function CopilotDock(props: CopilotDockProps) {
     lastItem?.kind === "message" &&
     lastItem.role === "assistant" &&
     lastItem.streaming;
-  const promptChips =
-    definition.instructions.markdown.trim().length === 0 &&
-    definition.context.mcpConnectionIds.length === 0 &&
-    definition.context.skillIds.length === 0
-      ? SCAFFOLD_PROMPTS
-      : REFINE_PROMPTS;
+  const promptChips = adapter.promptChips();
+  const emptyCopy = adapter.emptyStateCopy;
 
   return (
     <aside
@@ -358,12 +316,9 @@ export function CopilotDock(props: CopilotDockProps) {
               <span className="flex size-11 items-center justify-center rounded-full bg-black/[0.04] text-ink-3">
                 <Sparkles size={18} aria-hidden="true" />
               </span>
-              <p className="text-[13px] font-medium text-ink">
-                Build this workflow with copilot
-              </p>
+              <p className="text-[13px] font-medium text-ink">{emptyCopy.title}</p>
               <p className="text-[12px] leading-relaxed text-ink-3">
-                Describe what you want — suggestions land as Apply/Preview cards
-                you can accept one by one.
+                {emptyCopy.description}
               </p>
               <div className="flex flex-col gap-1.5">
                 {promptChips.map((prompt) => (
@@ -391,10 +346,7 @@ export function CopilotDock(props: CopilotDockProps) {
                       key={item.id}
                       proposal={item.proposal}
                       status={item.status}
-                      definition={definition}
-                      resources={resources}
-                      agentPresets={agentPresets}
-                      modelPresets={modelPresets}
+                      description={adapter.describeProposal(item.proposal)}
                       onApply={() => decide(item.id, "apply")}
                       onDismiss={() => decide(item.id, "dismiss")}
                       focusRef={(el) => {

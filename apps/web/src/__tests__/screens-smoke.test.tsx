@@ -1,10 +1,11 @@
 /**
- * Populated-state smoke tests for the context/settings screens — they render
- * real data without crashing and wire their primary interactions.
+ * Populated-state smoke tests for the agents/context/settings screens — they
+ * render real data without crashing and wire their primary interactions.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent } from "@testing-library/react";
 
 import {
@@ -13,9 +14,12 @@ import {
   renderWithProviders,
   type FetchMock,
 } from "../test/harness";
+import { renderWithRouter } from "../test/router";
+import { AgentsGrid } from "../components/agents/AgentsGrid";
 import { ContextHome } from "../components/context/ContextHome";
 import { ModelsPanel } from "../components/settings/ModelsPanel";
-import { AgentPresetsPanel } from "../components/settings/AgentPresetsPanel";
+import { ToastProvider } from "../components/ui/Toast";
+import { FIXTURE_AGENTS } from "../lib/agents/fixtures";
 
 ensureDomForThisFile();
 
@@ -72,22 +76,6 @@ const ALLOWLIST = {
   ],
 };
 
-const AGENTS = {
-  agents: [
-    {
-      id: "66666666-6666-4666-8666-666666666666",
-      name: "Support triager",
-      description: "Triages inbound support",
-      basePrompt: "You are a support triager.",
-      reasoningEffort: "medium",
-      modelPreset: "balanced",
-      modelId: null,
-      createdAt: NOW,
-      updatedAt: NOW,
-    },
-  ],
-};
-
 let fetchMock: FetchMock;
 
 beforeEach(() => {
@@ -132,17 +120,30 @@ test("ModelsPanel shows the three presets with current-model chips", async () =>
   expect(view.getByText(/OpenRouter · z-ai\/glm-5.2/)).toBeTruthy();
 });
 
-test("AgentPresetsPanel lists presets and opens the create drawer", async () => {
-  fetchMock
-    .on("GET", "/agents", () => jsonResponse(AGENTS))
-    .on("GET", "/model-allowlist", () => jsonResponse(ALLOWLIST));
-
-  const view = renderWithProviders(
-    <AgentPresetsPanel workspaceId="org_1" canManage />,
+test("AgentsGrid renders the workspace's agents with lifecycle chips", async () => {
+  fetchMock.on("GET", "/workspaces/org_1/agents", () =>
+    jsonResponse({ agents: FIXTURE_AGENTS.map((entry) => entry.summary) }),
   );
 
-  await view.findByText("Support triager");
-  fireEvent.click(view.getByRole("button", { name: "New preset" }));
-  // Drawer opens with the base-prompt field.
-  expect(await view.findByLabelText("Base prompt")).toBeTruthy();
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: 0 },
+      mutations: { retry: false },
+    },
+  });
+  const view = renderWithRouter(
+    <QueryClientProvider client={queryClient}>
+      <ToastProvider>
+        <AgentsGrid workspaceId="org_1" />
+      </ToastProvider>
+    </QueryClientProvider>,
+  );
+
+  await view.findByText("Executive assistant");
+  expect(view.getByText("Support triager")).toBeTruthy();
+  // The state matrix surfaces on the cards, and creation is offered.
+  expect(view.getAllByText("Published").length).toBe(2);
+  expect(view.getByText("Draft")).toBeTruthy();
+  expect(view.getByText("Build failed")).toBeTruthy();
+  expect(view.getByRole("button", { name: /New agent/ })).toBeTruthy();
 });

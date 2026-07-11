@@ -21,7 +21,7 @@ import {
   type FormField,
   type FormFieldType,
   type SlackTriggerBinding,
-  type WorkflowDefinition,
+  type WorkflowConfig,
 } from "@invisible-string/shared";
 
 import { describeCron } from "../../lib/builder/cron";
@@ -70,7 +70,7 @@ const TRIGGER_META: Record<
 };
 
 export interface TriggerEditorProps {
-  definition: WorkflowDefinition;
+  definition: WorkflowConfig;
   dispatch: (action: BuilderAction) => void;
 }
 

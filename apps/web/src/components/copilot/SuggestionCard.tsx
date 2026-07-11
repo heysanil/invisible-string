@@ -1,43 +1,28 @@
 /**
  * Copilot suggestion card — icon + human title + rationale + preview
- * (inline diff for setInstructions, compact before→after otherwise), with
- * Apply / Dismiss capsules. Applied cards collapse to a ✓ receipt line;
- * dismissed ones to a muted receipt. Keyboard: the card is focusable and
- * Enter applies, Delete/Backspace dismisses.
+ * (inline diff when the adapter provides one, compact before→after
+ * otherwise), with Apply / Dismiss capsules. Applied cards collapse to a ✓
+ * receipt line; dismissed ones to a muted receipt. Keyboard: the card is
+ * focusable and Enter applies, Delete/Backspace dismisses.
+ *
+ * Surface-agnostic: presentation arrives as a precomputed
+ * {@link ProposalDescription} from the dock's {@link CopilotSurfaceAdapter} —
+ * the card never touches workflow or agent draft types.
  */
-import { ArrowRight, Bot, Check, FileText, Plug, X, Zap } from "lucide-react";
-import { useRef, type ComponentType } from "react";
-import type {
-  AgentPresetDto,
-  CopilotProposal,
-  ModelPresetDto,
-  WorkflowDefinition,
-} from "@invisible-string/shared";
+import { ArrowRight, Check, X } from "lucide-react";
+import { useRef } from "react";
+import type { CopilotProposal } from "@invisible-string/shared";
 
-import type { Pillar } from "../../lib/builder/model";
-import {
-  describeProposal,
-  type MutationDescription,
-} from "../../lib/copilot/mutations";
+import type { ProposalDescription } from "../../lib/copilot/adapter";
 import type { SuggestionStatus } from "../../lib/copilot/useCopilot";
-import type { ContextResources } from "../../lib/builder/resources";
 import { cn } from "../../lib/cn";
-import { DiffView } from "./DiffView";
-
-const PILLAR_ICONS: Record<Pillar, ComponentType<{ size?: number }>> = {
-  trigger: Zap,
-  context: Plug,
-  agent: Bot,
-  instructions: FileText,
-};
+import { DiffView } from "../builder/DiffView";
 
 export interface SuggestionCardProps {
   proposal: CopilotProposal;
   status: SuggestionStatus;
-  definition: WorkflowDefinition;
-  resources: ContextResources;
-  agentPresets: readonly AgentPresetDto[];
-  modelPresets: readonly ModelPresetDto[];
+  /** Presentation computed by the surface adapter against the LIVE draft. */
+  description: ProposalDescription;
   onApply: () => void;
   onDismiss: () => void;
   /** Registers the focusable card element (keyboard flow after a decision). */
@@ -45,29 +30,13 @@ export interface SuggestionCardProps {
 }
 
 export function SuggestionCard(props: SuggestionCardProps) {
-  const {
-    proposal,
-    status,
-    definition,
-    resources,
-    agentPresets,
-    modelPresets,
-    onApply,
-    onDismiss,
-    focusRef,
-  } = props;
-  const live = describeProposal(
-    proposal,
-    definition,
-    resources,
-    agentPresets,
-    modelPresets,
-  );
+  const { proposal, status, onApply, onDismiss, focusRef } = props;
+  const live = props.description;
   // Receipts must not drift: the description is recomputed from the LIVE
-  // definition (right for a pending preview), but once the card settles the
-  // apply itself changes the definition — freeze the last PENDING description
-  // and render receipts from that copy.
-  const frozenRef = useRef<MutationDescription>(live);
+  // draft (right for a pending preview), but once the card settles the apply
+  // itself changes the draft — freeze the last PENDING description and render
+  // receipts from that copy.
+  const frozenRef = useRef<ProposalDescription>(live);
   if (status === "pending") frozenRef.current = live;
   const description = status === "pending" ? live : frozenRef.current;
 
@@ -89,7 +58,7 @@ export function SuggestionCard(props: SuggestionCardProps) {
     );
   }
 
-  const Icon = PILLAR_ICONS[description.pillar];
+  const Icon = description.icon;
 
   return (
     <div
@@ -129,11 +98,7 @@ export function SuggestionCard(props: SuggestionCardProps) {
         </div>
       </div>
 
-      <SuggestionPreview
-        proposal={proposal}
-        description={description}
-        definition={definition}
-      />
+      <SuggestionPreview description={description} />
 
       <div className="flex items-center gap-2">
         <button
@@ -156,20 +121,14 @@ export function SuggestionCard(props: SuggestionCardProps) {
 }
 
 function SuggestionPreview({
-  proposal,
   description,
-  definition,
 }: {
-  proposal: CopilotProposal;
-  description: MutationDescription;
-  definition: WorkflowDefinition;
+  description: ProposalDescription;
 }) {
-  if (proposal.tool === "setInstructions") {
+  // A full-text diff wins over the compact row when the adapter provides one.
+  if (description.diff) {
     return (
-      <DiffView
-        before={definition.instructions.markdown}
-        after={proposal.params.markdown}
-      />
+      <DiffView before={description.diff.before} after={description.diff.after} />
     );
   }
   if (description.before === null && description.after === null) return null;

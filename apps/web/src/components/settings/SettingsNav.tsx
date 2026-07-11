@@ -1,5 +1,5 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { Bot, Building2, Cpu, ListChecks, Plug, Users } from "lucide-react";
+import { Building2, Cpu, ListChecks, Plug, Users } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { cn } from "../../lib/cn";
@@ -14,7 +14,6 @@ interface NavItem {
 const ITEMS: NavItem[] = [
   { to: "/settings/models", label: "Models", icon: Cpu },
   { to: "/settings/allowlist", label: "Allowlist", icon: ListChecks },
-  { to: "/settings/agents", label: "Agent presets", icon: Bot },
   { to: "/settings/integrations", label: "Integrations", icon: Plug },
   { to: "/settings/members", label: "Members", icon: Users },
   { to: "/settings/workspace", label: "Workspace", icon: Building2 },

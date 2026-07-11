@@ -50,8 +50,8 @@ beforeEach(() => {
 const WS = "org_1";
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
-const WF_ID = "33333333-3333-4333-8333-333333333333";
-const WFV_ID = "44444444-4444-4444-8444-444444444444";
+const AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const AGV_ID = "44444444-4444-4444-8444-444444444444";
 const NOW = "2026-07-03T00:00:00.000Z";
 
 // ── mock useThreadStreams: feed a per-run store the test controls ───────────
@@ -104,8 +104,9 @@ function sessionResponse(status: RunStatus) {
   return {
     session: {
       id: SESSION_ID,
-      workflowId: WF_ID,
-      workflowVersionId: WFV_ID,
+      agentId: AGENT_ID,
+      agentVersionId: AGV_ID,
+      workflowId: null,
       origin: "chat",
       status: "active",
       eveSessionId: "eve1",
@@ -118,12 +119,15 @@ function sessionResponse(status: RunStatus) {
         agentSessionId: SESSION_ID,
         status,
         triggerEvent: {
-          workflowId: WF_ID,
+          agentId: AGENT_ID,
+          workflowId: null,
           triggerType: "manual",
           message: "Send the report",
           data: {},
           principal: { workspaceId: WS, source: "chat" },
         },
+        taskMessage: null,
+        deliveryStatus: null,
         eveRunId: "ev1",
         error: null,
         startedAt: NOW,
@@ -174,7 +178,7 @@ function renderContainer() {
   });
   return renderWithRouter(
     <QueryClientProvider client={client}>
-      <ThreadContainer workspaceId={WS} sessionId={SESSION_ID} workflowName="Report bot" />
+      <ThreadContainer workspaceId={WS} sessionId={SESSION_ID} agentName="Report bot" />
     </QueryClientProvider>,
   );
 }

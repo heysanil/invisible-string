@@ -1,22 +1,25 @@
 /**
  * Copilot panel state — owns the thread (streamed assistant messages +
- * suggestion cards), the socket lifecycle (one per open builder, disposed on
- * unmount), and the Apply/Dismiss flow.
+ * suggestion cards), the socket lifecycle (one per open dock, disposed on
+ * unmount), and the Apply/Dismiss flow. Surface-agnostic: everything the
+ * workflow and agent editors differ on rides the injected
+ * {@link CopilotSurfaceAdapter}.
  *
- * Protocol (packages/shared/src/copilot.ts): each `user_message` carries the
- * LIVE draft; the server streams `delta` text and validated `proposal`
- * frames, pausing its tool loop until the client answers each proposal with
- * a `mutation_result`. Applying routes the proposal through the builder
- * controller's dispatch (single writer) and reports `accepted`; dismissing
- * reports `rejected`. `abort` cuts the in-flight turn short.
+ * Protocol (packages/shared/src/copilot.ts): each `user_message` names its
+ * `surface` + `entityId` and carries the LIVE draft; the server streams
+ * `delta` text and validated `proposal` frames, pausing its tool loop until
+ * the client answers each proposal with a `mutation_result`. Applying routes
+ * the proposal through the surface controller's dispatch (single writer) and
+ * reports `accepted`; dismissing reports `rejected`. `abort` cuts the
+ * in-flight turn short.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   CopilotProposal,
   CopilotServerFrame,
-  WorkflowDefinition,
 } from "@invisible-string/shared";
 
+import type { CopilotSurfaceAdapter } from "./adapter";
 import {
   CopilotSocket,
   type CopilotSocketStatus,
@@ -45,13 +48,14 @@ export type CopilotThreadItem =
 
 export interface UseCopilotOptions {
   workspaceId: string;
-  workflowId: string;
+  /**
+   * The surface being edited. Read through a live ref — a new adapter object
+   * per render is fine and never re-keys the socket (the socket is
+   * per-workspace; the entity rides each frame).
+   */
+  adapter: CopilotSurfaceAdapter;
   /** Panel closed ⇒ no socket. */
   enabled: boolean;
-  /** Read the LIVE draft (sent with every user message). */
-  getDraft: () => WorkflowDefinition;
-  /** Apply an accepted proposal through the builder controller. */
-  applyProposal: (proposal: CopilotProposal) => void;
   createWebSocket?: WebSocketFactory;
   backoffBaseMs?: number;
 }
@@ -112,15 +116,8 @@ function humanizeError(code: string, message: string): string {
 }
 
 export function useCopilot(options: UseCopilotOptions): CopilotApi {
-  const {
-    workspaceId,
-    workflowId,
-    enabled,
-    getDraft,
-    applyProposal,
-    createWebSocket,
-    backoffBaseMs,
-  } = options;
+  const { workspaceId, adapter, enabled, createWebSocket, backoffBaseMs } =
+    options;
 
   const [items, setItems] = useState<CopilotThreadItem[]>([]);
   const [status, setStatus] = useState<CopilotSocketStatus>("closed");
@@ -136,11 +133,10 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
   generatingRef.current = generating;
 
   const socketRef = useRef<CopilotSocket | null>(null);
-  // Live refs so the socket callbacks never capture stale props.
-  const getDraftRef = useRef(getDraft);
-  getDraftRef.current = getDraft;
-  const applyProposalRef = useRef(applyProposal);
-  applyProposalRef.current = applyProposal;
+  // Live adapter ref so the socket callbacks never capture stale props (the
+  // adapter is rebuilt per render by the owning screen).
+  const adapterRef = useRef(adapter);
+  adapterRef.current = adapter;
 
   const handleFrame = useCallback((frame: CopilotServerFrame) => {
     switch (frame.type) {
@@ -179,12 +175,11 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
     }
   }, []);
 
-  // ── socket lifecycle: one per open builder panel ───────────────────────────
+  // ── socket lifecycle: one per open copilot panel ───────────────────────────
   useEffect(() => {
     if (!enabled) return;
     const socket = new CopilotSocket({
       workspaceId,
-      workflowId,
       onFrame: handleFrame,
       onStatus: (next) => {
         setStatus(next);
@@ -215,44 +210,36 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
       socket.dispose();
       if (socketRef.current === socket) socketRef.current = null;
     };
-  }, [
-    enabled,
-    workspaceId,
-    workflowId,
-    handleFrame,
-    createWebSocket,
-    backoffBaseMs,
-  ]);
+  }, [enabled, workspaceId, handleFrame, createWebSocket, backoffBaseMs]);
 
-  const send = useCallback(
-    (text: string): boolean => {
-      const trimmed = text.trim();
-      if (trimmed.length === 0) return false;
-      // One turn at a time: sending mid-turn would orphan the user's bubble
-      // (the server answers turn_in_progress and drops the message).
-      if (generatingRef.current) return false;
-      const sent = socketRef.current?.send({
-        type: "user_message",
-        workflowId,
-        draft: getDraftRef.current() as unknown as Record<string, unknown>,
-        message: trimmed,
-      });
-      if (!sent) return false;
-      setGenerating(true);
-      setItems((current) => [
-        ...current,
-        {
-          kind: "message",
-          id: nextLocalId(),
-          role: "user",
-          text: trimmed,
-          streaming: false,
-        },
-      ]);
-      return true;
-    },
-    [workflowId],
-  );
+  const send = useCallback((text: string): boolean => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return false;
+    // One turn at a time: sending mid-turn would orphan the user's bubble
+    // (the server answers turn_in_progress and drops the message).
+    if (generatingRef.current) return false;
+    const { entityRef, getDraft } = adapterRef.current;
+    const sent = socketRef.current?.send({
+      type: "user_message",
+      surface: entityRef.surface,
+      entityId: entityRef.entityId,
+      draft: getDraft() as unknown as Record<string, unknown>,
+      message: trimmed,
+    });
+    if (!sent) return false;
+    setGenerating(true);
+    setItems((current) => [
+      ...current,
+      {
+        kind: "message",
+        id: nextLocalId(),
+        role: "user",
+        text: trimmed,
+        streaming: false,
+      },
+    ]);
+    return true;
+  }, []);
 
   const stop = useCallback(() => {
     socketRef.current?.send({ type: "abort" });
@@ -270,7 +257,7 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
       );
       if (!item || item.status !== "pending") return;
       if (outcome === "accepted") {
-        applyProposalRef.current(item.proposal);
+        adapterRef.current.applyProposal(item.proposal);
       }
       socketRef.current?.send({
         type: "mutation_result",

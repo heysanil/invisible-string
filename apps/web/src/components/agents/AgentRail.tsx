@@ -1,103 +1,108 @@
 /**
- * Left pillar rail (270px glass): workflow name + draft/vN chip, four live
- * summary cards (each with ✓ valid / amber warning state; the ACTIVE card
- * "solidifies"), and Run draft + Publish capsules at the bottom with inline
- * build progress.
+ * Left agent rail (270px glass): monogram + name + lifecycle chips, four
+ * live section cards (Persona · Model · Context · Access — each with
+ * ✓ valid / amber issue badge and a live summary) that anchor-scroll the
+ * center column, and "Chat with agent" + Publish capsules at the bottom with
+ * inline build progress (builds belong to agents now).
  */
 import {
   AlertTriangle,
-  Bot,
   Check,
+  Cpu,
   FileText,
-  Play,
+  MessageCircle,
   Plug,
   Rocket,
-  Zap,
+  UserRound,
 } from "lucide-react";
 import type { ComponentType } from "react";
 import type {
-  AgentPresetDto,
-  McpConnectionDto,
   ModelPresetDto,
-  SkillDto,
-  WorkflowDefinition,
+  WorkspaceMemberDto,
 } from "@invisible-string/shared";
 
 import {
-  countIssues,
-  pillarIssueCount,
-  type BuilderDiagnostics,
-} from "../../lib/builder/diagnostics";
-import { PILLAR_LABELS, PILLARS, type Pillar } from "../../lib/builder/model";
+  countAgentIssues,
+  sectionIssueCount,
+  type AgentDiagnostics,
+} from "../../lib/agents/diagnostics";
+import {
+  AGENT_SECTIONS,
+  AGENT_SECTION_LABELS,
+  type AgentEditorState,
+  type AgentSection,
+} from "../../lib/agents/model";
 import {
   isPublishBusy,
   publishPhaseLabel,
   type PublishState,
-} from "../../lib/builder/publish-machine";
-import {
-  agentSummary,
-  contextChips,
-  instructionsSummary,
-  triggerSummary,
-} from "../../lib/builder/summary";
+} from "../../lib/agents/publish-machine";
+import type { ContextResources } from "../../lib/builder/resources";
+import { PRESET_LABEL } from "../../lib/labels";
 import { cn } from "../../lib/cn";
 import { Button } from "../ui/Button";
 import { Spinner } from "../ui/Spinner";
 import { StatusChip } from "../ui/StatusChip";
+import { AgentMonogram } from "./AgentMonogram";
+import { resolvedModelLine } from "./ModelSection";
 
-const PILLAR_ICONS: Record<Pillar, ComponentType<{ size?: number }>> = {
-  trigger: Zap,
+const SECTION_ICONS: Record<AgentSection, ComponentType<{ size?: number }>> = {
+  persona: FileText,
+  model: Cpu,
   context: Plug,
-  agent: Bot,
-  instructions: FileText,
+  access: UserRound,
 };
 
-export interface PillarRailProps {
+export interface AgentRailProps {
   name: string;
   publishedVersionId: string | null;
   isDirty: boolean;
-  definition: WorkflowDefinition;
-  diagnostics: BuilderDiagnostics;
-  activePillar: Pillar;
-  onFocusPillar: (pillar: Pillar) => void;
-  connections: readonly McpConnectionDto[];
-  skills: readonly SkillDto[];
-  agentPresets: readonly AgentPresetDto[];
+  state: AgentEditorState;
+  diagnostics: AgentDiagnostics;
+  /** The section the center column currently rests on (aria-current card). */
+  activeSection: AgentSection;
+  /** Anchor-scrolls the center column to the section. */
+  onSelectSection: (section: AgentSection) => void;
+  resources: ContextResources;
+  members: readonly WorkspaceMemberDto[];
   modelPresets: readonly ModelPresetDto[];
   publishState: PublishState;
   onPublish: () => void;
-  onRunDraft: () => void;
-  runDraftPending: boolean;
   canPublish: boolean;
-  /** Pillar to flash/settle after a copilot suggestion lands (or null). */
-  flashPillar?: Pillar | null;
+  onChatWithAgent: () => void;
+  chatPending: boolean;
+  /** Section to flash/settle after a copilot suggestion lands (or null). */
+  flashSection?: AgentSection | null;
 }
 
-export function PillarRail(props: PillarRailProps) {
+export function AgentRail(props: AgentRailProps) {
   const {
     name,
     publishedVersionId,
     isDirty,
-    definition,
+    state,
     diagnostics,
-    activePillar,
-    onFocusPillar,
+    activeSection,
+    onSelectSection,
     publishState,
     onPublish,
-    onRunDraft,
-    runDraftPending,
     canPublish,
+    onChatWithAgent,
+    chatPending,
   } = props;
 
-  const issues = countIssues(diagnostics);
+  const issues = countAgentIssues(diagnostics);
 
   return (
     <div className="glass-panel panel-enter flex w-[270px] shrink-0 flex-col overflow-hidden">
       {/* Header */}
       <header className="flex flex-col gap-2 px-4 pb-3 pt-4">
-        <h1 className="truncate text-[15px] font-semibold" title={name}>
-          {name}
-        </h1>
+        <div className="flex items-center gap-2.5">
+          <AgentMonogram name={name} active={publishedVersionId !== null} />
+          <h1 className="min-w-0 truncate text-[15px] font-semibold" title={name}>
+            {name}
+          </h1>
+        </div>
         <div className="flex items-center gap-1.5">
           {publishedVersionId ? (
             <StatusChip tone="success" dot>
@@ -114,29 +119,28 @@ export function PillarRail(props: PillarRailProps) {
 
       <div aria-hidden="true" className="mx-4 h-px bg-black/[0.06]" />
 
-      {/* Pillar cards */}
+      {/* Section cards */}
       <nav
-        aria-label="Workflow pillars"
+        aria-label="Agent sections"
         className="thin-scroll flex flex-1 flex-col gap-2 overflow-y-auto p-3"
       >
-        {PILLARS.map((pillar) => (
-          <PillarCard
-            key={pillar}
-            pillar={pillar}
-            active={pillar === activePillar}
-            flash={pillar === props.flashPillar}
-            issueCount={pillarIssueCount(diagnostics, pillar)}
+        {AGENT_SECTIONS.map((section) => (
+          <SectionCard
+            key={section}
+            section={section}
+            active={section === activeSection}
+            flash={section === props.flashSection}
+            issueCount={sectionIssueCount(diagnostics, section)}
             summary={
-              <PillarSummary
-                pillar={pillar}
-                definition={definition}
-                connections={props.connections}
-                skills={props.skills}
-                agentPresets={props.agentPresets}
+              <SectionSummary
+                section={section}
+                state={state}
+                resources={props.resources}
+                members={props.members}
                 modelPresets={props.modelPresets}
               />
             }
-            onClick={() => onFocusPillar(pillar)}
+            onClick={() => onSelectSection(section)}
           />
         ))}
       </nav>
@@ -166,12 +170,12 @@ export function PillarRail(props: PillarRailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={onRunDraft}
-          loading={runDraftPending}
+          onClick={onChatWithAgent}
+          loading={chatPending}
           className="w-full"
         >
-          {!runDraftPending ? <Play size={14} aria-hidden="true" /> : null}
-          Run draft
+          {!chatPending ? <MessageCircle size={14} aria-hidden="true" /> : null}
+          Chat with agent
         </Button>
         <Button
           variant="primary"
@@ -199,22 +203,22 @@ export function PillarRail(props: PillarRailProps) {
 
 // ── Card ────────────────────────────────────────────────────────────────────
 
-function PillarCard({
-  pillar,
+function SectionCard({
+  section,
   active,
   flash,
   issueCount,
   summary,
   onClick,
 }: {
-  pillar: Pillar;
+  section: AgentSection;
   active: boolean;
   flash?: boolean;
   issueCount: number;
   summary: React.ReactNode;
   onClick: () => void;
 }) {
-  const Icon = PILLAR_ICONS[pillar];
+  const Icon = SECTION_ICONS[section];
   return (
     <button
       type="button"
@@ -231,7 +235,7 @@ function PillarCard({
       <div className="flex items-center gap-2">
         <Icon size={14} aria-hidden="true" />
         <span className="flex-1 text-[13px] font-semibold text-ink">
-          {PILLAR_LABELS[pillar]}
+          {AGENT_SECTION_LABELS[section]}
         </span>
         {issueCount > 0 ? (
           <span
@@ -242,11 +246,7 @@ function PillarCard({
             <span className="text-[11px] font-semibold">{issueCount}</span>
           </span>
         ) : (
-          <Check
-            size={14}
-            className="text-ok"
-            aria-label="Valid"
-          />
+          <Check size={14} className="text-ok" aria-label="Valid" />
         )}
       </div>
       <div className="text-[12px] leading-snug text-ink-3">{summary}</div>
@@ -254,35 +254,70 @@ function PillarCard({
   );
 }
 
-// ── Per-pillar summary bodies ───────────────────────────────────────────────
+// ── Per-section summary bodies ──────────────────────────────────────────────
 
-function PillarSummary({
-  pillar,
-  definition,
-  connections,
-  skills,
-  agentPresets,
+function SectionSummary({
+  section,
+  state,
+  resources,
+  members,
   modelPresets,
 }: {
-  pillar: Pillar;
-  definition: WorkflowDefinition;
-  connections: readonly McpConnectionDto[];
-  skills: readonly SkillDto[];
-  agentPresets: readonly AgentPresetDto[];
+  section: AgentSection;
+  state: AgentEditorState;
+  resources: ContextResources;
+  members: readonly WorkspaceMemberDto[];
   modelPresets: readonly ModelPresetDto[];
 }) {
-  if (pillar === "trigger") {
-    const summary = triggerSummary(definition);
+  const definition = state.definition;
+
+  if (section === "persona") {
+    const persona = definition.persona;
+    const trimmed = persona.trim();
+    if (trimmed.length === 0) {
+      return <span className="text-ink-4">Empty — required to publish</span>;
+    }
+    const firstLine =
+      persona.split("\n").find((line) => line.trim().length > 0) ?? "";
+    const preview =
+      firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine;
     return (
-      <span className="flex flex-wrap items-center gap-1.5">
-        <StatusChip tone="ink">{summary.typeLabel}</StatusChip>
-        <span className="truncate">{summary.detail}</span>
+      <span className="flex flex-col gap-0.5">
+        <span className="truncate">{preview}</span>
+        <span className="text-[11px] text-ink-4">
+          {persona.length.toLocaleString()} character
+          {persona.length === 1 ? "" : "s"}
+        </span>
       </span>
     );
   }
 
-  if (pillar === "context") {
-    const chips = contextChips(definition, connections, skills);
+  if (section === "model") {
+    return (
+      <span className="flex flex-col gap-0.5">
+        <span className="font-medium text-ink-2">
+          {PRESET_LABEL[definition.model.preset]}
+        </span>
+        <span className="font-mono text-[11px] text-ink-3">
+          {resolvedModelLine(definition.model, modelPresets)}
+        </span>
+      </span>
+    );
+  }
+
+  if (section === "context") {
+    const chips = [
+      ...definition.context.mcpConnectionIds.map((id) => ({
+        kind: "connection" as const,
+        id,
+        name: resources.connectionById.get(id)?.name ?? "missing",
+      })),
+      ...definition.context.skillIds.map((id) => ({
+        kind: "skill" as const,
+        id,
+        name: resources.skillById.get(id)?.name ?? "missing",
+      })),
+    ];
     if (chips.length === 0) return <span>No connections or skills</span>;
     return (
       <span className="flex flex-wrap gap-1">
@@ -290,14 +325,9 @@ function PillarSummary({
           <span
             key={`${chip.kind}-${chip.id}`}
             className="inline-flex items-center gap-1 rounded-capsule bg-chip px-1.5 py-0.5 text-[11px] text-ink"
-            title={chip.gating ? `${chip.name} · ${chip.gating}` : chip.name}
+            title={chip.name}
           >
             {chip.name}
-            {chip.gating ? (
-              <span className="text-warn" title={chip.gating}>
-                ⏸
-              </span>
-            ) : null}
           </span>
         ))}
         {chips.length > 4 ? <span>+{chips.length - 4}</span> : null}
@@ -305,29 +335,10 @@ function PillarSummary({
     );
   }
 
-  if (pillar === "agent") {
-    const summary = agentSummary(definition, agentPresets, modelPresets);
-    return (
-      <span className="flex flex-col gap-0.5">
-        <span className="font-medium text-ink-2">{summary.presetName}</span>
-        <span className="font-mono text-[11px] text-ink-3">
-          {summary.modelChain}
-        </span>
-      </span>
-    );
-  }
-
-  const summary = instructionsSummary(definition);
-  if (summary.isEmpty) return <span className="text-ink-4">Empty</span>;
+  const member = members.find((m) => m.userId === state.runAsUserId);
   return (
-    <span className="flex flex-col gap-0.5">
-      <span className="truncate">{summary.preview}</span>
-      <span className="text-[11px] text-ink-4">
-        {summary.lineCount} line{summary.lineCount === 1 ? "" : "s"}
-        {summary.refCount > 0
-          ? ` · ${summary.refCount} @ref${summary.refCount === 1 ? "" : "s"}`
-          : ""}
-      </span>
+    <span className="truncate">
+      {member ? `Runs as ${member.email}` : "Runs as a former member"}
     </span>
   );
 }

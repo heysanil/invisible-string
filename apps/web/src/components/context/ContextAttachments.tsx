@@ -1,9 +1,11 @@
 /**
- * CONTEXT focused editor: two columns (connections · skills). Attached
- * resources render as removable chips; "Browse" opens a searchable picker of
- * workspace + user resources. Each attached connection has an inline settings
- * popover (tool allow/block tag inputs + approval policy) that mutates the
- * connection resource itself.
+ * Context attachments: two columns (connections · skills) over a plain
+ * attached-ids + callbacks contract, so any owner of a context list (today:
+ * the agent editor's CONTEXT section) can embed it. Attached resources render
+ * as removable rows; "Browse" opens a searchable picker of workspace + user
+ * resources. Each attached connection has an inline settings popover (tool
+ * allow/block tag inputs + approval policy) that mutates the connection
+ * resource itself.
  */
 import { Blocks, ExternalLink, FileText, Plug, Plus, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -13,7 +15,6 @@ import type {
   UpdateMcpConnectionRequest,
 } from "@invisible-string/shared";
 
-import type { BuilderAction } from "../../lib/builder/model";
 import {
   scopeRefOf,
   type ContextResources,
@@ -22,34 +23,49 @@ import {
 } from "../../lib/builder/resources";
 import { useUpdateMcpConnection } from "../../lib/queries/mcp-connections";
 import { cn } from "../../lib/cn";
+
+// Satisfies React's controlled-input contract; the real handler rides
+// onInput, matching the shared Input primitive (React's onChange for text
+// inputs never fires under happy-dom).
+function noopChange() {}
 import { Button } from "../ui/Button";
 import { Popover } from "../ui/Popover";
 import { Select } from "../ui/Select";
 import { StatusChip } from "../ui/StatusChip";
 import { TagInput } from "../ui/TagInput";
 import { useToast } from "../ui/Toast";
-import type { WorkflowDefinition } from "@invisible-string/shared";
 
-export interface ContextEditorProps {
+export interface ContextAttachmentsProps {
   workspaceId: string;
-  definition: WorkflowDefinition;
-  dispatch: (action: BuilderAction) => void;
+  /** Attached MCP connection ids, in attachment order. */
+  connectionIds: readonly string[];
+  /** Attached skill ids, in attachment order. */
+  skillIds: readonly string[];
+  onAddConnection: (id: string) => void;
+  onRemoveConnection: (id: string) => void;
+  onAddSkill: (id: string) => void;
+  onRemoveSkill: (id: string) => void;
+  /** Merged workspace + user resources (resolves ids to rows). */
   resources: ContextResources;
 }
 
-export function ContextEditor({
+export function ContextAttachments({
   workspaceId,
-  definition,
-  dispatch,
+  connectionIds,
+  skillIds,
+  onAddConnection,
+  onRemoveConnection,
+  onAddSkill,
+  onRemoveSkill,
   resources,
-}: ContextEditorProps) {
-  const attachedConnectionIds = new Set(definition.context.mcpConnectionIds);
-  const attachedSkillIds = new Set(definition.context.skillIds);
+}: ContextAttachmentsProps) {
+  const attachedConnectionIds = new Set(connectionIds);
+  const attachedSkillIds = new Set(skillIds);
 
-  const attachedConnections = definition.context.mcpConnectionIds
+  const attachedConnections = connectionIds
     .map((id) => resources.connectionById.get(id))
     .filter((c): c is ScopedConnection => c !== undefined);
-  const attachedSkills = definition.context.skillIds
+  const attachedSkills = skillIds
     .map((id) => resources.skillById.get(id))
     .filter((s): s is ScopedSkill => s !== undefined);
 
@@ -67,7 +83,7 @@ export function ContextEditor({
               title="Add a connection"
               options={resources.connections}
               attachedIds={attachedConnectionIds}
-              onPick={(id) => dispatch({ type: "addConnection", id })}
+              onPick={onAddConnection}
             />
           </div>
           {attachedConnections.length === 0 ? (
@@ -79,19 +95,16 @@ export function ContextEditor({
                   key={connection.id}
                   workspaceId={workspaceId}
                   connection={connection}
-                  onRemove={() =>
-                    dispatch({ type: "removeConnection", id: connection.id })
-                  }
+                  onRemove={() => onRemoveConnection(connection.id)}
                 />
               ))}
             </ul>
           )}
-          {definition.context.mcpConnectionIds.length >
-          attachedConnections.length ? (
-            <MissingNote count={
-              definition.context.mcpConnectionIds.length -
-              attachedConnections.length
-            } kind="connection" />
+          {connectionIds.length > attachedConnections.length ? (
+            <MissingNote
+              count={connectionIds.length - attachedConnections.length}
+              kind="connection"
+            />
           ) : null}
         </section>
 
@@ -106,7 +119,7 @@ export function ContextEditor({
               title="Add a skill"
               options={resources.skills}
               attachedIds={attachedSkillIds}
-              onPick={(id) => dispatch({ type: "addSkill", id })}
+              onPick={onAddSkill}
             />
           </div>
           {attachedSkills.length === 0 ? (
@@ -117,17 +130,16 @@ export function ContextEditor({
                 <SkillRow
                   key={skill.id}
                   skill={skill}
-                  onRemove={() =>
-                    dispatch({ type: "removeSkill", id: skill.id })
-                  }
+                  onRemove={() => onRemoveSkill(skill.id)}
                 />
               ))}
             </ul>
           )}
-          {definition.context.skillIds.length > attachedSkills.length ? (
-            <MissingNote count={
-              definition.context.skillIds.length - attachedSkills.length
-            } kind="skill" />
+          {skillIds.length > attachedSkills.length ? (
+            <MissingNote
+              count={skillIds.length - attachedSkills.length}
+              kind="skill"
+            />
           ) : null}
         </section>
       </div>
@@ -394,7 +406,8 @@ function ResourcePicker({
           <input
             value={query}
             autoFocus
-            onChange={(event) => setQuery(event.currentTarget.value)}
+            onChange={noopChange}
+            onInput={(event) => setQuery((event.target as HTMLInputElement).value)}
             placeholder={`Search ${kind}s`}
             aria-label={`Search ${kind}s`}
             className="h-8 flex-1 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-4"

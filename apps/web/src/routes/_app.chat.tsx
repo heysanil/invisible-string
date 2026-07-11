@@ -9,23 +9,23 @@ import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import { useActiveWorkspaceId } from "../lib/workspace";
 
 interface ChatSearch {
-  /** Preselected workflow to open a new chat for (from the builder's Run draft). */
-  workflow?: string;
+  /** Preselected agent to open a new chat for (from the agent editor's "Chat with agent"). */
+  agent?: string;
 }
 
 export const Route = createFileRoute("/_app/chat")({
   component: ChatPage,
   validateSearch: (search: Record<string, unknown>): ChatSearch => ({
-    workflow:
-      typeof search.workflow === "string" && search.workflow.length > 0
-        ? search.workflow
+    agent:
+      typeof search.agent === "string" && search.agent.length > 0
+        ? search.agent
         : undefined,
   }),
 });
 
 function ChatPage() {
   const { workspaceId } = useActiveWorkspaceId();
-  const { workflow: initialWorkflowId } = Route.useSearch();
+  const { agent: initialAgentId } = Route.useSearch();
 
   if (FIXTURE_MODE) return <FixtureChatShell />;
 
@@ -45,21 +45,19 @@ function ChatPage() {
           <EmptyState
             icon={MessageSquare}
             title="No conversations yet"
-            description="Start a session with a workflow and watch its runs stream here live."
+            description="Start a chat with an agent and watch its replies stream here live."
           />
         </Panel>
         <Panel className="panel-enter min-w-0 flex-1 overflow-hidden">
           <EmptyState
             icon={MessageSquare}
             title="Pick up a conversation"
-            description="Select a session on the left, or start a new chat with a published workflow."
+            description="Select a session on the left, or start a new chat with an agent."
           />
         </Panel>
       </div>
     );
   }
 
-  return (
-    <ChatShell workspaceId={workspaceId} initialWorkflowId={initialWorkflowId} />
-  );
+  return <ChatShell workspaceId={workspaceId} initialAgentId={initialAgentId} />;
 }

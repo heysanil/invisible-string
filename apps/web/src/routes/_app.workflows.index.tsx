@@ -1,3 +1,11 @@
+/**
+ * Workflows list — two-panel shape: the row list (trigger icon, agent chip,
+ * Published/Draft + last-run state) and a right-pane explainer. A workflow is
+ * a standing delegation: when a trigger fires, the chosen agent follows the
+ * instructions. New workflows seed their draft with the workspace's first
+ * PUBLISHED agent when one exists — no agent yet is a legal draft (the editor
+ * surfaces the gap).
+ */
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   Bot,
@@ -10,11 +18,9 @@ import {
   Zap,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import type {
-  RunStatus,
-  WorkflowSummaryDto,
-} from "@invisible-string/shared";
+import type { RunStatus, WorkflowSummaryDto } from "@invisible-string/shared";
 
+import { monogramInitials } from "../components/agents/AgentMonogram";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
@@ -23,7 +29,7 @@ import { StatusChip, type StatusTone } from "../components/ui/StatusChip";
 import { useToast } from "../components/ui/Toast";
 import { emptyDefinition } from "../lib/builder/model";
 import { cn } from "../lib/cn";
-import { useAgentPresets } from "../lib/queries/agent-presets";
+import { useAgents } from "../lib/queries/agents";
 import { useSessions } from "../lib/queries/sessions";
 import { useCreateWorkflow, useWorkflows } from "../lib/queries/workflows";
 import { errorMessage } from "../lib/forms";
@@ -49,6 +55,9 @@ const RUN_STATUS_TONE: Record<RunStatus, StatusTone> = {
   failed: "error",
   canceled: "neutral",
 };
+
+const DELEGATION_COPY =
+  "A workflow delegates work to an agent: when a trigger fires, your chosen agent follows the instructions.";
 
 function WorkflowsIndex() {
   const { workspaceId, isPending: workspacePending } = useActiveWorkspaceId();
@@ -81,23 +90,31 @@ function WorkflowsList({ workspaceId }: { workspaceId: string }) {
   const { toast } = useToast();
   const workflows = useWorkflows(workspaceId);
   const sessions = useSessions(workspaceId);
-  const agentPresets = useAgentPresets(workspaceId);
+  const agents = useAgents(workspaceId);
   const createWorkflow = useCreateWorkflow(workspaceId);
 
-  // Latest run status per workflow (sessions are ordered by activity desc).
+  // Latest run status per workflow (sessions are ordered by activity desc);
+  // chat sessions carry no workflow provenance and are skipped.
   const lastRunByWorkflow = new Map<string, RunStatus>();
   for (const session of sessions.data ?? []) {
-    if (session.lastRunStatus && !lastRunByWorkflow.has(session.workflowId)) {
+    if (
+      session.workflowId !== null &&
+      session.lastRunStatus &&
+      !lastRunByWorkflow.has(session.workflowId)
+    ) {
       lastRunByWorkflow.set(session.workflowId, session.lastRunStatus);
     }
   }
 
   async function createNew() {
-    const firstPreset = agentPresets.data?.[0];
+    // Seed the delegation with the first PUBLISHED agent; none yet is fine —
+    // the editor's Agent section surfaces the gap and links to /agents.
+    const firstPublished =
+      agents.data?.find((agent) => agent.publishedVersionId !== null) ?? null;
     try {
       const result = await createWorkflow.mutateAsync({
         name: "Untitled workflow",
-        draft: firstPreset ? emptyDefinition(firstPreset.id) : undefined,
+        draft: emptyDefinition(firstPublished?.id ?? null),
       });
       navigate({
         to: "/workflows/$workflowId",
@@ -182,8 +199,8 @@ function WorkflowsList({ workspaceId }: { workspaceId: string }) {
           title={list.length === 0 ? "No workflows yet" : "Select a workflow"}
           description={
             list.length === 0
-              ? "Assemble a trigger, context, agent, and instructions into an agent that runs in the cloud."
-              : "Choose a workflow from the list to open the builder, or create a new one."
+              ? DELEGATION_COPY
+              : `${DELEGATION_COPY} Choose one from the list to open its editor, or create a new one.`
           }
           action={list.length === 0 ? newButton : undefined}
         />
@@ -202,8 +219,8 @@ function WorkflowRow({
   onOpen: () => void;
 }) {
   const Icon = workflow.triggerType
-    ? (TRIGGER_ICON[workflow.triggerType] ?? Bot)
-    : Bot;
+    ? (TRIGGER_ICON[workflow.triggerType] ?? Zap)
+    : Zap;
   return (
     <li>
       <button
@@ -223,7 +240,8 @@ function WorkflowRow({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 pl-9">
-          {workflow.publishedVersionId ? (
+          <AgentChip agentName={workflow.agentName} />
+          {workflow.publishedAt !== null ? (
             <StatusChip tone="success" dot>
               Published
             </StatusChip>
@@ -240,5 +258,30 @@ function WorkflowRow({
         </div>
       </button>
     </li>
+  );
+}
+
+/** Who the workflow delegates to — tiny monogram + name (or the gap). */
+function AgentChip({ agentName }: { agentName: string | null }) {
+  if (agentName === null) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-capsule border border-dashed border-black/15 px-2 py-[2px] text-[11px] font-medium text-ink-4">
+        <Bot size={10} aria-hidden="true" /> No agent
+      </span>
+    );
+  }
+  return (
+    <span
+      data-testid="workflow-agent-chip"
+      className="inline-flex max-w-full items-center gap-1 rounded-capsule border border-black/[0.08] bg-white/50 py-[2px] pl-[2px] pr-2 text-[11px] font-medium text-ink-2"
+    >
+      <span
+        aria-hidden="true"
+        className="flex size-4 shrink-0 select-none items-center justify-center rounded-full bg-black/[0.06] text-[7.5px] font-semibold tracking-wide text-ink-3"
+      >
+        {monogramInitials(agentName)}
+      </span>
+      <span className="truncate">{agentName}</span>
+    </span>
   );
 }

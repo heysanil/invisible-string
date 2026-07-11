@@ -1,11 +1,13 @@
 /**
- * Fixture-mode smoke test: the canned session list mounts and every session
- * (streaming / parked / done / failed) renders its thread without a backend.
+ * Fixture-mode smoke test: the canned session list mounts (agent-titled rows
+ * + trigger provenance chips), every session (streaming / parked / done /
+ * failed) renders its thread without a backend, and the New chat button opens
+ * the agent picker into the first-message composer.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, fireEvent } from "@testing-library/react";
+import { cleanup, fireEvent, within } from "@testing-library/react";
 
 import { renderWithRouter } from "../test/router";
 
@@ -32,20 +34,44 @@ afterEach(cleanup);
 
 const { FixtureChatShell } = await import("../components/chat/FixtureChatShell");
 
-test("fixture shell lists every canned session and renders the active thread", async () => {
+test("fixture shell lists every canned session by agent name with provenance chips", async () => {
   const view = renderWithRouter(<FixtureChatShell />);
   // RouterProvider resolves its initial route asynchronously.
-  await view.findAllByText("Marketing copilot");
-  // All four fixture workflows appear in the list (chips).
-  for (const name of ["Marketing copilot", "Ops assistant", "Issue triage", "Release bot"]) {
+  await view.findAllByText("Executive assistant");
+  // All four fixture sessions appear, titled by their agent.
+  for (const name of ["Executive assistant", "Support triager", "Data analyst"]) {
     expect(view.getAllByText(name).length).toBeGreaterThan(0);
   }
+  // The webhook-origin session shows its origin chip + workflow provenance.
+  expect(view.getByText("webhook")).toBeTruthy();
+  expect(view.getByText("Nightly metrics digest")).toBeTruthy();
 });
 
 test("selecting the parked fixture session shows its approval card", async () => {
   const view = renderWithRouter(<FixtureChatShell />);
-  // Switch to the Ops assistant (parked-approval) session.
-  fireEvent.click((await view.findAllByText("Ops assistant"))[0]!);
+  // Both Executive assistant sessions render; the parked one is the second
+  // row (list order: live, parked). Index 0/1 are list rows — the active
+  // thread's header chip comes after them in DOM order.
+  fireEvent.click((await view.findAllByText("Executive assistant"))[1]!);
   expect(view.getByText(/Approve tool call: gmail_send/)).toBeTruthy();
   expect(view.getByRole("button", { name: "Approve" })).toBeTruthy();
+});
+
+test("New chat opens the agent picker and picking shows the composer", async () => {
+  const view = renderWithRouter(<FixtureChatShell />);
+  fireEvent.click(await view.findByRole("button", { name: /New chat/ }));
+
+  const dialog = view.getByRole("dialog", { name: "Start a new chat" });
+  const picker = within(dialog as HTMLElement);
+  // Published fixture agents only — the draft-only Release bot is absent.
+  expect(picker.getByText("Executive assistant")).toBeTruthy();
+  expect(picker.getByText("Support triager")).toBeTruthy();
+  expect(picker.getByText("Data analyst")).toBeTruthy();
+  expect(picker.queryByText("Release bot")).toBeNull();
+  // The Support triager's model override rides its row chip.
+  expect(picker.getByText("deepseek/deepseek-v4-pro")).toBeTruthy();
+
+  fireEvent.click(picker.getByText("Support triager"));
+  expect(view.getByText("New chat with Support triager")).toBeTruthy();
+  expect(view.getByPlaceholderText("Message Support triager…")).toBeTruthy();
 });

@@ -213,7 +213,7 @@ export function agentCopilotAdapter(
     emptyStateCopy: {
       title: "Shape this agent with copilot",
       description:
-        "Describe the teammate you're hiring — persona, model and tool suggestions land as Apply/Preview cards you can accept one by one.",
+        "Describe the agent you're building — persona, model and tool suggestions land as Apply/Preview cards you can accept one by one.",
     },
     promptChips: () => {
       const draft = getDraft();

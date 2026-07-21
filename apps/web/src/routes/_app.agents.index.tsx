@@ -32,7 +32,7 @@ function AgentsIndex() {
         <EmptyState
           icon={Bot}
           title="No active workspace"
-          description="Select or create a workspace to hire agents."
+          description="Select or create a workspace to build agents."
         />
       </Panel>
     );

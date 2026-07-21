@@ -5,7 +5,7 @@
  *
  *   sign in → author a skill (with a file attachment) in /context → install a
  *   registry MCP connection (registry browser, network-stubbed) + add a
- *   custom-URL MCP connection (→ the local stub server) → HIRE an agent in
+ *   custom-URL MCP connection (→ the local stub server) → BUILD an agent in
  *   /agents: persona, balanced model preset, both connections + the skill
  *   attached → Publish (real eve build; wait for the ready chip) → CHAT with
  *   it via the "New chat" agent picker: the WORKING BLOCK streams live steps
@@ -56,7 +56,7 @@ const AGENT_NAME = "Acceptance triage agent";
 const WORKFLOW_NAME = "Acceptance form workflow";
 const FORM_EMAIL = "jordan@acme.dev";
 
-test("hire an agent in the UI, publish + chat, then delegate a form workflow to it", async ({
+test("build an agent in the UI, publish + chat, then delegate a form workflow to it", async ({
   page,
 }) => {
   await signUpIntoWorkspace(page, "acceptance");
@@ -71,7 +71,7 @@ test("hire an agent in the UI, publish + chat, then delegate a form workflow to 
   await installRegistryConnection(page, { name: REGISTRY_CONNECTION, query: "notes" });
   await addCustomConnection(page, { name: CUSTOM_CONNECTION });
 
-  // ── hire the agent: persona · model · context ──────────────────────────────
+  // ── build the agent: persona · model · context ──────────────────────────────
   await openNewAgent(page, AGENT_NAME);
   await writePersona(
     page,

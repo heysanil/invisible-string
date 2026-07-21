@@ -29,7 +29,7 @@ cd e2e && SCREENSHOTS=1 bunx playwright test screenshots --project=acceptance
 
 That one command brings the full stack up (compose project `p2e2e`), signs up
 a fresh workspace through first-run onboarding, sends and views a pending
-invite from a second browser context, authors the skill/connections, hires +
+invite from a second browser context, authors the skill/connections, builds +
 publishes an agent (real `eve build`), chats with it, builds a workflow
 delegated to it (instant publish), drives the scripted copilot, walks the
 eight routes, and tears everything down. Add `E2E_REUSE=1` to keep the stack

@@ -9,7 +9,7 @@ import { useLoopPhase } from "./useLoopPhase";
 
 /*
  * Hero centerpiece — a hand-built, vector-sharp miniature of the real agent
- * editor, looping autonomously (~12s, calm): an agent is hired as its three
+ * editor, looping autonomously (~12s, calm): an agent comes together as its three
  * definition cards (Persona · Model · Context) fill in one by one and flip to
  * a green ✓, "Publish" presses itself → "Published and built." → the agent
  * goes on duty and a chat panel streams a working block that folds to a
@@ -157,7 +157,7 @@ export function AgentVignette() {
             animate={{ opacity: streaming || worked ? 0 : 1 }}
             className="col-start-1 row-start-1 flex items-start px-1 pt-1 text-[12px] text-ink-4"
           >
-            Hiring the agent…
+            Building the agent…
           </motion.div>
         </div>
       </div>

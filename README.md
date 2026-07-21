@@ -2,9 +2,9 @@
 
 # 🪢 invisible-string
 
-**A multi-tenant cloud platform for AI agents — hire, equip, delegate.**
+**A multi-tenant cloud platform for AI agents — build, equip, delegate.**
 
-Hire an Agent — a persona, a model, and the tools it can use — and it compiles
+Build an Agent — a persona, a model, and the tools it can use — and it compiles
 into a self-hosted [eve](https://eve.dev) agent on a durable, Postgres-backed
 worker pool. Chat with it directly, or delegate standing work with workflows
 fired from webhooks, forms, Slack, or a schedule.
@@ -24,9 +24,9 @@ fired from webhooks, forms, Slack, or a schedule.
 ## What is this?
 
 **invisible-string** is "Claude Code / Cowork in the cloud": a chat-centric web
-app where you hire **Agents** — like employees — and put them to work.
+app where you build **Agents** — a persona, a model, and the tools they can use — and put them to work.
 
-**An Agent is someone you hire:**
+**An Agent is a role you define:**
 
 <div align="center">
 
@@ -192,7 +192,7 @@ workflow-provenance chips; "Edit agent ↗" deep-links into the agent editor.
 ![Chat surface](docs/screenshots/chat.png)
 
 ### 🤖 Agents — `/agents`, `/agents/:id`
-Where you hire. A card grid of your Agents links into the agent editor — the
+Your agents at a glance. A card grid links into the agent editor — the
 flagship surface: the persona document in a markdown editor, the Model
 section (Powerful / Balanced / Quick preset, or a specific allowlisted model
 plus reasoning effort), Context (equip MCP connections & skills, each with an

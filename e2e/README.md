@@ -31,7 +31,7 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
 - **auth** — signup → land in the shell; logout; login (+ a bad-password path).
 - **agent-workflow** (THE acceptance, agents-first) — author a skill (with a
   file attachment) and two MCP connections (one via the registry browser, one
-  custom-URL) in `/context`; **hire an agent** in `/agents` (persona typed in
+  custom-URL) in `/context`; **build an agent** in `/agents` (persona typed in
   the markdown editor, Balanced preset, both connections + the skill
   attached); **publish** it (the agent is the compile unit — real eve build,
   wait for the ready chip); **chat with it** through the "New chat" agent

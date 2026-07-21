@@ -1,11 +1,11 @@
 # invisible-string
 
-> An open-source, self-hostable platform for AI agents: hire an agent — a persona, a model, and the tools it's equipped with — chat with it like a teammate, or delegate standing work with workflows fired from Slack, forms, webhooks, or a schedule. Every published agent compiles into a self-hosted, version-pinned process; runs stream live, pause for human approval, and survive infrastructure failure without losing work.
+> An open-source, self-hostable platform for AI agents: build an agent — a persona, a model, and the tools it's equipped with — chat with it directly, or delegate standing work with workflows fired from Slack, forms, webhooks, or a schedule. Every published agent compiles into a self-hosted, version-pinned process; runs stream live, pause for human approval, and survive infrastructure failure without losing work.
 
 ## Docs
 
 - [Overview](/docs/getting-started/overview): what invisible-string is and how the pieces fit
-- [Quickstart](/docs/getting-started/quickstart): hire, publish, chat, delegate
+- [Quickstart](/docs/getting-started/quickstart): build, publish, chat, delegate
 - [Agents](/docs/concepts/agents): persona, model, context — and how publishing versions them
 - [Workflows](/docs/concepts/workflows): standing delegations — trigger, agent, instructions
 - [Triggers](/docs/building/triggers): chat, webhook, form, Slack, and schedule ingress

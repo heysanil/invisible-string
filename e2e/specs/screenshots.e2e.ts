@@ -233,7 +233,7 @@ test("capture the eight product screenshots", async ({ page, browser }) => {
   ).toBeVisible();
   await shoot(page, "context.png");
 
-  // ── hire the agent: persona · model · context (the flagship editor) ────────
+  // ── build the agent: persona · model · context (the flagship editor) ────────
   await openNewAgent(page, AGENT_NAME);
   await page.getByLabel("Description").fill(AGENT_DESCRIPTION);
   await attachAgentResource(page, "connection", REGISTRY_CONNECTION);

@@ -1,7 +1,7 @@
 import { GlassPanel, StatusChip } from "../ui";
 import { Reveal, SectionHeading } from "./parts";
 
-/* "What would I hand off?" — three agents you could hire this afternoon, each
+/* "What would I hand off?" — work you could hand off this afternoon, each
    a trigger chip + a plain-language sketch of the standing work it handles.
    FeatureGrid's card DNA (glass panel, .lift, Reveal stagger); the icon square
    is swapped for a StatusChip trigger chip. No new animation machinery. */
@@ -34,7 +34,7 @@ export function UseCases() {
       <SectionHeading
         eyebrow="Use cases"
         title="What will you hand off first?"
-        lede="Agents you could hire this afternoon — equip one once, then delegate."
+        lede="Work you could hand off this afternoon — equip an agent once, then delegate."
       />
       <div className="mt-12 grid gap-4 md:grid-cols-3">
         {USE_CASES.map((u, i) => (

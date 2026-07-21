@@ -6,11 +6,11 @@ This spec amends `docs/superpowers/specs/2026-07-02-invisible-string-design.md` 
 
 ## §1 Motivation + concept model
 
-Today the platform is workflow-centric: users assemble **workflows** from four pillars (TRIGGER · CONTEXT · AGENT · INSTRUCTIONS), each published workflow compiles to its own eve artifact, and chat targets published workflows. "Agents" exist only as thin **agent presets** (persona + model defaults) picked inside the AGENT pillar. That inverts how people actually delegate work: you don't rebuild an employee for every task — you hire one, equip them, and hand them work.
+Today the platform is workflow-centric: users assemble **workflows** from four pillars (TRIGGER · CONTEXT · AGENT · INSTRUCTIONS), each published workflow compiles to its own eve artifact, and chat targets published workflows. "Agents" exist only as thin **agent presets** (persona + model defaults) picked inside the AGENT pillar. That inverts how people actually delegate work: you don't rebuild an assistant for every task — you set one up, equip it, and hand it work.
 
 The canonical concept block (replaces the four-pillar table everywhere — README, docs, landing):
 
-> **An Agent is someone you hire:**
+> **An Agent is a role you define:**
 >
 > | PERSONA | MODEL | CONTEXT |
 > |---|---|---|
@@ -24,7 +24,7 @@ The canonical concept block (replaces the four-pillar table everywhere — READM
 >
 > Every **published Agent** compiles to a real, self-hosted eve agent. A workflow builds nothing — when it fires, the platform dispatches the trigger event *and its instructions* to the bound agent version as the task message.
 
-The **employee metaphor is load-bearing**: an Agent is an employee you hire and equip ("Software engineer" with context7 + Figma MCP; "Compliance reviewer" with legal positioning); a Workflow is a standing delegation, the way you'd tell an EA "watch these Slack messages and prepare a report."
+The **delegation metaphor is load-bearing**: an Agent is a capable assistant you equip ("Software engineer" with context7 + Figma MCP; "Compliance reviewer" with legal positioning); a Workflow is a standing delegation, the way you'd brief an assistant: "watch these Slack messages and prepare a report." The voice is acceleration-first — agents take work off people's plates; employment/replacement framing ("hire") is retired.
 
 Approved product decisions:
 1. **The Agent is the compile unit.** Workflow instructions render at **dispatch time** as the task message — publishing a workflow builds nothing.
@@ -91,7 +91,7 @@ Everything else in the 2026-07-02 spec — **the E1 design tokens and the eve li
 
 | Term | Meaning | Where used |
 |---|---|---|
-| **Agent** (capital A) | The product entity: persona + model + context (MCP connections, skills). "You hire an Agent." | All product/marketing/docs prose |
+| **Agent** (capital A) | The product entity: persona + model + context (MCP connections, skills). "You build an Agent." | All product/marketing/docs prose |
 | **agent version** | Immutable published snapshot of an Agent, identified by content hash. The compile unit. Replaces "workflow version" everywhere. | Runtime/infra docs |
 | **compiled agent** / **artifact** | The eve build output (tarball) of an agent version | Runtime/infra docs |
 | **agent process** | The running `node .output/server/index.mjs` instance on a worker | Runtime/infra docs |
@@ -100,6 +100,6 @@ Everything else in the 2026-07-02 spec — **the E1 design tokens and the eve li
 Rules:
 1. In runtime docs, never write bare lowercase "agent" where entity-vs-process is ambiguous — pick a term from the table.
 2. No environment-variable renames follow from vocabulary (`WORKFLOW_POSTGRES_*` is the world package's contract).
-3. **Retired terms** (never used outside historical specs): *pillar*, *four pillars*, *agent preset*, *workflow version* (as compile unit), *chat with a workflow*.
-4. Marketing verb set: **hire / equip / delegate**. Tagline triplet: **"Hire. Delegate. Done."**
-5. The employee metaphor is the load-bearing explanation — lead with it.
+3. **Retired terms** (never used outside historical specs): *pillar*, *four pillars*, *agent preset*, *workflow version* (as compile unit), *chat with a workflow*, *hire* (as marketing verb).
+4. Marketing verb set: **describe / build / equip / delegate** (voice principle: accelerate people's work — never employment/replacement framing; "hire" is a retired term). Tagline triplet: **"Describe. Delegate. Done."**
+5. The delegation metaphor is the load-bearing explanation — lead with it.

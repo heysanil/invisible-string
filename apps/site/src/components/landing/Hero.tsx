@@ -45,7 +45,7 @@ export function Hero() {
         className="text-display-1 text-balance"
       >
         <motion.span variants={line} className="block">
-          Hire an agent,
+          Describe the work,
         </motion.span>
         <motion.span variants={line} className="block">
           consider it done.
@@ -58,9 +58,9 @@ export function Hero() {
         transition={{ duration: 0.4, ease: EASE, delay: 0.28 }}
         className="mt-6 max-w-2xl text-lede text-ink-2"
       >
-        Give an agent a job, a model, and the tools it needs. Chat with it like
-        a teammate — or put it on standing duty from Slack, forms, webhooks, or
-        a schedule. Live, reliable, and yours to approve.
+        Build an agent with a role, a model, and the tools it needs. Chat with
+        it directly — or put it on standing duty from Slack, forms, webhooks, or
+        a schedule. More time for the work only you can do.
       </motion.p>
 
       <motion.div
@@ -87,7 +87,7 @@ export function Hero() {
         className="mt-16 w-full max-w-4xl sm:mt-20"
       >
         <Vignette
-          label="An agent is hired — persona, model, tools — published, then handles a request in chat in six seconds."
+          label="An agent comes together — persona, model, tools — is published, then handles a request in chat in six seconds."
           className="p-0"
         >
           <AgentVignette />

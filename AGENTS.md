@@ -2,7 +2,7 @@
 
 Operational contract for anyone (human or agent) changing this codebase. `CLAUDE.md` is a symlink to this file. Read this first; it tells you what is load-bearing, how to verify changes, and which documents are the source of truth.
 
-**invisible-string** is a multi-tenant cloud platform for AI agents: users hire **Agents** (PERSONA · MODEL · CONTEXT — MCP connections & skills) in a chat-centric SPA; each **published Agent compiles to a self-hosted [eve](https://eve.dev) agent** (`packages/compiler` → `eve build` → tarball in object storage) that runs on a stateless worker pool with Postgres-backed durability (`@workflow/world-postgres`). Users chat with Agents directly, or delegate standing work with **workflows** (TRIGGER → AGENT → INSTRUCTIONS; webhook/form/Slack/schedule) — a workflow builds nothing: at dispatch the control plane renders its instructions + the trigger event into the task message for the bound agent version. An AI copilot lives in both editors.
+**invisible-string** is a multi-tenant cloud platform for AI agents: users build **Agents** (PERSONA · MODEL · CONTEXT — MCP connections & skills) in a chat-centric SPA; each **published Agent compiles to a self-hosted [eve](https://eve.dev) agent** (`packages/compiler` → `eve build` → tarball in object storage) that runs on a stateless worker pool with Postgres-backed durability (`@workflow/world-postgres`). Users chat with Agents directly, or delegate standing work with **workflows** (TRIGGER → AGENT → INSTRUCTIONS; webhook/form/Slack/schedule) — a workflow builds nothing: at dispatch the control plane renders its instructions + the trigger event into the task message for the bound agent version. An AI copilot lives in both editors.
 
 ---
 

@@ -4,7 +4,7 @@ import type { ComponentType } from "react";
 import { GlassPanel } from "../ui";
 import { Reveal, SectionHeading } from "./parts";
 
-/* "Hire the agent. Delegate the work." An Agent is someone you hire — three
+/* "Build the agent. Delegate the work." An Agent is a role you define — three
    cards spell out its definition (Persona · Model · Context) — and a Workflow
    is a standing delegation, drawn as a full-width trigger → agent →
    instructions strip beneath them. */
@@ -52,7 +52,7 @@ const DELEGATION: ReadonlyArray<{
     label: "Agent",
     icon: Bot,
     hint: "Who handles it",
-    copy: "One of the agents you've hired and published.",
+    copy: "One of the agents you've built and published.",
   },
   {
     label: "Instructions",
@@ -66,9 +66,9 @@ export function Agents() {
   return (
     <section className="site-container section-block">
       <SectionHeading
-        eyebrow="Hire it"
-        title="Hire the agent. Delegate the work."
-        lede="An agent is someone you hire — give it a persona, a model, and the tools it's equipped with. Publish it once: chat with it directly, or put it on standing duty."
+        eyebrow="Build it"
+        title="Build the agent. Delegate the work."
+        lede="Give an agent a role, a model, and the tools of its trade. Publish it once: chat with it directly, or put it on standing duty."
       />
 
       <div className="mt-12 grid gap-4 md:grid-cols-3">

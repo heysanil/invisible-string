@@ -37,7 +37,7 @@ test("a run parks on an inline HITL card, then responding resumes it", async ({
   await signUpIntoWorkspace(page, "approval");
   await addCustomConnection(page, { name: CONNECTION });
 
-  // Hire an agent, equip it with the connection, and gate the connection
+  // Build an agent, equip it with the connection, and gate the connection
   // behind approval — exercises the per-connection approval-policy UI.
   await openNewAgent(page, AGENT_NAME);
   await writePersona(

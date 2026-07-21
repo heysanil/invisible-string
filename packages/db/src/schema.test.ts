@@ -1,6 +1,7 @@
 /**
  * Pure schema-shape unit tests — no database required.
- * Verifies the contract points from INITIAL-SPEC.md §9 / docs/PLAN.md and the
+ * Verifies the contract points of the agents-first data model
+ * (docs/superpowers/specs/2026-07-10-agents-first-redesign.md) and the
  * Better Auth column expectations (CLI-generated names).
  */
 import { describe, expect, test } from "bun:test";
@@ -105,6 +106,14 @@ describe("product enums", () => {
   test("resource scope is workspace/user", () => {
     expect(schema.resourceScope.enumValues).toEqual(["workspace", "user"]);
   });
+
+  test("delivery status is pending/delivered/failed", () => {
+    expect(schema.deliveryStatus.enumValues).toEqual([
+      "pending",
+      "delivered",
+      "failed",
+    ]);
+  });
 });
 
 describe("run_events", () => {
@@ -144,14 +153,26 @@ describe("triggers", () => {
     const names = indexes.map((i) => i.config.name);
     expect(names).toContain("triggers_workflow_id_idx");
   });
+
+  test("schedule ticker columns: nullable cron + indexed next_fire_at", () => {
+    expect(schema.triggers.cron.notNull).toBe(false);
+    expect(schema.triggers.nextFireAt.notNull).toBe(false);
+    const { indexes } = config(schema.triggers);
+    const nextFire = indexes.find(
+      (i) => i.config.name === "triggers_next_fire_at_idx",
+    );
+    expect(nextFire).toBeDefined();
+    // Partial: the ticker only scans enabled schedule triggers.
+    expect(nextFire!.config.where).toBeDefined();
+  });
 });
 
 describe("indexes and uniques", () => {
-  test("agent_sessions has the workflow_id index", () => {
+  test("agent_sessions has the agent_id index", () => {
     const names = config(schema.agentSessions).indexes.map(
       (i) => i.config.name,
     );
-    expect(names).toContain("agent_sessions_workflow_id_idx");
+    expect(names).toContain("agent_sessions_agent_id_idx");
   });
 
   test("model_presets unique per (organization_id, slug)", () => {
@@ -183,6 +204,17 @@ describe("indexes and uniques", () => {
       unique!.config.columns.map((c) => (c as { name: string }).name),
     ).toEqual(["type", "external_id"]);
   });
+
+  test("agent_versions unique per (agent_id, content_hash) — publish idempotency is DB-enforced", () => {
+    const unique = config(schema.agentVersions).indexes.find(
+      (i) => i.config.unique,
+    );
+    expect(unique).toBeDefined();
+    expect(unique!.config.name).toBe("agent_versions_agent_id_content_hash_uidx");
+    expect(
+      unique!.config.columns.map((c) => (c as { name: string }).name),
+    ).toEqual(["agent_id", "content_hash"]);
+  });
 });
 
 describe("encrypted-at-rest columns are opaque text", () => {
@@ -198,20 +230,18 @@ describe("encrypted-at-rest columns are opaque text", () => {
   });
 });
 
-describe("workflow lineage", () => {
-  test("workflows reference run_as user, org, and published version", () => {
-    const fkTables = config(schema.workflows).foreignKeys.map(
+describe("agent lineage", () => {
+  test("agents reference org, run_as user, and published version", () => {
+    const fkTables = config(schema.agents).foreignKeys.map(
       (fk) => getTableConfig(fk.reference().foreignTable as PgTable).name,
     );
-    expect(fkTables.sort()).toEqual([
-      "organization",
-      "user",
-      "workflow_versions",
-    ]);
+    expect(fkTables.sort()).toEqual(["agent_versions", "organization", "user"]);
+    expect(schema.agents.runAsUserId.notNull).toBe(true);
+    expect(schema.agents.publishedVersionId.notNull).toBe(false);
   });
 
-  test("workflow_versions carry hash inputs (compiler + eve versions)", () => {
-    expect(columnNames(schema.workflowVersions)).toEqual(
+  test("agent_versions carry hash inputs (compiler + eve versions)", () => {
+    expect(columnNames(schema.agentVersions)).toEqual(
       expect.arrayContaining([
         "content_hash",
         "compiler_version",
@@ -221,14 +251,21 @@ describe("workflow lineage", () => {
     );
   });
 
-  test("workflow_builds cache is keyed by hash", () => {
-    expect(schema.workflowBuilds.hash.primary).toBe(true);
+  test("agent_versions pin the resolved model (dispatch key injection)", () => {
+    expect(schema.agentVersions.modelProvider.notNull).toBe(true);
+    expect(schema.agentVersions.modelId.notNull).toBe(true);
   });
 
-  test("agent_sessions pin workflow version and track worker affinity", () => {
+  test("builds cache is keyed by hash", () => {
+    expect(schema.builds.hash.primary).toBe(true);
+  });
+
+  test("agent_sessions pin agent version and track worker affinity", () => {
     expect(columnNames(schema.agentSessions)).toEqual(
       expect.arrayContaining([
-        "workflow_version_id",
+        "agent_id",
+        "agent_version_id",
+        "workflow_id",
         "eve_session_id",
         "continuation_token",
         "affinity_worker_id",
@@ -237,5 +274,63 @@ describe("workflow lineage", () => {
         "status",
       ]),
     );
+    expect(schema.agentSessions.agentId.notNull).toBe(true);
+    expect(schema.agentSessions.agentVersionId.notNull).toBe(true);
+  });
+
+  test("agent_sessions keep workflow provenance as nullable SET NULL", () => {
+    expect(schema.agentSessions.workflowId.notNull).toBe(false);
+    const workflowFk = config(schema.agentSessions).foreignKeys.find(
+      (fk) =>
+        getTableConfig(fk.reference().foreignTable as PgTable).name ===
+        "workflows",
+    );
+    expect(workflowFk?.onDelete).toBe("set null");
+  });
+});
+
+describe("workflow delegation", () => {
+  test("workflows reference org and the published agent only", () => {
+    const fkTables = config(schema.workflows).foreignKeys.map(
+      (fk) => getTableConfig(fk.reference().foreignTable as PgTable).name,
+    );
+    expect(fkTables.sort()).toEqual(["agents", "organization"]);
+  });
+
+  test("published snapshot columns exist; drafts default to {}", () => {
+    expect(columnNames(schema.workflows)).toEqual(
+      expect.arrayContaining([
+        "draft",
+        "published",
+        "published_at",
+        "enabled",
+        "published_agent_id",
+      ]),
+    );
+    expect(schema.workflows.published.notNull).toBe(false);
+    expect(schema.workflows.enabled.notNull).toBe(true);
+  });
+
+  test("agent deletion is RESTRICTed while a published workflow delegates to it", () => {
+    const agentFk = config(schema.workflows).foreignKeys.find(
+      (fk) =>
+        getTableConfig(fk.reference().foreignTable as PgTable).name ===
+        "agents",
+    );
+    expect(agentFk?.onDelete).toBe("restrict");
+    const names = config(schema.workflows).indexes.map((i) => i.config.name);
+    expect(names).toContain("workflows_published_agent_id_idx");
+  });
+
+  test("runs carry dispatch provenance + delivery bookkeeping", () => {
+    expect(columnNames(schema.runs)).toEqual(
+      expect.arrayContaining([
+        "task_message",
+        "delivery_status",
+        "delivery_error",
+      ]),
+    );
+    expect(schema.runs.taskMessage.notNull).toBe(false);
+    expect(schema.runs.deliveryStatus.notNull).toBe(false);
   });
 });

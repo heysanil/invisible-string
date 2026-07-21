@@ -4,7 +4,7 @@
  * - inline decorations: resolved `@refs` render as ink-on-8%-black pills;
  *   unresolved refs get an amber underline (hover explains why).
  *
- * The reference sources change as the user edits other pillars, so both
+ * The reference sources change as the user edits other sections, so both
  * facilities read from a `StateField` the React wrapper reconfigures via a
  * `StateEffect` — no editor teardown per keystroke.
  */

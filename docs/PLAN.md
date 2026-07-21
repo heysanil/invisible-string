@@ -8,6 +8,8 @@ This plan is the outcome of a brainstorming pass: live eve/Better Auth/OpenRoute
 
 **Spec authority:** `INITIAL-SPEC.md` §2 locked decisions are honored throughout. Where live eve docs contradicted the spec, the docs win (per spec §0) — corrections listed below.
 
+**2026-07-10 supersession:** the four-pillar, workflow-centric product model this plan was written against is superseded by the agents-first redesign (`docs/superpowers/specs/2026-07-10-agents-first-redesign.md`); Phases 0–4 below remain the historical record — see Phase 5 at the bottom.
+
 ---
 
 ## Decisions made in brainstorming (now locked)
@@ -166,3 +168,19 @@ Per spec §10 verbatim (Better Auth mount, workspace/user MCP + skills CRUD, reg
 1. `git init` + initial commit of `INITIAL-SPEC.md` + this plan; materialize the approved design as `docs/superpowers/specs/2026-07-02-invisible-string-design.md` (content = this file's design sections) and commit. Commits never reference Claude (user rule).
 2. Save visual-decision + preference notes to memory (user prefers Apple liquid-glass monochrome aesthetics; detailed large mockups).
 3. Follow superpowers flow: `writing-plans` skill expands Phase 0 into a TDD task list, then `executing-plans`/`subagent-driven-development` per phase; `verification-before-completion` before each phase sign-off.
+
+---
+
+## Phase 5 — Agents-first re-architecture (2026-07-10)
+
+**Design record:** `docs/superpowers/specs/2026-07-10-agents-first-redesign.md` (concept model, IA, technical decisions, supersessions of INITIAL-SPEC §2 rows and the 2026-07-02 spec, vocabulary standard). **Status: in progress.**
+
+The Agent (PERSONA · MODEL · CONTEXT) becomes the first-class entity and the compile unit; workflows simplify to standing delegations (TRIGGER → AGENT → INSTRUCTIONS) with no builds of their own. Scope:
+
+1. **Contracts + data** — `packages/shared` (`AgentDefinition`, `WorkflowConfig`, shared `renderTaskMessage`, re-keyed DTOs, surface-discriminated copilot frames) + `packages/db` (migration 0005: `agents` expanded in place, `agent_versions`/`builds` replace `workflow_versions`/`workflow_builds`, workflows simplified with `publishedAgentId`, trigger `cron`/`nextFireAt`, session/run re-keys; destructive — dev stacks reset with `docker compose down -v`).
+2. **Compiler** — `compile(AgentDefinition)`; artifact emits only the default eve channel (trigger channels, compiled schedules, and outbound-delivery codegen deleted); world prefix `ag_v_`; JWT audience `agent-version:<hash>`; `COMPILER_VERSION` 3.0.0 + golden regen.
+3. **Control plane** — agent CRUD + publish/build lifecycle; chat sessions target Agents; workflow publish = validate + snapshot + trigger sync (no build); dispatch renders the task message and drives eve's native session API; control-plane Slack DeliveryService (at-least-once) + schedule cron ticker; copilot two surfaces; seeded-agent auto-publish. Worker: zero code changes.
+4. **Web SPA** — Agents top-level section + flagship agent editor; chat agent picker; single-column workflow editor with manual Run; Settings loses agent presets.
+5. **Acceptance + e2e rewrite, then docs/site messaging pivot** (README, MDX docs tree, landing) per the vocabulary standard.
+
+**Acceptance:** the full lane matrix (unit/typecheck, DB-gated integration incl. `SPIKE_EVE_BUILD=1`, phase-1 and phase-3 acceptance re-keyed agent-first + schedule + control-plane Slack delivery proofs, keyed lanes manual, Playwright e2e, prod-compose smoke) green in its documented lanes.

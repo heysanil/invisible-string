@@ -10,6 +10,7 @@ import {
 } from "./trigger-event";
 
 const minimalEvent = {
+  agentId: "9d3c1a2b-4e5f-4a6b-8c7d-1e2f3a4b5c6d",
   workflowId: "6b4d8f6e-3a4e-4f6a-9a0e-2f6a1c9d8e7b",
   triggerType: "manual",
   message: "run the weekly report",
@@ -20,10 +21,32 @@ const minimalEvent = {
 describe("triggerEventSchema", () => {
   test("parses a minimal envelope", () => {
     const parsed = triggerEventSchema.parse(minimalEvent);
+    expect(parsed.agentId).toBe(minimalEvent.agentId);
     expect(parsed.workflowId).toBe(minimalEvent.workflowId);
     expect(parsed.files).toBeUndefined();
     expect(parsed.continuationToken).toBeUndefined();
     expect(parsed.context).toBeUndefined();
+  });
+
+  test("workflowId is null for direct chat sessions", () => {
+    const parsed = triggerEventSchema.parse({ ...minimalEvent, workflowId: null });
+    expect(parsed.workflowId).toBeNull();
+  });
+
+  test("agentId is required and must be a uuid", () => {
+    const { agentId: _agentId, ...rest } = minimalEvent;
+    expect(triggerEventSchema.safeParse(rest).success).toBe(false);
+    expect(
+      triggerEventSchema.safeParse({ ...minimalEvent, agentId: "agent-1" }).success,
+    ).toBe(false);
+  });
+
+  test("workflowId must be a uuid or null, never undefined", () => {
+    expect(
+      triggerEventSchema.safeParse({ ...minimalEvent, workflowId: "wf-1" }).success,
+    ).toBe(false);
+    const { workflowId: _workflowId, ...rest } = minimalEvent;
+    expect(triggerEventSchema.safeParse(rest).success).toBe(false);
   });
 
   test("parses a full envelope (files, principal user, continuation, context)", () => {

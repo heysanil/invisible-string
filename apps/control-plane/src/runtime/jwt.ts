@@ -5,11 +5,11 @@
  * supervisor injects (PLAN correction 7; proven in the Phase-0 spike).
  *
  * TENANT ISOLATION (security review): the signing secret and the audience
- * are both bound to the workflow VERSION —
+ * are both bound to the agent VERSION —
  * - secret: HKDF-style derivation `derivePlatformJwtSecret(master, hash)`,
  *   injected per agent as PLATFORM_JWT_SECRET, so a leaked agent env cannot
  *   verify or mint tokens for any other version;
- * - audience: `workflow-agent:<hash>` (compiler bakes the same value into
+ * - audience: `agent-version:<hash>` (compiler bakes the same value into
  *   the generated verifier), so a minted token is rejected by every agent
  *   except the one version it was minted for.
  *

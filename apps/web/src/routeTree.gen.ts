@@ -18,16 +18,18 @@ import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppContextRouteImport } from './routes/_app.context'
 import { Route as AppChatRouteImport } from './routes/_app.chat'
+import { Route as AppAgentsRouteImport } from './routes/_app.agents'
 import { Route as AppWorkflowsIndexRouteImport } from './routes/_app.workflows.index'
 import { Route as AppSettingsIndexRouteImport } from './routes/_app.settings.index'
 import { Route as AppContextIndexRouteImport } from './routes/_app.context.index'
+import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppWorkflowsWorkflowIdRouteImport } from './routes/_app.workflows.$workflowId'
 import { Route as AppSettingsWorkspaceRouteImport } from './routes/_app.settings.workspace'
 import { Route as AppSettingsModelsRouteImport } from './routes/_app.settings.models'
 import { Route as AppSettingsMembersRouteImport } from './routes/_app.settings.members'
 import { Route as AppSettingsIntegrationsRouteImport } from './routes/_app.settings.integrations'
 import { Route as AppSettingsAllowlistRouteImport } from './routes/_app.settings.allowlist'
-import { Route as AppSettingsAgentsRouteImport } from './routes/_app.settings.agents'
+import { Route as AppAgentsAgentIdRouteImport } from './routes/_app.agents.$agentId'
 import { Route as AppContextSkillsSkillIdRouteImport } from './routes/_app.context.skills.$skillId'
 
 const SignupRoute = SignupRouteImport.update({
@@ -75,6 +77,11 @@ const AppChatRoute = AppChatRouteImport.update({
   path: '/chat',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsRoute = AppAgentsRouteImport.update({
+  id: '/agents',
+  path: '/agents',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppWorkflowsIndexRoute = AppWorkflowsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -89,6 +96,11 @@ const AppContextIndexRoute = AppContextIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => AppContextRoute,
+} as any)
+const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppAgentsRoute,
 } as any)
 const AppWorkflowsWorkflowIdRoute = AppWorkflowsWorkflowIdRouteImport.update({
   id: '/$workflowId',
@@ -120,10 +132,10 @@ const AppSettingsAllowlistRoute = AppSettingsAllowlistRouteImport.update({
   path: '/allowlist',
   getParentRoute: () => AppSettingsRoute,
 } as any)
-const AppSettingsAgentsRoute = AppSettingsAgentsRouteImport.update({
-  id: '/agents',
-  path: '/agents',
-  getParentRoute: () => AppSettingsRoute,
+const AppAgentsAgentIdRoute = AppAgentsAgentIdRouteImport.update({
+  id: '/$agentId',
+  path: '/$agentId',
+  getParentRoute: () => AppAgentsRoute,
 } as any)
 const AppContextSkillsSkillIdRoute = AppContextSkillsSkillIdRouteImport.update({
   id: '/skills/$skillId',
@@ -135,18 +147,20 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
+  '/agents': typeof AppAgentsRouteWithChildren
   '/chat': typeof AppChatRoute
   '/context': typeof AppContextRouteWithChildren
   '/settings': typeof AppSettingsRouteWithChildren
   '/workflows': typeof AppWorkflowsRouteWithChildren
   '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
-  '/settings/agents': typeof AppSettingsAgentsRoute
+  '/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
   '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/agents/': typeof AppAgentsIndexRoute
   '/context/': typeof AppContextIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
   '/workflows/': typeof AppWorkflowsIndexRoute
@@ -158,13 +172,14 @@ export interface FileRoutesByTo {
   '/signup': typeof SignupRoute
   '/chat': typeof AppChatRoute
   '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
-  '/settings/agents': typeof AppSettingsAgentsRoute
+  '/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
   '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/agents': typeof AppAgentsIndexRoute
   '/context': typeof AppContextIndexRoute
   '/settings': typeof AppSettingsIndexRoute
   '/workflows': typeof AppWorkflowsIndexRoute
@@ -176,18 +191,20 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
   '/signup': typeof SignupRoute
+  '/_app/agents': typeof AppAgentsRouteWithChildren
   '/_app/chat': typeof AppChatRoute
   '/_app/context': typeof AppContextRouteWithChildren
   '/_app/settings': typeof AppSettingsRouteWithChildren
   '/_app/workflows': typeof AppWorkflowsRouteWithChildren
   '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
-  '/_app/settings/agents': typeof AppSettingsAgentsRoute
+  '/_app/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/_app/settings/allowlist': typeof AppSettingsAllowlistRoute
   '/_app/settings/integrations': typeof AppSettingsIntegrationsRoute
   '/_app/settings/members': typeof AppSettingsMembersRoute
   '/_app/settings/models': typeof AppSettingsModelsRoute
   '/_app/settings/workspace': typeof AppSettingsWorkspaceRoute
   '/_app/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/context/': typeof AppContextIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
   '/_app/workflows/': typeof AppWorkflowsIndexRoute
@@ -199,18 +216,20 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/signup'
+    | '/agents'
     | '/chat'
     | '/context'
     | '/settings'
     | '/workflows'
     | '/accept-invitation/$invitationId'
-    | '/settings/agents'
+    | '/agents/$agentId'
     | '/settings/allowlist'
     | '/settings/integrations'
     | '/settings/members'
     | '/settings/models'
     | '/settings/workspace'
     | '/workflows/$workflowId'
+    | '/agents/'
     | '/context/'
     | '/settings/'
     | '/workflows/'
@@ -222,13 +241,14 @@ export interface FileRouteTypes {
     | '/signup'
     | '/chat'
     | '/accept-invitation/$invitationId'
-    | '/settings/agents'
+    | '/agents/$agentId'
     | '/settings/allowlist'
     | '/settings/integrations'
     | '/settings/members'
     | '/settings/models'
     | '/settings/workspace'
     | '/workflows/$workflowId'
+    | '/agents'
     | '/context'
     | '/settings'
     | '/workflows'
@@ -239,18 +259,20 @@ export interface FileRouteTypes {
     | '/_app'
     | '/login'
     | '/signup'
+    | '/_app/agents'
     | '/_app/chat'
     | '/_app/context'
     | '/_app/settings'
     | '/_app/workflows'
     | '/accept-invitation/$invitationId'
-    | '/_app/settings/agents'
+    | '/_app/agents/$agentId'
     | '/_app/settings/allowlist'
     | '/_app/settings/integrations'
     | '/_app/settings/members'
     | '/_app/settings/models'
     | '/_app/settings/workspace'
     | '/_app/workflows/$workflowId'
+    | '/_app/agents/'
     | '/_app/context/'
     | '/_app/settings/'
     | '/_app/workflows/'
@@ -330,6 +352,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppChatRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents': {
+      id: '/_app/agents'
+      path: '/agents'
+      fullPath: '/agents'
+      preLoaderRoute: typeof AppAgentsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/workflows/': {
       id: '/_app/workflows/'
       path: '/'
@@ -350,6 +379,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/context/'
       preLoaderRoute: typeof AppContextIndexRouteImport
       parentRoute: typeof AppContextRoute
+    }
+    '/_app/agents/': {
+      id: '/_app/agents/'
+      path: '/'
+      fullPath: '/agents/'
+      preLoaderRoute: typeof AppAgentsIndexRouteImport
+      parentRoute: typeof AppAgentsRoute
     }
     '/_app/workflows/$workflowId': {
       id: '/_app/workflows/$workflowId'
@@ -393,12 +429,12 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsAllowlistRouteImport
       parentRoute: typeof AppSettingsRoute
     }
-    '/_app/settings/agents': {
-      id: '/_app/settings/agents'
-      path: '/agents'
-      fullPath: '/settings/agents'
-      preLoaderRoute: typeof AppSettingsAgentsRouteImport
-      parentRoute: typeof AppSettingsRoute
+    '/_app/agents/$agentId': {
+      id: '/_app/agents/$agentId'
+      path: '/$agentId'
+      fullPath: '/agents/$agentId'
+      preLoaderRoute: typeof AppAgentsAgentIdRouteImport
+      parentRoute: typeof AppAgentsRoute
     }
     '/_app/context/skills/$skillId': {
       id: '/_app/context/skills/$skillId'
@@ -409,6 +445,20 @@ declare module '@tanstack/react-router' {
     }
   }
 }
+
+interface AppAgentsRouteChildren {
+  AppAgentsAgentIdRoute: typeof AppAgentsAgentIdRoute
+  AppAgentsIndexRoute: typeof AppAgentsIndexRoute
+}
+
+const AppAgentsRouteChildren: AppAgentsRouteChildren = {
+  AppAgentsAgentIdRoute: AppAgentsAgentIdRoute,
+  AppAgentsIndexRoute: AppAgentsIndexRoute,
+}
+
+const AppAgentsRouteWithChildren = AppAgentsRoute._addFileChildren(
+  AppAgentsRouteChildren,
+)
 
 interface AppContextRouteChildren {
   AppContextIndexRoute: typeof AppContextIndexRoute
@@ -425,7 +475,6 @@ const AppContextRouteWithChildren = AppContextRoute._addFileChildren(
 )
 
 interface AppSettingsRouteChildren {
-  AppSettingsAgentsRoute: typeof AppSettingsAgentsRoute
   AppSettingsAllowlistRoute: typeof AppSettingsAllowlistRoute
   AppSettingsIntegrationsRoute: typeof AppSettingsIntegrationsRoute
   AppSettingsMembersRoute: typeof AppSettingsMembersRoute
@@ -435,7 +484,6 @@ interface AppSettingsRouteChildren {
 }
 
 const AppSettingsRouteChildren: AppSettingsRouteChildren = {
-  AppSettingsAgentsRoute: AppSettingsAgentsRoute,
   AppSettingsAllowlistRoute: AppSettingsAllowlistRoute,
   AppSettingsIntegrationsRoute: AppSettingsIntegrationsRoute,
   AppSettingsMembersRoute: AppSettingsMembersRoute,
@@ -463,6 +511,7 @@ const AppWorkflowsRouteWithChildren = AppWorkflowsRoute._addFileChildren(
 )
 
 interface AppRouteChildren {
+  AppAgentsRoute: typeof AppAgentsRouteWithChildren
   AppChatRoute: typeof AppChatRoute
   AppContextRoute: typeof AppContextRouteWithChildren
   AppSettingsRoute: typeof AppSettingsRouteWithChildren
@@ -470,6 +519,7 @@ interface AppRouteChildren {
 }
 
 const AppRouteChildren: AppRouteChildren = {
+  AppAgentsRoute: AppAgentsRouteWithChildren,
   AppChatRoute: AppChatRoute,
   AppContextRoute: AppContextRouteWithChildren,
   AppSettingsRoute: AppSettingsRouteWithChildren,

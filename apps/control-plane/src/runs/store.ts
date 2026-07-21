@@ -48,6 +48,27 @@ export interface RunStore {
   getRunStatus(
     runId: string,
   ): Promise<{ status: RunStatus; error: string | null } | null>;
+  /**
+   * Settle a run's outbound-reply obligation (Slack today): flips
+   * `delivery_status` from `pending` to delivered/failed. CAS like markRun —
+   * only a PENDING delivery is settled (racing settlers — the live tailer
+   * hook vs the boot-time recovery sweep — resolve to one winner), and the
+   * return value says whether this call was it. Runs with no delivery owed
+   * (`delivery_status` null) are never touched.
+   */
+  markDelivery(
+    runId: string,
+    status: "delivered" | "failed",
+    error?: string | null,
+  ): Promise<boolean>;
+  /**
+   * Update a session's status. Transitioning to a TERMINAL status
+   * (closed/error) also releases the session's `slack_thread_key`: a terminal
+   * session can never continue its Slack thread (findSlackThreadSession skips
+   * it), so keeping the key would permanently block the partial unique index
+   * slot — every later message in that thread would 409 `session_busy` and be
+   * silently dropped, with no recovery path.
+   */
   markSession(agentSessionId: string, status: AgentSessionStatus): Promise<void>;
   updateSessionContinuation(
     agentSessionId: string,
@@ -124,6 +145,24 @@ export function createDrizzleRunStore(db: Db): RunStore {
       return updated.length > 0;
     },
 
+    async markDelivery(runId, status, error) {
+      const updated = await db
+        .update(schema.runs)
+        .set({
+          deliveryStatus: status,
+          deliveryError: error ?? null,
+        })
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            // Only a pending obligation is settled (see RunStore.markDelivery).
+            eq(schema.runs.deliveryStatus, "pending"),
+          ),
+        )
+        .returning({ id: schema.runs.id });
+      return updated.length > 0;
+    },
+
     async getRunStatus(runId) {
       const rows = await db
         .select({ status: schema.runs.status, error: schema.runs.error })
@@ -136,7 +175,15 @@ export function createDrizzleRunStore(db: Db): RunStore {
     async markSession(agentSessionId, status) {
       await db
         .update(schema.agentSessions)
-        .set({ status })
+        .set({
+          status,
+          // Terminal sessions release their Slack thread key (see the
+          // interface doc) so the next thread message can mint a fresh
+          // session instead of being dropped forever.
+          ...(status === "closed" || status === "error"
+            ? { slackThreadKey: null }
+            : {}),
+        })
         .where(eq(schema.agentSessions.id, agentSessionId));
     },
 

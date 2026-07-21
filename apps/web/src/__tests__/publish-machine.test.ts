@@ -4,7 +4,7 @@
  * re-entrancy guards.
  */
 import { expect, test } from "bun:test";
-import type { PublishWorkflowResponse } from "@invisible-string/shared";
+import type { PublishAgentResponse } from "@invisible-string/shared";
 
 import {
   INITIAL_PUBLISH_STATE,
@@ -12,13 +12,13 @@ import {
   publishPhaseLabel,
   publishReducer,
   type PublishState,
-} from "../lib/builder/publish-machine";
+} from "../lib/agents/publish-machine";
 
 function response(
-  overrides: Partial<PublishWorkflowResponse> = {},
-): PublishWorkflowResponse {
+  overrides: Partial<PublishAgentResponse> = {},
+): PublishAgentResponse {
   return {
-    workflowId: "11111111-1111-4111-8111-111111111111",
+    agentId: "11111111-1111-4111-8111-111111111111",
     versionId: "22222222-2222-4222-8222-222222222222",
     contentHash: "hash123",
     buildStatus: "succeeded",

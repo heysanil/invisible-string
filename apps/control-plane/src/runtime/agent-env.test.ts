@@ -27,6 +27,7 @@ const RUNTIME: RuntimeConfig = {
   workerHeartbeatTtlMs: 30_000,
   maxAgentsPerWorker: 20,
   workerSweepIntervalMs: 30_000,
+  scheduleTickMs: 30_000,
   npmCacheDir: "/tmp/npm-cache",
   buildRoot: "/var/lib/agents",
   sseHeartbeatMs: 15_000,
@@ -62,14 +63,14 @@ describe("buildAgentEnv", () => {
   test("openrouter versions get OPENROUTER_API_KEY and never the anthropic key", () => {
     const env = buildAgentEnv({
       runtime: RUNTIME,
-      worldUrl: "postgres://dev:dev@localhost:5432/ws_v_abcdef012345",
+      worldUrl: "postgres://dev:dev@localhost:5432/ag_v_abcdef012345",
       contentHash: HASH,
       provider: "openrouter",
       mcpEnv: {},
     });
     expect(env.OPENROUTER_API_KEY).toBe("or-key");
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
-    expect(env.WORKFLOW_POSTGRES_URL).toContain("ws_v_abcdef012345");
+    expect(env.WORKFLOW_POSTGRES_URL).toContain("ag_v_abcdef012345");
     expect(env.WORKFLOW_POSTGRES_JOB_PREFIX).toBe(HASH);
     // Per-version DERIVED secret — never the platform master.
     expect(env.PLATFORM_JWT_SECRET).toBe(derivePlatformJwtSecret("jwt-secret", HASH));

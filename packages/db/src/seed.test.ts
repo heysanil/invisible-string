@@ -1,18 +1,20 @@
 /**
  * Pure unit tests for the seed builders — no database required.
- * Locked defaults per INITIAL-SPEC.md §2/§7.
+ * Locked model defaults per INITIAL-SPEC.md §2/§7; default agents per the
+ * agents-first redesign spec.
  */
 import { describe, expect, test } from "bun:test";
 
 import {
-  DEFAULT_AGENT_PRESETS,
+  DEFAULT_AGENTS,
   DEFAULT_MODEL_PRESETS,
-  buildAgentPresetRows,
+  buildAgentRows,
   buildAllowlistRows,
   buildModelPresetRows,
 } from "./seed";
 
 const ORG = "org_test";
+const OWNER = "user_owner";
 
 describe("model preset seeds (locked, spec §2)", () => {
   test("exactly the three locked presets, all via OpenRouter", () => {
@@ -47,7 +49,7 @@ describe("model preset seeds (locked, spec §2)", () => {
   test("builders are deterministic", () => {
     expect(buildModelPresetRows(ORG)).toEqual(buildModelPresetRows(ORG));
     expect(buildAllowlistRows(ORG)).toEqual(buildAllowlistRows(ORG));
-    expect(buildAgentPresetRows(ORG)).toEqual(buildAgentPresetRows(ORG));
+    expect(buildAgentRows(ORG, OWNER)).toEqual(buildAgentRows(ORG, OWNER));
   });
 });
 
@@ -65,29 +67,36 @@ describe("allowlist seeds", () => {
   });
 });
 
-describe("agent preset seeds", () => {
+describe("default agent seeds", () => {
   test("General Purpose / Software Engineer / Product Designer", () => {
-    expect(DEFAULT_AGENT_PRESETS.map((p) => p.name)).toEqual([
+    expect(DEFAULT_AGENTS.map((a) => a.name)).toEqual([
       "General Purpose",
       "Software Engineer",
       "Product Designer",
     ]);
   });
 
-  test("all default to the balanced model preset with a real base prompt", () => {
-    for (const preset of DEFAULT_AGENT_PRESETS) {
-      expect(preset.modelPreset).toBe("balanced");
-      expect(preset.basePrompt.length).toBeGreaterThan(80);
-      expect(preset.reasoningEffort).toBe("medium");
-      expect(preset.description.length).toBeGreaterThan(10);
+  test("all drafts are full AgentDefinitions on the balanced preset", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      expect(agent.draft.persona.length).toBeGreaterThan(80);
+      expect(agent.draft.model).toEqual({
+        preset: "balanced",
+        reasoning: "medium",
+      });
+      expect(agent.draft.context).toEqual({
+        mcpConnectionIds: [],
+        skillIds: [],
+      });
+      expect(agent.description.length).toBeGreaterThan(10);
     }
   });
 
-  test("buildAgentPresetRows stamps the organization id", () => {
-    const rows = buildAgentPresetRows(ORG);
+  test("buildAgentRows stamps the organization id and run-as user", () => {
+    const rows = buildAgentRows(ORG, OWNER);
     expect(rows).toHaveLength(3);
     for (const row of rows) {
       expect(row.organizationId).toBe(ORG);
+      expect(row.runAsUserId).toBe(OWNER);
     }
   });
 });

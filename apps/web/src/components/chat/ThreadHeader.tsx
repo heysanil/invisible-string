@@ -1,10 +1,12 @@
 /**
- * Thread header: session title, workflow chip + pinned version, resolved
- * model chip, and an "Edit workflow ↗" link into the builder route.
+ * Thread header: session title, monogram-fronted agent chip + pinned agent
+ * version, resolved model chip, a workflow provenance chip for
+ * trigger-origin sessions, and an "Edit agent ↗" link into the agent editor.
  */
 import { ArrowUpRight, Cpu, GitBranch, Zap } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 
+import { AgentMonogram } from "../agents/AgentMonogram";
 import { livenessOf, StatusDot, type Liveness } from "./StatusDot";
 import { Chip } from "./Chip";
 import type {
@@ -14,12 +16,14 @@ import type {
 
 export interface ThreadHeaderProps {
   title: string;
-  workflowName: string;
-  workflowId: string;
-  /** Pinned workflow version (short hash / id) — the session's frozen version. */
+  agentName: string;
+  agentId: string;
+  /** Pinned agent version (short hash / id) — the session's frozen version. */
   versionLabel: string | null;
   /** Resolved model id from the run's session.started event. */
   modelId: string | null;
+  /** Workflow provenance — set only for trigger-origin sessions. */
+  workflowName: string | null;
   sessionStatus: AgentSessionStatus;
   lastRunStatus: RunStatus | null;
 }
@@ -33,10 +37,11 @@ const LIVENESS_TEXT: Record<Liveness, string> = {
 
 export function ThreadHeader({
   title,
-  workflowName,
-  workflowId,
+  agentName,
+  agentId,
   versionLabel,
   modelId,
+  workflowName,
   sessionStatus,
   lastRunStatus,
 }: ThreadHeaderProps) {
@@ -54,9 +59,22 @@ export function ThreadHeader({
           </span>
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          <Chip icon={Zap}>{workflowName}</Chip>
+          <Chip
+            leading={
+              // Chip-scale monogram: the important overrides win over the
+              // size preset (cn has no tailwind-merge).
+              <AgentMonogram
+                name={agentName}
+                size="sm"
+                className="size-4! text-[8px]!"
+              />
+            }
+            title="Agent"
+          >
+            {agentName}
+          </Chip>
           {versionLabel !== null ? (
-            <Chip icon={GitBranch} mono title="Pinned workflow version">
+            <Chip icon={GitBranch} mono title="Pinned agent version">
               {versionLabel}
             </Chip>
           ) : null}
@@ -65,14 +83,19 @@ export function ThreadHeader({
               {modelId}
             </Chip>
           ) : null}
+          {workflowName !== null ? (
+            <Chip icon={Zap} title="Started by workflow">
+              {workflowName}
+            </Chip>
+          ) : null}
         </div>
       </div>
       <Link
-        to="/workflows/$workflowId"
-        params={{ workflowId }}
+        to="/agents/$agentId"
+        params={{ agentId }}
         className="lift inline-flex h-8 shrink-0 items-center gap-1 rounded-capsule border border-black/10 bg-white/40 px-3 text-[12.5px] font-medium text-ink-2 hover:bg-white/70 hover:text-ink"
       >
-        Edit workflow
+        Edit agent
         <ArrowUpRight size={14} strokeWidth={2} aria-hidden="true" />
       </Link>
     </header>

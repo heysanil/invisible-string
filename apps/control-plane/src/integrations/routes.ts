@@ -1,7 +1,13 @@
 /**
- * Trigger ingress + integrations + trigger-binding HTTP surface (docs/PLAN.md
- * Phase 3 task 3). Mounted only when the runtime is configured (dispatch needs
- * workers + artifacts).
+ * Trigger ingress + integrations + trigger-binding HTTP surface. Mounted only
+ * when the runtime is configured (dispatch needs workers + artifacts).
+ *
+ * Agents-first (2026-07-10 redesign): ingress resolves the workflow's
+ * published snapshot + its agent's CURRENT published version and hands both
+ * to `dispatchTriggerRun`, which renders the instructions into the task
+ * message — nothing trigger-specific reaches the agent, and no per-trigger
+ * env (the old SLACK_BOT_TOKEN injection) exists; Slack replies are delivered
+ * by the control-plane DeliveryService (runs/delivery.ts).
  *
  * PUBLIC (token/signature authenticated, no session):
  * - POST /t/:token                    webhook + form ingress → dispatcher
@@ -18,14 +24,16 @@
  */
 import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
+import { z } from "zod";
 import { schema } from "@invisible-string/db";
 import {
+  formFieldSchema,
   formSubmissionToTriggerData,
-  parseWorkflowDraft,
   slackEventToTriggerData,
   slackTriggerBindingSchema,
   slackWebhookBodySchema,
   updateSlackTriggerBindingRequestSchema,
+  workflowConfigSchema,
   TRIGGER_INGRESS_MAX_BODY_BYTES,
   SLACK_REPLAY_WINDOW_SECONDS,
   SLACK_SIGNATURE_HEADER,
@@ -39,24 +47,30 @@ import {
   type SlackTriggerBinding,
   type TriggerIngressResponse,
   type TriggerPrincipal,
+  type WorkflowConfig,
 } from "@invisible-string/shared";
 
 import { resolveWorkspace, workspacePlugin } from "../workspace";
+import { publishedWorkflowOf } from "../resources/workflows";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import {
   dispatchTriggerRun,
   findSlackThreadSession,
+  resolveWorkflowDispatchTarget,
   slackThreadKey,
   type DispatchTriggerInput,
 } from "../runtime/dispatch";
-import { requireReadyVersion, type ReadyVersion, type RuntimeDeps } from "../runtime/routes";
+import {
+  requireReadyAgentVersion,
+  type ReadyAgentVersion,
+  type RuntimeDeps,
+} from "../runtime/routes";
 import {
   ingressUrlForToken,
   slackRedirectUri,
   type IntegrationsConfig,
 } from "./config";
 import {
-  decryptIntegrationCredentials,
   encryptIntegrationCredentials,
   type SlackStoredCredentials,
 } from "./crypto";
@@ -262,9 +276,6 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             }
           }
 
-          if (!workflow.publishedVersionId) throw errors.workflowNotPublished();
-          const ready = await requireReadyVersion(runtime, workflow.publishedVersionId);
-
           // Idempotency (webhook only): a source key maps redelivery to the
           // original run.
           const idemKey =
@@ -278,7 +289,18 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             }
           }
 
-          const { message, data } = mapIngressBody(trigger.type, bodyJson, ready);
+          // Kill switch + published snapshot + the agent's CURRENT published
+          // version with a ready build (floating binding).
+          const target = await resolveWorkflowDispatchTarget(runtime, workflow);
+
+          // Form submissions validate against the trigger row's formSchema —
+          // synced at workflow publish (and token rotation), so the persisted
+          // row is authoritative for what this token accepts.
+          const { message, data } = mapIngressBody(
+            trigger.type,
+            bodyJson,
+            trigger.formSchema,
+          );
 
           const principal: TriggerPrincipal = {
             workspaceId: workflow.organizationId,
@@ -292,13 +314,12 @@ export function integrationsPlugin(deps: IntegrationDeps) {
 
           const result = await dispatchTriggerRun(runtime, {
             organizationId: workflow.organizationId,
-            workflowId: workflow.id,
-            ready,
+            workflow: { id: workflow.id, snapshot: target.snapshot },
+            agent: target.agent,
             origin: trigger.type,
             triggerType: trigger.type,
             principal,
-            message,
-            data,
+            ingress: { message, data },
           });
 
           if (idemKey) {
@@ -591,16 +612,16 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     set: { status?: number | string },
   ): Promise<CreateWebhookTokenResponse> {
     const workflow = await loadWorkflowOwned(organizationId, workflowId);
-    const definition = parseWorkflowDraft(workflow.draft);
+    const parsed = workflowConfigSchema.safeParse(workflow.draft);
+    const draft = parsed.success ? parsed.data : null;
     if (
-      !definition ||
-      (definition.trigger.type !== "webhook" && definition.trigger.type !== "form")
+      !draft ||
+      (draft.trigger.type !== "webhook" && draft.trigger.type !== "form")
     ) {
-      throw errors.triggerTypeMismatch("webhook", definition?.trigger.type ?? "unknown");
+      throw errors.triggerTypeMismatch("webhook", draft?.trigger.type ?? "unknown");
     }
-    const triggerType = definition.trigger.type;
-    const formSchema =
-      definition.trigger.type === "form" ? definition.trigger.fields : null;
+    const triggerType = draft.trigger.type;
+    const formSchema = draft.trigger.type === "form" ? draft.trigger.fields : null;
 
     const token = generateIngressToken();
     const trigger = await upsertTriggerType(db, workflowId, triggerType);
@@ -629,8 +650,13 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     // TWO events (`app_mention` AND `message.channels`) with DIFFERENT
     // event_ids, so event_id dedup cannot catch it. The app_mention twin is
     // authoritative (Slack pre-scopes it to our bot); drop the raw `message`
-    // twin so a single user message never dispatches twice. DMs are exempt —
-    // Slack sends no app_mention for IMs, the message.im IS the event.
+    // twin so a single user message never dispatches twice. Slack fires
+    // app_mention for a mention ANYWHERE in the text (not just leading), so
+    // the twin check must match mid-text mentions too — a leading-only check
+    // lets "can <@bot> summarize this?" in an active thread dispatch twice
+    // (both twins pass the busy-guard when they arrive seconds apart). DMs
+    // are exempt — Slack sends no app_mention for IMs, the message.im IS the
+    // event.
     const botUserId = (
       integration.metadata as Partial<SlackIntegrationMetadata> | null
     )?.botUserId;
@@ -639,7 +665,7 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       event.channel_type !== "im" &&
       typeof botUserId === "string" &&
       botUserId.length > 0 &&
-      (event.text ?? "").trimStart().startsWith(`<@${botUserId}>`)
+      (event.text ?? "").includes(`<@${botUserId}>`)
     ) {
       return;
     }
@@ -647,14 +673,10 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     const mapped = slackEventToTriggerData(event);
     if (!mapped.ok) return; // bot echo / edit / empty — ignore
 
-    const botToken = decryptSlackBotToken(integration.credentialsEncrypted, integration.externalId);
-    const extraAgentEnv: Record<string, string> = { SLACK_BOT_TOKEN: botToken };
-    if (config.slack && config.slack.apiBaseUrl !== "https://slack.com/api") {
-      // Point the compiled agent's outbound Slack calls at the same (stub)
-      // endpoint in non-production deployments.
-      extraAgentEnv.SLACK_API_BASE_URL = config.slack.apiBaseUrl;
-    }
-
+    // NOTE (agents-first): no SLACK_BOT_TOKEN ever enters agent env — the
+    // control-plane DeliveryService posts the reply off the run's terminal
+    // event (runs/delivery.ts), so agent env is identical across dispatch
+    // paths and warm processes can't hold a stale token.
     const triggers = await listSlackTriggersForIntegration(db, integration.id);
     for (const { trigger, workflow } of triggers) {
       const bindingResult = trigger.binding
@@ -679,18 +701,28 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       if (!existingSession && !shouldStartNewSlackSession(event, binding)) {
         continue; // new thread that this binding does not start on
       }
-      if (!workflow.publishedVersionId) continue;
 
-      // Continuation runs the SESSION's pinned version (immutable); a new
-      // session runs the workflow's current published version.
-      const versionId = existingSession
-        ? existingSession.workflowVersionId
-        : workflow.publishedVersionId;
-      let ready: ReadyVersion;
+      // Continuation runs the SESSION's pinned agent version (immutable —
+      // republishing never migrates a live thread); a new session runs the
+      // workflow's agent's CURRENT published version. Instructions always
+      // come from the workflow's published snapshot.
+      let snapshot: WorkflowConfig;
+      let agent: ReadyAgentVersion;
       try {
-        ready = await requireReadyVersion(runtime, versionId);
+        if (existingSession) {
+          if (!workflow.enabled) continue;
+          snapshot = publishedWorkflowOf(workflow).config;
+          agent = await requireReadyAgentVersion(
+            runtime,
+            existingSession.agentVersionId,
+          );
+        } else {
+          const target = await resolveWorkflowDispatchTarget(runtime, workflow);
+          snapshot = target.snapshot;
+          agent = target.agent;
+        }
       } catch {
-        continue; // version not ready — skip this workflow
+        continue; // disabled / unpublished / build not ready — skip this workflow
       }
 
       const principal: TriggerPrincipal = {
@@ -699,14 +731,12 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       };
       const dispatchInput: DispatchTriggerInput = {
         organizationId: workflow.organizationId,
-        workflowId: workflow.id,
-        ready,
+        workflow: { id: workflow.id, snapshot },
+        agent,
         origin: "slack",
         triggerType: "slack",
         principal,
-        message: mapped.value.message,
-        data: mapped.value.data,
-        extraAgentEnv,
+        ingress: { message: mapped.value.message, data: mapped.value.data },
         ...(existingSession
           ? { existingSession }
           : {
@@ -730,7 +760,16 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           fields: { source: "slack" },
         });
       } catch (error) {
-        if (isRuntimeApiError(error) && error.code === "session_busy") continue;
+        if (isRuntimeApiError(error) && error.code === "session_busy") {
+          // Expected under fan-out (a racing twin/duplicate already owns the
+          // thread's turn) — but never drop a Slack message with no trace.
+          logger.warn("dispatch.session_busy", {
+            workspaceId: workflow.organizationId,
+            workflowId: workflow.id,
+            fields: { source: "slack", dropped: true },
+          });
+          continue;
+        }
         logger.error("dispatch.failed", {
           workspaceId: workflow.organizationId,
           workflowId: workflow.id,
@@ -741,24 +780,27 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     }
   }
 
-  function decryptSlackBotToken(credentialsEncrypted: string, teamId: string): string {
-    const plaintext = decryptIntegrationCredentials(
-      credentialsEncrypted,
-      masterKey,
-      "slack",
-      teamId,
-    );
-    return (JSON.parse(plaintext) as SlackStoredCredentials).botToken;
-  }
 }
 
 // ── ingress body → TriggerEvent slice ────────────────────────────────────────
 
-/** Map a webhook/form ingress body to the model message + trigger data. */
+/**
+ * Shape guard over the trigger row's persisted `form_schema` jsonb —
+ * `{ fields: FormField[] }`, as written by `setTriggerToken` and
+ * `syncTriggerForPublish` (integrations/service.ts).
+ */
+const persistedFormSchema = z.object({ fields: z.array(formFieldSchema).min(1) });
+
+/**
+ * Map a webhook/form ingress body to the model message + trigger data. Form
+ * submissions validate against the TRIGGER ROW's `form_schema` (synced at
+ * workflow publish / token rotation) — the persisted row is what this token
+ * accepts, independent of later draft edits.
+ */
 export function mapIngressBody(
   triggerType: "webhook" | "form",
   body: unknown,
-  ready: ReadyVersion,
+  formSchema: unknown,
 ): { message: string; data: Record<string, unknown> } {
   if (triggerType === "webhook") {
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
@@ -772,17 +814,19 @@ export function mapIngressBody(
     return { message, data: record };
   }
 
-  // form: validate against the PUBLISHED version's form schema (authoritative).
-  const definition = ready.definition;
-  if (definition.trigger.type !== "form") {
-    throw errors.triggerTypeMismatch("form", definition.trigger.type);
+  // form: the persisted field schema is authoritative.
+  const parsed = persistedFormSchema.safeParse(formSchema);
+  if (!parsed.success) {
+    throw errors.formValidationFailed(
+      "this trigger has no form schema — republish the workflow to sync it",
+    );
   }
   const values = (body as { values?: unknown })?.values;
   if (typeof values !== "object" || values === null || Array.isArray(values)) {
     throw errors.formValidationFailed("form body must be { values: { ... } }");
   }
   const mapped = formSubmissionToTriggerData(
-    definition.trigger.fields,
+    parsed.data.fields,
     values as Record<string, unknown>,
   );
   if (!mapped.ok) throw errors.formValidationFailed(mapped.reason);

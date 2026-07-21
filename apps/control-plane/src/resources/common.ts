@@ -10,19 +10,16 @@
 import { and, eq, type SQL } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
-  AgentPresetDto,
   MasterKey,
   McpConnectionDto,
   ModelAllowlistEntryDto,
   ModelPresetDto,
   SkillDto,
-  WorkflowDto,
-  WorkflowSummaryDto,
 } from "@invisible-string/shared";
 
 import type { ArtifactStore } from "../artifacts";
 import type { Auth } from "../auth";
-import type { CompileWorkflowFn } from "../build/compiler-contract";
+import type { CompileAgentFn } from "../build/compiler-contract";
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
 import type { WorkspaceDeps } from "../workspace";
@@ -35,7 +32,7 @@ export interface ResourceDeps {
   workspaceDeps: WorkspaceDeps;
   auth: Auth;
   masterKey: MasterKey | undefined;
-  compile: CompileWorkflowFn;
+  compile: CompileAgentFn;
   /** Object store for skill attachments (undefined when S3 is unconfigured). */
   artifacts: ArtifactStore | undefined;
   registry: RegistryClient;
@@ -98,10 +95,8 @@ export function parseBody<T>(
 
 type McpConnectionRow = typeof schema.mcpConnections.$inferSelect;
 type SkillRow = typeof schema.skills.$inferSelect;
-type WorkflowRow = typeof schema.workflows.$inferSelect;
 type ModelPresetRow = typeof schema.modelPresets.$inferSelect;
 type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
-type AgentRow = typeof schema.agents.$inferSelect;
 
 /** Secrets are NEVER echoed — only `hasCredentials`. */
 export function mcpConnectionDto(row: McpConnectionRow): McpConnectionDto {
@@ -137,33 +132,8 @@ export function skillDto(row: SkillRow): SkillDto {
   };
 }
 
-/** `draft.trigger.type` for list chips (null when the draft has no valid trigger). */
-function draftTriggerType(draft: unknown): string | null {
-  if (typeof draft !== "object" || draft === null) return null;
-  const trigger = (draft as { trigger?: unknown }).trigger;
-  if (typeof trigger !== "object" || trigger === null) return null;
-  const type = (trigger as { type?: unknown }).type;
-  return typeof type === "string" ? type : null;
-}
-
-export function workflowSummaryDto(row: WorkflowRow): WorkflowSummaryDto {
-  return {
-    id: row.id,
-    name: row.name,
-    runAsUserId: row.runAsUserId,
-    publishedVersionId: row.publishedVersionId,
-    triggerType: draftTriggerType(row.draft),
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
-  };
-}
-
-export function workflowDto(row: WorkflowRow): WorkflowDto {
-  return {
-    ...workflowSummaryDto(row),
-    draft: (row.draft as Record<string, unknown>) ?? {},
-  };
-}
+// Workflow DTO mappers live in resources/workflows.ts (the summary needs an
+// agent-name join, so it is no longer a pure row mapper).
 
 export function modelPresetDto(row: ModelPresetRow): ModelPresetDto {
   return {
@@ -189,16 +159,5 @@ export function modelAllowlistEntryDto(
   };
 }
 
-export function agentPresetDto(row: AgentRow): AgentPresetDto {
-  return {
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    basePrompt: row.basePrompt,
-    reasoningEffort: row.reasoningEffort,
-    modelPreset: row.modelPreset,
-    modelId: row.modelId,
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
-  };
-}
+// Agent DTO mappers live in resources/agents.ts (the summary needs a
+// published-version join, so it is no longer a pure row mapper).

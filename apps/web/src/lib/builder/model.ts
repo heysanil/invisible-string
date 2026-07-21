@@ -1,7 +1,7 @@
 /**
- * Builder editor model — a pure reducer over the four-pillar
- * {@link WorkflowDefinition}. The UI dispatches semantic actions; the
- * definition the reducer carries is EXACTLY what gets PATCHed to
+ * Workflow editor model — a pure reducer over the {@link WorkflowConfig}
+ * delegation (TRIGGER → AGENT → INSTRUCTIONS). The UI dispatches semantic
+ * actions; the config the reducer carries is EXACTLY what gets PATCHed to
  * `workflows.draft` (round-trip lossless: `definitionOf(initBuilderState(d))`
  * deep-equals `d` — proven in __tests__/builder-model.test.ts).
  *
@@ -12,21 +12,22 @@
 import type {
   FormField,
   FormFieldType,
-  ModelPresetSlug,
-  ReasoningEffort,
   SlackTriggerBinding,
   TriggerConfig,
-  WorkflowDefinition,
+  WorkflowConfig,
 } from "@invisible-string/shared";
 
-// ── Pillars ─────────────────────────────────────────────────────────────────
+// ── Sections ────────────────────────────────────────────────────────────────
+//
+// The delegation memo's three sections, in reading order: when it runs → who
+// does the work → what they should do. Diagnostics, copilot section flashes
+// and the editor column all key off these.
 
-export const PILLARS = ["trigger", "context", "agent", "instructions"] as const;
-export type Pillar = (typeof PILLARS)[number];
+export const WORKFLOW_SECTIONS = ["trigger", "agent", "instructions"] as const;
+export type WorkflowSection = (typeof WORKFLOW_SECTIONS)[number];
 
-export const PILLAR_LABELS: Record<Pillar, string> = {
+export const WORKFLOW_SECTION_LABELS: Record<WorkflowSection, string> = {
   trigger: "Trigger",
-  context: "Context",
   agent: "Agent",
   instructions: "Instructions",
 };
@@ -55,9 +56,8 @@ export interface TriggerDrafts {
 }
 
 export interface BuilderState {
-  definition: WorkflowDefinition;
+  definition: WorkflowConfig;
   triggerDrafts: TriggerDrafts;
-  activePillar: Pillar;
 }
 
 // ── Defaults ────────────────────────────────────────────────────────────────
@@ -87,36 +87,35 @@ function defaultTriggerDrafts(): TriggerDrafts {
 }
 
 /**
- * A shape-valid empty definition for a brand-new workflow. The caller
- * supplies the workspace's first agent preset id — a definition without one
- * cannot be saved (agentPresetId must be a uuid).
+ * A shape-valid empty config for a brand-new workflow. The caller supplies
+ * the workspace's first PUBLISHED agent id — or null when none exists yet
+ * (the draft stays saveable; the Agent section surfaces the gap and publish
+ * is blocked until an agent is chosen).
  */
-export function emptyDefinition(agentPresetId: string): WorkflowDefinition {
+export function emptyDefinition(agentId: string | null): WorkflowConfig {
   return {
     trigger: { type: "manual" },
-    context: { mcpConnectionIds: [], skillIds: [] },
-    agent: { agentPresetId },
+    agentId,
     instructions: { markdown: "" },
   };
 }
 
-export function initBuilderState(definition: WorkflowDefinition): BuilderState {
+export function initBuilderState(definition: WorkflowConfig): BuilderState {
   const drafts = defaultTriggerDrafts();
   const trigger = definition.trigger;
   // Seed the matching per-type draft with the stored config.
   const triggerDrafts: TriggerDrafts = { ...drafts, [trigger.type]: trigger };
-  return { definition, triggerDrafts, activePillar: "trigger" };
+  return { definition, triggerDrafts };
 }
 
-/** The definition the builder would persist right now. */
-export function definitionOf(state: BuilderState): WorkflowDefinition {
+/** The config the builder would persist right now. */
+export function definitionOf(state: BuilderState): WorkflowConfig {
   return state.definition;
 }
 
 // ── Actions ─────────────────────────────────────────────────────────────────
 
 export type BuilderAction =
-  | { type: "focusPillar"; pillar: Pillar }
   | { type: "setTriggerType"; triggerType: TriggerType }
   | { type: "setTrigger"; trigger: TriggerConfig }
   | { type: "addFormField" }
@@ -125,14 +124,7 @@ export type BuilderAction =
   | { type: "moveFormField"; index: number; direction: -1 | 1 }
   | { type: "setSlackBinding"; patch: Partial<SlackTriggerBinding> }
   | { type: "setCron"; cron: string }
-  | { type: "addConnection"; id: string }
-  | { type: "removeConnection"; id: string }
-  | { type: "addSkill"; id: string }
-  | { type: "removeSkill"; id: string }
-  | { type: "setAgentPreset"; id: string }
-  | { type: "setModelPreset"; preset: ModelPresetSlug | undefined }
-  | { type: "setModelId"; modelId: string | undefined }
-  | { type: "setReasoning"; reasoning: ReasoningEffort | undefined }
+  | { type: "setAgentId"; id: string | null }
   | { type: "setInstructions"; markdown: string };
 
 // ── Reducer ─────────────────────────────────────────────────────────────────
@@ -143,30 +135,6 @@ function withTrigger(state: BuilderState, trigger: TriggerConfig): BuilderState 
     definition: { ...state.definition, trigger },
     triggerDrafts: { ...state.triggerDrafts, [trigger.type]: trigger },
   };
-}
-
-/** Agent pillar rebuild — omits cleared overrides instead of writing undefined. */
-function withAgent(
-  state: BuilderState,
-  patch: {
-    agentPresetId?: string;
-    modelPreset?: ModelPresetSlug | undefined | null;
-    modelId?: string | undefined | null;
-    reasoning?: ReasoningEffort | undefined | null;
-  },
-): BuilderState {
-  const current = state.definition.agent;
-  const next: WorkflowDefinition["agent"] = {
-    agentPresetId: patch.agentPresetId ?? current.agentPresetId,
-  };
-  const modelPreset =
-    "modelPreset" in patch ? patch.modelPreset : current.modelPreset;
-  const modelId = "modelId" in patch ? patch.modelId : current.modelId;
-  const reasoning = "reasoning" in patch ? patch.reasoning : current.reasoning;
-  if (modelPreset != null) next.modelPreset = modelPreset;
-  if (modelId != null) next.modelId = modelId;
-  if (reasoning != null) next.reasoning = reasoning;
-  return { ...state, definition: { ...state.definition, agent: next } };
 }
 
 function updateFormFields(
@@ -193,9 +161,6 @@ export function builderReducer(
   action: BuilderAction,
 ): BuilderState {
   switch (action.type) {
-    case "focusPillar":
-      return { ...state, activePillar: action.pillar };
-
     case "setTrigger":
       // Whole-config replacement (copilot suggestions land here) — same
       // draft-preserving path as manual edits.
@@ -257,74 +222,11 @@ export function builderReducer(
       return withTrigger(state, { ...trigger, cron: action.cron });
     }
 
-    case "addConnection": {
-      const context = state.definition.context;
-      if (context.mcpConnectionIds.includes(action.id)) return state;
+    case "setAgentId":
       return {
         ...state,
-        definition: {
-          ...state.definition,
-          context: {
-            ...context,
-            mcpConnectionIds: [...context.mcpConnectionIds, action.id],
-          },
-        },
+        definition: { ...state.definition, agentId: action.id },
       };
-    }
-
-    case "removeConnection": {
-      const context = state.definition.context;
-      return {
-        ...state,
-        definition: {
-          ...state.definition,
-          context: {
-            ...context,
-            mcpConnectionIds: context.mcpConnectionIds.filter(
-              (id) => id !== action.id,
-            ),
-          },
-        },
-      };
-    }
-
-    case "addSkill": {
-      const context = state.definition.context;
-      if (context.skillIds.includes(action.id)) return state;
-      return {
-        ...state,
-        definition: {
-          ...state.definition,
-          context: { ...context, skillIds: [...context.skillIds, action.id] },
-        },
-      };
-    }
-
-    case "removeSkill": {
-      const context = state.definition.context;
-      return {
-        ...state,
-        definition: {
-          ...state.definition,
-          context: {
-            ...context,
-            skillIds: context.skillIds.filter((id) => id !== action.id),
-          },
-        },
-      };
-    }
-
-    case "setAgentPreset":
-      return withAgent(state, { agentPresetId: action.id });
-
-    case "setModelPreset":
-      return withAgent(state, { modelPreset: action.preset ?? null });
-
-    case "setModelId":
-      return withAgent(state, { modelId: action.modelId ?? null });
-
-    case "setReasoning":
-      return withAgent(state, { reasoning: action.reasoning ?? null });
 
     case "setInstructions":
       return {
@@ -339,10 +241,10 @@ export function builderReducer(
 
 // ── Small helpers the UI shares ─────────────────────────────────────────────
 
-/** Structural equality on definitions (undefined-key insensitive). */
+/** Structural equality on configs (undefined-key insensitive). */
 export function definitionsEqual(
-  a: WorkflowDefinition,
-  b: WorkflowDefinition,
+  a: WorkflowConfig,
+  b: WorkflowConfig,
 ): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }

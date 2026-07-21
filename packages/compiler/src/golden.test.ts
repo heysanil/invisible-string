@@ -68,8 +68,8 @@ describe("golden files", () => {
 // produced it. Any template change (digest drift) without a version bump
 // fails — including under UPDATE_GOLDEN=1, which refuses to rewrite the
 // digest until version.ts is bumped in the same commit. Without this, an
-// edited template would cache-hit stale artifacts in workflow_builds for
-// identical workflow configs (the exact invisible staleness the hash exists
+// edited template would cache-hit stale artifacts in the builds table for
+// identical agent configs (the exact invisible staleness the hash exists
 // to prevent).
 
 const DIGEST_PATH = join(FIXTURES_DIR, ".golden-digest.json");

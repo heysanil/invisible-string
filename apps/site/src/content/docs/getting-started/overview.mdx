@@ -8,50 +8,54 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Overview
 
-invisible-string automates your work from a plain-language description: say what
-you want done, and it becomes a workflow that runs from chat, Slack, a form, a
-webhook, or a schedule — streaming live, pausing for your approval, and yours to
-run wherever you host it.
+invisible-string puts agents to work for you: give an agent a role, a
+model, and the tools it needs, then chat with it like a teammate — or put it on
+standing duty from Slack, forms, webhooks, or a schedule. Runs stream live,
+pause for your approval, and are yours to run wherever you host them.
 
-invisible-string is a multi-tenant cloud platform for agent workflows. You
-assemble a workflow from four pillars — **Trigger**, **Context**, **Agent**, and
-**Instructions** — in a chat-centric builder, and every published workflow
-compiles into a real, self-hosted [eve](https://eve.dev) agent that runs on a
-durable, Postgres-backed worker pool.
+invisible-string is a multi-tenant cloud platform for AI agents. You build an
+**Agent** — a persona, a model, and the context it's equipped with — and every
+published Agent compiles into a real, self-hosted [eve](https://eve.dev) agent
+that runs on a durable, Postgres-backed worker pool.
 
-A workflow isn't orchestration glue. Publishing compiles your pillar
-configuration into a standalone, version-pinned agent artifact — built once,
-cached by content hash, and run on a stateless worker pool where runs survive a
-worker dying mid-flight and resume on any live worker.
+## Agents
 
-## The four pillars
+An Agent is a role you define, fully described by three decisions:
 
-Every workflow is exactly four decisions. Each pillar is a small, focused
-editor, and together they fully describe a runnable agent.
+### Persona
 
-### Trigger
+Who it is and how it works — the natural-language description of its role,
+judgment, and working style.
 
-How the workflow fires: from chat, a webhook, a form submission, or a Slack
-event.
+### Model
+
+How it thinks: `powerful`, `balanced`, or `quick`, resolved within the
+workspace's model allowlist.
 
 ### Context
 
-What the agent can reach: MCP connections and authored skills, scoped to the
-workspace and packaged straight into the compiled agent.
+What it's equipped with: MCP connections and authored skills, packaged straight
+into the compiled agent.
 
-### Agent
+An Agent isn't a prompt template. Publishing compiles its definition into a
+standalone, version-pinned artifact — built once, cached by content hash, and
+run on a stateless worker pool where runs survive a worker dying mid-flight and
+resume on any live worker. You chat with published Agents directly.
 
-Which model runs the workflow, chosen from `powerful`, `balanced`, and `quick`
-presets within the workspace's model allowlist.
+## Workflows
 
-### Instructions
+For standing work, delegate with a **workflow**: a trigger (webhook, form,
+Slack event, or schedule), the published Agent that handles it, and
+instructions for what to do when it fires, with `@trigger` references into the
+event's data.
 
-The natural-language spec the agent follows, with `@`-references into trigger
-data and context (connections and skills).
+A workflow builds nothing — publishing is instant, and when the trigger fires
+the platform delivers the event *and the instructions* to the bound Agent as
+its task.
 
 ## Where to go next
 
-Head to the [Quickstart](/docs/getting-started/quickstart) to assemble, publish,
-and run your first workflow end to end.
+Head to the [Quickstart](/docs/getting-started/quickstart) to build, publish,
+and delegate to your first agent end to end.
 
 <UnderConstruction />

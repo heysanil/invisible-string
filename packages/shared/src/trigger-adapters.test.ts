@@ -9,7 +9,7 @@ import {
   formSubmissionToTriggerData,
   slackEventToTriggerData,
 } from "./trigger-adapters";
-import type { FormField } from "./workflow-definition";
+import type { FormField } from "./workflow-config";
 
 describe("slackEventToTriggerData", () => {
   test("app_mention strips the leading mention and captures reply target", () => {

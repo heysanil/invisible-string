@@ -1,6 +1,8 @@
 /**
- * `WS /workspaces/:workspaceId/copilot` — the builder copilot socket
- * (spec §12, PLAN Phase 4).
+ * `WS /workspaces/:workspaceId/copilot` — the copilot socket (spec §12).
+ * One socket, two surfaces: each `user_message` frame names the editor it is
+ * about (`surface: "workflow" | "agent"`) plus the `entityId` being edited;
+ * the server selects the matching toolset/prompt (see prompt.ts).
  *
  * - Authenticated at UPGRADE via the Better Auth session cookie the SPA
  *   already sends (beforeHandle rejects 401/403 before the handshake
@@ -13,9 +15,10 @@
  *   (config.maxTurnsPerWindow / maxTokensPerWindow / budgetWindowMs) — the
  *   per-turn caps alone would let a client loop unlimited cheap turns on the
  *   platform key.
- * - Each `user_message` frame re-checks that the workflowId belongs to the
- *   socket's workspace and reloads the workspace inventory fresh, then runs
- *   one CopilotSession turn (see session.ts for the tool loop).
+ * - Each `user_message` frame re-checks that the surface entity belongs to
+ *   the socket's workspace (workflow or agent row per `surface`) and reloads
+ *   the workspace inventory fresh, then runs one CopilotSession turn (see
+ *   session.ts for the tool loop).
  */
 import { Elysia } from "elysia";
 import { and, eq } from "drizzle-orm";
@@ -23,6 +26,7 @@ import { schema } from "@invisible-string/db";
 import {
   copilotClientFrameSchema,
   type CopilotServerFrame,
+  type CopilotSurface,
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
@@ -41,20 +45,40 @@ export interface CopilotDeps {
   config: CopilotConfig;
   transport: CopilotTransport;
   loadInventory: LoadInventoryFn;
-  /** True when `workflowId` exists inside `organizationId` (IDOR guard). */
-  workflowExists: (workflowId: string, organizationId: string) => Promise<boolean>;
+  /**
+   * True when the surface's entity (workflow or agent row per `surface`)
+   * exists inside `organizationId` (IDOR guard).
+   */
+  entityExists: (
+    surface: CopilotSurface,
+    entityId: string,
+    organizationId: string,
+  ) => Promise<boolean>;
 }
 
-/** Production `workflowExists` backed by drizzle. */
-export function createWorkflowExists(db: Db): CopilotDeps["workflowExists"] {
-  return async (workflowId, organizationId) => {
+/** Production `entityExists` backed by drizzle. */
+export function createEntityExists(db: Db): CopilotDeps["entityExists"] {
+  return async (surface, entityId, organizationId) => {
+    if (surface === "workflow") {
+      const rows = await db
+        .select({ id: schema.workflows.id })
+        .from(schema.workflows)
+        .where(
+          and(
+            eq(schema.workflows.id, entityId),
+            eq(schema.workflows.organizationId, organizationId),
+          ),
+        )
+        .limit(1);
+      return rows.length > 0;
+    }
     const rows = await db
-      .select({ id: schema.workflows.id })
-      .from(schema.workflows)
+      .select({ id: schema.agents.id })
+      .from(schema.agents)
       .where(
         and(
-          eq(schema.workflows.id, workflowId),
-          eq(schema.workflows.organizationId, organizationId),
+          eq(schema.agents.id, entityId),
+          eq(schema.agents.organizationId, organizationId),
         ),
       )
       .limit(1);
@@ -74,7 +98,7 @@ export function createCopilotDeps(opts: {
     config: opts.config,
     transport: opts.transport,
     loadInventory: createInventoryLoader(opts.db),
-    workflowExists: createWorkflowExists(opts.db),
+    entityExists: createEntityExists(opts.db),
   };
 }
 
@@ -226,8 +250,8 @@ export function copilotPlugin(deps: CopilotDeps) {
           }
           budget.turns += 1;
           budget.tokens += inputEstimate;
-          // Async turn: re-authorize the caller, scope-check the workflow,
-          // load fresh inventory, run.
+          // Async turn: re-authorize the caller, scope-check the surface
+          // entity, load fresh inventory, run.
           void (async () => {
             // Membership/session re-validation per turn: a socket opened with
             // a since-revoked session (logout, member removal) must not keep
@@ -251,15 +275,16 @@ export function copilotPlugin(deps: CopilotDeps) {
               ws.close(1008, "unauthorized");
               return;
             }
-            const exists = await deps.workflowExists(
-              frame.workflowId,
+            const exists = await deps.entityExists(
+              frame.surface,
+              frame.entityId,
               state.workspace.organizationId,
             );
             if (!exists) {
               send(ws, {
                 type: "error",
-                code: "workflow_not_found",
-                message: "workflow not found in this workspace",
+                code: "entity_not_found",
+                message: `${frame.surface} not found in this workspace`,
               });
               return;
             }
@@ -268,6 +293,7 @@ export function copilotPlugin(deps: CopilotDeps) {
               state.workspace.userId,
             );
             const outputTokens = await state.session.runTurn({
+              surface: frame.surface,
               message: frame.message,
               draft: frame.draft,
               inventory,

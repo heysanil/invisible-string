@@ -32,10 +32,11 @@ afterEach(async () => {
 
 const HEADER: ThreadHeaderProps = {
   title: "Test thread",
-  workflowName: "Marketing copilot",
-  workflowId: "wf1",
+  agentName: "Executive assistant",
+  agentId: "ag1",
   versionLabel: "a1b2c3",
   modelId: "deepseek/deepseek-v4-pro",
+  workflowName: null,
   sessionStatus: "active",
   lastRunStatus: "succeeded",
 };
@@ -54,7 +55,7 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
   };
 }
 
-test("thread header shows workflow, version and model chips", async () => {
+test("thread header shows agent, version and model chips", async () => {
   const view = renderWithRouter(
     <ThreadView
       header={HEADER}
@@ -65,10 +66,25 @@ test("thread header shows workflow, version and model chips", async () => {
     />,
   );
   // RouterProvider resolves its initial route asynchronously.
-  expect(await view.findByText("Marketing copilot")).toBeTruthy();
+  expect(await view.findByText("Executive assistant")).toBeTruthy();
   expect(view.getByText("a1b2c3")).toBeTruthy();
   expect(view.getByText("deepseek/deepseek-v4-pro")).toBeTruthy();
-  expect(view.getByText("Edit workflow")).toBeTruthy();
+  expect(view.getByText("Edit agent")).toBeTruthy();
+  // Chat-origin sessions carry no workflow provenance chip.
+  expect(view.queryByTitle("Started by workflow")).toBeNull();
+});
+
+test("a trigger-origin header adds the workflow provenance chip", async () => {
+  const view = renderWithRouter(
+    <ThreadView
+      header={{ ...HEADER, workflowName: "Nightly metrics digest" }}
+      runs={[baseRun()]}
+      isChatOrigin={false}
+      onRespond={() => {}}
+      onSend={() => {}}
+    />,
+  );
+  expect(await view.findByText("Nightly metrics digest")).toBeTruthy();
 });
 
 test("a completed working block renders collapsed and expands on click", () => {

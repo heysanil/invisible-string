@@ -42,9 +42,9 @@ describe("buildSidebar", () => {
     // sections in authored sequence regardless of alphabetics.
     const sections = buildSidebar([
       ["platform/security", fm("Security", "Platform", 42)],
-      ["building/builder", fm("The builder", "Building", 30)],
+      ["building/agent-editor", fm("The agent editor", "Building", 30)],
       ["gs/overview", fm("Overview", "Getting started", 10)],
-      ["concepts/pillars", fm("The four pillars", "Concepts", 20)],
+      ["concepts/agents", fm("Agents", "Concepts", 20)],
     ]);
     expect(sections.map((s) => s.section)).toEqual([
       "Getting started",
@@ -71,7 +71,7 @@ describe("flattenSidebar", () => {
   const sections: SidebarSection[] = buildSidebar([
     ["gs/overview", fm("Overview", "Getting started", 10)],
     ["gs/quickstart", fm("Quickstart", "Getting started", 11)],
-    ["concepts/pillars", fm("The four pillars", "Concepts", 20)],
+    ["concepts/agents", fm("Agents", "Concepts", 20)],
   ]);
 
   test("flattens in reading order and carries the section", () => {
@@ -79,7 +79,7 @@ describe("flattenSidebar", () => {
     expect(flat.map((d) => d.slug)).toEqual([
       "gs/overview",
       "gs/quickstart",
-      "concepts/pillars",
+      "concepts/agents",
     ]);
     expect(flat[2]?.section).toBe("Concepts");
   });

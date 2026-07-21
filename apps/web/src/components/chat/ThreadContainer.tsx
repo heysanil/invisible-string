@@ -42,8 +42,10 @@ import type { ThreadHeaderProps } from "./ThreadHeader";
 export interface ThreadContainerProps {
   workspaceId: string;
   sessionId: string;
-  /** From the session list (detail DTO doesn't carry it). */
-  workflowName?: string;
+  /** From the session list (the detail DTO doesn't carry names). */
+  agentName?: string;
+  /** Workflow provenance for trigger-origin sessions (null for direct chat). */
+  workflowName?: string | null;
 }
 
 interface PendingInput {
@@ -68,6 +70,7 @@ function isActiveStatus(status: RunStatus): boolean {
 export function ThreadContainer({
   workspaceId,
   sessionId,
+  agentName,
   workflowName,
 }: ThreadContainerProps) {
   const queryClient = useQueryClient();
@@ -217,14 +220,15 @@ export function ThreadContainer({
 
   const { session } = data;
   const title = titleFromMessage(runRows[0]?.triggerEvent.message ?? "");
-  const versionLabel = shortId(session.workflowVersionId);
+  const versionLabel = shortId(session.agentVersionId);
 
   const header: ThreadHeaderProps = {
     title,
-    workflowName: workflowName ?? "Workflow",
-    workflowId: session.workflowId,
+    agentName: agentName ?? "Agent",
+    agentId: session.agentId,
     versionLabel,
     modelId,
+    workflowName: workflowName ?? null,
     sessionStatus: session.status,
     lastRunStatus: lastRun?.status ?? null,
   };

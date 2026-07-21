@@ -8,8 +8,10 @@
  *
  * Injected per agent:
  * - WORKFLOW_POSTGRES_URL      → the version's DEDICATED world database
- *                                (ws_v_<hash12>; job prefix does NOT isolate —
+ *                                (ag_v_<hash12>; job prefix does NOT isolate —
  *                                design correction #10 / REPORT finding 11)
+ *                                (env names are the world package's contract
+ *                                — never rename to match platform nouns)
  * - WORKFLOW_POSTGRES_JOB_PREFIX → version hash, observability/log grouping ONLY
  * - WORKFLOW_POSTGRES_MAX_POOL_SIZE / _WORKER_CONCURRENCY → connection budget
  * - PLATFORM_JWT_SECRET        → channel-auth verification secret, DERIVED

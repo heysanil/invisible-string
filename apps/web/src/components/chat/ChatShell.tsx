@@ -1,84 +1,124 @@
 /**
  * Chat section shell: floating glass session-list panel + floating glass
- * thread pane. Owns session selection, the "New chat" workflow picker, and
- * the create-session round-trip. Live thread rendering lives in
+ * thread pane. Owns session selection, the "New chat" agent picker, and the
+ * create-session round-trip. Live thread rendering lives in
  * {@link ThreadContainer}; this component is the two-panel frame + list.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { MessageSquare, Workflow } from "lucide-react";
+import { useQueries } from "@tanstack/react-query";
+import { Cpu, MessageSquare } from "lucide-react";
 
-import type { WorkflowSummaryDto } from "@invisible-string/shared";
+import type { AgentSummaryDto } from "@invisible-string/shared";
 
 import { errorMessage } from "../../lib/forms";
 import {
+  fetchAgent,
+  queryKeys,
+  useAgents,
   useCreateSession,
   useSessions,
-  useWorkflows,
 } from "../../lib/queries";
+import { AgentMonogram } from "../agents/AgentMonogram";
 import { useToast } from "../ui/Toast";
 import { EmptyState } from "../ui/EmptyState";
 import { Panel } from "../ui/Panel";
+import { AgentPicker, agentModelLabel } from "./AgentPicker";
+import { Chip } from "./Chip";
 import { Composer } from "./Composer";
 import { SessionList, type SessionListItem } from "./SessionList";
 import { ThreadContainer } from "./ThreadContainer";
-import { WorkflowPicker } from "./WorkflowPicker";
 
 export function ChatShell({
   workspaceId,
-  initialWorkflowId,
+  initialAgentId,
+  initialSessionId,
 }: {
   workspaceId: string;
-  /** When set (from the builder's Run draft), open a new chat for this workflow. */
-  initialWorkflowId?: string;
+  /** When set (from the agent editor's "Chat with agent"), open a new chat for this agent. */
+  initialAgentId?: string;
+  /** When set (from the workflow editor's test-run "View in Chat"), open this session. */
+  initialSessionId?: string;
 }) {
   const toast = useToast();
   const sessionsQuery = useSessions(workspaceId);
-  const workflowsQuery = useWorkflows(workspaceId);
+  const agentsQuery = useAgents(workspaceId);
   const createSession = useCreateSession(workspaceId);
 
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [pickerOpen, setPickerOpen] = useState(false);
-  /** Workflow chosen in the picker → the composer collects the first message. */
-  const [draftWorkflow, setDraftWorkflow] = useState<WorkflowSummaryDto | null>(
-    null,
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    initialSessionId ?? null,
   );
+  const [pickerOpen, setPickerOpen] = useState(false);
+  /** Agent chosen in the picker → the composer collects the first message. */
+  const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(null);
 
-  // Deep-link from the builder: once workflows load, open the new-chat composer
-  // for the requested workflow. Honored once so the user can freely navigate
-  // away without it re-triggering.
+  // Deep-link from the agent editor: once agents load, open the new-chat
+  // composer for the requested agent. Honored once so the user can freely
+  // navigate away without it re-triggering.
   const deepLinkHandled = useRef<string | null>(null);
-  const workflows = workflowsQuery.data;
+  const agents = agentsQuery.data;
   useEffect(() => {
-    if (!initialWorkflowId || deepLinkHandled.current === initialWorkflowId) {
+    if (!initialAgentId || deepLinkHandled.current === initialAgentId) {
       return;
     }
-    if (!workflows) return;
-    const match = workflows.find((w) => w.id === initialWorkflowId);
-    deepLinkHandled.current = initialWorkflowId;
+    if (!agents) return;
+    const match = agents.find((agent) => agent.id === initialAgentId);
+    deepLinkHandled.current = initialAgentId;
     if (match) {
-      setDraftWorkflow(match);
+      setDraftAgent(match);
       setActiveSessionId(null);
     }
-  }, [initialWorkflowId, workflows]);
+  }, [initialAgentId, agents]);
+
+  // Model chips (picker rows + new-chat header) derive from each agent's
+  // PUBLISHED definition — a new session pins the agent's published version,
+  // so a draft-only model change must not show up here. The list DTO carries
+  // no model; details are fetched lazily (picker open / agent drafted) into
+  // the same cache `useAgent` reads, so the editor route reuses them.
+  const publishedAgents = useMemo(
+    () => (agents ?? []).filter((agent) => agent.publishedVersionId !== null),
+    [agents],
+  );
+  const detailsEnabled = pickerOpen || draftAgent !== null;
+  const agentDetails = useQueries({
+    queries: publishedAgents.map((agent) => ({
+      queryKey: queryKeys.agents.detail(workspaceId, agent.id),
+      queryFn: ({ signal }: { signal: AbortSignal }) =>
+        fetchAgent(workspaceId, agent.id, signal),
+      staleTime: 30_000,
+      enabled: detailsEnabled,
+    })),
+  });
+  const modelLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    agentDetails.forEach((query, index) => {
+      const agent = publishedAgents[index];
+      const label =
+        query.data === undefined
+          ? null
+          : agentModelLabel(query.data.agent.publishedDefinition);
+      if (agent !== undefined && label !== null) labels.set(agent.id, label);
+    });
+    return labels;
+  }, [agentDetails, publishedAgents]);
 
   const sessions: SessionListItem[] = useMemo(
     () =>
       (sessionsQuery.data ?? []).map((session) => ({
         ...session,
-        title: session.workflowName,
+        title: session.agentName,
       })),
     [sessionsQuery.data],
   );
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
 
-  function startSession(workflow: WorkflowSummaryDto, message: string) {
+  function startSession(agent: AgentSummaryDto, message: string) {
     createSession.mutate(
-      { workflowId: workflow.id, message },
+      { agentId: agent.id, message },
       {
         onSuccess: (data) => {
           setActiveSessionId(data.session.id);
-          setDraftWorkflow(null);
+          setDraftAgent(null);
         },
         onError: (error) => {
           toast.toast({ variant: "error", message: errorMessage(error) });
@@ -99,9 +139,9 @@ export function ChatShell({
           isError={sessionsQuery.isError}
           error={sessionsQuery.error}
           onRetry={() => void sessionsQuery.refetch()}
-          activeSessionId={draftWorkflow !== null ? null : activeSessionId}
+          activeSessionId={draftAgent !== null ? null : activeSessionId}
           onSelect={(id) => {
-            setDraftWorkflow(null);
+            setDraftAgent(null);
             setActiveSessionId(id);
           }}
           onNewChat={() => setPickerOpen(true)}
@@ -109,34 +149,37 @@ export function ChatShell({
       </Panel>
 
       <Panel className="panel-enter min-w-0 flex-1 overflow-hidden">
-        {draftWorkflow !== null ? (
+        {draftAgent !== null ? (
           <NewChatComposer
-            workflow={draftWorkflow}
+            agent={draftAgent}
+            modelLabel={modelLabels.get(draftAgent.id) ?? null}
             sending={createSession.isPending}
-            onSend={(message) => startSession(draftWorkflow, message)}
-            onCancel={() => setDraftWorkflow(null)}
+            onSend={(message) => startSession(draftAgent, message)}
+            onCancel={() => setDraftAgent(null)}
           />
         ) : activeSession !== null ? (
           <ThreadContainer
             key={activeSession.id}
             workspaceId={workspaceId}
             sessionId={activeSession.id}
+            agentName={activeSession.agentName}
             workflowName={activeSession.workflowName}
           />
         ) : (
           <EmptyState
             icon={MessageSquare}
             title="Pick up a conversation"
-            description="Select a session on the left, or start a new chat with a published workflow."
+            description="Select a session on the left, or start a new chat with an agent."
           />
         )}
       </Panel>
 
       {pickerOpen ? (
-        <WorkflowPicker
-          workflows={workflowsQuery.data ?? []}
-          onPick={(workflow) => {
-            setDraftWorkflow(workflow);
+        <AgentPicker
+          agents={agents ?? []}
+          modelLabels={modelLabels}
+          onPick={(agent) => {
+            setDraftAgent(agent);
             setActiveSessionId(null);
             setPickerOpen(false);
           }}
@@ -147,14 +190,17 @@ export function ChatShell({
   );
 }
 
-/** First-message composer shown after a workflow is chosen for a new chat. */
-function NewChatComposer({
-  workflow,
+/** First-message composer shown after an agent is chosen for a new chat. */
+export function NewChatComposer({
+  agent,
+  modelLabel,
   sending,
   onSend,
   onCancel,
 }: {
-  workflow: WorkflowSummaryDto;
+  agent: AgentSummaryDto;
+  /** Resolved model / preset slug chip; null while the detail loads. */
+  modelLabel: string | null;
   sending: boolean;
   onSend: (message: string) => void;
   onCancel: () => void;
@@ -162,11 +208,16 @@ function NewChatComposer({
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-black/[0.06] px-5 py-3.5">
-        <div className="flex min-w-0 items-center gap-2">
-          <Workflow size={16} className="shrink-0 text-ink-3" aria-hidden="true" />
+        <div className="flex min-w-0 items-center gap-2.5">
+          <AgentMonogram name={agent.name} size="sm" />
           <h1 className="min-w-0 truncate text-[15px] font-semibold text-ink">
-            {workflow.name}
+            {agent.name}
           </h1>
+          {modelLabel !== null ? (
+            <Chip icon={Cpu} mono title="Resolved model">
+              {modelLabel}
+            </Chip>
+          ) : null}
         </div>
         <button
           type="button"
@@ -179,8 +230,8 @@ function NewChatComposer({
       <div className="flex flex-1 items-center justify-center">
         <EmptyState
           icon={MessageSquare}
-          title={`New chat with ${workflow.name}`}
-          description="Send the first message to start this workflow. Its runs will stream here live."
+          title={`New chat with ${agent.name}`}
+          description="Send the first message — replies stream here live."
         />
       </div>
       <div className="mx-auto w-full max-w-3xl">
@@ -188,7 +239,7 @@ function NewChatComposer({
           autoFocus
           onSend={onSend}
           sending={sending}
-          placeholder={`Message ${workflow.name}…`}
+          placeholder={`Message ${agent.name}…`}
         />
       </div>
     </div>

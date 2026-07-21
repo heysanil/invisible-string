@@ -1,108 +1,93 @@
 /**
- * Copilot proposal presentation + application.
+ * WORKFLOW-surface copilot adapter (see adapter.ts for the seam).
  *
- * `proposalToActions` maps a typed copilot proposal (shared protocol:
- * `{id, tool, params, rationale}`) onto the EXISTING builder reducer actions
- * (single writer — the same path manual edits take, so autosave / dirty
- * state / dry-run all just work). A `setAgent` proposal may touch several
- * agent fields, hence the array. `describeProposal` turns a proposal + the
- * CURRENT definition into the card's title, affected pillar, and a compact
- * before→after preview.
+ * `proposalToActions` maps a typed workflow proposal (shared protocol:
+ * `{id, tool, params, rationale}`; tools `setTrigger` / `setAgent` /
+ * `setInstructions`) onto the EXISTING builder reducer actions (single
+ * writer — the same path manual edits take, so autosave / dirty state /
+ * validation all just work). `describeWorkflowProposal` turns a proposal +
+ * the CURRENT config into the card's icon, title and compact before→after
+ * preview (`setInstructions` carries a full diff instead).
  */
-import type {
-  AgentPresetDto,
-  CopilotProposal,
-  ModelPresetDto,
-  WorkflowDefinition,
+import { Bot, FileText, Sparkles, Zap } from "lucide-react";
+import {
+  WORKFLOW_COPILOT_MUTATION_TOOLS,
+  type AgentSummaryDto,
+  type CopilotProposal,
+  type WorkflowConfig,
+  type WorkflowCopilotMutationTool,
 } from "@invisible-string/shared";
 
-import type { BuilderAction, Pillar } from "../builder/model";
-import type { ContextResources } from "../builder/resources";
-import { agentSummary, triggerSummary } from "../builder/summary";
+import type { BuilderAction, WorkflowSection } from "../builder/model";
+import { agentChipSummary, triggerSummary } from "../builder/summary";
+import type { CopilotSurfaceAdapter, ProposalDescription } from "./adapter";
 
-/** The pillar a proposal's mutation lands on (rail flash + card icon). */
-export function pillarOfProposal(proposal: CopilotProposal): Pillar {
+/** Proposals belonging to the workflow surface (any other tool = server bug). */
+export type WorkflowCopilotProposal = Extract<
+  CopilotProposal,
+  { tool: WorkflowCopilotMutationTool }
+>;
+
+export function isWorkflowProposal(
+  proposal: CopilotProposal,
+): proposal is WorkflowCopilotProposal {
+  return (WORKFLOW_COPILOT_MUTATION_TOOLS as readonly string[]).includes(
+    proposal.tool,
+  );
+}
+
+/** The section a proposal's mutation lands on (flash + card icon). */
+export function sectionOfProposal(
+  proposal: WorkflowCopilotProposal,
+): WorkflowSection {
   switch (proposal.tool) {
     case "setTrigger":
       return "trigger";
-    case "addContext":
-    case "removeContext":
-      return "context";
     case "setAgent":
-    case "setModelPreset":
       return "agent";
     case "setInstructions":
       return "instructions";
   }
 }
 
-/** Map a copilot proposal to the builder reducer actions that apply it. */
-export function proposalToActions(proposal: CopilotProposal): BuilderAction[] {
+/** Map a workflow proposal to the builder reducer actions that apply it. */
+export function proposalToActions(
+  proposal: WorkflowCopilotProposal,
+): BuilderAction[] {
   switch (proposal.tool) {
     case "setTrigger":
       return [{ type: "setTrigger", trigger: proposal.params.trigger }];
-    case "addContext":
-      return [
-        proposal.params.kind === "connection"
-          ? { type: "addConnection", id: proposal.params.id }
-          : { type: "addSkill", id: proposal.params.id },
-      ];
-    case "removeContext":
-      return [
-        proposal.params.kind === "connection"
-          ? { type: "removeConnection", id: proposal.params.id }
-          : { type: "removeSkill", id: proposal.params.id },
-      ];
-    case "setAgent": {
-      const { agentPresetId, reasoning, modelId } = proposal.params;
-      const actions: BuilderAction[] = [];
-      if (agentPresetId !== undefined) {
-        actions.push({ type: "setAgentPreset", id: agentPresetId });
-      }
-      if (reasoning !== undefined) {
-        actions.push({ type: "setReasoning", reasoning });
-      }
-      if (modelId !== undefined) {
-        actions.push({ type: "setModelId", modelId });
-      }
-      return actions;
-    }
-    case "setModelPreset":
-      return [{ type: "setModelPreset", preset: proposal.params.slug }];
+    case "setAgent":
+      return [{ type: "setAgentId", id: proposal.params.agentId }];
     case "setInstructions":
       return [{ type: "setInstructions", markdown: proposal.params.markdown }];
   }
 }
 
-export interface MutationDescription {
-  pillar: Pillar;
-  title: string;
-  /** Compact before → after strings (setInstructions uses the diff view). */
-  before: string | null;
-  after: string | null;
-}
+const SECTION_ICONS: Record<WorkflowSection, ProposalDescription["icon"]> = {
+  trigger: Zap,
+  agent: Bot,
+  instructions: FileText,
+};
 
-function contextName(
-  params: { kind: "connection" | "skill"; id: string },
-  resources: ContextResources,
-): string {
-  if (params.kind === "connection") {
-    return resources.connectionById.get(params.id)?.name ?? params.id;
-  }
-  return resources.skillById.get(params.id)?.name ?? params.id;
-}
-
-function sourceCount(count: number): string {
-  return `${count} source${count === 1 ? "" : "s"}`;
-}
-
-export function describeProposal(
+/** Presentation for an off-surface proposal (server bug — apply is a no-op). */
+export function unsupportedProposalDescription(
   proposal: CopilotProposal,
-  definition: WorkflowDefinition,
-  resources: ContextResources,
-  agentPresets: readonly AgentPresetDto[],
-  modelPresets: readonly ModelPresetDto[],
-): MutationDescription {
+): ProposalDescription {
+  return {
+    icon: Sparkles,
+    title: `Unsupported suggestion (${proposal.tool})`,
+    before: null,
+    after: null,
+  };
+}
+
+export function describeWorkflowProposal(
+  proposal: WorkflowCopilotProposal,
+  definition: WorkflowConfig,
+  agents: readonly AgentSummaryDto[],
+): ProposalDescription {
+  const icon = SECTION_ICONS[sectionOfProposal(proposal)];
   switch (proposal.tool) {
     case "setTrigger": {
       const next = triggerSummary({
@@ -111,80 +96,91 @@ export function describeProposal(
       });
       const current = triggerSummary(definition);
       return {
-        pillar: "trigger",
+        icon,
         title: `Set trigger: ${next.typeLabel} — ${next.detail}`,
         before: `${current.typeLabel} · ${current.detail}`,
         after: `${next.typeLabel} · ${next.detail}`,
       };
     }
-    case "addContext": {
-      const name = contextName(proposal.params, resources);
-      const count =
-        definition.context.mcpConnectionIds.length +
-        definition.context.skillIds.length;
-      return {
-        pillar: "context",
-        title: `Add ${proposal.params.kind}: ${name}`,
-        before: sourceCount(count),
-        after: `${sourceCount(count + 1)} — + ${name}`,
-      };
-    }
-    case "removeContext": {
-      const name = contextName(proposal.params, resources);
-      const count =
-        definition.context.mcpConnectionIds.length +
-        definition.context.skillIds.length;
-      return {
-        pillar: "context",
-        title: `Remove ${proposal.params.kind}: ${name}`,
-        before: sourceCount(count),
-        after: `${sourceCount(Math.max(0, count - 1))} — − ${name}`,
-      };
-    }
     case "setAgent": {
-      const { agentPresetId, reasoning, modelId } = proposal.params;
-      const current = agentSummary(definition, agentPresets, modelPresets);
-      const parts: string[] = [];
-      const afterParts: string[] = [];
-      if (agentPresetId !== undefined) {
-        const nextName =
-          agentPresets.find((p) => p.id === agentPresetId)?.name ??
-          agentPresetId;
-        parts.push(`Set agent: ${nextName}`);
-        afterParts.push(nextName);
-      }
-      if (reasoning !== undefined) {
-        parts.push(`reasoning ${reasoning}`);
-        afterParts.push(`reasoning ${reasoning}`);
-      }
-      if (modelId !== undefined) {
-        parts.push(`model ${modelId}`);
-        afterParts.push(modelId);
-      }
+      const current = agentChipSummary(definition.agentId, agents);
+      const next = agentChipSummary(proposal.params.agentId, agents);
+      // Fall back to the raw id when the inventory can't resolve it, so the
+      // model's intent stays visible rather than "Unknown agent" twice.
+      const nextName = next.agent ? next.name : proposal.params.agentId;
       return {
-        pillar: "agent",
-        title: parts.join(" · ") || "Update agent",
-        before: `${current.presetName} · ${current.modelChain} · reasoning ${current.reasoning}`,
-        after: afterParts.join(" · ") || null,
-      };
-    }
-    case "setModelPreset": {
-      const current = agentSummary(definition, agentPresets, modelPresets);
-      return {
-        pillar: "agent",
-        title: `Set model preset: ${proposal.params.slug}`,
-        before: current.modelChain,
-        after: proposal.params.slug,
+        icon,
+        title: `Set agent: ${nextName}`,
+        before: current.status === "none" ? "No agent" : current.name,
+        after: nextName,
       };
     }
     case "setInstructions": {
-      const isEmpty = definition.instructions.markdown.trim().length === 0;
+      const before = definition.instructions.markdown;
       return {
-        pillar: "instructions",
-        title: isEmpty ? "Write instructions" : "Rewrite instructions",
-        before: null, // diff view carries the preview
+        icon,
+        title:
+          before.trim().length === 0
+            ? "Write instructions"
+            : "Rewrite instructions",
+        before: null, // the diff carries the preview
         after: null,
+        diff: { before, after: proposal.params.markdown },
       };
     }
   }
+}
+
+// ── The adapter ──────────────────────────────────────────────────────────────
+
+const SCAFFOLD_PROMPTS = [
+  "Set this up to triage Slack mentions",
+  "Delegate this to the right agent",
+  "Draft the instructions",
+] as const;
+
+const REFINE_PROMPTS = [
+  "Tighten the instructions",
+  "Explain this workflow's issues",
+  "Make the trigger more specific",
+] as const;
+
+export interface WorkflowCopilotAdapterOptions {
+  workflowId: string;
+  /** Must read the LIVE draft (a ref-backed closure, never a stale capture). */
+  getDraft: () => WorkflowConfig;
+  /** The builder controller's dispatch (single writer). */
+  dispatch: (action: BuilderAction) => void;
+  /** Workspace agent inventory (resolves `setAgent` ids to names). */
+  agents: readonly AgentSummaryDto[];
+  /** Fired after an accepted proposal is applied (section flash). */
+  onApplied?: (section: WorkflowSection) => void;
+}
+
+export function workflowCopilotAdapter(
+  options: WorkflowCopilotAdapterOptions,
+): CopilotSurfaceAdapter<WorkflowConfig> {
+  const { workflowId, getDraft, dispatch, agents, onApplied } = options;
+  return {
+    entityRef: { surface: "workflow", entityId: workflowId },
+    getDraft,
+    applyProposal: (proposal) => {
+      if (!isWorkflowProposal(proposal)) return;
+      for (const action of proposalToActions(proposal)) dispatch(action);
+      onApplied?.(sectionOfProposal(proposal));
+    },
+    describeProposal: (proposal) =>
+      isWorkflowProposal(proposal)
+        ? describeWorkflowProposal(proposal, getDraft(), agents)
+        : unsupportedProposalDescription(proposal),
+    emptyStateCopy: {
+      title: "Build this workflow with copilot",
+      description:
+        "Describe what you want — suggestions land as Apply/Preview cards you can accept one by one.",
+    },
+    promptChips: () =>
+      getDraft().instructions.markdown.trim().length === 0
+        ? SCAFFOLD_PROMPTS
+        : REFINE_PROMPTS,
+  };
 }

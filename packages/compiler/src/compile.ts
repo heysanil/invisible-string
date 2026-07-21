@@ -1,29 +1,28 @@
 /**
  * compile(definition, deps) → { files, hash }
  *
- * The PURE workflow → eve-project code generator (docs/PLAN.md Phase 1
- * task 2). No I/O beyond its inputs; deterministic; throws typed
- * CompileError on any internally inconsistent input. The reference
- * implementation for everything emitted here is the Phase-0 spike project
- * (spike/agent-project) — these templates mirror what it PROVED works.
+ * The PURE agent → eve-project code generator (docs/PLAN.md Phase 1 task 2,
+ * re-keyed by the agents-first redesign: the AGENT is the compile unit). No
+ * I/O beyond its inputs; deterministic; throws typed CompileError on any
+ * internally inconsistent input. The reference implementation for everything
+ * emitted here is the Phase-0 spike project (spike/agent-project) — these
+ * templates mirror what it PROVED works.
+ *
+ * The artifact is trigger-agnostic: it emits ONLY the default eve channel.
+ * Workflow instructions and `@trigger.*` data are rendered into the task
+ * message at DISPATCH time by the control plane (`renderTaskMessage` in
+ * packages/shared), never compiled in.
  */
 import {
-  workflowDefinitionSchema,
-  type ReasoningEffort,
-  type WorkflowDefinition,
+  agentDefinitionSchema,
+  type AgentDefinition,
 } from "@invisible-string/shared";
 
 import { emitAgentTs } from "./codegen/agent";
-import { emitEveChannel, emitTriggerChannel } from "./codegen/channels";
+import { emitEveChannel } from "./codegen/channels";
 import { emitConnection } from "./codegen/connections";
-import {
-  emitEnvLib,
-  emitPlatformAuthLib,
-  emitSlackLib,
-  emitTriggerEventLib,
-} from "./codegen/libs";
+import { emitEnvLib, emitPlatformAuthLib } from "./codegen/libs";
 import { emitPackageJson, emitTsconfig } from "./codegen/project";
-import { emitSchedule } from "./codegen/schedules";
 import { emitSkill } from "./codegen/skills";
 import {
   ENV_NAME_PATTERN,
@@ -31,7 +30,7 @@ import {
   SLUG_PATTERN,
 } from "./codegen/strings";
 import { CompileError } from "./errors";
-import { computeWorkflowHash } from "./hash";
+import { computeAgentHash } from "./hash";
 import { renderInstructions } from "./instructions";
 import type {
   CompileDeps,
@@ -52,7 +51,7 @@ function assertSlug(kind: string, slug: string): void {
   }
 }
 
-function validateDeps(definition: WorkflowDefinition, deps: CompileDeps): void {
+function validateDeps(definition: AgentDefinition, deps: CompileDeps): void {
   if (!MODEL_PROVIDERS.has(deps.resolvedModel.provider)) {
     throw new CompileError(
       "INVALID_DEPS",
@@ -64,27 +63,20 @@ function validateDeps(definition: WorkflowDefinition, deps: CompileDeps): void {
     throw new CompileError("INVALID_DEPS", "resolvedModel.modelId is empty");
   }
   assertSlug("workspace", deps.workspaceSlug);
-  assertSlug("workflow", deps.workflowSlug);
+  assertSlug("agent", deps.agentSlug);
 
-  if (deps.agentPreset.id !== definition.agent.agentPresetId) {
-    throw new CompileError(
-      "AGENT_PRESET_MISMATCH",
-      `deps.agentPreset.id "${deps.agentPreset.id}" does not match definition.agent.agentPresetId "${definition.agent.agentPresetId}"`,
-      { expected: definition.agent.agentPresetId, actual: deps.agentPreset.id },
-    );
-  }
   // Model resolution happens upstream, but an explicit modelId override in
   // the definition MUST be what the control plane resolved (spec §7: the
   // override wins) — anything else is an internally inconsistent input.
   if (
-    definition.agent.modelId !== undefined &&
-    definition.agent.modelId !== deps.resolvedModel.modelId
+    definition.model.modelId !== undefined &&
+    definition.model.modelId !== deps.resolvedModel.modelId
   ) {
     throw new CompileError(
       "MODEL_MISMATCH",
-      `definition.agent.modelId "${definition.agent.modelId}" does not match deps.resolvedModel.modelId "${deps.resolvedModel.modelId}"`,
+      `definition.model.modelId "${definition.model.modelId}" does not match deps.resolvedModel.modelId "${deps.resolvedModel.modelId}"`,
       {
-        definitionModelId: definition.agent.modelId,
+        definitionModelId: definition.model.modelId,
         resolvedModelId: deps.resolvedModel.modelId,
       },
     );
@@ -296,21 +288,21 @@ function validateSkill(skill: ResolvedSkill): void {
 }
 
 /**
- * Compile a workflow definition into a complete, buildable eve project.
+ * Compile an agent definition into a complete, buildable eve project.
  *
  * @returns `files` — project-root-relative path → content — and `hash`, the
- * deterministic workflow-version hash (see hash.ts for exactly what it
- * covers). Same input → same files and same hash.
+ * deterministic agent-version hash (see hash.ts for exactly what it covers).
+ * Same input → same files and same hash.
  */
 export function compile(
-  definition: WorkflowDefinition,
+  definition: AgentDefinition,
   deps: CompileDeps,
 ): CompileResult {
-  const parsedDefinition = workflowDefinitionSchema.safeParse(definition);
+  const parsedDefinition = agentDefinitionSchema.safeParse(definition);
   if (!parsedDefinition.success) {
     throw new CompileError(
       "INVALID_DEFINITION",
-      `workflow definition failed validation: ${parsedDefinition.error.issues
+      `agent definition failed validation: ${parsedDefinition.error.issues
         .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
         .join("; ")}`,
       { issues: parsedDefinition.error.issues },
@@ -333,49 +325,23 @@ export function compile(
   const sortedDeps: CompileDeps = { ...deps, connections, skills };
 
   const rendered = renderInstructions(def, sortedDeps);
-  const reasoning: ReasoningEffort | undefined =
-    def.agent.reasoning ?? deps.agentPreset.defaultReasoning;
   const dev = deps.options?.dev === true;
 
   // The hash is a pure function of the INPUTS (never of the emitted bytes),
   // so it can be computed up front and baked into the generated code — the
   // platform-auth JWT audience is bound to this version's hash.
-  const hash = computeWorkflowHash(def, deps);
+  const hash = computeAgentHash(def, deps);
 
   const files = new Map<string, string>();
   files.set("package.json", emitPackageJson(sortedDeps));
   files.set("tsconfig.json", emitTsconfig());
-  files.set("agent/agent.ts", emitAgentTs(sortedDeps, reasoning));
+  files.set("agent/agent.ts", emitAgentTs(sortedDeps, def.model.reasoning));
   files.set("agent/instructions.md", rendered.markdown);
   files.set("agent/lib/platform-auth.ts", emitPlatformAuthLib(dev, hash));
   if (connections.some((connection) => connection.auth.kind !== "none")) {
     files.set("agent/lib/env.ts", emitEnvLib());
   }
   files.set("agent/channels/eve.ts", emitEveChannel(sortedDeps));
-
-  const trigger = def.trigger;
-  if (
-    trigger.type === "form" ||
-    trigger.type === "webhook" ||
-    trigger.type === "slack"
-  ) {
-    files.set("agent/lib/trigger-event.ts", emitTriggerEventLib());
-    // The Slack channel posts its terminal reply through the Slack Web API
-    // (agent/lib/slack.ts) — a standalone, dependency-free helper so it stays
-    // unit-testable against a stub server (slack-outbound.test.ts).
-    if (trigger.type === "slack") {
-      files.set("agent/lib/slack.ts", emitSlackLib());
-    }
-    files.set(
-      `agent/channels/${trigger.type}.ts`,
-      emitTriggerChannel(trigger.type, rendered.triggerRefPaths),
-    );
-  } else if (trigger.type === "schedule") {
-    files.set(
-      "agent/schedules/schedule.ts",
-      emitSchedule(trigger.cron, deps.workflowSlug),
-    );
-  }
 
   for (const connection of connections) {
     files.set(
@@ -389,7 +355,7 @@ export function compile(
     }
   }
 
-  // computeWorkflowHash canonicalizes key order AND resolved-entry array
-  // order itself, so this matches control-plane pre-computed hashes.
+  // computeAgentHash canonicalizes key order AND resolved-entry array order
+  // itself, so this matches control-plane pre-computed hashes.
   return { files, hash };
 }

@@ -1,24 +1,25 @@
 ---
 title: Copilot
 section: Building
-order: 31
+order: 32
 ---
 
 import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Copilot
 
-The builder's docked right rail is an AI copilot. It reads the current draft
-definition plus the workspace inventory — MCP connections, skills, agent
-presets, model presets, and the allowlist — and proposes edits as **typed
-mutations**: `setTrigger`, `addContext`, `removeContext`, `setAgent`,
-`setModelPreset`, and `setInstructions`, streamed over a WebSocket.
+Both editors dock an AI copilot on the right. It reads the current draft plus
+the workspace inventory — MCP connections, skills, published Agents, model
+presets, and the allowlist — and proposes edits as **typed mutations**, streamed
+over a WebSocket. In the agent editor those are `setPersona`, `setModel`,
+`addContext`, and `removeContext`; in the workflow editor, `setTrigger`,
+`setAgent`, and `setInstructions`.
 
 Every proposal renders as a structured **Apply / Dismiss** card with a preview
-— an inline diff for instructions, before-and-after otherwise. The server never
-mutates your draft directly: accepted mutations are applied client-side through
-the same controller manual edits use, so autosave, dry-run, and diagnostics all
-just work. Invalid tool calls — unknown ids, non-allowlisted models, dangling
-references — bounce back to the model server-side and never reach the UI.
+— an inline diff for text, before-and-after otherwise. The server never mutates
+your draft directly: accepted mutations are applied client-side through the
+same controller manual edits use, so autosave and diagnostics all just work.
+Invalid tool calls — unknown ids, non-allowlisted models, dangling references —
+bounce back to the model server-side and never reach the UI.
 
 <UnderConstruction />

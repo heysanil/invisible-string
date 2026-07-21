@@ -11,6 +11,6 @@ export * from "./mcp-connections";
 export * from "./registry";
 export * from "./skills";
 export * from "./models";
-export * from "./agent-presets";
+export * from "./agents";
 export * from "./members";
 export * from "./integrations";

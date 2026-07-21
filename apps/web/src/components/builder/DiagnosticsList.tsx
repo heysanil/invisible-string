@@ -1,10 +1,10 @@
 import { AlertTriangle, Info } from "lucide-react";
 
-import type { PillarDiagnostic } from "../../lib/builder/diagnostics";
+import type { BuilderDiagnostic } from "../../lib/builder/diagnostics";
 import { cn } from "../../lib/cn";
 
 /**
- * Inline list of a pillar's diagnostics, shown atop its focused editor.
+ * Inline list of a section's diagnostics, shown atop its editor body.
  * When `onAskCopilot` is provided, a subtle "✦ ask copilot to fix" affordance
  * pre-fills the copilot composer with the issue list.
  */
@@ -12,7 +12,7 @@ export function DiagnosticsList({
   diagnostics,
   onAskCopilot,
 }: {
-  diagnostics: readonly PillarDiagnostic[];
+  diagnostics: readonly BuilderDiagnostic[];
   onAskCopilot?: (prompt: string) => void;
 }) {
   if (diagnostics.length === 0) return null;

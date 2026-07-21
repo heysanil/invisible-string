@@ -1,39 +1,41 @@
 /**
- * Builder diagnostics: a client-side mirror of the compiler's draft checks
- * plus the distributor that routes dry-run-compile errors (the payload of
- * `POST .../versions/dry-run-compile` when `ok: false`) onto the four pillar
- * cards.
+ * Workflow editor diagnostics: a client-side mirror of the server's workflow
+ * validator plus the distributor that routes server findings (the
+ * `diagnostics` array riding GET/PATCH workflow responses) onto the three
+ * editor sections.
  *
- * Severity semantics:
- * - "error"   — blocks publish (the compiler/publish endpoint would reject).
+ * Severity semantics (mirrors `workflowDiagnosticSchema`):
+ * - "error"   — blocks publish (the publish endpoint would reject).
  * - "warning" — legal draft, but worth surfacing (e.g. empty instructions
- *   are saveable yet unpublishable).
+ *   are saveable yet unpublishable; an agent republish stranding a
+ *   `@connection` ref degrades gracefully at dispatch).
  */
 import {
   triggerConfigSchema,
-  type ApiErrorInfo,
-  type WorkflowDefinition,
+  type AgentSummaryDto,
+  type WorkflowConfig,
+  type WorkflowDiagnostics,
 } from "@invisible-string/shared";
 
-import type { Pillar } from "./model";
+import type { WorkflowSection } from "./model";
 import { unresolvedReferences, type ReferenceSources } from "./references";
 
 export type DiagnosticSeverity = "error" | "warning";
 
-export interface PillarDiagnostic {
+export interface BuilderDiagnostic {
   severity: DiagnosticSeverity;
   message: string;
 }
 
 export interface BuilderDiagnostics {
-  pillars: Record<Pillar, PillarDiagnostic[]>;
-  /** Issues that belong to the whole draft, not one pillar. */
-  general: PillarDiagnostic[];
+  sections: Record<WorkflowSection, BuilderDiagnostic[]>;
+  /** Issues that belong to the whole draft, not one section. */
+  general: BuilderDiagnostic[];
 }
 
 export function emptyDiagnostics(): BuilderDiagnostics {
   return {
-    pillars: { trigger: [], context: [], agent: [], instructions: [] },
+    sections: { trigger: [], agent: [], instructions: [] },
     general: [],
   };
 }
@@ -43,8 +45,8 @@ export function mergeDiagnostics(
 ): BuilderDiagnostics {
   const merged = emptyDiagnostics();
   for (const set of sets) {
-    for (const pillar of Object.keys(merged.pillars) as Pillar[]) {
-      merged.pillars[pillar].push(...set.pillars[pillar]);
+    for (const section of Object.keys(merged.sections) as WorkflowSection[]) {
+      merged.sections[section].push(...set.sections[section]);
     }
     merged.general.push(...set.general);
   }
@@ -54,39 +56,44 @@ export function mergeDiagnostics(
 export function countIssues(diagnostics: BuilderDiagnostics): number {
   return (
     diagnostics.general.length +
-    Object.values(diagnostics.pillars).reduce(
+    Object.values(diagnostics.sections).reduce(
       (sum, list) => sum + list.length,
       0,
     )
   );
 }
 
-export function pillarIssueCount(
+export function sectionIssueCount(
   diagnostics: BuilderDiagnostics,
-  pillar: Pillar,
+  section: WorkflowSection,
 ): number {
-  return diagnostics.pillars[pillar].length;
+  return diagnostics.sections[section].length;
 }
 
 // ── Local (client-mirror) checks ────────────────────────────────────────────
 
 export interface LocalCheckInputs {
-  definition: WorkflowDefinition;
-  /** Reference sources resolved from the attached context resources. */
+  definition: WorkflowConfig;
+  /** Reference sources resolved from the SELECTED AGENT's context. */
   sources: ReferenceSources;
-  /** Known agent preset ids; null while still loading (skip the check). */
-  agentPresetIds: readonly string[] | null;
-  /** Enabled allowlist model ids; null while still loading (skip the check). */
-  allowedModelIds: readonly string[] | null;
+  /** Workspace agent inventory; null while still loading (skip the check). */
+  agents: readonly AgentSummaryDto[] | null;
+  /**
+   * False while the selected agent's context is still resolving —
+   * `@connection`/`@skill` reference checks are skipped so a slow agent
+   * fetch never flashes false "not attached" warnings (`@trigger` refs
+   * validate regardless: they depend only on the local trigger config).
+   */
+  contextResolved: boolean;
 }
 
 /**
- * Instant validation while typing — the dry-run endpoint confirms on save,
- * but pillar cards must not wait a network round-trip to flag a removed
+ * Instant validation while typing — the server validator confirms on save,
+ * but section cards must not wait a network round-trip to flag a removed
  * form field or an empty instructions doc.
  */
 export function localDiagnostics(inputs: LocalCheckInputs): BuilderDiagnostics {
-  const { definition, sources, agentPresetIds, allowedModelIds } = inputs;
+  const { definition, sources, agents, contextResolved } = inputs;
   const diagnostics = emptyDiagnostics();
 
   // TRIGGER — shape per the shared schema (dedup zod noise into one line each).
@@ -97,40 +104,35 @@ export function localDiagnostics(inputs: LocalCheckInputs): BuilderDiagnostics {
       const message = issue.message;
       if (seen.has(message)) continue;
       seen.add(message);
-      diagnostics.pillars.trigger.push({ severity: "error", message });
+      diagnostics.sections.trigger.push({ severity: "error", message });
     }
   }
 
-  // AGENT — preset must exist; a model override must be allowlisted.
-  if (definition.agent.agentPresetId === "") {
-    diagnostics.pillars.agent.push({
+  // AGENT — publish requires an existing, PUBLISHED agent.
+  if (definition.agentId === null) {
+    diagnostics.sections.agent.push({
       severity: "error",
-      message: "Choose an agent preset.",
+      message: "Choose an agent to do the work.",
     });
-  } else if (
-    agentPresetIds !== null &&
-    !agentPresetIds.includes(definition.agent.agentPresetId)
-  ) {
-    diagnostics.pillars.agent.push({
-      severity: "error",
-      message: "The selected agent preset no longer exists.",
-    });
-  }
-  if (
-    definition.agent.modelId !== undefined &&
-    allowedModelIds !== null &&
-    !allowedModelIds.includes(definition.agent.modelId)
-  ) {
-    diagnostics.pillars.agent.push({
-      severity: "error",
-      message: `Model "${definition.agent.modelId}" is not on the workspace allowlist.`,
-    });
+  } else if (agents !== null) {
+    const agent = agents.find((a) => a.id === definition.agentId);
+    if (!agent) {
+      diagnostics.sections.agent.push({
+        severity: "error",
+        message: "The selected agent no longer exists — choose another.",
+      });
+    } else if (agent.publishedVersionId === null) {
+      diagnostics.sections.agent.push({
+        severity: "error",
+        message: `"${agent.name}" isn't published yet — publish it in Agents first.`,
+      });
+    }
   }
 
   // INSTRUCTIONS — empty is a saveable draft but unpublishable; unresolved
-  // @references mirror the compiler's publish-time errors.
+  // @references mirror the server validator's publish-time errors.
   if (definition.instructions.markdown.trim().length === 0) {
-    diagnostics.pillars.instructions.push({
+    diagnostics.sections.instructions.push({
       severity: "warning",
       message: "Instructions are empty — required to publish.",
     });
@@ -140,9 +142,12 @@ export function localDiagnostics(inputs: LocalCheckInputs): BuilderDiagnostics {
       definition.instructions.markdown,
       sources,
     )) {
+      // Connection/skill resolvability is unknowable until the selected
+      // agent's context has loaded — only trigger refs are judged locally.
+      if (!contextResolved && problem.ref.kind !== "trigger") continue;
       if (seen.has(problem.ref.raw)) continue;
       seen.add(problem.ref.raw);
-      diagnostics.pillars.instructions.push({
+      diagnostics.sections.instructions.push({
         severity: "warning",
         message: `${problem.ref.raw} — ${problem.reason}`,
       });
@@ -152,131 +157,37 @@ export function localDiagnostics(inputs: LocalCheckInputs): BuilderDiagnostics {
   return diagnostics;
 }
 
-// ── Dry-run error distribution ──────────────────────────────────────────────
+// ── Server-finding distribution ─────────────────────────────────────────────
 
-/** Serialized issue shapes carried in dry-run/publish 422 `details`. */
-interface WireIssue {
-  message: string;
-  /** zod path array (draft_invalid) or compiler dotted path (compile_failed). */
-  path?: ReadonlyArray<string | number> | string;
-}
-
-function isWireIssue(value: unknown): value is WireIssue {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { message?: unknown }).message === "string"
-  );
-}
-
-function pillarFromPathHead(head: string | number | undefined): Pillar | null {
-  if (
-    head === "trigger" ||
-    head === "context" ||
-    head === "agent" ||
-    head === "instructions"
-  ) {
-    return head;
-  }
+/**
+ * Map a server diagnostic's dot path (rooted at the config key, e.g.
+ * "agentId" / "instructions.markdown" / "trigger.fields.0.key") onto a
+ * section; unrooted paths land in the general bucket.
+ */
+function sectionFromPath(path: string): WorkflowSection | null {
+  const head = path.split(".")[0] ?? "";
+  if (head === "trigger") return "trigger";
+  if (head === "agentId" || head === "agent") return "agent";
+  if (head === "instructions") return "instructions";
   return null;
 }
 
 /**
- * Compiler issue paths look like `connections.<name>.…` / `skills.<name>` and
- * pathless messages are prefixed with the CompileErrorCode (see
- * apps/control-plane/src/build/compiler-adapter.ts).
+ * Route the shared-validator findings that ride workflow GET/PATCH responses
+ * ({@link WorkflowDiagnostics}) onto the section cards.
  */
-function pillarFromCompileIssue(issue: WireIssue): Pillar | null {
-  const path = typeof issue.path === "string" ? issue.path : "";
-  if (path.startsWith("connections.") || path.startsWith("skills.")) {
-    return "context";
-  }
-  const code = issue.message.split(":")[0] ?? "";
-  switch (code) {
-    case "EMPTY_INSTRUCTIONS":
-    case "UNRESOLVED_REFERENCE":
-    case "TRIGGER_REF_NOT_ALLOWED":
-    case "TRIGGER_REF_UNKNOWN_FIELD":
-      return "instructions";
-    case "AGENT_PRESET_MISMATCH":
-    case "MODEL_MISMATCH":
-      return "agent";
-    case "MISSING_CONNECTION":
-    case "UNEXPECTED_CONNECTION":
-    case "MISSING_SKILL":
-    case "UNEXPECTED_SKILL":
-    case "DUPLICATE_SLUG":
-    case "INVALID_SLUG":
-    case "INVALID_HEADER":
-    case "INVALID_TOOL_FILTER":
-    case "INVALID_APPROVAL":
-    case "INVALID_SKILL_FILE":
-      return "context";
-    default:
-      return null;
-  }
-}
-
-function push(
-  diagnostics: BuilderDiagnostics,
-  pillar: Pillar | null,
-  message: string,
-): void {
-  const diagnostic: PillarDiagnostic = { severity: "error", message };
-  if (pillar === null) diagnostics.general.push(diagnostic);
-  else diagnostics.pillars[pillar].push(diagnostic);
-}
-
-/**
- * Route a dry-run-compile failure (`{ok:false, error}` payload — codes from
- * apps/control-plane/src/runtime/errors.ts) onto the pillar cards.
- */
-export function dryRunDiagnostics(error: ApiErrorInfo): BuilderDiagnostics {
+export function serverDiagnostics(
+  findings: WorkflowDiagnostics,
+): BuilderDiagnostics {
   const diagnostics = emptyDiagnostics();
-  const details = Array.isArray(error.details) ? error.details : [];
-
-  switch (error.code) {
-    case "draft_invalid": {
-      // details = zod issues with array paths rooted at the pillar key.
-      let routed = false;
-      for (const raw of details) {
-        if (!isWireIssue(raw)) continue;
-        const path = Array.isArray(raw.path) ? raw.path : [];
-        push(
-          diagnostics,
-          pillarFromPathHead(path[0]),
-          path.length > 0 ? `${path.join(".")}: ${raw.message}` : raw.message,
-        );
-        routed = true;
-      }
-      if (!routed) push(diagnostics, null, error.message);
-      return diagnostics;
-    }
-
-    case "compile_failed": {
-      // details = CompileIssue[] ({path?: string, message}).
-      let routed = false;
-      for (const raw of details) {
-        if (!isWireIssue(raw)) continue;
-        push(diagnostics, pillarFromCompileIssue(raw), raw.message);
-        routed = true;
-      }
-      if (!routed) push(diagnostics, null, error.message);
-      return diagnostics;
-    }
-
-    case "agent_preset_not_found":
-    case "model_preset_not_found":
-    case "model_not_allowlisted":
-      push(diagnostics, "agent", error.message);
-      return diagnostics;
-
-    case "context_resource_not_found":
-      push(diagnostics, "context", error.message);
-      return diagnostics;
-
-    default:
-      push(diagnostics, null, error.message);
-      return diagnostics;
+  for (const finding of findings) {
+    const entry: BuilderDiagnostic = {
+      severity: finding.severity,
+      message: finding.message,
+    };
+    const section = sectionFromPath(finding.path);
+    if (section === null) diagnostics.general.push(entry);
+    else diagnostics.sections[section].push(entry);
   }
+  return diagnostics;
 }

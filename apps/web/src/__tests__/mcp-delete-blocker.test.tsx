@@ -1,7 +1,8 @@
 /**
- * Deleting an MCP connection that published workflows still reference must
- * not silently fail: a 409 with workflow names surfaces as a helpful blocker
- * dialog that lists them.
+ * Deleting an MCP connection that AGENTS still reference must not silently
+ * fail: the server's 409 `connection_in_use` carries a bare array of agent
+ * names (errors.connectionInUse) which surfaces as a helpful blocker dialog
+ * that names the agents and prescribes achievable remediation.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -52,7 +53,7 @@ afterEach(() => {
   cleanup();
 });
 
-test("409 on delete opens a blocker dialog listing the workflows", async () => {
+test("409 on delete opens a blocker dialog naming the agents (real server shape: bare name array)", async () => {
   fetchMock
     .on("GET", "/mcp-connections", () => jsonResponse(CONNECTIONS))
     .on("DELETE", "/mcp-connections/", () =>
@@ -60,8 +61,9 @@ test("409 on delete opens a blocker dialog listing the workflows", async () => {
         {
           error: {
             code: "connection_in_use",
-            message: "in use",
-            details: { workflows: ["Daily digest", "Standup bot"] },
+            message: "connection is referenced by 2 agent(s): Support Bot, Research Assistant",
+            // errors.connectionInUse sends a BARE array of agent names.
+            details: ["Support Bot", "Research Assistant"],
           },
         },
         409,
@@ -83,8 +85,15 @@ test("409 on delete opens a blocker dialog listing the workflows", async () => {
   const confirm = await view.findByRole("dialog");
   fireEvent.click(within(confirm).getByRole("button", { name: "Remove" }));
 
-  // The 409 flips it to a blocker dialog listing the blocking workflows.
+  // The 409 flips it to a blocker dialog listing the blocking AGENTS, with
+  // remediation the user can actually perform (the reference lives on the
+  // agent's context — unpublishing workflows can never clear it).
   expect(await view.findByText("Still in use")).toBeTruthy();
-  expect(await view.findByText("Daily digest")).toBeTruthy();
-  expect(view.getByText("Standup bot")).toBeTruthy();
+  expect(await view.findByText("Support Bot")).toBeTruthy();
+  expect(view.getByText("Research Assistant")).toBeTruthy();
+  expect(
+    view.getByText(
+      "The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it.",
+    ),
+  ).toBeTruthy();
 });

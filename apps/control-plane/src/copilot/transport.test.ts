@@ -22,6 +22,8 @@ const SYSTEM = [
   '- id=22222222-2222-4222-8222-222222222222 name="notes archive" ref=@notes-archive',
   "Skills:",
   '- id=33333333-3333-4333-8333-333333333333 name="Triage Guide" ref=@skill.triage-guide',
+  "## Workspace agents (select with setAgent by id)",
+  '- id=44444444-4444-4444-8444-444444444444 name="General Purpose" published context=[(none)]',
 ].join("\n");
 
 function request(messages: ModelMessage[]): TransportRequest {
@@ -90,6 +92,38 @@ describe("createKeyedScriptedTransport", () => {
       kind: "skill",
       id: "33333333-3333-4333-8333-333333333333",
     });
+  });
+
+  test("resolves {{agentId:<name>}} against the agent inventory (name match, no ref slug)", async () => {
+    const transport = createKeyedScriptedTransport([
+      {
+        match: "delegate this",
+        steps: [
+          {
+            toolCalls: [
+              {
+                toolName: "setAgent",
+                input: { agentId: "{{agentId:General Purpose}}" },
+              },
+              {
+                // Unresolvable names stay as-is so validation fails loudly.
+                toolName: "setAgent",
+                input: { agentId: "{{agentId:No Such Agent}}" },
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    const parts = await collect(transport, [
+      { role: "user", content: "please delegate this workflow" },
+    ]);
+    const calls = parts.filter((p) => p.type === "tool-call");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.input).toEqual({
+      agentId: "44444444-4444-4444-8444-444444444444",
+    });
+    expect(calls[1]!.input).toEqual({ agentId: "{{agentId:No Such Agent}}" });
   });
 
   test("step index derives from tool messages after the last user turn (stateless replay)", async () => {

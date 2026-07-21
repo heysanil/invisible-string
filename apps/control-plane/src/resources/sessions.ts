@@ -1,8 +1,10 @@
 /**
- * Session list (chat surface). Workspace-wide or per-workflow, ordered by last
- * activity (max of session/latest-run update time), carrying the latest run's
- * status for the list rows. Session DETAIL, message posting, run input, and
- * SSE stay in the runtime plugin (they dispatch to eve).
+ * Session list (chat surface). Workspace-wide, per-agent, or per-workflow,
+ * ordered by last activity (max of session/latest-run update time), carrying
+ * the latest run's status plus the agent name (identity header) and workflow
+ * name (provenance chip; null for direct chat). Session DETAIL, message
+ * posting, run input, and SSE stay in the runtime plugin (they dispatch to
+ * eve).
  */
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -49,6 +51,9 @@ export async function listSessions(
   const filters = parseBody(listSessionsQuerySchema, query ?? {});
 
   const conditions = [eq(schema.agentSessions.organizationId, organizationId)];
+  if (filters.agentId) {
+    conditions.push(eq(schema.agentSessions.agentId, filters.agentId));
+  }
   if (filters.workflowId) {
     conditions.push(eq(schema.agentSessions.workflowId, filters.workflowId));
   }
@@ -59,10 +64,14 @@ export async function listSessions(
   const rows = await deps.db
     .select({
       session: schema.agentSessions,
+      agentName: schema.agents.name,
       workflowName: schema.workflows.name,
     })
     .from(schema.agentSessions)
-    .innerJoin(schema.workflows, eq(schema.agentSessions.workflowId, schema.workflows.id))
+    .innerJoin(schema.agents, eq(schema.agentSessions.agentId, schema.agents.id))
+    // Workflow provenance is nullable (direct chat) and survives workflow
+    // deletion as null (FK SET NULL) — hence the LEFT join.
+    .leftJoin(schema.workflows, eq(schema.agentSessions.workflowId, schema.workflows.id))
     .where(and(...conditions));
 
   const runs = await latestRuns(
@@ -70,17 +79,20 @@ export async function listSessions(
     rows.map((r) => r.session.id),
   );
 
-  const sessions: AgentSessionSummaryDto[] = rows.map(({ session, workflowName }) => {
-    const run = runs.get(session.id);
-    const lastActivity =
-      run && run.updatedAt > session.updatedAt ? run.updatedAt : session.updatedAt;
-    return {
-      ...sessionSummaryBase(session),
-      workflowName,
-      lastRunStatus: run?.status ?? null,
-      lastActivityAt: lastActivity.toISOString(),
-    };
-  });
+  const sessions: AgentSessionSummaryDto[] = rows.map(
+    ({ session, agentName, workflowName }) => {
+      const run = runs.get(session.id);
+      const lastActivity =
+        run && run.updatedAt > session.updatedAt ? run.updatedAt : session.updatedAt;
+      return {
+        ...sessionSummaryBase(session),
+        agentName,
+        workflowName: workflowName ?? null,
+        lastRunStatus: run?.status ?? null,
+        lastActivityAt: lastActivity.toISOString(),
+      };
+    },
+  );
 
   sessions.sort((a, b) => (a.lastActivityAt < b.lastActivityAt ? 1 : -1));
   return { sessions };
@@ -89,8 +101,9 @@ export async function listSessions(
 function sessionSummaryBase(row: SessionRow) {
   return {
     id: row.id,
+    agentId: row.agentId,
+    agentVersionId: row.agentVersionId,
     workflowId: row.workflowId,
-    workflowVersionId: row.workflowVersionId,
     origin: row.origin,
     status: row.status,
     eveSessionId: row.eveSessionId,

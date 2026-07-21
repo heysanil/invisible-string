@@ -1,13 +1,16 @@
 /**
  * Fixture-mode chat shell (VITE_FIXTURE_MODE=1): renders the full session
  * list + thread from a canned event log with NO backend — every working
- * block / reply / approval / error state is visible for design + E2E review.
- * It reuses the exact production reducer and components; only the data source
- * differs.
+ * block / reply / approval / error state is visible for design + E2E review,
+ * plus the agent picker → new-chat composer flow. It reuses the exact
+ * production reducer and components; only the data source differs.
  */
 import { useMemo, useState } from "react";
 import { MessageSquare } from "lucide-react";
 
+import type { AgentSummaryDto } from "@invisible-string/shared";
+
+import { FIXTURE_AGENTS } from "../../lib/agents/fixtures";
 import { reduceRunView } from "../../lib/chat/run-view";
 import {
   FIXTURE_SESSIONS,
@@ -16,11 +19,30 @@ import {
 import { titleFromMessage } from "../../lib/chat/time";
 import { EmptyState } from "../ui/EmptyState";
 import { Panel } from "../ui/Panel";
+import { AgentPicker, agentModelLabel } from "./AgentPicker";
+import { NewChatComposer } from "./ChatShell";
 import { SessionList, type SessionListItem } from "./SessionList";
 import { ThreadView } from "./ThreadView";
 import type { ThreadHeaderProps } from "./ThreadHeader";
 
-export function FixtureChatShell() {
+const FIXTURE_AGENT_SUMMARIES: AgentSummaryDto[] = FIXTURE_AGENTS.map(
+  (entry) => entry.summary,
+);
+
+/** Model chip labels from the fixture drafts (no queries in fixture mode). */
+const FIXTURE_MODEL_LABELS: ReadonlyMap<string, string> = new Map(
+  FIXTURE_AGENTS.flatMap((entry) => {
+    const label = agentModelLabel(entry.definition);
+    return label === null ? [] : [[entry.agent.id, label] as const];
+  }),
+);
+
+export function FixtureChatShell({
+  initialAgentId,
+}: {
+  /** ?agent= deep link (the fixture agent editor's "Chat with agent"). */
+  initialAgentId?: string;
+}) {
   const [activeId, setActiveId] = useState<string>(
     FIXTURE_SESSIONS[0]?.summary.id ?? "",
   );
@@ -28,10 +50,18 @@ export function FixtureChatShell() {
   const now = useMemo(() => new Date(), []);
   // Locally answered approvals (fixture interactivity).
   const [answered, setAnswered] = useState<Set<string>>(new Set());
+  const [pickerOpen, setPickerOpen] = useState(false);
+  /** Agent picked for a new chat — shows the real first-message composer.
+   *  Seeded from the deep link so ?agent= opens the composer, same as prod. */
+  const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(
+    () =>
+      FIXTURE_AGENT_SUMMARIES.find((agent) => agent.id === initialAgentId) ??
+      null,
+  );
 
   const sessions: SessionListItem[] = FIXTURE_SESSIONS.map((session) => ({
     ...session.summary,
-    title: session.summary.workflowName,
+    title: session.summary.agentName,
   }));
 
   const active: FixtureSession | undefined = FIXTURE_SESSIONS.find(
@@ -47,15 +77,26 @@ export function FixtureChatShell() {
         <SessionList
           sessions={sessions}
           isLoading={false}
-          activeSessionId={activeId}
-          onSelect={setActiveId}
-          onNewChat={() => undefined}
+          activeSessionId={draftAgent !== null ? null : activeId}
+          onSelect={(id) => {
+            setDraftAgent(null);
+            setActiveId(id);
+          }}
+          onNewChat={() => setPickerOpen(true)}
           now={now}
         />
       </Panel>
 
       <Panel className="panel-enter min-w-0 flex-1 overflow-hidden">
-        {active === undefined ? (
+        {draftAgent !== null ? (
+          <NewChatComposer
+            agent={draftAgent}
+            modelLabel={FIXTURE_MODEL_LABELS.get(draftAgent.id) ?? null}
+            sending={false}
+            onSend={() => undefined}
+            onCancel={() => setDraftAgent(null)}
+          />
+        ) : active === undefined ? (
           <EmptyState
             icon={MessageSquare}
             title="Pick up a conversation"
@@ -72,6 +113,18 @@ export function FixtureChatShell() {
           />
         )}
       </Panel>
+
+      {pickerOpen ? (
+        <AgentPicker
+          agents={FIXTURE_AGENT_SUMMARIES}
+          modelLabels={FIXTURE_MODEL_LABELS}
+          onPick={(agent) => {
+            setDraftAgent(agent);
+            setPickerOpen(false);
+          }}
+          onClose={() => setPickerOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -102,14 +155,16 @@ function FixtureThread({
   const lastRun = runViews[runViews.length - 1];
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
+  const { summary } = session;
 
   const header: ThreadHeaderProps = {
     title: titleFromMessage(session.runs[0]?.run.triggerEvent.message ?? ""),
-    workflowName: session.workflowName,
-    workflowId: session.workflowId,
+    agentName: summary.agentName,
+    agentId: summary.agentId,
     versionLabel: session.versionLabel,
     modelId,
-    sessionStatus: session.summary.status,
+    workflowName: summary.workflowName,
+    sessionStatus: summary.status,
     lastRunStatus: lastRun?.status ?? null,
   };
 
@@ -117,7 +172,7 @@ function FixtureThread({
     <ThreadView
       header={header}
       runs={runViews}
-      isChatOrigin={session.isChatOrigin}
+      isChatOrigin={summary.origin === "chat"}
       onRespond={(_runId, response) => onAnswer(response.requestId)}
       onSend={() => undefined}
       composerDisabledReason={

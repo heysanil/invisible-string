@@ -1,38 +1,73 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Check, CircleAlert } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+/**
+ * The workflow editor — a single focused column that reads like a delegation
+ * memo: when it runs (Trigger) → who does the work (Agent) → what they should
+ * do (Instructions). No rail, no pillar switching — all three sections stay
+ * expanded, separated by hairlines, inside one `max-w-3xl` scroll column.
+ *
+ * Publish is INSTANT (validate + snapshot server-side; builds belong to the
+ * agent editor). The header carries the lifecycle: back arrow · inline name ·
+ * SaveIndicator · Published/Draft chip · Run (TestRunPopover through the real
+ * trigger path) · Publish. The copilot dock rides the right rail on the
+ * workflow surface.
+ */
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  ArrowLeft,
+  Bot,
+  CircleAlert,
+  FileText,
+  Rocket,
+  Zap,
+} from "lucide-react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
 import type {
-  AgentPresetDto,
-  ModelAllowlistEntryDto,
-  ModelPresetDto,
+  AgentSummaryDto,
+  GetWorkflowResponse,
+  WorkflowConfig,
   WorkflowDto,
-  WorkspaceMemberDto,
 } from "@invisible-string/shared";
-import { parseWorkflowDraft } from "@invisible-string/shared";
+import { parseWorkflowConfig } from "@invisible-string/shared";
 
-import { AgentEditor } from "../components/builder/AgentEditor";
-import { ContextEditor } from "../components/builder/ContextEditor";
-import { CopilotDock, type CopilotPrefill } from "../components/builder/CopilotDock";
+import { AgentSection } from "../components/builder/AgentSection";
 import { DiagnosticsList } from "../components/builder/DiagnosticsList";
 import { InstructionsPanel } from "../components/builder/InstructionsPanel";
 import { LiveTriggerConfig } from "../components/builder/LiveTriggerConfig";
-import { PillarRail } from "../components/builder/PillarRail";
+import { SaveIndicator } from "../components/builder/SaveIndicator";
+import { TestRunPopover } from "../components/builder/TestRunPopover";
 import { TriggerEditor } from "../components/builder/TriggerEditor";
-import { Spinner } from "../components/ui/Spinner";
+import { CopilotDock, type CopilotPrefill } from "../components/copilot/CopilotDock";
+import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Panel } from "../components/ui/Panel";
+import { Spinner } from "../components/ui/Spinner";
+import { StatusChip } from "../components/ui/StatusChip";
 import { useToast } from "../components/ui/Toast";
-import { PILLAR_LABELS, emptyDefinition, type Pillar } from "../lib/builder/model";
+import { useSelectedAgentContext } from "../lib/builder/agent-context";
 import { countIssues } from "../lib/builder/diagnostics";
+import {
+  definitionsEqual,
+  emptyDefinition,
+  WORKFLOW_SECTIONS,
+  WORKFLOW_SECTION_LABELS,
+  type WorkflowSection,
+} from "../lib/builder/model";
 import { useContextResources } from "../lib/builder/resources";
 import {
   builderStateFromWorkflow,
   useBuilderController,
   type SaveStatus,
 } from "../lib/builder/useBuilderController";
-import { useAgentPresets } from "../lib/queries/agent-presets";
-import { useModelAllowlist, useModelPresets } from "../lib/queries/models";
-import { useWorkspaceMembers } from "../lib/queries/members";
+import { workflowCopilotAdapter } from "../lib/copilot/mutations";
+import { useAgents } from "../lib/queries/agents";
+import { queryKeys } from "../lib/queries/keys";
 import { useUpdateWorkflow, useWorkflow } from "../lib/queries/workflows";
 import { errorMessage } from "../lib/forms";
 import { cn } from "../lib/cn";
@@ -53,7 +88,7 @@ function BuilderRoute() {
         <EmptyState
           icon={CircleAlert}
           title="No active workspace"
-          description="Select a workspace to open the builder."
+          description="Select a workspace to open the workflow editor."
         />
       </BuilderShell>
     );
@@ -68,16 +103,12 @@ function BuilderLoader({
   workspaceId: string;
   workflowId: string;
 }) {
+  const queryClient = useQueryClient();
   const workflow = useWorkflow(workspaceId, workflowId);
   const resources = useContextResources(workspaceId);
-  const agentPresets = useAgentPresets(workspaceId);
-  const modelPresets = useModelPresets(workspaceId);
-  const allowlist = useModelAllowlist(workspaceId);
-  const members = useWorkspaceMembers(workspaceId);
+  const agents = useAgents(workspaceId);
 
-  if (workflow.isPending || agentPresets.isPending) {
-    return <CenteredSpinner />;
-  }
+  if (workflow.isPending) return <CenteredSpinner />;
 
   if (workflow.isError || !workflow.data) {
     return (
@@ -99,18 +130,11 @@ function BuilderLoader({
     );
   }
 
-  const presets = agentPresets.data ?? [];
-  if (presets.length === 0) {
-    return (
-      <BuilderShell>
-        <EmptyState
-          icon={CircleAlert}
-          title="No agent presets yet"
-          description="Create an agent preset in this workspace before building a workflow."
-        />
-      </BuilderShell>
-    );
-  }
+  // Validator findings ride the GET response (dropped by useWorkflow's
+  // select) — pull them from the cached raw response as the controller seed.
+  const initialDiagnostics = queryClient.getQueryData<GetWorkflowResponse>(
+    queryKeys.workflows.detail(workspaceId, workflowId),
+  )?.diagnostics;
 
   return (
     <Builder
@@ -119,10 +143,12 @@ function BuilderLoader({
       workspaceId={workspaceId}
       workflow={workflow.data}
       resources={resources}
-      agentPresets={presets}
-      modelPresets={modelPresets.data ?? []}
-      allowlist={allowlist.data ?? []}
-      members={members.data ?? []}
+      agents={agents.data ?? null}
+      // null + error ≠ loading: the Agent section must show a designed error
+      // state with retry, not skeleton ghost cards forever.
+      agentsError={agents.isError}
+      onRetryAgents={() => void agents.refetch()}
+      {...(initialDiagnostics ? { initialDiagnostics } : {})}
     />
   );
 }
@@ -131,55 +157,62 @@ function Builder({
   workspaceId,
   workflow,
   resources,
-  agentPresets,
-  modelPresets,
-  allowlist,
-  members,
+  agents,
+  agentsError = false,
+  onRetryAgents,
+  initialDiagnostics,
 }: {
   workspaceId: string;
   workflow: WorkflowDto;
   resources: ReturnType<typeof useContextResources>;
-  agentPresets: readonly AgentPresetDto[];
-  modelPresets: readonly ModelPresetDto[];
-  allowlist: readonly ModelAllowlistEntryDto[];
-  members: readonly WorkspaceMemberDto[];
+  agents: readonly AgentSummaryDto[] | null;
+  agentsError?: boolean;
+  onRetryAgents?: () => void;
+  initialDiagnostics?: GetWorkflowResponse["diagnostics"];
 }) {
-  const navigate = useNavigate();
   const { toast } = useToast();
-  const updateWorkflow = useUpdateWorkflow(workspaceId);
 
   const initialState = useMemo(
     () =>
       builderStateFromWorkflow(
-        parseWorkflowDraft(workflow.draft),
-        emptyDefinition(agentPresets[0]!.id),
+        parseWorkflowConfig(workflow.draft),
+        emptyDefinition(null),
       ),
     // Seed once per Builder mount (keyed by workflow.id upstream).
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
+  // The definition lives inside the controller, but the selected agent's
+  // context query must be a top-level hook — track the id through state
+  // initialized from the same seed the controller uses.
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
+    initialState.definition.agentId,
+  );
+  const agentContext = useSelectedAgentContext(workspaceId, selectedAgentId);
+
   const controller = useBuilderController({
     workspaceId,
     workflow,
     initialState,
     resources,
-    agentPresets,
-    modelPresets,
-    allowlist,
+    agents,
+    agentContext,
+    ...(initialDiagnostics ? { initialDiagnostics } : {}),
   });
 
   const { state, dispatch, diagnostics, referenceSources } = controller;
   const definition = state.definition;
-  const activePillar = state.activePillar;
 
-  const [runAsUserId, setRunAsUserId] = useState(workflow.runAsUserId);
-  const [runDraftPending, setRunDraftPending] = useState(false);
+  // Keep the agent-context query keyed to the live selection.
+  useEffect(() => {
+    setSelectedAgentId(definition.agentId);
+  }, [definition.agentId]);
 
-  // Copilot plumbing: composer prefill (from diagnostics affordances) and the
-  // pillar-card flash after an applied suggestion.
+  // ── copilot plumbing (prefill + applied-suggestion flash) ─────────────────
+
   const [copilotPrefill, setCopilotPrefill] = useState<CopilotPrefill | null>(null);
-  const [flashPillar, setFlashPillar] = useState<Pillar | null>(null);
+  const [flashSection, setFlashSection] = useState<WorkflowSection | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flashClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -187,66 +220,64 @@ function Builder({
     setCopilotPrefill((current) => ({ id: (current?.id ?? 0) + 1, text }));
   }
 
-  function onSuggestionApplied(pillar: Pillar) {
-    setFlashPillar(null);
+  function onSuggestionApplied(section: WorkflowSection) {
+    setFlashSection(null);
     // Cancel BOTH timers: a stale clear-timer from the previous apply would
     // otherwise cut the new flash short mid-animation.
     if (flashTimer.current) clearTimeout(flashTimer.current);
     if (flashClearTimer.current) clearTimeout(flashClearTimer.current);
     // Re-arm on the next frame so consecutive applies re-trigger the animation.
-    flashTimer.current = setTimeout(() => setFlashPillar(pillar), 16);
+    flashTimer.current = setTimeout(() => setFlashSection(section), 16);
     flashClearTimer.current = setTimeout(
-      () => setFlashPillar((p) => (p === pillar ? null : p)),
+      () => setFlashSection((s) => (s === section ? null : s)),
       900,
     );
   }
 
-  function changeRunAs(userId: string) {
-    setRunAsUserId(userId);
-    updateWorkflow.mutate(
-      { workflowId: workflow.id, patch: { runAsUserId: userId } },
-      {
-        onError: (error) => {
-          setRunAsUserId(workflow.runAsUserId);
-          toast({ variant: "error", message: errorMessage(error) });
-        },
-      },
-    );
-  }
+  // The adapter reads the LIVE draft through a ref — never a stale capture.
+  const draftRef = useRef<WorkflowConfig>(definition);
+  draftRef.current = definition;
+  const adapter = workflowCopilotAdapter({
+    workflowId: workflow.id,
+    getDraft: () => draftRef.current,
+    dispatch,
+    agents: agents ?? [],
+    onApplied: onSuggestionApplied,
+  });
+
+  // ── publish (instant: validate + snapshot) ────────────────────────────────
+
+  const isPublished = workflow.publishedAt !== null;
+  // Run dispatches the PUBLISHED snapshot — stale means unsaved edits OR a
+  // saved draft that has drifted from the last snapshot.
+  const publishedConfig = useMemo(
+    () => parseWorkflowConfig(workflow.published),
+    [workflow.published],
+  );
+  const publishedStale =
+    !isPublished ||
+    publishedConfig === null ||
+    !definitionsEqual(definition, publishedConfig);
 
   async function onPublish() {
     const response = await controller.publish();
-    if (response && response.buildStatus === "succeeded") {
-      toast({
-        variant: "success",
-        message: response.cached
-          ? "Published — served from build cache."
-          : "Published and built.",
-      });
+    if (response) {
+      toast({ variant: "success", message: "Published — live for new runs." });
     }
   }
 
-  async function onRunDraft() {
-    setRunDraftPending(true);
-    try {
-      const response = await controller.publish();
-      if (!response) return; // publish surfaced its own error
-      if (response.buildStatus !== "succeeded") {
-        toast({
-          variant: "error",
-          message: "The draft must build cleanly before you can run it.",
-        });
-        return;
-      }
-      toast({
-        variant: "success",
-        message: "Draft published — starting a session in Chat.",
-      });
-      navigate({ to: "/chat", search: { workflow: workflow.id } });
-    } finally {
-      setRunDraftPending(false);
-    }
-  }
+  // Publish failures surface as toasts (the button itself stays put).
+  const publishError =
+    controller.publishState.phase === "error" ? controller.publishState.error : null;
+  useEffect(() => {
+    if (!publishError) return;
+    toast({ variant: "error", message: publishError });
+    controller.resetPublish();
+    // toast/controller identities are stable enough; keyed on the error text.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [publishError]);
+
+  const publishPending = controller.publishState.phase === "publishing";
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -256,106 +287,143 @@ function Builder({
         saveStatus={controller.saveStatus}
         issueCount={countIssues(diagnostics)}
         isDirty={controller.isDirty}
+        isPublished={isPublished}
+        runPopover={
+          <TestRunPopover
+            workspaceId={workspaceId}
+            workflowId={workflow.id}
+            trigger={definition.trigger}
+            isPublished={isPublished}
+            isDirty={publishedStale}
+            canPublish={controller.canPublish}
+            publishPending={publishPending}
+            onPublish={onPublish}
+          />
+        }
+        publishButton={
+          <Button
+            size="sm"
+            onClick={() => void onPublish()}
+            disabled={!controller.canPublish}
+            loading={publishPending}
+          >
+            {!publishPending ? <Rocket size={14} aria-hidden="true" /> : null}
+            Publish
+          </Button>
+        }
       />
 
       <div className="flex min-h-0 flex-1 gap-4">
-        <PillarRail
-          name={workflow.name}
-          publishedVersionId={workflow.publishedVersionId}
-          isDirty={controller.isDirty}
-          definition={definition}
-          diagnostics={diagnostics}
-          activePillar={activePillar}
-          onFocusPillar={controller.focusPillar}
-          connections={resources.connections}
-          skills={resources.skills}
-          agentPresets={agentPresets}
-          modelPresets={modelPresets}
-          publishState={controller.publishState}
-          onPublish={onPublish}
-          onRunDraft={onRunDraft}
-          runDraftPending={runDraftPending}
-          canPublish={controller.canPublish}
-          flashPillar={flashPillar}
-        />
-
         <Panel className="panel-enter flex min-w-0 flex-1 flex-col overflow-hidden">
-          <header className="flex items-baseline justify-between px-6 pb-3 pt-5">
-            <h2 className="text-[16px]">{PILLAR_LABELS[activePillar]}</h2>
-            <span className="text-[12px] text-ink-4">{pillarHint(activePillar)}</span>
-          </header>
-          <div aria-hidden="true" className="mx-6 h-px bg-black/[0.06]" />
           <div className="thin-scroll flex-1 overflow-y-auto p-6">
-            <div className="mx-auto flex max-w-2xl flex-col gap-4">
-              <DiagnosticsList
-                diagnostics={diagnostics.pillars[activePillar]}
-                onAskCopilot={askCopilot}
-              />
-              {activePillar === "trigger" ? (
-                <>
-                  <TriggerEditor definition={definition} dispatch={dispatch} />
-                  {definition.trigger.type === "webhook" ||
-                  definition.trigger.type === "form" ||
-                  definition.trigger.type === "slack" ? (
-                    <LiveTriggerConfig
-                      workspaceId={workspaceId}
-                      workflowId={workflow.id}
-                      triggerType={definition.trigger.type}
-                      slackBinding={
-                        definition.trigger.type === "slack"
-                          ? definition.trigger.binding
-                          : undefined
-                      }
-                    />
+            <div className="mx-auto flex max-w-3xl flex-col">
+              {diagnostics.general.length > 0 ? (
+                <div className="pb-6">
+                  <DiagnosticsList
+                    diagnostics={diagnostics.general}
+                    onAskCopilot={askCopilot}
+                  />
+                </div>
+              ) : null}
+
+              {WORKFLOW_SECTIONS.map((section, index) => (
+                <div key={section} className="flex flex-col">
+                  {index > 0 ? (
+                    <div aria-hidden="true" className="my-8 h-px bg-black/[0.06]" />
                   ) : null}
-                </>
-              ) : null}
-              {activePillar === "context" ? (
-                <ContextEditor
-                  workspaceId={workspaceId}
-                  definition={definition}
-                  dispatch={dispatch}
-                  resources={resources}
-                />
-              ) : null}
-              {activePillar === "agent" ? (
-                <AgentEditor
-                  definition={definition}
-                  dispatch={dispatch}
-                  presets={agentPresets}
-                  modelPresets={modelPresets}
-                  allowlist={allowlist}
-                  members={members}
-                  runAsUserId={runAsUserId}
-                  onChangeRunAs={changeRunAs}
-                />
-              ) : null}
-              {activePillar === "instructions" ? (
-                <InstructionsPanel
-                  definition={definition}
-                  onChange={(markdown) =>
-                    dispatch({ type: "setInstructions", markdown })
-                  }
-                  resources={resources}
-                />
-              ) : null}
+                  <section
+                    aria-labelledby={`workflow-section-${section}`}
+                    className={cn(
+                      "flex scroll-mt-6 flex-col gap-4 rounded-card",
+                      flashSection === section && "pillar-flash",
+                    )}
+                  >
+                    <SectionHeader section={section} />
+                    <DiagnosticsList
+                      diagnostics={diagnostics.sections[section]}
+                      onAskCopilot={askCopilot}
+                    />
+                    {section === "trigger" ? (
+                      <>
+                        <TriggerEditor definition={definition} dispatch={dispatch} />
+                        {definition.trigger.type === "webhook" ||
+                        definition.trigger.type === "form" ||
+                        definition.trigger.type === "slack" ? (
+                          <LiveTriggerConfig
+                            workspaceId={workspaceId}
+                            workflowId={workflow.id}
+                            triggerType={definition.trigger.type}
+                            slackBinding={
+                              definition.trigger.type === "slack"
+                                ? definition.trigger.binding
+                                : undefined
+                            }
+                          />
+                        ) : null}
+                      </>
+                    ) : null}
+                    {section === "agent" ? (
+                      <AgentSection
+                        agents={agents}
+                        isError={agentsError}
+                        {...(onRetryAgents ? { onRetry: onRetryAgents } : {})}
+                        selectedAgentId={definition.agentId}
+                        dispatch={dispatch}
+                      />
+                    ) : null}
+                    {section === "instructions" ? (
+                      <InstructionsPanel
+                        definition={definition}
+                        onChange={(markdown) =>
+                          dispatch({ type: "setInstructions", markdown })
+                        }
+                        sources={referenceSources}
+                      />
+                    ) : null}
+                  </section>
+                </div>
+              ))}
             </div>
           </div>
         </Panel>
 
         <CopilotDock
           workspaceId={workspaceId}
-          workflowId={workflow.id}
-          definition={definition}
-          dispatch={dispatch}
-          resources={resources}
-          agentPresets={agentPresets}
-          modelPresets={modelPresets}
+          adapter={adapter}
           prefill={copilotPrefill}
-          onApplied={onSuggestionApplied}
         />
       </div>
     </div>
+  );
+}
+
+// ── Sections ────────────────────────────────────────────────────────────────
+
+const SECTION_ICONS: Record<WorkflowSection, ComponentType<{ size?: number }>> = {
+  trigger: Zap,
+  agent: Bot,
+  instructions: FileText,
+};
+
+const SECTION_HINTS: Record<WorkflowSection, string> = {
+  trigger: "When this runs",
+  agent: "Who does the work",
+  instructions: "What they should do",
+};
+
+function SectionHeader({ section }: { section: WorkflowSection }) {
+  const Icon = SECTION_ICONS[section];
+  return (
+    <header className="flex items-baseline justify-between">
+      <h2
+        id={`workflow-section-${section}`}
+        className="flex items-center gap-2 text-[16px]"
+      >
+        <Icon size={15} aria-hidden="true" />
+        {WORKFLOW_SECTION_LABELS[section]}
+      </h2>
+      <span className="text-[12px] text-ink-4">{SECTION_HINTS[section]}</span>
+    </header>
   );
 }
 
@@ -367,12 +435,18 @@ function BuilderHeader({
   saveStatus,
   issueCount,
   isDirty,
+  isPublished,
+  runPopover,
+  publishButton,
 }: {
   workspaceId: string;
   workflow: WorkflowDto;
   saveStatus: SaveStatus;
   issueCount: number;
   isDirty: boolean;
+  isPublished: boolean;
+  runPopover: ReactNode;
+  publishButton: ReactNode;
 }) {
   const { toast } = useToast();
   const updateWorkflow = useUpdateWorkflow(workspaceId);
@@ -399,7 +473,10 @@ function BuilderHeader({
   }
 
   return (
-    <Panel className="panel-enter flex items-center gap-3 px-4 py-2.5">
+    // z-10: the Run popover drops DOWN out of this panel over the row below;
+    // without it the copilot dock (a later glass-panel sibling, its own
+    // stacking context) paints over the open popover.
+    <Panel className="panel-enter z-10 flex items-center gap-3 px-4 py-2.5">
       <Link
         to="/workflows"
         aria-label="Back to workflows"
@@ -422,65 +499,22 @@ function BuilderHeader({
         className="min-w-0 flex-1 rounded-card bg-transparent px-2 py-1 text-[15px] font-semibold text-ink outline-none hover:bg-black/[0.03] focus-visible:bg-white/70"
       />
       <SaveIndicator status={saveStatus} issueCount={issueCount} isDirty={isDirty} />
+      {isPublished ? (
+        <StatusChip tone="success" dot>
+          Published
+        </StatusChip>
+      ) : (
+        <StatusChip tone="neutral" dot>
+          Draft
+        </StatusChip>
+      )}
+      {runPopover}
+      {publishButton}
     </Panel>
   );
 }
 
-function SaveIndicator({
-  status,
-  issueCount,
-  isDirty,
-}: {
-  status: SaveStatus;
-  issueCount: number;
-  isDirty: boolean;
-}) {
-  if (status === "saving" || (isDirty && status !== "error")) {
-    return (
-      <span className="flex items-center gap-1.5 text-[12.5px] text-ink-3">
-        <Spinner size={12} /> Saving…
-      </span>
-    );
-  }
-  if (status === "error") {
-    return (
-      <span className="flex items-center gap-1.5 text-[12.5px] text-err">
-        <CircleAlert size={13} aria-hidden="true" /> Save failed
-      </span>
-    );
-  }
-  if (status === "saved") {
-    return issueCount > 0 ? (
-      <span className="flex items-center gap-1.5 text-[12.5px] text-warn">
-        <CircleAlert size={13} aria-hidden="true" />
-        {issueCount} issue{issueCount === 1 ? "" : "s"}
-      </span>
-    ) : (
-      <span className="flex items-center gap-1.5 text-[12.5px] text-ink-3">
-        <Check size={13} className="text-ok" aria-hidden="true" /> Saved · compiles
-        clean
-      </span>
-    );
-  }
-  return (
-    <span className={cn("text-[12.5px] text-ink-4")}>All changes saved</span>
-  );
-}
-
 // ── shells ──────────────────────────────────────────────────────────────────
-
-function pillarHint(pillar: keyof typeof PILLAR_LABELS): string {
-  switch (pillar) {
-    case "trigger":
-      return "How runs start";
-    case "context":
-      return "Tools and knowledge";
-    case "agent":
-      return "Model and persona";
-    case "instructions":
-      return "What the agent does";
-  }
-}
 
 function BuilderShell({ children }: { children: React.ReactNode }) {
   return (

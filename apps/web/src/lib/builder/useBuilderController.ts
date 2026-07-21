@@ -1,26 +1,28 @@
 /**
- * Builder controller: owns the editor reducer, debounced autosave, dry-run
- * compile after each save, diagnostics distribution, and the publish state
- * machine. The route renders; this hook holds the behavior.
+ * Workflow editor controller: owns the editor reducer, debounced autosave,
+ * diagnostics distribution, and the (instant) publish flow. The route
+ * renders; this hook holds the behavior.
  *
- * Save → dry-run chain: publish snapshots the STORED draft, and dry-run
- * compiles the STORED draft, so both must run AFTER a successful PATCH. The
- * debounce collapses keystrokes; a publish/run flushes any pending save first.
+ * Workflows compile nothing — publish validates + snapshots server-side and
+ * returns immediately, so there is no build poll here (builds belong to the
+ * AGENT editor, lib/agents). Save → validate chain: the PATCH response
+ * carries the shared validator's findings for the SAVED draft; a publish
+ * flushes any pending save first so it snapshots what the user sees.
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type {
-  AgentPresetDto,
-  ModelAllowlistEntryDto,
-  ModelPresetDto,
+  AgentContext,
+  AgentSummaryDto,
   PublishWorkflowResponse,
+  WorkflowDiagnostics,
   WorkflowDto,
 } from "@invisible-string/shared";
 
 import {
-  dryRunDiagnostics,
   emptyDiagnostics,
   localDiagnostics,
   mergeDiagnostics,
+  serverDiagnostics,
   type BuilderDiagnostics,
 } from "./diagnostics";
 import {
@@ -29,52 +31,54 @@ import {
   definitionsEqual,
   initBuilderState,
   type BuilderState,
-  type Pillar,
 } from "./model";
-import {
-  INITIAL_PUBLISH_STATE,
-  publishReducer,
-  type PublishState,
-} from "./publish-machine";
 import type { ReferenceSources } from "./references";
 import type { ContextResources } from "./resources";
-import {
-  fetchBuildStatus,
-  useDryRunCompile,
-  usePublishWorkflow,
-  useUpdateWorkflow,
-} from "../queries/workflows";
+import { usePublishWorkflow, useUpdateWorkflow } from "../queries/workflows";
 import { ApiError } from "../api-client";
-
-/** Poll cadence + ceiling for the post-publish build-status watch. */
-const BUILD_POLL_INTERVAL_MS = 1500;
-const BUILD_POLL_MAX_ATTEMPTS = 1000; // ~25 min ceiling; a fresh eve build is minutes
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const AUTOSAVE_DELAY_MS = 700;
 
 export type SaveStatus = "idle" | "saving" | "saved" | "error";
 
+// ── publish (instant — no build phases) ─────────────────────────────────────
+
+export type WorkflowPublishPhase = "idle" | "publishing" | "published" | "error";
+
+export interface WorkflowPublishState {
+  phase: WorkflowPublishPhase;
+  /** Populated in "error". */
+  error: string | null;
+}
+
+const INITIAL_PUBLISH_STATE: WorkflowPublishState = { phase: "idle", error: null };
+
 export interface BuilderControllerOptions {
   workspaceId: string;
   workflow: WorkflowDto;
   initialState: BuilderState;
+  /** Merged workspace+user connections/skills (resolves context ids to names). */
   resources: ContextResources;
-  agentPresets: readonly AgentPresetDto[];
-  modelPresets: readonly ModelPresetDto[];
-  allowlist: readonly ModelAllowlistEntryDto[];
+  /** Workspace agent inventory; null while loading (agent checks skip). */
+  agents: readonly AgentSummaryDto[] | null;
+  /**
+   * The SELECTED agent's attached context (what `@connection`/`@skill`
+   * autocomplete + validation resolve against). Null while no agent is
+   * selected or its detail is still loading.
+   */
+  agentContext: AgentContext | null;
+  /** Validator findings that rode the workflow GET (seed until first save). */
+  initialDiagnostics?: WorkflowDiagnostics;
 }
 
 export interface BuilderController {
   state: BuilderState;
   dispatch: React.Dispatch<Parameters<typeof builderReducer>[1]>;
-  focusPillar: (pillar: Pillar) => void;
   saveStatus: SaveStatus;
   isDirty: boolean;
   diagnostics: BuilderDiagnostics;
   referenceSources: ReferenceSources;
-  publishState: PublishState;
+  publishState: WorkflowPublishState;
   publish: () => Promise<PublishWorkflowResponse | null>;
   resetPublish: () => void;
   canPublish: boolean;
@@ -90,23 +94,22 @@ export function useBuilderController(
     workflow,
     initialState,
     resources,
-    agentPresets,
-    modelPresets,
-    allowlist,
+    agents,
+    agentContext,
+    initialDiagnostics,
   } = options;
 
   const [state, dispatch] = useReducer(builderReducer, initialState);
   const definition = definitionOf(state);
 
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
-  const [dryRun, setDryRun] = useState<BuilderDiagnostics>(emptyDiagnostics());
-  const [publishState, publishDispatch] = useReducer(
-    publishReducer,
-    INITIAL_PUBLISH_STATE,
+  const [serverFindings, setServerFindings] = useState<BuilderDiagnostics>(() =>
+    initialDiagnostics ? serverDiagnostics(initialDiagnostics) : emptyDiagnostics(),
   );
+  const [publishState, setPublishState] =
+    useState<WorkflowPublishState>(INITIAL_PUBLISH_STATE);
 
   const updateWorkflow = useUpdateWorkflow(workspaceId);
-  const dryRunCompile = useDryRunCompile(workspaceId);
   const publishWorkflow = usePublishWorkflow(workspaceId);
 
   // Last definition known to be persisted on the server (dirtiness baseline).
@@ -117,17 +120,7 @@ export function useBuilderController(
 
   const isDirty = !definitionsEqual(definition, savedRef.current);
 
-  // ── save + dry-run ─────────────────────────────────────────────────────────
-
-  const runDryRun = useCallback(async () => {
-    try {
-      const result = await dryRunCompile.mutateAsync(workflow.id);
-      setDryRun(result.ok ? emptyDiagnostics() : dryRunDiagnostics(result.error));
-    } catch {
-      // A dry-run transport failure is non-fatal — local checks still apply.
-      setDryRun(emptyDiagnostics());
-    }
-  }, [dryRunCompile, workflow.id]);
+  // ── save (PATCH answers the validator's findings for free) ────────────────
 
   const save = useCallback(
     async (next: ReturnType<typeof definitionOf>) => {
@@ -140,17 +133,11 @@ export function useBuilderController(
           });
           savedRef.current = next;
           setSaveStatus("saved");
-          // The PATCH already dry-ran the saved draft — consume its diagnostics
-          // instead of a redundant follow-up call. Fall back to the dedicated
-          // endpoint only when the server omitted them (e.g. object store down).
+          // The PATCH validated the saved draft — consume its findings
+          // instead of a follow-up call (omitted = validation didn't run;
+          // keep whatever we had rather than pretending the draft is clean).
           if (result.diagnostics) {
-            setDryRun(
-              result.diagnostics.ok
-                ? emptyDiagnostics()
-                : dryRunDiagnostics(result.diagnostics.error),
-            );
-          } else {
-            await runDryRun();
+            setServerFindings(serverDiagnostics(result.diagnostics));
           }
         } catch {
           setSaveStatus("error");
@@ -160,7 +147,7 @@ export function useBuilderController(
       await promise;
       inFlightSave.current = null;
     },
-    [updateWorkflow, workflow.id, runDryRun],
+    [updateWorkflow, workflow.id],
   );
 
   // Debounced autosave on definition change.
@@ -188,22 +175,23 @@ export function useBuilderController(
     }
   }, [definition, save]);
 
-  // ── diagnostics (local mirror ⊕ dry-run) ──────────────────────────────────
+  // ── diagnostics (local mirror ⊕ server findings) ──────────────────────────
 
+  // `@connection`/`@skill` sources come from the SELECTED AGENT's context —
+  // the workflow attaches nothing itself; it delegates to an equipped agent.
   const referenceSources = useMemo<ReferenceSources>(() => {
-    const connections = definition.context.mcpConnectionIds
+    const connections = (agentContext?.mcpConnectionIds ?? [])
       .map((id) => resources.connectionById.get(id))
       .filter((c): c is NonNullable<typeof c> => c !== undefined)
       .map((c) => ({ name: c.name, description: c.description }));
-    const skills = definition.context.skillIds
+    const skills = (agentContext?.skillIds ?? [])
       .map((id) => resources.skillById.get(id))
       .filter((s): s is NonNullable<typeof s> => s !== undefined)
       .map((s) => ({ name: s.name, description: s.description }));
     return { trigger: definition.trigger, connections, skills };
   }, [
     definition.trigger,
-    definition.context.mcpConnectionIds,
-    definition.context.skillIds,
+    agentContext,
     resources.connectionById,
     resources.skillById,
   ]);
@@ -213,84 +201,49 @@ export function useBuilderController(
       localDiagnostics({
         definition,
         sources: referenceSources,
-        agentPresetIds: agentPresets.map((p) => p.id),
-        allowedModelIds: allowlist
-          .filter((entry) => entry.enabled)
-          .map((entry) => entry.modelId),
+        agents,
+        // No agent selected ⇒ nothing to wait for (refs are then judged
+        // against empty sources, which is the truth).
+        contextResolved: definition.agentId === null || agentContext !== null,
       }),
-    [definition, referenceSources, agentPresets, allowlist],
+    [definition, referenceSources, agents, agentContext],
   );
 
-  // Only trust the dry-run while it reflects the SAVED draft (drop it the
-  // moment the user edits again — the local mirror covers the gap).
+  // Only trust server findings while they reflect the SAVED draft (drop them
+  // the moment the user edits again — the local mirror covers the gap).
   const diagnostics = useMemo(
-    () => (isDirty ? local : mergeDiagnostics(local, dryRun)),
-    [isDirty, local, dryRun],
+    () => (isDirty ? local : mergeDiagnostics(local, serverFindings)),
+    [isDirty, local, serverFindings],
   );
 
-  void modelPresets; // consumed by summaries in the rail, not here.
-
-  // ── publish ────────────────────────────────────────────────────────────────
+  // ── publish (validate + snapshot; instant) ────────────────────────────────
 
   const publish = useCallback(async (): Promise<PublishWorkflowResponse | null> => {
-    publishDispatch({ type: "start" });
+    setPublishState({ phase: "publishing", error: null });
     try {
       await flush();
       const response = await publishWorkflow.mutateAsync(workflow.id);
-      publishDispatch({ type: "received", response });
-
-      // A fresh build answers "building"/"pending" and finishes in the
-      // background — poll the version's build status until it is terminal so
-      // the rail flips from "Building…" to the ready/error chip.
-      let current = response;
-      let attempts = 0;
-      while (
-        (current.buildStatus === "building" || current.buildStatus === "pending") &&
-        attempts < BUILD_POLL_MAX_ATTEMPTS
-      ) {
-        attempts += 1;
-        await sleep(BUILD_POLL_INTERVAL_MS);
-        try {
-          const status = await fetchBuildStatus(
-            workspaceId,
-            workflow.id,
-            response.versionId,
-          );
-          current = {
-            ...response,
-            buildStatus: status.status,
-            buildError: status.error,
-          };
-          publishDispatch({ type: "received", response: current });
-        } catch {
-          // Transient poll failure — keep waiting for the build to settle.
-        }
-      }
-      return current;
+      setPublishState({ phase: "published", error: null });
+      return response;
     } catch (error) {
       const message =
         error instanceof ApiError
           ? error.message
           : "Publish failed. Try again.";
-      publishDispatch({ type: "failed", message });
+      setPublishState({ phase: "error", error: message });
       return null;
     }
-  }, [flush, publishWorkflow, workflow.id, workspaceId]);
+  }, [flush, publishWorkflow, workflow.id]);
 
   const resetPublish = useCallback(() => {
-    publishDispatch({ type: "reset" });
+    setPublishState(INITIAL_PUBLISH_STATE);
   }, []);
-
-  const focusPillar = useCallback(
-    (pillar: Pillar) => dispatch({ type: "focusPillar", pillar }),
-    [],
-  );
 
   // Publish is offered whenever there are no blocking errors (warnings ok).
   const canPublish = useMemo(
     () =>
       diagnostics.general.every((d) => d.severity !== "error") &&
-      Object.values(diagnostics.pillars).every((list) =>
+      Object.values(diagnostics.sections).every((list) =>
         list.every((d) => d.severity !== "error"),
       ) &&
       definition.instructions.markdown.trim().length > 0,
@@ -300,7 +253,6 @@ export function useBuilderController(
   return {
     state,
     dispatch,
-    focusPillar,
     saveStatus,
     isDirty,
     diagnostics,

@@ -68,6 +68,23 @@ describe("MetricsRegistry", () => {
     m.recordBuildCache(false);
     expect(m.buildCache()).toEqual({ hits: 2, misses: 1, hitRate: 2 / 3 });
   });
+
+  test("delivery counters tally settled outbound replies", () => {
+    const m = new MetricsRegistry();
+    m.recordDelivery("delivered");
+    m.recordDelivery("delivered");
+    m.recordDelivery("failed");
+    expect(m.deliveryCounts()).toEqual({ delivered: 2, failed: 1 });
+  });
+
+  test("schedule counters tally ticker mechanics", () => {
+    const m = new MetricsRegistry();
+    m.recordSchedule("due");
+    m.recordSchedule("dispatched");
+    m.recordSchedule("due");
+    m.recordSchedule("failed");
+    expect(m.scheduleCounts()).toEqual({ due: 2, dispatched: 1, failed: 1 });
+  });
 });
 
 describe("collectMetrics", () => {
@@ -104,8 +121,15 @@ describe("collectMetrics", () => {
       ],
     });
 
+    registry.recordDelivery("delivered");
+    registry.recordSchedule("dispatched");
+
     const snapshot = await collectMetrics({ registry, reader, now: NOW });
+    // Additive keys (deliveries/schedule) must not break shared-contract
+    // parsers — zod strips unknown object keys.
     expect(internalMetricsResponseSchema.safeParse(snapshot).success).toBe(true);
+    expect(snapshot.deliveries).toEqual({ delivered: 1, failed: 0 });
+    expect(snapshot.schedule).toEqual({ due: 0, dispatched: 1, failed: 0 });
     expect(snapshot.queueDepth).toBe(3);
     expect(snapshot.activeRuns).toBe(2);
     expect(snapshot.activeSessions).toBe(5);
@@ -128,6 +152,8 @@ describe("renderMetricsText", () => {
   test("emits Prometheus-style lines", async () => {
     const registry = new MetricsRegistry();
     registry.recordTrigger("manual", "received");
+    registry.recordDelivery("failed");
+    registry.recordSchedule("due");
     const snapshot = await collectMetrics({
       registry,
       reader: fakeReader({ runsByStatus: { ...emptyRunsByStatus(), queued: 4 } }),
@@ -136,6 +162,8 @@ describe("renderMetricsText", () => {
     expect(text).toContain("is_scheduler_queue_depth 4");
     expect(text).toContain('is_triggers_total{type="manual",outcome="received"} 1');
     expect(text).toContain('is_run_duration_ms_bucket{le="+Inf"}');
+    expect(text).toContain('is_deliveries_total{outcome="failed"} 1');
+    expect(text).toContain('is_schedule_fires_total{outcome="due"} 1');
   });
 });
 

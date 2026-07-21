@@ -82,6 +82,9 @@ function memoryStore(): MemoryStore {
         ? null
         : { status: store.runStatus, error: null };
     },
+    async markDelivery() {
+      return true; // delivery settlement is covered in delivery.test.ts
+    },
     async markSession(_sessionId, status) {
       store.sessionStatus = status;
     },
@@ -243,6 +246,7 @@ describe("tailRun", () => {
     const bus = new RunEventBus();
     const frames = collectFrames(bus, "run-1");
     const startIndexes: number[] = [];
+    const finishes: Array<{ status: string; lastAssistantMessage: string | null }> = [];
 
     const handle = tailRun({
       runId: "run-1",
@@ -254,8 +258,15 @@ describe("tailRun", () => {
       store,
       bus,
       maxWallClockMs: 5_000,
+      onFinish: (info) => finishes.push(info),
     });
     await handle.done;
+
+    // The finish hook carries the run's terminal reply (delivery seam): the
+    // fixture's message.completed(finishReason=stop) text.
+    expect(finishes).toEqual([
+      expect.objectContaining({ status: "succeeded", lastAssistantMessage: "pong" }),
+    ]);
 
     expect(startIndexes).toEqual([0]);
     expect(store.events.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -384,6 +395,7 @@ describe("tailRun", () => {
     const lines = await fixtureLines("mocked-turn-events.ndjson");
     const store = memoryStore();
     const bus = new RunEventBus();
+    const finishes: Array<{ lastAssistantMessage: string | null }> = [];
 
     const handle = tailRun({
       runId: "run-1",
@@ -394,12 +406,15 @@ describe("tailRun", () => {
       store,
       bus,
       maxWallClockMs: 60,
+      onFinish: (info) => finishes.push(info),
     });
     await handle.done;
 
     expect(store.runStatus).toBe("failed");
     expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
     expect(store.events).toHaveLength(2); // partial progress is preserved
+    // No stop-message was seen → nothing for the delivery seam.
+    expect(finishes[0]?.lastAssistantMessage).toBeNull();
   });
 
   test("leftover events of a previous turn are persisted but never classify the NEW run as terminal", async () => {
@@ -421,6 +436,7 @@ describe("tailRun", () => {
     ];
     const store = memoryStore();
     const bus = new RunEventBus();
+    const finishes: Array<{ lastAssistantMessage: string | null }> = [];
 
     const handle = tailRun({
       runId: "run-2",
@@ -429,6 +445,7 @@ describe("tailRun", () => {
       store,
       bus,
       maxWallClockMs: 5_000,
+      onFinish: (info) => finishes.push(info),
     });
     await handle.done;
 
@@ -438,6 +455,9 @@ describe("tailRun", () => {
     expect(store.events).toHaveLength(leftovers.length + ownTurn.length);
     expect(store.runStatus).toBe("succeeded");
     expect(store.sessionStatus).toBe("active");
+    // The leftover stop-message ("old") is NEVER this run's reply — only the
+    // run's own turn feeds the delivery seam.
+    expect(finishes[0]?.lastAssistantMessage).toBe("new");
   });
 
   test("a leftover input.requested does not park the NEW run (pending-input resets at its own turn)", async () => {

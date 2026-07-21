@@ -32,6 +32,9 @@ function scopeSegments(ref: ScopeRef): readonly string[] {
 }
 
 export interface SessionListFilters {
+  /** Restrict to one agent (the agent's chat history). */
+  agentId?: string;
+  /** Restrict to one workflow (trigger provenance). */
   workflowId?: string;
   status?: AgentSessionStatus;
 }
@@ -50,6 +53,7 @@ export const queryKeys = {
         "sessions",
         workspaceId,
         "list",
+        filters.agentId ?? null,
         filters.workflowId ?? null,
         filters.status ?? null,
       ] as const,
@@ -78,12 +82,11 @@ export const queryKeys = {
   modelAllowlist: {
     list: (workspaceId: string) => ["model-allowlist", workspaceId] as const,
   },
-  agentPresets: {
-    all: (workspaceId: string) => ["agent-presets", workspaceId] as const,
-    list: (workspaceId: string) =>
-      ["agent-presets", workspaceId, "list"] as const,
+  agents: {
+    all: (workspaceId: string) => ["agents", workspaceId] as const,
+    list: (workspaceId: string) => ["agents", workspaceId, "list"] as const,
     detail: (workspaceId: string, agentId: string) =>
-      ["agent-presets", workspaceId, "detail", agentId] as const,
+      ["agents", workspaceId, "detail", agentId] as const,
   },
   members: {
     list: (workspaceId: string) => ["members", workspaceId] as const,

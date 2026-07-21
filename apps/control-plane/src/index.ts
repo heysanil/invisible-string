@@ -6,8 +6,8 @@
  * workspace-scoping macro → Phase-1 runtime API (publish/build, sessions,
  * runs, SSE) when the runtime env is configured (see runtime/config.ts).
  *
- * The workflow compiler is injected (tests use stubs); the production
- * default is `compileWorkflow` — the adapter over @invisible-string/compiler
+ * The agent compiler is injected (tests use stubs); the production default
+ * is `compileAgent` — the adapter over @invisible-string/compiler
  * (build/compiler-adapter.ts).
  */
 import { cors } from "@elysiajs/cors";
@@ -28,8 +28,8 @@ import {
   createArtifactStore,
   type ArtifactStore,
 } from "./artifacts";
-import { compileWorkflow } from "./build/compiler-adapter";
-import { type CompileWorkflowFn } from "./build/compiler-contract";
+import { compileAgent } from "./build/compiler-adapter";
+import { type CompileAgentFn } from "./build/compiler-contract";
 import {
   BuildService,
   createDrizzleBuildStore,
@@ -41,6 +41,10 @@ import {
 } from "./build/steps";
 import { createWorldProvisioner, worldDatabaseExists } from "./build/world";
 import { RunEventBus } from "./runs/bus";
+import {
+  createDeliveryService,
+  createDrizzleDeliveryReader,
+} from "./runs/delivery";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { resourcesPlugin } from "./resources/plugin";
@@ -52,7 +56,8 @@ import { createRegistryClient, type RegistryClient } from "./resources/registry"
 import type { ResourceDeps } from "./resources/common";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
-import { runtimePlugin, type RuntimeDeps } from "./runtime/routes";
+import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
+import { createScheduleTicker, type ScheduleTicker } from "./runtime/schedule-ticker";
 import { createWorkerSweeper } from "./runtime/worker-sweeper";
 import {
   createWorkerClient,
@@ -99,7 +104,7 @@ export interface AppStack {
 /** Test seams for the runtime API (fakes for compiler/worker/steps/store). */
 export interface RuntimeOverrides {
   runtimeConfig?: RuntimeConfig;
-  compile?: CompileWorkflowFn;
+  compile?: CompileAgentFn;
   buildSteps?: BuildSteps;
   artifacts?: ArtifactStore;
   workerClient?: WorkerClient;
@@ -277,17 +282,40 @@ export function createRuntimeDeps(opts: {
   const runStore = createDrizzleRunStore(db);
   const bus = new RunEventBus();
   const metrics = new MetricsRegistry();
+  // Outbound reply delivery (Slack replies are posted by the CONTROL PLANE —
+  // agent artifacts are trigger-agnostic and never see a bot token). Shares
+  // the slackClient test override with the integrations plugin so a stubbed
+  // Slack server observes both ingress reactions and delivered replies.
+  const delivery = createDeliveryService({
+    reader: createDrizzleDeliveryReader(db),
+    runStore,
+    slackClient:
+      overrides?.slackClient ??
+      createSlackClient({
+        apiBaseUrl: env.SLACK_API_BASE_URL?.trim() || undefined,
+      }),
+    masterKey: config.encryptionMasterKey,
+    logger,
+    onOutcome: (outcome) => metrics.recordDelivery(outcome),
+  });
   const tailers = new RunTailerManager({
     store: runStore,
     bus,
     maxWallClockMs: runtime.maxRunWallClockMs,
     logger,
     // Feed the run-duration histogram from every completed run (parked
-    // `waiting` runs are not finished, so they are excluded).
-    onFinish: ({ status, durationMs }) => {
-      if (status === "succeeded" || status === "failed" || status === "canceled") {
-        metrics.recordRunDuration(durationMs);
+    // `waiting` runs are not finished, so they are excluded), then settle any
+    // pending outbound reply — deliver() no-ops for runs owing none and
+    // never throws into the tailer.
+    onFinish: (info) => {
+      if (
+        info.status === "succeeded" ||
+        info.status === "failed" ||
+        info.status === "canceled"
+      ) {
+        metrics.recordRunDuration(info.durationMs);
       }
+      void delivery.deliver(info);
     },
   });
 
@@ -299,11 +327,12 @@ export function createRuntimeDeps(opts: {
     artifacts,
     buildService,
     buildStore,
-    compile: overrides?.compile ?? compileWorkflow,
+    compile: overrides?.compile ?? compileAgent,
     workerClient,
     runStore,
     bus,
     tailers,
+    delivery,
     metrics,
     logger,
   };
@@ -335,7 +364,43 @@ export function createAppStack(
   const config = loadConfig(env);
   const logger = createLogger({ env });
   const dbHandle = createDb(config.databaseUrl);
-  const auth = createAuth(config, dbHandle.db);
+  // The seeded-workspace publish kick needs the runtime graph, which is built
+  // AFTER auth (workspace deps wrap the auth instance) — late-bind via a slot.
+  const runtimeSlot: { current: RuntimeDeps | null } = { current: null };
+  const auth = createAuth(config, dbHandle.db, {
+    // Fire-and-forget: a brand-new workspace publishes its seeded
+    // "General Purpose" agent so first chat needs no manual publish step
+    // (design §5.8). Runtime unconfigured ⇒ no-op; failures log-and-continue
+    // and never surface into the signup request.
+    onWorkspaceSeeded: (organizationId) => {
+      const runtime = runtimeSlot.current;
+      if (!runtime) return;
+      void publishAgentByName(runtime, organizationId, "General Purpose")
+        .then((result) => {
+          if (!result) {
+            logger.warn("workspace.seed_agent_publish_skipped", {
+              workspaceId: organizationId,
+              fields: { reason: "seed agent not found" },
+            });
+            return;
+          }
+          logger.info("workspace.seed_agent_published", {
+            workspaceId: organizationId,
+            fields: {
+              agentId: result.agentId,
+              versionId: result.versionId,
+              buildStatus: result.buildStatus,
+            },
+          });
+        })
+        .catch((error) => {
+          logger.warn("workspace.seed_agent_publish_failed", {
+            workspaceId: organizationId,
+            err: error,
+          });
+        });
+    },
+  });
   const workspaceDeps = createWorkspaceDeps(auth, dbHandle.db);
   const runtimeDeps = createRuntimeDeps({
     env,
@@ -345,6 +410,7 @@ export function createAppStack(
     logger,
     overrides: runtimeOverrides,
   });
+  runtimeSlot.current = runtimeDeps;
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,
@@ -355,7 +421,7 @@ export function createAppStack(
     workspaceDeps,
     auth,
     masterKey: config.encryptionMasterKey,
-    compile: runtimeOverrides?.compile ?? compileWorkflow,
+    compile: runtimeOverrides?.compile ?? compileAgent,
     // Skill attachments live in the same object store as build artifacts.
     artifacts: runtimeDeps?.artifacts,
     registry:
@@ -477,15 +543,26 @@ if (import.meta.main) {
     },
   });
 
+  let scheduleTicker: ScheduleTicker | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
-    // they hold cap slots and hang SSE streams forever otherwise.
-    void reconcileInterruptedRuns(stack.runtime)
-      .then(({ resumed, failed }) => {
-        if (resumed > 0 || failed > 0) {
+    // they hold cap slots and hang SSE streams forever otherwise. The
+    // delivery sweep settles TERMINAL runs stranded with a pending Slack
+    // reply: succeeded ones deliver late (at-least-once), failed/canceled
+    // ones settle the ledger (see runs/delivery.ts).
+    void reconcileInterruptedRuns(stack.runtime, {
+      delivery: stack.runtime.delivery,
+    })
+      .then(({ resumed, failed, deliveries }) => {
+        if (
+          resumed > 0 ||
+          failed > 0 ||
+          deliveries.delivered > 0 ||
+          deliveries.failed > 0
+        ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s)`,
-            fields: { resumed, failed },
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            fields: { resumed, failed, deliveries },
           });
         }
       })
@@ -501,6 +578,14 @@ if (import.meta.main) {
       log: (message) => logger.info("sweeper.pass", { msg: message }),
     });
     sweeper.start();
+    // Schedule ticker: fires due cron workflows from the control plane
+    // (compiled schedules are dead in production — spike finding 6). Safe
+    // multi-instance via per-trigger advisory locks; SCHEDULE_TICK_MS tunes
+    // the scan cadence.
+    scheduleTicker = createScheduleTicker(stack.runtime, {
+      tickMs: stack.runtime.runtime.scheduleTickMs,
+    });
+    scheduleTicker.start();
   }
 
   // Graceful shutdown (SIGTERM/SIGINT): stop accepting new connections, drain
@@ -514,8 +599,8 @@ if (import.meta.main) {
       fields: { signal },
     });
     stack.app.server?.stop();
-    void stack
-      .close()
+    void Promise.resolve(scheduleTicker?.stop())
+      .then(() => stack.close())
       .catch((error) => {
         logger.error("control-plane.shutdown_failed", { err: error });
       })

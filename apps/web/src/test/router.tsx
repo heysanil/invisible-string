@@ -29,7 +29,34 @@ export function renderWithRouter(ui: ReactNode) {
     path: "/workflows/$workflowId",
     component: () => null,
   });
-  const routeTree = rootRoute.addChildren([indexRoute, workflowRoute]);
+  const agentsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/agents",
+    component: () => null,
+  });
+  const agentRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/agents/$agentId",
+    component: () => null,
+  });
+  const contextRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/context",
+    component: () => null,
+  });
+  const chatRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/chat",
+    component: () => null,
+  });
+  const routeTree = rootRoute.addChildren([
+    indexRoute,
+    workflowRoute,
+    agentsRoute,
+    agentRoute,
+    contextRoute,
+    chatRoute,
+  ]);
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries: ["/"] }),

@@ -1,0 +1,46 @@
+---
+title: Workflows
+section: Concepts
+order: 21
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Workflows
+
+A workflow is a **standing delegation** — the way you'd tell an assistant
+"watch these Slack messages and prepare a report." It reads like a delegation
+memo in three parts: *when it happens* (**Trigger**), *who handles it*
+(**Agent**), and *what they should do* (**Instructions**).
+
+## Trigger
+
+When the workflow fires: manually with **Run now** in the workflow editor, a
+webhook, a form submission, a Slack event, or a schedule. (Manual runs land in
+Chat where you can follow them live — Chat itself starts conversations with
+Agents, not workflows.) Each kind is covered in
+[Triggers](/docs/building/triggers).
+
+## Agent
+
+Which published Agent handles the work. A workflow binds one Agent and attaches
+no extra context — the Agent's own equipment (connections, skills) is the
+context, and the instructions may reference it but never extend it.
+
+## Instructions
+
+What to do when the trigger fires, with `@trigger` references into the event's
+data. Instructions aren't compiled into anything: when the workflow fires, the
+platform renders them — `@trigger` references resolved against the live event —
+and delivers them to the Agent as its task message.
+
+## No builds
+
+Publishing a workflow builds nothing. Publish validates the delegation — the
+Agent exists and is published, the instructions are non-empty, every
+`@`-reference is legal — and snapshots it, so edits go live instantly. When the
+trigger fires, the platform starts a session against the Agent's current
+published version, and that session pins the exact agent version it started
+with, just like chat.
+
+<UnderConstruction />

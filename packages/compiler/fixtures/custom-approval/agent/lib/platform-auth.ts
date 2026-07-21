@@ -8,11 +8,11 @@ import {
  * Platform route auth: an HS256 JWT signed with this agent's
  * PLATFORM_JWT_SECRET (a per-version secret derived by the control plane),
  * minted by the control-plane dispatcher. The audience is bound to THIS
- * workflow version's hash, so tokens minted for other versions are rejected.
+ * agent version's hash, so tokens minted for other versions are rejected.
  * Claim constants mirror the platform contract (packages/shared).
  */
 export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "workflow-agent:05ee06aa0de29a1f23f02b9c2c275262f16ed6907f503a9b491905b2adcbe323";
+export const PLATFORM_JWT_AUDIENCE = "agent-version:9559700dc3167db035c9c05aab4d76d6831e6f0871ec710bd7f43777ed0a75a0";
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {

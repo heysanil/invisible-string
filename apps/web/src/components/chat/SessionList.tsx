@@ -1,7 +1,8 @@
 /**
- * Session list panel: recency-grouped sessions, each row = derived title +
- * workflow chip + live status dot + relative time. Client-side search filter
- * and a "New chat" capsule that opens the workflow picker.
+ * Session list panel: recency-grouped sessions, each row = agent-name title +
+ * live status dot + relative time (+ origin/workflow provenance chips for
+ * trigger-started sessions). Client-side search filter and a "New chat"
+ * capsule that opens the agent picker.
  */
 import { useMemo, useState } from "react";
 import { MessageCircle, Plus, Search } from "lucide-react";
@@ -21,8 +22,13 @@ import { Spinner } from "../ui/Spinner";
 import { Chip } from "./Chip";
 import { livenessOf, StatusDot } from "./StatusDot";
 
+// Satisfies React's controlled-input contract; the real handler rides
+// onInput, matching the shared Input primitive (React's onChange for text
+// inputs never fires under happy-dom).
+function noopChange() {}
+
 export interface SessionListItem extends AgentSessionSummaryDto {
-  /** Row title — the workflow name (the list DTO carries no first message). */
+  /** Row title — the agent name (the list DTO carries no first message). */
   title: string;
 }
 
@@ -59,7 +65,8 @@ export function SessionList({
     return sessions.filter(
       (session) =>
         session.title.toLowerCase().includes(q) ||
-        session.workflowName.toLowerCase().includes(q),
+        session.agentName.toLowerCase().includes(q) ||
+        (session.workflowName?.toLowerCase().includes(q) ?? false),
     );
   }, [sessions, query]);
 
@@ -97,7 +104,10 @@ export function SessionList({
           <Search size={14} aria-hidden="true" className="shrink-0 text-ink-4" />
           <input
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={noopChange}
+            onInput={(event) =>
+              setQuery((event.target as HTMLInputElement).value)
+            }
             placeholder="Search conversations"
             aria-label="Search conversations"
             className="min-w-0 flex-1 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-4"
@@ -123,7 +133,7 @@ export function SessionList({
           <EmptyState
             icon={MessageCircle}
             title="No conversations yet"
-            description="Start a session with a workflow and watch its runs stream here live."
+            description="Start a chat with an agent and watch its replies stream here live."
           />
         ) : filtered.length === 0 ? (
           <p className="px-4 py-8 text-center text-[13px] text-ink-4">
@@ -182,7 +192,7 @@ function SessionRow({
       <div className="flex items-center gap-2">
         <StatusDot state={liveness} />
         <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium text-ink">
-          {session.title || session.workflowName}
+          {session.title || session.agentName}
         </span>
         <span className="shrink-0 text-[11px] text-ink-4">
           {relativeTime(session.lastActivityAt, now)}
@@ -191,6 +201,9 @@ function SessionRow({
       {session.origin !== "chat" ? (
         <div className="flex items-center gap-1.5 pl-4">
           <Chip>{session.origin}</Chip>
+          {session.workflowName !== null ? (
+            <Chip title="Started by workflow">{session.workflowName}</Chip>
+          ) : null}
         </div>
       ) : null}
     </button>

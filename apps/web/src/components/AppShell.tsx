@@ -1,5 +1,5 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { Blocks, MessageCircle, Settings, Zap } from "lucide-react";
+import { Blocks, Bot, MessageCircle, Settings, Zap } from "lucide-react";
 import { useRef, type KeyboardEvent, type ReactNode } from "react";
 
 import { cn } from "../lib/cn";
@@ -8,6 +8,7 @@ import { Tooltip } from "./ui/Tooltip";
 
 export const NAV_ITEMS = [
   { to: "/chat", label: "Chat", icon: MessageCircle },
+  { to: "/agents", label: "Agents", icon: Bot },
   { to: "/workflows", label: "Workflows", icon: Zap },
   { to: "/context", label: "Context", icon: Blocks },
   { to: "/settings", label: "Settings", icon: Settings },

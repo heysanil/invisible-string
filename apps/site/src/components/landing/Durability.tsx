@@ -41,7 +41,7 @@ export function Durability() {
           align="left"
           eyebrow="Reliability"
           title="It finishes what it starts."
-          lede="Every step is saved the moment it happens. If the server running your workflow dies mid-run, another picks up exactly where it left off — no lost work, no starting over."
+          lede="Every step is saved the moment it happens. If the server running your agent dies mid-run, another picks up exactly where it left off — no lost work, no starting over."
         />
 
         <Reveal delay={0.1}>

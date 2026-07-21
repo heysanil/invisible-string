@@ -1,20 +1,20 @@
 /**
  * Adapter: control-plane `CompileRequest` → @invisible-string/compiler's pure
  * `compile(definition, deps)` (wired as the default `compile` in
- * createAppStack — this replaces the Integrate-stage placeholder).
+ * createAppStack).
  *
  * The control plane resolves rows by UUID and validates preset→model +
  * allowlist BEFORE this runs; the adapter's job is shaping row data into the
  * compiler's resolved-dependency types:
  * - names → slugs (lowercase kebab; must be unique per kind — `@refs` in
- *   instructions address connections/skills by slug)
+ *   personas address connections/skills by slug)
  * - `authConfigEncrypted` presence → `bearerToken` auth; the generated code
  *   reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar`), which MUST equal the
  *   env var the dispatcher injects (`mcpTokenEnvName(name)` in
  *   runtime/agent-env.ts) — asserted here so drift is a compile error, not a
  *   silently-unauthenticated agent
  * - db approval policy `{default, tools?}` → compiler ApprovalSpec
- * - typed CompileError → WorkflowCompileError (surfaces as a 422)
+ * - typed CompileError → AgentCompileError (surfaces as a 422)
  *
  * SECRETS DISCIPLINE: nothing here carries a secret VALUE — only env var
  * names ever reach the compiler/generated files.
@@ -33,13 +33,13 @@ import {
 
 import { BUILD_ENV_EPOCH } from "./steps";
 import {
-  WorkflowCompileError,
+  AgentCompileError,
   type CompileConnection,
   type CompileIssue,
   type CompileRequest,
   type CompileResult,
   type CompileSkill,
-  type CompileWorkflowFn,
+  type CompileAgentFn,
 } from "./compiler-contract";
 
 /** Lowercase-kebab slug from a human name (compiler SLUG grammar). */
@@ -85,7 +85,7 @@ function uniqueSlugs<T extends { name: string }>(
     bySlug.set(slug, row);
     result.set(row, slug);
   }
-  if (problems.length > 0) throw new WorkflowCompileError(problems);
+  if (problems.length > 0) throw new AgentCompileError(problems);
   return result;
 }
 
@@ -103,7 +103,7 @@ export function approvalSpecFromPolicy(
   if (policy === null) return { mode: "never" };
   const mode = policy.default ?? "never";
   if (typeof mode !== "string" || !DB_DECISIONS.has(mode)) {
-    throw new WorkflowCompileError([
+    throw new AgentCompileError([
       issue(
         `connections.${connectionName}.approvalPolicy.default`,
         `unknown approval default "${String(mode)}" (expected never|once|always)`,
@@ -115,7 +115,7 @@ export function approvalSpecFromPolicy(
     return { mode: mode as "never" | "once" | "always" };
   }
   if (typeof tools !== "object" || Array.isArray(tools)) {
-    throw new WorkflowCompileError([
+    throw new AgentCompileError([
       issue(`connections.${connectionName}.approvalPolicy.tools`, "tools must be an object"),
     ]);
   }
@@ -123,7 +123,7 @@ export function approvalSpecFromPolicy(
     if (decision === "always") return { tool, decision: "ask" as const };
     if (decision === "never") return { tool, decision: "allow" as const };
     if (decision === "deny") return { tool, decision: "deny" as const };
-    throw new WorkflowCompileError([
+    throw new AgentCompileError([
       issue(
         `connections.${connectionName}.approvalPolicy.tools.${tool}`,
         `unknown decision "${String(decision)}" (expected always|never|deny)`,
@@ -143,7 +143,7 @@ function toolFilterFrom(
   const allow = connection.toolAllow;
   const block = connection.toolBlock;
   if (allow && allow.length > 0 && block && block.length > 0) {
-    throw new WorkflowCompileError([
+    throw new AgentCompileError([
       issue(
         `connections.${connection.name}.tools`,
         "a connection may set a tool allowlist OR a blocklist, not both",
@@ -160,7 +160,7 @@ function resolveConnection(
   slug: string,
 ): ResolvedMcpConnection {
   if (!connection.url) {
-    throw new WorkflowCompileError([
+    throw new AgentCompileError([
       issue(`connections.${connection.name}.url`, "connection has no resolved MCP server URL"),
     ]);
   }
@@ -171,7 +171,7 @@ function resolveConnection(
       // Dispatcher (mcpTokenEnvName) and generated code (connectionTokenEnvVar)
       // must agree on the env var name — a mismatch would boot the agent
       // without its credential.
-      throw new WorkflowCompileError([
+      throw new AgentCompileError([
         issue(
           `connections.${connection.name}.auth`,
           `token env var mismatch: dispatcher injects ${connection.envTokenVar}, generated code reads ${canonical}`,
@@ -214,8 +214,8 @@ function resolveSkill(skill: CompileSkill, slug: string): ResolvedSkill {
   };
 }
 
-/** The production CompileWorkflowFn over @invisible-string/compiler. */
-export const compileWorkflow: CompileWorkflowFn = (
+/** The production CompileAgentFn over @invisible-string/compiler. */
+export const compileAgent: CompileAgentFn = (
   request: CompileRequest,
 ): CompileResult => {
   const connectionSlugs = uniqueSlugs("connection", request.connections);
@@ -234,15 +234,7 @@ export const compileWorkflow: CompileWorkflowFn = (
         modelId: request.model.modelId,
       },
       workspaceSlug: request.workspaceSlug,
-      workflowSlug: request.workflowSlug,
-      agentPreset: {
-        id: request.definition.agent.agentPresetId,
-        name: request.model.agentName,
-        persona: request.model.basePrompt,
-        // resolveModel already applied the definition's reasoning override;
-        // passing the RESOLVED value as the preset default is equivalent.
-        defaultReasoning: request.model.reasoning,
-      },
+      agentSlug: request.agentSlug,
       connections: request.connections.map((connection) =>
         resolveConnection(connection, connectionSlugs.get(connection)!),
       ),
@@ -256,7 +248,7 @@ export const compileWorkflow: CompileWorkflowFn = (
     };
   } catch (error) {
     if (error instanceof CompileError) {
-      throw new WorkflowCompileError([
+      throw new AgentCompileError([
         { message: `${error.code}: ${error.message}` },
       ]);
     }

@@ -1,8 +1,7 @@
 /**
- * Merged CONTEXT resources for the builder. MCP connections and skills exist
- * at BOTH workspace and user scope (spec §9); the context pillar attaches by
- * id across both, so the builder needs one flat list per kind tagged with its
- * scope.
+ * Merged context resources for the editors. MCP connections and skills exist
+ * at BOTH workspace and user scope (spec §9); agents attach them by id across
+ * both, so the editors need one flat list per kind tagged with its scope.
  */
 import { useMemo } from "react";
 import type {

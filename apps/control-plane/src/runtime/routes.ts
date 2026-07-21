@@ -1,17 +1,25 @@
 /**
- * Runtime API (docs/PLAN.md Phase 1 tasks 3+5+6):
+ * Runtime API — agent lifecycle + chat sessions + runs (agents-first
+ * redesign: the AGENT is the compile unit; workflows have no builds).
  *
- * - POST /workspaces/:workspaceId/workflows/:wfId/publish
- *     snapshot draft → immutable workflow_versions row (idempotent by content
- *     hash) → kick the build → respond with version + build status.
- * - POST /workspaces/:workspaceId/workflows/:wfId/versions/dry-run-compile
- *     compile the draft without persisting; structured errors for the builder.
- * - POST /workspaces/:workspaceId/workflows/:wfId/sessions {message}
- *     requires published+ready version → scheduler picks a live worker →
- *     ensure-agent (artifact URL + env) → POST eve session (platform JWT,
- *     202) → persist agent_sessions + runs → start the NDJSON tailer.
+ * - POST /workspaces/:workspaceId/agents/:agentId/publish
+ *     snapshot the agent's draft → immutable agent_versions row (idempotent
+ *     by content hash) → kick the build → respond with version + build status.
+ * - GET  /workspaces/:workspaceId/agents/:agentId/versions/:versionId/build
+ *     build status the agent editor polls after an async publish.
+ * - POST /workspaces/:workspaceId/agents/:agentId/dry-run-compile
+ *     compile the draft without persisting; structured errors for the editor.
+ * - POST /workspaces/:workspaceId/agents/:agentId/sessions {message}
+ *     chat: requires a published agent + ready build → scheduler picks a live
+ *     worker → ensure-agent (artifact URL + env) → POST eve session (platform
+ *     JWT, 202) → persist agent_sessions + runs → start the NDJSON tailer.
+ *     Chat sessions carry `workflowId: null`.
+ * - POST /workspaces/:workspaceId/workflows/:wfId/run {message?, data?}
+ *     manual "Run now": dispatch the workflow's published snapshot through
+ *     the shared trigger-dispatch path (renders the task message).
  * - POST /sessions/:id/messages {message} — continuation token, new run.
  * - GET  /sessions/:id — session + runs.
+ * - POST /runs/:id/input — HITL answer; POST /runs/:id/cancel — abort.
  * - GET  /runs/:id/stream — resumable SSE (Last-Event-ID) over run_events.
  *
  * OWNERSHIP (PLAN correction 8): eve does not enforce session ownership.
@@ -22,51 +30,51 @@
  */
 import { and, asc, count, eq, inArray, ne } from "drizzle-orm";
 import { Elysia } from "elysia";
+import { z } from "zod";
 import { schema } from "@invisible-string/db";
 import {
   createSessionRequestSchema,
   postMessageRequestSchema,
   runCancelRequestSchema,
   runInputRequestSchema,
+  runWorkflowRequestSchema,
+  type AgentDefinition,
   type AgentSessionDto,
   type BuildStatusResponse,
   type EveInputResponse,
-  type PublishWorkflowResponse,
+  type PublishAgentResponse,
   type RunCancelResponse,
   type RunDto,
   type Logger,
   type TriggerEvent,
-  type WorkflowDefinition,
   type MasterKey,
 } from "@invisible-string/shared";
 
 import type { Db, DbClient } from "../db";
 import type { ArtifactStore } from "../artifacts";
 import type { BuildService, BuildStore } from "../build/service";
-import { type CompileWorkflowFn } from "../build/compiler-contract";
+import { type CompileAgentFn } from "../build/compiler-contract";
 import { worldNameForHash, worldUrlFor } from "../build/world";
 import { RunEventBus } from "../runs/bus";
+import type { DeliveryService } from "../runs/delivery";
 import { createRunSseResponse, parseLastEventId } from "../runs/sse";
 import type { RunStore } from "../runs/store";
 import type { RunTailerManager } from "../runs/tailer";
+import { loadPublishedWorkflow } from "../resources/workflows";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
 import { buildAgentEnv, decryptMcpEnv } from "./agent-env";
 import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
 import {
   compileOrThrow,
   dryRunCompile,
-  parseDefinition,
+  parseAgentDefinition,
   resolveCompileInputs,
   type CompileServiceDeps,
 } from "./compile-service";
 import type { RuntimeConfig } from "./config";
+import { dispatchTriggerRun } from "./dispatch";
 import { errors, isRuntimeApiError, RuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
-import {
-  loadModelResolutionData,
-  resolveModel,
-  type ModelProvider,
-} from "./model-resolution";
 import {
   createDrizzleMetricsReader,
   metricsPlugin,
@@ -84,11 +92,17 @@ export interface RuntimeDeps {
   artifacts: ArtifactStore;
   buildService: BuildService;
   buildStore: BuildStore;
-  compile: CompileWorkflowFn;
+  compile: CompileAgentFn;
   workerClient: WorkerClient;
   runStore: RunStore;
   bus: RunEventBus;
   tailers: RunTailerManager;
+  /**
+   * Outbound reply delivery (runs/delivery.ts). Optional so focused test
+   * fixtures need not wire it; createRuntimeDeps always does — the tailer's
+   * onFinish hook and boot recovery (reconcileInterruptedRuns) consume it.
+   */
+  delivery?: DeliveryService;
   /** In-process fleet metrics (GET /internal/metrics). */
   metrics: MetricsRegistry;
   /** Structured, redaction-safe logger (correlation ids threaded per call). */
@@ -97,28 +111,28 @@ export interface RuntimeDeps {
 
 // ── row loading + ownership ─────────────────────────────────────────────────
 
-type WorkflowRow = typeof schema.workflows.$inferSelect;
-type VersionRow = typeof schema.workflowVersions.$inferSelect;
+type AgentRow = typeof schema.agents.$inferSelect;
+type AgentVersionRow = typeof schema.agentVersions.$inferSelect;
 type SessionRow = typeof schema.agentSessions.$inferSelect;
 type RunRow = typeof schema.runs.$inferSelect;
 
-async function loadWorkflowOwned(
+export async function loadAgentOwned(
   db: Db,
   organizationId: string,
-  workflowId: string,
-): Promise<WorkflowRow> {
+  agentId: string,
+): Promise<AgentRow> {
   const rows = await db
     .select()
-    .from(schema.workflows)
+    .from(schema.agents)
     .where(
       and(
-        eq(schema.workflows.id, workflowId),
-        eq(schema.workflows.organizationId, organizationId),
+        eq(schema.agents.id, agentId),
+        eq(schema.agents.organizationId, organizationId),
       ),
     )
     .limit(1);
   const row = rows[0];
-  if (!row) throw errors.workflowNotFound();
+  if (!row) throw errors.notFound("agent");
   return row;
 }
 
@@ -166,21 +180,10 @@ async function loadRunOwned(
   return row;
 }
 
-async function loadVersion(db: Db, versionId: string): Promise<VersionRow> {
-  const rows = await db
-    .select()
-    .from(schema.workflowVersions)
-    .where(eq(schema.workflowVersions.id, versionId))
-    .limit(1);
-  const row = rows[0];
-  if (!row) throw errors.workflowNotPublished();
-  return row;
-}
-
 // ── compile-input resolution ────────────────────────────────────────────────
 //
-// parseDefinition / resolveCompileInputs / compileOrThrow live in
-// compile-service.ts (shared with the Phase-2 builder draft validation).
+// parseAgentDefinition / resolveCompileInputs / compileOrThrow live in
+// compile-service.ts (shared with the agent editor's draft validation).
 
 /** The compile-service deps view of a RuntimeDeps (db + secrets + store). */
 function compileServiceDeps(deps: RuntimeDeps): CompileServiceDeps {
@@ -197,8 +200,9 @@ function compileServiceDeps(deps: RuntimeDeps): CompileServiceDeps {
 export function sessionDto(row: SessionRow): AgentSessionDto {
   return {
     id: row.id,
+    agentId: row.agentId,
+    agentVersionId: row.agentVersionId,
     workflowId: row.workflowId,
-    workflowVersionId: row.workflowVersionId,
     origin: row.origin,
     status: row.status,
     eveSessionId: row.eveSessionId,
@@ -213,6 +217,8 @@ export function runDto(row: RunRow): RunDto {
     agentSessionId: row.agentSessionId,
     status: row.status,
     triggerEvent: row.triggerEvent as unknown as TriggerEvent,
+    taskMessage: row.taskMessage,
+    deliveryStatus: row.deliveryStatus,
     eveRunId: row.eveRunId,
     error: row.error,
     startedAt: row.startedAt?.toISOString() ?? null,
@@ -232,79 +238,64 @@ function parseBody<T>(schemaLike: { safeParse(v: unknown): { success: boolean; d
 // ── dispatch helpers ────────────────────────────────────────────────────────
 
 /**
- * Provider that was COMPILED into a version. Stored on the row at publish;
- * legacy rows re-resolve from the immutable config snapshot.
+ * A published agent version whose build succeeded — everything a dispatch
+ * path needs: the immutable version row (content hash + compiled-in
+ * provider/model), its parsed AgentDefinition (context ids drive env
+ * assembly), and the artifact to ensure on a worker.
  */
-export async function providerForVersion(
-  db: Db,
-  organizationId: string,
-  version: VersionRow,
-  definition: WorkflowDefinition,
-): Promise<ModelProvider> {
-  if (version.modelProvider) return version.modelProvider;
-  const data = await loadModelResolutionData(
-    db,
-    organizationId,
-    definition.agent.agentPresetId,
-  );
-  return resolveModel(definition.agent, data).provider;
-}
-
-export interface ReadyVersion {
-  version: VersionRow;
-  definition: WorkflowDefinition;
+export interface ReadyAgentVersion {
+  version: AgentVersionRow;
+  definition: AgentDefinition;
   artifactKey: string;
 }
 
-/** The published version must have a succeeded build with its artifact. */
-export async function requireReadyVersion(
+/** The agent version must exist and have a succeeded build + artifact. */
+export async function requireReadyAgentVersion(
   deps: RuntimeDeps,
   versionId: string,
-): Promise<ReadyVersion> {
-  const version = await loadVersion(deps.db, versionId);
+): Promise<ReadyAgentVersion> {
+  const rows = await deps.db
+    .select()
+    .from(schema.agentVersions)
+    .where(eq(schema.agentVersions.id, versionId))
+    .limit(1);
+  const version = rows[0];
+  if (!version) throw errors.agentNotPublished();
   const build = await deps.buildStore.get(version.contentHash);
   if (!build || build.status !== "succeeded" || !build.artifactKey) {
     throw errors.versionNotReady(build?.status ?? version.buildStatus);
   }
-  const definition = parseDefinition(version.config);
+  const definition = parseAgentDefinition(version.definition);
   return { version, definition, artifactKey: build.artifactKey };
 }
 
 /**
- * ensure-agent on the picked worker with the version's full env. `extraEnv`
- * lets a caller inject additional non-secret-or-decrypted vars (e.g. the Slack
- * team bot token `SLACK_BOT_TOKEN` for a slack-triggered version) that ride
- * the same spawn-time-only env channel as provider keys and MCP tokens.
+ * ensure-agent on the picked worker with the version's full env. The provider
+ * key matches the version's COMPILED-IN provider (`agent_versions.model_provider`
+ * — resolved at publish; dispatch never re-resolves), and MCP secrets are
+ * decrypted from the definition's own context. Agent env is identical across
+ * every dispatch path — chat, workflow triggers, failover.
  */
 export async function ensureAgentOnWorker(
   deps: RuntimeDeps,
   worker: { id: string; address: string },
-  ready: ReadyVersion,
+  ready: ReadyAgentVersion,
   organizationId: string,
-  extraEnv?: Record<string, string>,
 ): Promise<void> {
+  void organizationId; // ownership was checked when the caller resolved the version
   const hash = ready.version.contentHash;
-  const provider = await providerForVersion(
-    deps.db,
-    organizationId,
-    ready.version,
-    ready.definition,
-  );
   const mcpEnv = await decryptMcpEnv(
     deps.db,
     deps.masterKey,
     ready.definition.context.mcpConnectionIds,
   );
-  const env = {
-    ...buildAgentEnv({
-      runtime: deps.runtime,
-      worldUrl: worldUrlFor(deps.runtime.worldDatabaseUrl, worldNameForHash(hash)),
-      contentHash: hash,
-      provider,
-      mcpEnv,
-    }),
-    ...(extraEnv ?? {}),
-  };
+  const env = buildAgentEnv({
+    runtime: deps.runtime,
+    worldUrl: worldUrlFor(deps.runtime.worldDatabaseUrl, worldNameForHash(hash)),
+    contentHash: hash,
+    provider: ready.version.modelProvider,
+    mcpEnv,
+  });
   try {
     await deps.workerClient.ensureAgent(worker.address, hash, {
       artifactUrl: deps.artifacts.presignGetUrl(ready.artifactKey),
@@ -368,6 +359,15 @@ export async function failDispatch(
   if (options.failSessionId) {
     await deps.runStore.markSession(options.failSessionId, "error");
   }
+  // Settle a pending outbound-reply marker NOW (slack-origin runs are born
+  // owing one): the tailer hook never fires for a run that failed before its
+  // tail started, and only the boot sweep would otherwise clear it. deliver()
+  // no-ops for runs owing nothing and never throws.
+  await deps.delivery?.deliver({
+    runId,
+    status: "failed",
+    lastAssistantMessage: null,
+  });
   if (isRuntimeApiError(error)) throw error;
   throw errors.workerDispatchFailed(detail);
 }
@@ -396,6 +396,143 @@ export async function countDispatchingRuns(
       ),
     );
   return rows[0]?.value ?? 0;
+}
+
+// ── agent publish (route + seeded-workspace kick share this core) ──────────
+
+/**
+ * Snapshot the agent's draft into an immutable `agent_versions` row
+ * (idempotent by content hash), point `agents.published_version_id` at it,
+ * and kick the build (single-flight per hash; cache hit = no-op).
+ */
+export async function publishAgent(
+  deps: RuntimeDeps,
+  organizationId: string,
+  agentId: string,
+): Promise<PublishAgentResponse> {
+  const agent = await loadAgentOwned(deps.db, organizationId, agentId);
+  const definition = parseAgentDefinition(agent.draft);
+  const inputs = await resolveCompileInputs(
+    compileServiceDeps(deps),
+    organizationId,
+    agent.runAsUserId,
+    definition,
+  );
+  const compiled = compileOrThrow(deps.compile, definition, inputs, agent.name);
+
+  // Idempotent by content hash: an existing version of this agent with
+  // the same hash is re-published, not duplicated. The unique index on
+  // (agent_id, content_hash) makes this race-proof — two concurrent
+  // publishes of the same draft (the seeded-workspace kick vs a user click,
+  // two browser tabs) resolve to ONE row: the loser's insert no-ops on
+  // conflict and re-selects the winner's row.
+  const existing = await deps.db
+    .select()
+    .from(schema.agentVersions)
+    .where(
+      and(
+        eq(schema.agentVersions.agentId, agent.id),
+        eq(schema.agentVersions.contentHash, compiled.hash),
+      ),
+    )
+    .limit(1);
+
+  let version = existing[0];
+  if (!version) {
+    const inserted = await deps.db
+      .insert(schema.agentVersions)
+      .values({
+        agentId: agent.id,
+        definition: definition as unknown as Record<string, unknown>,
+        contentHash: compiled.hash,
+        compilerVersion: compiled.compilerVersion,
+        eveVersion: compiled.eveVersion,
+        modelProvider: inputs.model.provider,
+        modelId: inputs.model.modelId,
+        buildStatus: "pending",
+      })
+      .onConflictDoNothing({
+        target: [schema.agentVersions.agentId, schema.agentVersions.contentHash],
+      })
+      .returning();
+    version = inserted[0];
+    if (!version) {
+      // Lost the race — adopt the concurrent publisher's row.
+      const winner = await deps.db
+        .select()
+        .from(schema.agentVersions)
+        .where(
+          and(
+            eq(schema.agentVersions.agentId, agent.id),
+            eq(schema.agentVersions.contentHash, compiled.hash),
+          ),
+        )
+        .limit(1);
+      version = winner[0]!;
+    }
+  }
+
+  await deps.db
+    .update(schema.agents)
+    .set({ publishedVersionId: version.id })
+    .where(eq(schema.agents.id, agent.id));
+
+  // Kick the build (single-flight per hash; cache hit = no-op). A
+  // cached-succeeded outcome resolves fast enough to await; a fresh
+  // build answers "building" immediately and progresses in background.
+  const pre = await deps.buildStore.get(compiled.hash);
+  const buildPromise = deps.buildService.ensureBuild(compiled.hash, compiled.files);
+  // Outcome is persisted; never leave the promise unhandled. Feed the
+  // build-cache hit-rate gauge from the resolved outcome (hit vs fresh).
+  buildPromise
+    .then((outcome) => deps.metrics.recordBuildCache(outcome.cached))
+    .catch(() => {});
+
+  let buildStatus: PublishAgentResponse["buildStatus"] = "building";
+  let cached = false;
+  let buildError: string | null = null;
+  if (pre?.status === "succeeded" && pre.artifactKey) {
+    const outcome = await buildPromise;
+    buildStatus = outcome.status;
+    cached = outcome.cached;
+    buildError = outcome.errorLog;
+  }
+
+  return {
+    agentId: agent.id,
+    versionId: version.id,
+    contentHash: compiled.hash,
+    buildStatus,
+    cached,
+    buildError,
+  };
+}
+
+/**
+ * Publish a workspace's agent by NAME — the onboarding kick: a freshly
+ * seeded workspace fire-and-forget-publishes its "General Purpose" agent so
+ * first chat needs no manual publish step (index.ts wires this behind the
+ * auth module's onWorkspaceSeeded hook). Null when no such agent exists —
+ * callers log-and-continue; they never fail the signup.
+ */
+export async function publishAgentByName(
+  deps: RuntimeDeps,
+  organizationId: string,
+  name: string,
+): Promise<PublishAgentResponse | null> {
+  const rows = await deps.db
+    .select({ id: schema.agents.id })
+    .from(schema.agents)
+    .where(
+      and(
+        eq(schema.agents.organizationId, organizationId),
+        eq(schema.agents.name, name),
+      ),
+    )
+    .limit(1);
+  const agent = rows[0];
+  if (!agent) return null;
+  return publishAgent(deps, organizationId, agent.id);
 }
 
 // ── the plugin ──────────────────────────────────────────────────────────────
@@ -434,149 +571,39 @@ export function runtimePlugin(deps: RuntimeDeps) {
       return undefined;
     })
 
-    // Workflows CRUD (list/get/create/update/delete) live in the Phase-2
-    // resources plugin (resources/workflows.ts); the runtime plugin owns the
+    // Agent CRUD (list/get/create/update/delete) lives in the resources
+    // plugin (resources/agents.ts); the runtime plugin owns the
     // compile/build/dispatch verbs below.
 
-    // ── publish ────────────────────────────────────────────────────────────
+    // ── agent publish ──────────────────────────────────────────────────────
     .post(
-      "/workspaces/:workspaceId/workflows/:wfId/publish",
-      async ({ workspace, params }): Promise<PublishWorkflowResponse> => {
-        const workflow = await loadWorkflowOwned(
-          db,
-          workspace.organizationId,
-          params.wfId,
-        );
-        const definition = parseDefinition(workflow.draft);
-        const inputs = await resolveCompileInputs(
-          compileServiceDeps(deps),
-          workspace.organizationId,
-          workflow.runAsUserId,
-          definition,
-        );
-        const compiled = compileOrThrow(deps.compile, definition, inputs, workflow.name);
-
-        // Idempotent by content hash: an existing version of this workflow
-        // with the same hash is re-published, not duplicated.
-        const existing = await db
-          .select()
-          .from(schema.workflowVersions)
-          .where(
-            and(
-              eq(schema.workflowVersions.workflowId, workflow.id),
-              eq(schema.workflowVersions.contentHash, compiled.hash),
-            ),
-          )
-          .limit(1);
-
-        let version = existing[0];
-        if (!version) {
-          const inserted = await db
-            .insert(schema.workflowVersions)
-            .values({
-              workflowId: workflow.id,
-              config: definition as unknown as Record<string, unknown>,
-              contentHash: compiled.hash,
-              compilerVersion: compiled.compilerVersion,
-              eveVersion: compiled.eveVersion,
-              modelProvider: inputs.model.provider,
-              modelId: inputs.model.modelId,
-              buildStatus: "pending",
-            })
-            .returning();
-          version = inserted[0]!;
-        }
-
-        await db
-          .update(schema.workflows)
-          .set({ publishedVersionId: version.id })
-          .where(eq(schema.workflows.id, workflow.id));
-
-        // Keep live Slack routing rules in sync with what was just published:
-        // the binding's rules (mentionOnly / channelId / DMs) are part of the
-        // workflow definition, so a republish must update the persisted
-        // trigger row — otherwise ingress keeps routing on stale rules. The
-        // integration (team) pointer is user-managed and preserved; nothing
-        // happens until the user has bound a team.
-        if (definition.trigger.type === "slack") {
-          const triggerRows = await db
-            .select({
-              id: schema.triggers.id,
-              type: schema.triggers.type,
-              integrationId: schema.triggers.integrationId,
-            })
-            .from(schema.triggers)
-            .where(eq(schema.triggers.workflowId, workflow.id))
-            .limit(1);
-          const triggerRow = triggerRows[0];
-          if (triggerRow?.type === "slack" && triggerRow.integrationId) {
-            await db
-              .update(schema.triggers)
-              .set({
-                binding: definition.trigger
-                  .binding as unknown as Record<string, unknown>,
-              })
-              .where(eq(schema.triggers.id, triggerRow.id));
-          }
-        }
-
-        // Kick the build (single-flight per hash; cache hit = no-op). A
-        // cached-succeeded outcome resolves fast enough to await; a fresh
-        // build answers "building" immediately and progresses in background.
-        const pre = await deps.buildStore.get(compiled.hash);
-        const buildPromise = deps.buildService.ensureBuild(
-          compiled.hash,
-          compiled.files,
-        );
-        // Outcome is persisted; never leave the promise unhandled. Feed the
-        // build-cache hit-rate gauge from the resolved outcome (hit vs fresh).
-        buildPromise
-          .then((outcome) => deps.metrics.recordBuildCache(outcome.cached))
-          .catch(() => {});
-
-        let buildStatus: PublishWorkflowResponse["buildStatus"] = "building";
-        let cached = false;
-        let buildError: string | null = null;
-        if (pre?.status === "succeeded" && pre.artifactKey) {
-          const outcome = await buildPromise;
-          buildStatus = outcome.status;
-          cached = outcome.cached;
-          buildError = outcome.errorLog;
-        }
-
-        return {
-          workflowId: workflow.id,
-          versionId: version.id,
-          contentHash: compiled.hash,
-          buildStatus,
-          cached,
-          buildError,
-        };
-      },
+      "/workspaces/:workspaceId/agents/:agentId/publish",
+      ({ workspace, params }): Promise<PublishAgentResponse> =>
+        publishAgent(deps, workspace.organizationId, params.agentId),
       { requireWorkspace: true },
     )
 
-    // ── build status (builder polls this after an async publish) ───────────
+    // ── build status (agent editor polls this after an async publish) ──────
     .get(
-      "/workspaces/:workspaceId/workflows/:wfId/versions/:versionId/build",
+      "/workspaces/:workspaceId/agents/:agentId/versions/:versionId/build",
       async ({ workspace, params }): Promise<BuildStatusResponse> => {
-        const workflow = await loadWorkflowOwned(
+        const agent = await loadAgentOwned(
           db,
           workspace.organizationId,
-          params.wfId,
+          params.agentId,
         );
         const rows = await db
           .select()
-          .from(schema.workflowVersions)
+          .from(schema.agentVersions)
           .where(
             and(
-              eq(schema.workflowVersions.id, params.versionId),
-              eq(schema.workflowVersions.workflowId, workflow.id),
+              eq(schema.agentVersions.id, params.versionId),
+              eq(schema.agentVersions.agentId, agent.id),
             ),
           )
           .limit(1);
         const version = rows[0];
-        if (!version) throw errors.notFound("workflow version");
+        if (!version) throw errors.notFound("agent_version");
         const build = await deps.buildStore.get(version.contentHash);
         return {
           status: build?.status ?? version.buildStatus,
@@ -586,43 +613,42 @@ export function runtimePlugin(deps: RuntimeDeps) {
       { requireWorkspace: true },
     )
 
-    // ── dry-run compile (builder UI) ───────────────────────────────────────
+    // ── dry-run compile (agent editor) ─────────────────────────────────────
     .post(
-      "/workspaces/:workspaceId/workflows/:wfId/versions/dry-run-compile",
+      "/workspaces/:workspaceId/agents/:agentId/dry-run-compile",
       async ({ workspace, params }) => {
-        const workflow = await loadWorkflowOwned(
+        const agent = await loadAgentOwned(
           db,
           workspace.organizationId,
-          params.wfId,
+          params.agentId,
         );
         // Shape errors, model/allowlist errors, and compile problems are all
         // the PAYLOAD of a dry run (`ok:false`), not a failed request — the
-        // builder renders them inline. dryRunCompile centralizes that.
-        const definition = parseDefinition(workflow.draft);
+        // editor renders them inline. dryRunCompile centralizes that.
         return dryRunCompile(
           compileServiceDeps(deps),
           workspace.organizationId,
-          workflow.runAsUserId,
-          workflow.name,
-          definition,
+          agent.runAsUserId,
+          agent.name,
+          agent.draft,
         );
       },
       { requireWorkspace: true },
     )
 
-    // ── create session ─────────────────────────────────────────────────────
+    // ── create chat session ────────────────────────────────────────────────
     .post(
-      "/workspaces/:workspaceId/workflows/:wfId/sessions",
+      "/workspaces/:workspaceId/agents/:agentId/sessions",
       async ({ workspace, params, body, set }) => {
         const { message } = parseBody(createSessionRequestSchema, body);
         deps.metrics.recordTrigger("manual", "received");
-        const workflow = await loadWorkflowOwned(
+        const agent = await loadAgentOwned(
           db,
           workspace.organizationId,
-          params.wfId,
+          params.agentId,
         );
-        if (!workflow.publishedVersionId) throw errors.workflowNotPublished();
-        const ready = await requireReadyVersion(deps, workflow.publishedVersionId);
+        if (!agent.publishedVersionId) throw errors.agentNotPublished();
+        const ready = await requireReadyAgentVersion(deps, agent.publishedVersionId);
         const { worker } = await selectWorker(db, {
           heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
           defaultMaxAgents: runtime.maxAgentsPerWorker,
@@ -634,8 +660,11 @@ export function runtimePlugin(deps: RuntimeDeps) {
           userId: workspace.userId,
           source: "chat",
         };
+        // Storage-only provenance (never sent to the agent — the chat message
+        // itself goes through verbatim as the eve session message).
         const triggerEvent: TriggerEvent = {
-          workflowId: workflow.id,
+          agentId: agent.id,
+          workflowId: null,
           triggerType: "manual",
           message,
           data: {},
@@ -657,8 +686,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
             .insert(schema.agentSessions)
             .values({
               organizationId: workspace.organizationId,
-              workflowId: workflow.id,
-              workflowVersionId: ready.version.id,
+              agentId: agent.id,
+              agentVersionId: ready.version.id,
+              workflowId: null,
               eveSessionId: null,
               continuationToken: null,
               origin: "chat",
@@ -714,6 +744,61 @@ export function runtimePlugin(deps: RuntimeDeps) {
       { requireWorkspace: true },
     )
 
+    // ── manual "Run now" (workflow test run) ───────────────────────────────
+    //
+    // Dispatches the workflow's PUBLISHED snapshot through the shared
+    // trigger-dispatch path — the instructions render into the task message
+    // exactly as a real trigger event would (`data` lets the test-run popover
+    // exercise webhook/form-shaped `@trigger.*` refs). Deliberately ignores
+    // `enabled` (that switch gates unattended trigger ingress; this is an
+    // explicit member action, like chat).
+    .post(
+      "/workspaces/:workspaceId/workflows/:wfId/run",
+      async ({ workspace, params, body, set }) => {
+        const input = parseBody(runWorkflowRequestSchema, body ?? {});
+        const { workflow, config, agentId } = await loadPublishedWorkflow(
+          db,
+          workspace.organizationId,
+          params.wfId,
+        );
+
+        // FLOATING binding: resolve the agent's CURRENT published version;
+        // the session/run rows pin the exact version used. A snapshot whose
+        // agent vanished (deleted despite RESTRICT / cross-workspace drift)
+        // surfaces as the typed workflow_agent_missing, not a bare 404.
+        const agent = await loadAgentOwned(
+          db,
+          workspace.organizationId,
+          agentId,
+        ).catch((error) => {
+          if (isRuntimeApiError(error) && error.status === 404) {
+            throw errors.workflowAgentMissing();
+          }
+          throw error;
+        });
+        if (!agent.publishedVersionId) throw errors.agentNotPublished();
+        const ready = await requireReadyAgentVersion(deps, agent.publishedVersionId);
+
+        const result = await dispatchTriggerRun(deps, {
+          organizationId: workspace.organizationId,
+          workflow: { id: workflow.id, snapshot: config },
+          agent: ready,
+          origin: "chat",
+          triggerType: "manual",
+          principal: {
+            workspaceId: workspace.organizationId,
+            userId: workspace.userId,
+            source: "manual",
+          },
+          ingress: { message: input.message ?? "", data: input.data ?? {} },
+        });
+
+        set.status = 201;
+        return { session: sessionDto(result.session), run: runDto(result.run) };
+      },
+      { requireWorkspace: true },
+    )
+
     // ── follow-up message ──────────────────────────────────────────────────
     .post(
       "/sessions/:sessionId/messages",
@@ -735,7 +820,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
         }
         const eveSessionId = session.eveSessionId;
         const continuationToken = session.continuationToken;
-        const ready = await requireReadyVersion(deps, session.workflowVersionId);
+        // Sessions pin their agent version at creation — a follow-up always
+        // rides the SAME compiled artifact, even after a republish.
+        const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
         const { worker } = await selectWorker(db, {
           heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
           defaultMaxAgents: runtime.maxAgentsPerWorker,
@@ -744,6 +831,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         });
 
         const triggerEvent: TriggerEvent = {
+          agentId: session.agentId,
           workflowId: session.workflowId,
           triggerType: "manual",
           message,
@@ -857,7 +945,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
         }
         const eveSessionId = session.eveSessionId;
         const continuationToken = session.continuationToken;
-        const ready = await requireReadyVersion(deps, session.workflowVersionId);
+        const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
         const { worker } = await selectWorker(db, {
           heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
           defaultMaxAgents: runtime.maxAgentsPerWorker,
@@ -996,6 +1084,14 @@ export function runtimePlugin(deps: RuntimeDeps) {
             status: "canceled",
             error: reason,
             completedAt: new Date(),
+          });
+          // No tail ⇒ no tailer hook ⇒ settle a pending outbound-reply
+          // marker here (canceled runs owe no reply; deliver() no-ops for
+          // runs owing nothing).
+          await deps.delivery?.deliver({
+            runId: run.id,
+            status: "canceled",
+            lastAssistantMessage: null,
           });
           deps.bus.publish(run.id, {
             kind: "status",

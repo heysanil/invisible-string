@@ -66,11 +66,11 @@ afterEach(() => {
   cleanup();
 });
 
-test("shell renders the glass dock with all four sections", async () => {
+test("shell renders the glass dock with all five sections", async () => {
   const { view } = renderAt("/chat");
   const nav = await view.findByRole("navigation", { name: "Primary" });
   expect(nav).toBeTruthy();
-  for (const label of ["Chat", "Workflows", "Context", "Settings"]) {
+  for (const label of ["Chat", "Agents", "Workflows", "Context", "Settings"]) {
     expect(view.getByRole("link", { name: label })).toBeTruthy();
   }
   expect(await view.findByText("No conversations yet")).toBeTruthy();
@@ -93,6 +93,13 @@ test("dock navigation switches routes", async () => {
   // The demo session's workspace is resolved, so the Workflows section
   // renders its real (empty) list rather than the no-workspace gate.
   expect(await view.findByText("No workflows yet")).toBeTruthy();
+
+  const agentsLink = view.getByRole("link", { name: "Agents" });
+  fireEvent.click(agentsLink);
+  await waitFor(() => {
+    expect(router.state.location.pathname).toBe("/agents");
+  });
+  expect(await view.findByText("No agents yet")).toBeTruthy();
 
   const contextLink = view.getByRole("link", { name: "Context" });
   fireEvent.click(contextLink);

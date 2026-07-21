@@ -1,7 +1,7 @@
 /**
  * Typed compile failures. The control plane maps these onto publish-time API
- * errors (build never starts when compile throws), and the builder UI mirrors
- * the same checks client-side as draft warnings.
+ * errors (build never starts when compile throws), and the agent editor
+ * mirrors the same checks client-side as draft warnings.
  *
  * Model resolution and allowlist validation happen in the CONTROL PLANE
  * before compile — compile() only re-checks INTERNAL consistency of the
@@ -10,15 +10,13 @@
  */
 
 export type CompileErrorCode =
-  /** The WorkflowDefinition failed schema validation. */
+  /** The AgentDefinition failed schema validation. */
   | "INVALID_DEFINITION"
-  /** A dependency field is malformed (model, preset, slugs, …). */
+  /** A dependency field is malformed (model, slugs, …). */
   | "INVALID_DEPS"
-  /** Instructions are empty — valid as a draft, unpublishable. */
-  | "EMPTY_INSTRUCTIONS"
-  /** deps.agentPreset does not match definition.agent.agentPresetId. */
-  | "AGENT_PRESET_MISMATCH"
-  /** definition.agent.modelId is set and differs from deps.resolvedModel. */
+  /** The persona is empty — valid as a draft, unpublishable. */
+  | "EMPTY_PERSONA"
+  /** definition.model.modelId is set and differs from deps.resolvedModel. */
   | "MODEL_MISMATCH"
   /** A definition.context.mcpConnectionIds entry has no resolved connection. */
   | "MISSING_CONNECTION"
@@ -40,12 +38,10 @@ export type CompileErrorCode =
   | "INVALID_APPROVAL"
   /** A packaged-skill file path escapes the skill directory or is empty. */
   | "INVALID_SKILL_FILE"
-  /** An @reference names an unknown connection/skill, or is bare. */
+  /** A persona @reference names an unknown connection/skill, or is bare. */
   | "UNRESOLVED_REFERENCE"
-  /** @trigger.* used with a trigger type that carries no dispatch data. */
-  | "TRIGGER_REF_NOT_ALLOWED"
-  /** @trigger.<key> does not match any form field key. */
-  | "TRIGGER_REF_UNKNOWN_FIELD";
+  /** @trigger.* in a persona — agents are trigger-agnostic. */
+  | "TRIGGER_REF_NOT_ALLOWED";
 
 export class CompileError extends Error {
   readonly code: CompileErrorCode;

@@ -1,6 +1,7 @@
 /**
  * Accessibility smoke: axe-core scans of the primary surfaces — /login,
- * /chat, /workflows/:id, /context, /settings — with no serious or critical
+ * /agents, /agents/:id (the agent editor), /workflows/:id (the delegation
+ * editor), /chat, /context, /settings — with no serious or critical
  * violations.
  *
  * color-contrast is disabled: axe computes contrast against the nearest opaque
@@ -11,7 +12,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
-import { openNewWorkflow } from "../support/builder.ts";
+import { openNewAgent, openNewWorkflow } from "../support/builder.ts";
 import { gotoSection } from "../support/authoring.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
 
@@ -37,13 +38,26 @@ test("no serious or critical a11y violations on the primary surfaces", async ({
   await expect(page.getByRole("button", { name: /^sign in$/i })).toBeVisible();
   await scan(page, "/login");
 
-  // Authenticate + seed a workspace, then build a workflow to scan the builder.
+  // Authenticate + seed a workspace.
   await signUpIntoWorkspace(page, "a11y");
-  const workflowName = "A11y workflow";
-  await openNewWorkflow(page, workflowName);
+
+  // ── /agents (card grid) ────────────────────────────────────────────────────
+  await gotoSection(page, "Agents");
   await expect(
-    page.getByRole("navigation", { name: "Workflow pillars" }),
+    page.getByRole("heading", { name: "Agents", level: 1 }),
   ).toBeVisible();
+  await scan(page, "/agents");
+
+  // ── /agents/:id (the agent editor) ─────────────────────────────────────────
+  await openNewAgent(page, "A11y agent");
+  await expect(
+    page.getByRole("navigation", { name: "Agent sections" }),
+  ).toBeVisible();
+  await scan(page, "/agents/:id");
+
+  // ── /workflows/:id (the three-section delegation editor) ───────────────────
+  await openNewWorkflow(page, "A11y workflow");
+  await expect(page.getByRole("heading", { name: "Trigger", level: 2 })).toBeVisible();
   await scan(page, "/workflows/:id");
 
   // ── /chat ──────────────────────────────────────────────────────────────────

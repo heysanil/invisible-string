@@ -35,7 +35,7 @@ export interface NamedResource {
 
 export interface ReferenceSources {
   trigger: TriggerConfig;
-  /** Attached MCP connections (the workflow's context pillar, resolved). */
+  /** Attached MCP connections (the selected agent's context, resolved). */
   connections: readonly NamedResource[];
   /** Attached skills. */
   skills: readonly NamedResource[];

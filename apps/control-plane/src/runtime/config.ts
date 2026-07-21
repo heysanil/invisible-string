@@ -15,8 +15,8 @@ import type { ArtifactStoreConfig } from "../artifacts";
 export interface RuntimeConfig {
   /**
    * World Postgres SERVER url (WORLD_DATABASE_URL). Its database is only used
-   * as the maintenance connection for provisioning; each workflow version
-   * gets its own isolated world database `ws_v_<hash12>` (see build/world.ts
+   * as the maintenance connection for provisioning; each agent version
+   * gets its own isolated world database `ag_v_<hash12>` (see build/world.ts
    * for why database-per-version, not search_path schema).
    */
   worldDatabaseUrl: string;
@@ -61,6 +61,12 @@ export interface RuntimeConfig {
    * their sessions' affinity, and reschedules interrupted runs elsewhere.
    */
   workerSweepIntervalMs: number;
+  /**
+   * Schedule-ticker cadence (SCHEDULE_TICK_MS, default 30s — keep in sync
+   * with runtime/schedule-ticker.ts DEFAULT_SCHEDULE_TICK_MS): how often the
+   * control plane scans for due cron triggers. Tests shrink it.
+   */
+  scheduleTickMs: number;
   /** Shared npm cache dir for agent-project installs (NPM_CACHE_DIR). */
   npmCacheDir: string;
   /**
@@ -172,6 +178,12 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     workerHeartbeatTtlMs,
     problems,
   );
+  const scheduleTickMs = parsePositiveInt(
+    env.SCHEDULE_TICK_MS,
+    "SCHEDULE_TICK_MS",
+    30_000,
+    problems,
+  );
   const sseHeartbeatMs = parsePositiveInt(
     env.SSE_HEARTBEAT_MS,
     "SSE_HEARTBEAT_MS",
@@ -219,6 +231,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     workerHeartbeatTtlMs,
     maxAgentsPerWorker,
     workerSweepIntervalMs,
+    scheduleTickMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",

@@ -1,16 +1,18 @@
 /**
- * TriggerEvent — the ONE normalized trigger envelope (INITIAL-SPEC.md §8).
+ * TriggerEvent — the ONE normalized trigger envelope, persisted on
+ * `runs.trigger_event` as a STORAGE/PROVENANCE record. It is NEVER sent to
+ * agents: compiled agents expose only eve's default channel, and what they
+ * receive is the rendered task message (`renderTaskMessage` in render.ts).
  *
  * Every trigger type is pluggable behind this shape:
  * - Control-plane trigger ADAPTERS (form, webhook, slack, …) convert raw
  *   inbound platform events into a `TriggerEvent`. Raw platform parsing lives
- *   ONLY in adapters, never in compiled agents.
- * - The dispatcher POSTs the envelope (platform-JWT authenticated) to the
- *   compiled agent's matching trigger channel, authored under
- *   `/eve/v1/platform/<trigger>` (locked route convention — spike/REPORT.md
- *   finding 7; rides the proxy's forwarded `/eve/` prefix).
- * - Instruction `@trigger.*` references resolve against `data` at dispatch
- *   time (see `parseReferences` in workflow-definition.ts).
+ *   ONLY in adapters, never anywhere downstream.
+ * - The dispatcher renders the workflow's instructions against this
+ *   envelope's `message`/`data`/`context` (instruction `@trigger.*` refs
+ *   resolve against `data` — `parseReferences` in workflow-config.ts), sends
+ *   THAT string to the agent's eve session, and stores the envelope on the
+ *   run row for audit/provenance.
  */
 import { z } from "zod";
 
@@ -84,9 +86,12 @@ export const triggerFileSchema = z.object({
 
 export type TriggerFile = z.infer<typeof triggerFileSchema>;
 
-/** The normalized trigger envelope, exactly per INITIAL-SPEC.md §8. */
+/** The normalized trigger envelope (spec §8 shape, agents-first keys). */
 export const triggerEventSchema = z.object({
-  workflowId: z.string().min(1),
+  /** Agent whose published version handled the run. */
+  agentId: z.uuid(),
+  /** Workflow that delegated the run; null for direct chat sessions. */
+  workflowId: z.uuid().nullable(),
   /** Open string union — see {@link TriggerType}. */
   triggerType: z.string().min(1),
   /** Model-facing prompt / primary input. */
@@ -98,16 +103,16 @@ export const triggerEventSchema = z.object({
   /** Maps conversational/threaded triggers onto an existing agent session. */
   continuationToken: z.string().min(1).optional(),
   /**
-   * Extra blocks injected before the model sees `message`. NOT a `send()`
-   * option (PLAN correction 2): the eve channel injects these via its
-   * `onMessage` hook (`return { auth, context: [...] }`); custom trigger
-   * channels fold them into the message content.
+   * Extra platform context blocks. `renderTaskMessage` folds them into the
+   * task message's `<trigger-context>` block after the resolved trigger
+   * values.
    */
   context: z.array(z.string()).optional(),
 });
 
 export interface TriggerEvent {
-  workflowId: string;
+  agentId: string;
+  workflowId: string | null;
   triggerType: TriggerType;
   message: string;
   data: Record<string, unknown>;

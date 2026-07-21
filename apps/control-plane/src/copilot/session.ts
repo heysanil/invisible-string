@@ -20,6 +20,7 @@ import type { ModelMessage } from "ai";
 import type {
   CopilotMutationOutcome,
   CopilotServerFrame,
+  CopilotSurface,
 } from "@invisible-string/shared";
 
 import type { CopilotConfig } from "./config";
@@ -28,7 +29,7 @@ import { buildSystemPrompt, buildToolSpecs } from "./prompt";
 import type { CopilotTransport } from "./transport";
 import {
   applyAcceptedMutation,
-  draftContextState,
+  draftStateFor,
   validateMutation,
 } from "./validate";
 
@@ -110,6 +111,8 @@ export class CopilotSession {
    * Resolves with the model output tokens the turn consumed (budget metering).
    */
   async runTurn(opts: {
+    /** Which editor the turn is about — selects prompt, toolset, validation. */
+    surface: CopilotSurface;
     message: string;
     draft: Record<string, unknown>;
     inventory: WorkspaceInventory;
@@ -133,13 +136,15 @@ export class CopilotSession {
     this.abortController = abortController;
 
     const system = buildSystemPrompt({
+      surface: opts.surface,
       draft: opts.draft,
       inventory: opts.inventory,
     });
-    const tools = buildToolSpecs();
-    // Draft state the semantic checks run against — updated as the user
-    // accepts proposals so later calls in the same turn see their effect.
-    const draftState = draftContextState(opts.draft);
+    const tools = buildToolSpecs(opts.surface);
+    // Draft state the semantic checks run against (carries the surface) —
+    // updated as the user accepts proposals so later calls in the same turn
+    // see their effect.
+    const draftState = draftStateFor(opts.surface, opts.draft);
     this.messages.push({ role: "user", content: opts.message });
 
     let outputTokens = 0;

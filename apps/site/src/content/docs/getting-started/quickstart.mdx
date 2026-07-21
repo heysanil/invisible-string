@@ -8,27 +8,35 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Quickstart
 
-Assemble a workflow, publish it, and watch it compile into a running agent —
+Build your first agent, publish it, chat with it, and put it on standing duty —
 end to end in a few minutes.
 
-## Assemble the four pillars
+## Build your first agent
 
-Open the builder and fill in each pillar: pick a trigger, attach context, choose
-a model preset, and write the instructions. Status chips flip to a checkmark as
-each pillar becomes valid, and a debounced dry-run compile surfaces diagnostics
-directly on the pillar cards as you go.
+Open **Agents** and create one: write the persona (who it is and how it works),
+pick a model preset, and equip its context — MCP connections and skills from
+your workspace's library. The editor autosaves as you go, and the docked
+copilot can draft any of it from a plain-language description.
 
 ## Publish
 
-Press **Publish**. The platform compiles your configuration, runs the build,
-stores the tarball by content hash, and reports back **Published and built.** —
-your workflow now has a real, version-pinned agent artifact behind it.
+Press **Publish**. The platform compiles the Agent's definition, runs the
+build, stores the artifact by content hash, and reports back **Published and
+built.** — your Agent now has a real, version-pinned artifact behind it.
 
-## Run it
+## Chat with it
 
-Fire the workflow from chat or its trigger. The run streams live over resumable
-SSE — working blocks, the streamed reply, inline human-in-the-loop approvals —
-and because durability is Postgres-backed, a worker dying mid-run resumes on any
-live worker instead of losing the run.
+Start a chat and hand it work. The session binds your Agent and streams each
+run live over resumable SSE — working blocks, the streamed reply, inline
+human-in-the-loop approvals — and because durability is Postgres-backed, a
+worker dying mid-run resumes on any live worker instead of losing the run.
+
+## Delegate standing work
+
+Create a **workflow**: pick a trigger (webhook, form, Slack, or a schedule),
+bind your published Agent, and write instructions with `@trigger` references
+into the event's data. Publishing is instant — workflows build nothing — and
+from then on, every time the trigger fires, the platform delivers the event and
+your instructions to the Agent as its task.
 
 <UnderConstruction />

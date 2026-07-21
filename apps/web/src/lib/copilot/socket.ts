@@ -1,8 +1,10 @@
 /**
- * Copilot WebSocket client — one socket per open builder, typed frames from
- * @invisible-string/shared, exponential-backoff reconnect, torn down on
- * dispose. The WebSocket constructor is injectable so tests can drive a
- * scripted fake without a network.
+ * Copilot WebSocket client — one socket per open dock (workflow OR agent
+ * editor; the socket is per-WORKSPACE, each `user_message` frame names its
+ * surface + entity), typed frames from @invisible-string/shared,
+ * exponential-backoff reconnect, torn down on dispose. The WebSocket
+ * constructor is injectable so tests can drive a scripted fake without a
+ * network.
  */
 import {
   parseCopilotServerFrame,
@@ -30,7 +32,6 @@ export type WebSocketFactory = (url: string) => WebSocketLike;
 
 export interface CopilotSocketOptions {
   workspaceId: string;
-  workflowId: string;
   onFrame: (frame: CopilotServerFrame) => void;
   onStatus?: (status: CopilotSocketStatus) => void;
   createWebSocket?: WebSocketFactory;
@@ -43,12 +44,10 @@ const WS_OPEN = 1;
 
 export function copilotSocketUrl(
   workspaceId: string,
-  workflowId: string,
   base: string = API_BASE_URL,
 ): string {
   const url = new URL(`/workspaces/${workspaceId}/copilot`, base);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("workflowId", workflowId);
   return url.toString();
 }
 
@@ -62,7 +61,7 @@ export class CopilotSocket {
 
   constructor(options: CopilotSocketOptions) {
     this.options = options;
-    this.url = copilotSocketUrl(options.workspaceId, options.workflowId);
+    this.url = copilotSocketUrl(options.workspaceId);
     this.connect();
   }
 
@@ -132,7 +131,7 @@ export class CopilotSocket {
     const ws = this.ws;
     this.ws = null;
     try {
-      ws?.close(1000, "builder closed");
+      ws?.close(1000, "copilot closed");
     } catch {
       // already closed
     }

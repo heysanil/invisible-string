@@ -1,41 +1,53 @@
 /**
- * Copilot proposal → builder-action mapping and card descriptions. Every
- * proposal tool must land on the SAME reducer paths manual edits use.
+ * Workflow-surface copilot adapter: proposal → builder-action mapping, card
+ * descriptions, and the adapter factory. Every proposal tool must land on
+ * the SAME reducer paths manual edits use.
  */
 import { describe, expect, test } from "bun:test";
-import type { CopilotProposal, WorkflowDefinition } from "@invisible-string/shared";
+import type {
+  AgentSummaryDto,
+  CopilotProposal,
+  WorkflowConfig,
+} from "@invisible-string/shared";
 
-import { builderReducer, initBuilderState } from "../lib/builder/model";
-import type { ContextResources } from "../lib/builder/resources";
+import { builderReducer, initBuilderState, type BuilderAction } from "../lib/builder/model";
 import {
-  describeProposal,
-  pillarOfProposal,
+  describeWorkflowProposal,
+  isWorkflowProposal,
   proposalToActions,
+  sectionOfProposal,
+  unsupportedProposalDescription,
+  workflowCopilotAdapter,
 } from "../lib/copilot/mutations";
 
-const PRESET_ID = "a1111111-1111-4111-8111-111111111111";
-const OTHER_PRESET_ID = "a2222222-2222-4222-8222-222222222222";
+const AGENT_ID = "a1111111-1111-4111-8111-111111111111";
+const OTHER_AGENT_ID = "a2222222-2222-4222-8222-222222222222";
+const WORKFLOW_ID = "wf-1";
 
-const definition: WorkflowDefinition = {
+const definition: WorkflowConfig = {
   trigger: { type: "manual" },
-  context: { mcpConnectionIds: ["conn-1"], skillIds: [] },
-  agent: { agentPresetId: PRESET_ID },
+  agentId: AGENT_ID,
   instructions: { markdown: "Old instructions" },
 };
 
-const resources = {
-  connections: [],
-  skills: [],
-  connectionById: new Map([["conn-1", { id: "conn-1", name: "zendesk" }]]),
-  skillById: new Map([["skill-1", { id: "skill-1", name: "triage" }]]),
-  isPending: false,
-  isError: false,
-} as unknown as ContextResources;
+function agentSummary(id: string, name: string): AgentSummaryDto {
+  return {
+    id,
+    name,
+    description: null,
+    runAsUserId: "user-1",
+    publishedVersionId: "v-1",
+    publishedAt: "2026-07-01T00:00:00.000Z",
+    buildStatus: "succeeded",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    updatedAt: "2026-07-01T00:00:00.000Z",
+  };
+}
 
-const agentPresets = [
-  { id: PRESET_ID, name: "General" },
-  { id: OTHER_PRESET_ID, name: "Support Agent" },
-] as never[];
+const agents = [
+  agentSummary(AGENT_ID, "General assistant"),
+  agentSummary(OTHER_AGENT_ID, "Support triager"),
+];
 
 function proposal<T extends CopilotProposal["tool"]>(
   tool: T,
@@ -46,156 +58,177 @@ function proposal<T extends CopilotProposal["tool"]>(
 
 describe("proposalToActions", () => {
   test("setTrigger replaces the whole trigger through the reducer", () => {
-    const [action] = proposalToActions(
-      proposal("setTrigger", {
-        trigger: {
-          type: "slack",
-          binding: { mentionOnly: true, includeDirectMessages: false },
-        },
-      }),
-    );
+    const p = proposal("setTrigger", {
+      trigger: {
+        type: "slack",
+        binding: { mentionOnly: true, includeDirectMessages: false },
+      },
+    });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    const [action] = proposalToActions(p);
     const next = builderReducer(initBuilderState(definition), action!);
     expect(next.definition.trigger.type).toBe("slack");
     // Draft-preserving: previous manual trigger survives in triggerDrafts.
     expect(next.triggerDrafts.manual).toEqual({ type: "manual" });
   });
 
-  test("addContext maps by kind", () => {
-    expect(
-      proposalToActions(proposal("addContext", { kind: "connection", id: "c" })),
-    ).toEqual([{ type: "addConnection", id: "c" }]);
-    expect(
-      proposalToActions(proposal("addContext", { kind: "skill", id: "s" })),
-    ).toEqual([{ type: "addSkill", id: "s" }]);
-  });
-
-  test("removeContext maps by kind", () => {
-    expect(
-      proposalToActions(
-        proposal("removeContext", { kind: "connection", id: "conn-1" }),
-      ),
-    ).toEqual([{ type: "removeConnection", id: "conn-1" }]);
-    expect(
-      proposalToActions(proposal("removeContext", { kind: "skill", id: "s" })),
-    ).toEqual([{ type: "removeSkill", id: "s" }]);
-  });
-
-  test("setAgent fans out to one action per provided field", () => {
-    expect(proposalToActions(proposal("setAgent", { agentPresetId: "x" }))).toEqual([
-      { type: "setAgentPreset", id: "x" },
+  test("setAgent maps onto setAgentId", () => {
+    const p = proposal("setAgent", { agentId: OTHER_AGENT_ID });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    expect(proposalToActions(p)).toEqual([
+      { type: "setAgentId", id: OTHER_AGENT_ID },
     ]);
-    expect(
-      proposalToActions(
-        proposal("setAgent", {
-          agentPresetId: "x",
-          reasoning: "high",
-          modelId: "anthropic/claude-sonnet-5",
-        }),
-      ),
-    ).toEqual([
-      { type: "setAgentPreset", id: "x" },
-      { type: "setReasoning", reasoning: "high" },
-      { type: "setModelId", modelId: "anthropic/claude-sonnet-5" },
+    const next = builderReducer(
+      initBuilderState(definition),
+      proposalToActions(p)[0]!,
+    );
+    expect(next.definition.agentId).toBe(OTHER_AGENT_ID);
+  });
+
+  test("setInstructions maps onto the existing action", () => {
+    const p = proposal("setInstructions", { markdown: "New" });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    expect(proposalToActions(p)).toEqual([
+      { type: "setInstructions", markdown: "New" },
     ]);
   });
 
-  test("setModelPreset / setInstructions map onto existing actions", () => {
-    expect(proposalToActions(proposal("setModelPreset", { slug: "quick" }))).toEqual([
-      { type: "setModelPreset", preset: "quick" },
-    ]);
-    expect(
-      proposalToActions(proposal("setInstructions", { markdown: "New" })),
-    ).toEqual([{ type: "setInstructions", markdown: "New" }]);
+  test("sectionOfProposal routes every tool to its section", () => {
+    const cases = [
+      [proposal("setTrigger", { trigger: { type: "manual" } }), "trigger"],
+      [proposal("setAgent", { agentId: AGENT_ID }), "agent"],
+      [proposal("setInstructions", { markdown: "x" }), "instructions"],
+    ] as const;
+    for (const [p, section] of cases) {
+      if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+      expect(sectionOfProposal(p)).toBe(section);
+    }
   });
 
-  test("pillarOfProposal routes every tool to its pillar", () => {
-    expect(pillarOfProposal(proposal("setTrigger", { trigger: { type: "manual" } }))).toBe(
-      "trigger",
+  test("isWorkflowProposal rejects agent-surface tools", () => {
+    expect(isWorkflowProposal(proposal("setPersona", { markdown: "x" }))).toBe(
+      false,
     );
     expect(
-      pillarOfProposal(proposal("addContext", { kind: "skill", id: "s" })),
-    ).toBe("context");
-    expect(pillarOfProposal(proposal("setAgent", { reasoning: "low" }))).toBe("agent");
-    expect(pillarOfProposal(proposal("setModelPreset", { slug: "quick" }))).toBe(
-      "agent",
-    );
-    expect(
-      pillarOfProposal(proposal("setInstructions", { markdown: "x" })),
-    ).toBe("instructions");
+      isWorkflowProposal(
+        proposal("addContext", { kind: "skill", id: AGENT_ID }),
+      ),
+    ).toBe(false);
   });
 });
 
-describe("describeProposal", () => {
+describe("describeWorkflowProposal", () => {
   test("setTrigger names the new trigger and shows before→after", () => {
-    const d = describeProposal(
-      proposal("setTrigger", {
-        trigger: {
-          type: "slack",
-          binding: {
-            mentionOnly: true,
-            includeDirectMessages: false,
-            channelId: "support",
-          },
+    const p = proposal("setTrigger", {
+      trigger: {
+        type: "slack",
+        binding: {
+          mentionOnly: true,
+          includeDirectMessages: false,
+          channelId: "support",
         },
-      }),
-      definition,
-      resources,
-      agentPresets,
-      [],
-    );
-    expect(d.pillar).toBe("trigger");
+      },
+    });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    const d = describeWorkflowProposal(p, definition, agents);
     expect(d.title).toContain("Slack");
     expect(d.title).toContain("#support");
     expect(d.before).toContain("Manual");
+    expect(d.diff).toBeUndefined();
   });
 
-  test("addContext resolves the resource name", () => {
-    const d = describeProposal(
-      proposal("addContext", { kind: "skill", id: "skill-1" }),
-      definition,
-      resources,
-      agentPresets,
-      [],
-    );
-    expect(d.title).toBe("Add skill: triage");
-    expect(d.after).toContain("triage");
+  test("setAgent resolves names from the inventory", () => {
+    const p = proposal("setAgent", { agentId: OTHER_AGENT_ID });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    const d = describeWorkflowProposal(p, definition, agents);
+    expect(d.title).toBe("Set agent: Support triager");
+    expect(d.before).toBe("General assistant");
+    expect(d.after).toBe("Support triager");
   });
 
-  test("removeContext shows the shrinking count", () => {
-    const d = describeProposal(
-      proposal("removeContext", { kind: "connection", id: "conn-1" }),
-      definition,
-      resources,
-      agentPresets,
-      [],
-    );
-    expect(d.title).toBe("Remove connection: zendesk");
-    expect(d.after).toContain("0 sources");
+  test("setAgent falls back to the raw id when the inventory misses", () => {
+    const p = proposal("setAgent", { agentId: OTHER_AGENT_ID });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    const d = describeWorkflowProposal(p, { ...definition, agentId: null }, []);
+    expect(d.title).toBe(`Set agent: ${OTHER_AGENT_ID}`);
+    expect(d.before).toBe("No agent");
   });
 
-  test("setAgent resolves the preset name and includes extra fields", () => {
-    const d = describeProposal(
-      proposal("setAgent", { agentPresetId: OTHER_PRESET_ID, reasoning: "high" }),
-      definition,
-      resources,
-      agentPresets,
-      [],
-    );
-    expect(d.title).toContain("Set agent: Support Agent");
-    expect(d.title).toContain("reasoning high");
-    expect(d.before).toContain("General");
-  });
-
-  test("setInstructions defers preview to the diff view", () => {
-    const d = describeProposal(
-      proposal("setInstructions", { markdown: "New" }),
-      definition,
-      resources,
-      agentPresets,
-      [],
-    );
-    expect(d.pillar).toBe("instructions");
+  test("setInstructions defers preview to the diff", () => {
+    const p = proposal("setInstructions", { markdown: "New" });
+    if (!isWorkflowProposal(p)) throw new Error("expected workflow proposal");
+    const d = describeWorkflowProposal(p, definition, agents);
     expect(d.title).toBe("Rewrite instructions");
     expect(d.before).toBeNull();
+    expect(d.diff).toEqual({ before: "Old instructions", after: "New" });
+
+    const empty = describeWorkflowProposal(
+      p,
+      { ...definition, instructions: { markdown: "  " } },
+      agents,
+    );
+    expect(empty.title).toBe("Write instructions");
+  });
+
+  test("off-surface proposals get the unsupported fallback", () => {
+    const d = unsupportedProposalDescription(
+      proposal("setPersona", { markdown: "x" }),
+    );
+    expect(d.title).toContain("setPersona");
+    expect(d.before).toBeNull();
+  });
+});
+
+describe("workflowCopilotAdapter", () => {
+  function makeAdapter(draft: WorkflowConfig = definition) {
+    const dispatched: BuilderAction[] = [];
+    const applied: string[] = [];
+    const adapter = workflowCopilotAdapter({
+      workflowId: WORKFLOW_ID,
+      getDraft: () => draft,
+      dispatch: (action) => dispatched.push(action),
+      agents,
+      onApplied: (section) => applied.push(section),
+    });
+    return { adapter, dispatched, applied };
+  }
+
+  test("entityRef names the workflow surface", () => {
+    const { adapter } = makeAdapter();
+    expect(adapter.entityRef).toEqual({
+      surface: "workflow",
+      entityId: WORKFLOW_ID,
+    });
+  });
+
+  test("applyProposal dispatches reducer actions and reports the section", () => {
+    const { adapter, dispatched, applied } = makeAdapter();
+    adapter.applyProposal(proposal("setAgent", { agentId: OTHER_AGENT_ID }));
+    expect(dispatched).toEqual([{ type: "setAgentId", id: OTHER_AGENT_ID }]);
+    expect(applied).toEqual(["agent"]);
+  });
+
+  test("applyProposal ignores off-surface proposals (server bug)", () => {
+    const { adapter, dispatched, applied } = makeAdapter();
+    adapter.applyProposal(proposal("setPersona", { markdown: "x" }));
+    expect(dispatched).toEqual([]);
+    expect(applied).toEqual([]);
+  });
+
+  test("promptChips scaffold on an empty draft, refine once instructions exist", () => {
+    const empty = makeAdapter({ ...definition, instructions: { markdown: "" } });
+    expect(empty.adapter.promptChips().length).toBeGreaterThan(0);
+    const refine = makeAdapter();
+    expect(refine.adapter.promptChips()).not.toEqual(
+      empty.adapter.promptChips(),
+    );
+  });
+
+  test("describeProposal reads the LIVE draft via getDraft", () => {
+    const { adapter } = makeAdapter();
+    const d = adapter.describeProposal(
+      proposal("setInstructions", { markdown: "New" }),
+    );
+    expect(d.diff?.before).toBe("Old instructions");
   });
 });

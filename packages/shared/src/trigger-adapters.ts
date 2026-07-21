@@ -5,10 +5,10 @@
  *
  * These are PURE, I/O-FREE typed mappers: raw source event → the message/data/
  * continuation fields of a {@link TriggerEvent}. The control-plane dispatcher
- * wraps the result with `workflowId` + `principal` (identity/routing concerns
- * that are not part of the source payload) and POSTs the full envelope to the
- * compiled channel. Keeping them pure makes ingress fully unit-testable with no
- * network, DB, or clock dependency.
+ * wraps the result with `agentId`/`workflowId` + `principal` (identity/routing
+ * concerns that are not part of the source payload), renders the task message
+ * from it (render.ts), and persists the envelope on the run. Keeping them pure
+ * makes ingress fully unit-testable with no network, DB, or clock dependency.
  *
  * Signature verification (Slack) and rate limits / payload caps live in the
  * ingress ROUTE, upstream of these mappers — never here.
@@ -18,12 +18,12 @@ import type {
   SlackInnerEvent,
   SlackMessageEvent,
 } from "./api";
-import type { FormField } from "./workflow-definition";
+import type { FormField } from "./workflow-config";
 
 /**
  * The source-agnostic slice of a {@link TriggerEvent} a mapper produces. The
- * dispatcher completes the envelope with `workflowId`, `principal`, and
- * (for Slack) resolves `continuationToken` from the thread mapping.
+ * dispatcher completes the envelope with `agentId`/`workflowId`, `principal`,
+ * and (for Slack) resolves `continuationToken` from the thread mapping.
  */
 export interface MappedTriggerData {
   /** Model-facing prompt / primary input. */
@@ -38,7 +38,7 @@ export type TriggerMapResult<T> =
 
 // ── Slack ────────────────────────────────────────────────────────────────────
 
-/** Reply routing captured from an inbound Slack event (compiled channel reads these). */
+/** Reply routing captured from an inbound Slack event (control-plane delivery reads these). */
 export interface SlackReplyTarget {
   channel: string;
   /** thread_ts when the message is threaded, else the message's own ts. */
@@ -124,8 +124,8 @@ export function slackEventToTriggerData(
   const data: Record<string, unknown> = {
     eventType: event.type,
     channel: event.channel,
-    // The compiled Slack channel reads data.channel / data.thread_ts / data.ts
-    // to build its reply target — keep these keys in the envelope.
+    // The control-plane delivery service reads data.channel / data.thread_ts /
+    // data.ts to build its reply target — keep these keys in the envelope.
     ts: event.ts,
     thread_ts: threadTs,
     text: message,

@@ -1,12 +1,14 @@
 /**
- * Shared compile-input resolution + dry-run (used by publish, session
- * dispatch, and the Phase-2 builder's draft validation).
+ * Shared compile-input resolution + dry-run for AGENT publishing (used by
+ * agent publish, the agent editor's draft validation, and the dry-run route).
  *
  * The control plane resolves everything the pure compiler needs — the model
- * (preset → allowlist), the referenced MCP connections and authored skills
- * (ownership-checked), and skill ATTACHMENT BYTES fetched from the object
- * store — then calls the injected `compile`. Typed errors (422s) surface to
- * the API; a dry run returns compile problems as its PAYLOAD, not a failure.
+ * (definition.model → preset mapping → allowlist), the definition's
+ * referenced MCP connections and authored skills (ownership-checked against
+ * the agent's run-as user), and skill ATTACHMENT BYTES fetched from the
+ * object store — then calls the injected `compile`. Typed errors (422s)
+ * surface to the API; a dry run returns compile problems as its PAYLOAD, not
+ * a failure.
  *
  * SECRETS DISCIPLINE: this path may decrypt a connection's stored auth to
  * learn its SHAPE (bearer vs headers) and header NAMES so the generated code
@@ -15,17 +17,17 @@
  */
 import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type { ApiErrorInfo, MasterKey, WorkflowDefinition } from "@invisible-string/shared";
-import { workflowDefinitionSchema } from "@invisible-string/shared";
+import type { AgentDefinition, ApiErrorInfo, MasterKey } from "@invisible-string/shared";
+import { agentDefinitionSchema } from "@invisible-string/shared";
 
 import type { ArtifactStore } from "../artifacts";
 import { slugifyName } from "../build/compiler-adapter";
 import {
-  WorkflowCompileError,
+  AgentCompileError,
   type CompileConnection,
   type CompileResult,
   type CompileSkill,
-  type CompileWorkflowFn,
+  type CompileAgentFn,
 } from "../build/compiler-contract";
 import type { Db } from "../db";
 import { mcpAuthShape, mcpHeaderEnvName, mcpTokenEnvName } from "./agent-env";
@@ -41,7 +43,7 @@ export interface CompileServiceDeps {
   masterKey: MasterKey | undefined;
   /** Object store the skill attachments live in (null when S3 is unconfigured). */
   artifacts: ArtifactStore | undefined;
-  compile: CompileWorkflowFn;
+  compile: CompileAgentFn;
 }
 
 export interface CompileInputs {
@@ -52,9 +54,9 @@ export interface CompileInputs {
   workspaceSlug: string;
 }
 
-/** Shape-guard a stored draft/config into a four-pillar definition (422). */
-export function parseDefinition(raw: unknown): WorkflowDefinition {
-  const parsed = workflowDefinitionSchema.safeParse(raw);
+/** Shape-guard a stored draft/definition into an AgentDefinition (422). */
+export function parseAgentDefinition(raw: unknown): AgentDefinition {
+  const parsed = agentDefinitionSchema.safeParse(raw);
   if (!parsed.success) {
     throw errors.draftInvalid(
       parsed.error.issues.map((issue) => ({
@@ -70,21 +72,17 @@ export function parseDefinition(raw: unknown): WorkflowDefinition {
  * Resolve the definition's referenced resources. Model resolution + allowlist
  * validation run FIRST so their typed errors surface before any compile work.
  * Context resources must be workspace-scoped rows of this workspace or
- * user-scoped rows of the workflow's run-as user (spec §2).
+ * user-scoped rows of the agent's run-as user (spec §2).
  */
 export async function resolveCompileInputs(
   deps: CompileServiceDeps,
   organizationId: string,
   runAsUserId: string,
-  definition: WorkflowDefinition,
+  definition: AgentDefinition,
 ): Promise<CompileInputs> {
   const { db } = deps;
-  const data = await loadModelResolutionData(
-    db,
-    organizationId,
-    definition.agent.agentPresetId,
-  );
-  const model = resolveModel(definition.agent, data);
+  const data = await loadModelResolutionData(db, organizationId);
+  const model = resolveModel(definition.model, data);
 
   const orgRows = await db
     .select({ slug: schema.organization.slug })
@@ -184,10 +182,10 @@ async function fetchSkillFiles(
 }
 
 export function compileOrThrow(
-  compile: CompileWorkflowFn,
-  definition: WorkflowDefinition,
+  compile: CompileAgentFn,
+  definition: AgentDefinition,
   inputs: CompileInputs,
-  workflowName: string,
+  agentName: string,
 ): CompileResult {
   try {
     return compile({
@@ -196,10 +194,10 @@ export function compileOrThrow(
       connections: inputs.connections,
       skills: inputs.skills,
       workspaceSlug: inputs.workspaceSlug,
-      workflowSlug: slugifyName(workflowName) || "workflow",
+      agentSlug: slugifyName(agentName) || "agent",
     });
   } catch (error) {
-    if (error instanceof WorkflowCompileError) {
+    if (error instanceof AgentCompileError) {
       throw errors.compileFailed(error.issues);
     }
     throw error;
@@ -212,24 +210,26 @@ export type DryRunResult =
   | { ok: false; error: ApiErrorInfo };
 
 /**
- * Compile the definition without persisting anything. Compile/validation
- * problems (422s) become `{ ok: false, error }`; anything else propagates.
+ * Compile the RAW draft without persisting anything. Shape problems, model/
+ * allowlist problems, and compile problems (all 422s) become
+ * `{ ok: false, error }`; anything else propagates.
  */
 export async function dryRunCompile(
   deps: CompileServiceDeps,
   organizationId: string,
   runAsUserId: string,
-  workflowName: string,
-  definition: WorkflowDefinition,
+  agentName: string,
+  draft: unknown,
 ): Promise<DryRunResult> {
   try {
+    const definition = parseAgentDefinition(draft);
     const inputs = await resolveCompileInputs(
       deps,
       organizationId,
       runAsUserId,
       definition,
     );
-    const compiled = compileOrThrow(deps.compile, definition, inputs, workflowName);
+    const compiled = compileOrThrow(deps.compile, definition, inputs, agentName);
     return { ok: true, contentHash: compiled.hash };
   } catch (error) {
     if (isRuntimeApiError(error) && error.status === 422) {

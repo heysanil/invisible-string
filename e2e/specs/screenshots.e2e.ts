@@ -17,17 +17,18 @@
  * control-plane → worker → vite preview, eve mock model, scripted copilot
  * fake — see global-setup.ts): one signup + workspace, the data is built
  * once, then the routes are walked in an order that needs only a single
- * publish (real eve build). Two shots ride outside that single workspace:
- * onboarding.png is captured on first-run, before the workspace exists (the
- * signup that seeds the rest of the run happens through this same screen);
- * invite.png is captured from a second, unauthenticated browser context that
- * drives an invited user through login/signup up to — but never past — the
- * accept-invitation confirm panel, so the pending invite stays inert. Every
- * shot first asserts the state it photographs — the same assertions the
- * acceptance specs use — because a blank pane is a failure, not a
- * deliverable. Captures are full-window at 1600×1000, deviceScaleFactor 2
- * (crisp retina), with animations force-completed and the caret hidden at
- * shot time.
+ * explicit publish (the agent's real eve build; the seeded "General Purpose"
+ * agent builds itself in the background and the copilot shot waits on it).
+ * Two shots ride outside that single workspace: onboarding.png is captured
+ * on first-run, before the workspace exists (the signup that seeds the rest
+ * of the run happens through this same screen); invite.png is captured from
+ * a second, unauthenticated browser context that drives an invited user
+ * through login/signup up to — but never past — the accept-invitation
+ * confirm panel, so the pending invite stays inert. Every shot first asserts
+ * the state it photographs — the same assertions the acceptance specs use —
+ * because a blank pane is a failure, not a deliverable. Captures are
+ * full-window at 1600×1000, deviceScaleFactor 2 (crisp retina), with
+ * animations force-completed and the caret hidden at shot time.
  */
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -43,20 +44,26 @@ import {
   installRegistryConnection,
 } from "../support/authoring.ts";
 import {
-  appendInstructions,
-  attachResource,
+  appendPersona,
+  attachAgentResource,
+  openNewAgent,
   openNewWorkflow,
-  publishAndWaitReady,
+  publishAgentAndWaitReady,
+  publishWorkflow,
+  selectWorkflowAgent,
+  setAgentModelPreset,
   setFormTriggerWithTwoFields,
   startChatAndSend,
+  waitForAgentPublished,
   writeInstructionsWithTriggerRef,
+  writePersona,
   RUN_TIMEOUT_MS,
 } from "../support/builder.ts";
 import {
-  SCAFFOLD_CONNECTION_NAME,
+  SCAFFOLD_AGENT_NAME,
   SCAFFOLD_PROMPT,
 } from "../support/copilot-script.ts";
-import { openCopilotAndSend, railCard } from "../support/copilot.ts";
+import { agentRailCard, openCopilotAndSend } from "../support/copilot.ts";
 import { signUp, uniqueAccount } from "../support/flows.ts";
 
 /** docs/screenshots/, resolved from this spec (e2e/specs → repo root). */
@@ -74,16 +81,29 @@ test.skip(
 test.use({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 2 });
 
 const WORKSPACE_NAME = "Acme Support";
+const AGENT_NAME = "Support Concierge";
+const AGENT_DESCRIPTION = "Front-line support triage and warm, on-brand replies.";
 const WORKFLOW_NAME = "Support triage workflow";
 const REGISTRY_CONNECTION = "Registry notes";
+const CUSTOM_CONNECTION = "notes";
 const SKILL_NAME = "Brand voice";
+
+// The agent's persona document — this IS the agent, so it reads like one.
+// (@notes is a real attached-connection reference; the persona editor has no
+// autocomplete, it is typed verbatim.)
+const AGENT_PERSONA =
+  "You are Acme's support concierge — the first voice a customer hears.\n\n" +
+  "Triage every inbound request, check @notes for related history, and draft " +
+  "warm, concise replies in plain language. Escalate anything irreversible to " +
+  "a human before acting.";
 
 // The chat shot photographs a real published run replying in clean prose — a
 // support-triage draft, not a tool-JSON dump. The message reads naturally (no
 // built-in tool name, so eve's mock never fires the working block); the reply
-// text is authored as a `Reply with exactly:` fixture appended to this shot's
-// instructions (below), which the mock returns verbatim as the assistant's
-// prose. See e2e/README.md on the mock's fixture + tool-name behaviour.
+// text is authored as a `Reply with exactly:` fixture appended to the PERSONA
+// after agents.png is captured (below), which the mock returns verbatim as
+// the assistant's prose. See e2e/README.md on the mock's fixture + tool-name
+// behaviour.
 const CHAT_MESSAGE =
   "A customer emailed asking to reset their password. Can you draft a warm, friendly reply?";
 const CHAT_REPLY =
@@ -121,7 +141,7 @@ async function shoot(page: Page, file: string): Promise<void> {
   });
 }
 
-test("capture the seven product screenshots", async ({ page, browser }) => {
+test("capture the eight product screenshots", async ({ page, browser }) => {
   mkdirSync(OUT_DIR, { recursive: true });
 
   // A designed identity for the owner — invite.png's subtitle shows this
@@ -143,7 +163,7 @@ test("capture the seven product screenshots", async ({ page, browser }) => {
   await expect(
     page.getByRole("navigation", { name: "Primary" }),
   ).toBeVisible();
-  await page.goto("/workflows");
+  await page.goto("/agents");
 
   // ── invite.png — invite confirm panel, viewed by a not-yet-joined invitee ──
   const invitee = uniqueAccount("invitee");
@@ -195,7 +215,7 @@ test("capture the seven product screenshots", async ({ page, browser }) => {
     name: REGISTRY_CONNECTION,
     query: "notes",
   });
-  await addCustomConnection(page, { name: SCAFFOLD_CONNECTION_NAME });
+  await addCustomConnection(page, { name: CUSTOM_CONNECTION });
 
   // ── context.png — /context with two connection cards + one skill row ───────
   await gotoSection(page, "Context");
@@ -206,72 +226,50 @@ test("capture the seven product screenshots", async ({ page, browser }) => {
     page.getByRole("heading", { name: REGISTRY_CONNECTION, exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: SCAFFOLD_CONNECTION_NAME, exact: true }),
+    page.getByRole("heading", { name: CUSTOM_CONNECTION, exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: new RegExp(`^${SKILL_NAME}`) }),
   ).toBeVisible();
   await shoot(page, "context.png");
 
-  // ── build the workflow: form trigger · 2 context chips · instructions ──────
-  await openNewWorkflow(page, WORKFLOW_NAME);
-  await setFormTriggerWithTwoFields(page, [
-    { key: "email", label: "Customer email" },
-    { key: "topic", label: "Topic" },
-  ]);
-  await attachResource(page, "connection", REGISTRY_CONNECTION);
-  await attachResource(page, "connection", SCAFFOLD_CONNECTION_NAME);
-  await attachResource(page, "skill", SKILL_NAME);
-  // The lead references @notes inline (a real connection ref), then the
-  // helper exercises the live `@trigger.` autocomplete pick for the field
-  // ref — two resolved @refs land in the instructions. Note: no "\n" may be
-  // typed right after an `@` word or the open autocomplete would eat Enter.
-  await writeInstructionsWithTriggerRef(page, {
-    lead:
-      "Triage each inbound support request and draft a concise, friendly reply.\n\n" +
-      "Check @notes for related history, then note the sender ",
-    triggerField: "email",
-  });
+  // ── build the agent: persona · model · context (the flagship editor) ────────
+  await openNewAgent(page, AGENT_NAME);
+  await page.getByLabel("Description").fill(AGENT_DESCRIPTION);
+  await attachAgentResource(page, "connection", REGISTRY_CONNECTION);
+  await attachAgentResource(page, "connection", CUSTOM_CONNECTION);
+  await attachAgentResource(page, "skill", SKILL_NAME);
+  await writePersona(page, AGENT_PERSONA);
+  await setAgentModelPreset(page, "Balanced");
 
-  // ── builder.png — all four pillar cards populated, editor focused ──────────
-  await expect(railCard(page, "Trigger")).toContainText("Form");
-  await expect(railCard(page, "Trigger")).toContainText("2 fields");
-  await expect(railCard(page, "Context")).toContainText(REGISTRY_CONNECTION);
-  await expect(railCard(page, "Context")).toContainText(
-    SCAFFOLD_CONNECTION_NAME,
+  // ── agents.png — the agent editor, every rail card live ────────────────────
+  await expect(agentRailCard(page, "Persona")).toContainText(
+    "support concierge",
   );
-  await expect(railCard(page, "Context")).toContainText(SKILL_NAME);
-  await expect(railCard(page, "Agent")).toContainText("General Purpose");
-  await expect(railCard(page, "Instructions")).toContainText("@ref");
-  const editor = page.getByRole("textbox", { name: "Instructions editor" });
-  await expect(editor).toContainText("@trigger.email");
-  await expect(editor).toContainText("@notes");
-  // The autocomplete tooltip must be gone (the pick closes it) and the editor
-  // focused — the shot shows the instructions pane as the active surface.
-  await expect(page.locator(".cm-tooltip-autocomplete")).toHaveCount(0);
-  // Autosave settles first, so the header reads "Saved · compiles clean"
-  // rather than a mid-flight "Saving…" spinner + amber "Unsaved" chip.
-  await expect(page.getByText("Saved · compiles clean")).toBeVisible();
-  await expect(page.getByText("Unsaved", { exact: true })).toBeHidden();
-  await editor.focus();
-  await expect(editor).toBeFocused();
-  await shoot(page, "builder.png");
+  await expect(agentRailCard(page, "Model")).toContainText("Balanced");
+  await expect(agentRailCard(page, "Context")).toContainText(REGISTRY_CONNECTION);
+  await expect(agentRailCard(page, "Context")).toContainText(CUSTOM_CONNECTION);
+  await expect(agentRailCard(page, "Context")).toContainText(SKILL_NAME);
+  await expect(agentRailCard(page, "Access")).toContainText("Runs as");
+  // Autosave settles first, so the header reads "Saved" rather than a
+  // mid-flight "Saving…" spinner.
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await shoot(page, "agents.png");
 
-  // ── publish (real eve build) and run it from chat ──────────────────────────
-  // Append the shot-only reply fixture to the (already-photographed) builder
-  // instructions, then publish that draft. builder.png was captured above, so
-  // this extra line never shows there — it only steers the mock to answer this
-  // one chat in clean prose. A space + blank line leads the text so the newline
-  // lands cleanly after the trailing `@trigger.email` ref.
-  await appendInstructions(page, ` \n\nReply with exactly: ${CHAT_REPLY}`);
-  await expect(page.getByText("Saved · compiles clean")).toBeVisible();
-  await publishAndWaitReady(page);
-  await startChatAndSend(page, WORKFLOW_NAME, CHAT_MESSAGE);
+  // ── publish the agent (real eve build) and chat with it ────────────────────
+  // Append the shot-only reply fixture to the (already-photographed) persona,
+  // then publish that draft. agents.png was captured above, so this extra
+  // line never shows there — it only steers the mock to answer this one chat
+  // in clean prose.
+  await appendPersona(page, `\n\nReply with exactly: ${CHAT_REPLY}`);
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await publishAgentAndWaitReady(page);
+  await startChatAndSend(page, AGENT_NAME, CHAT_MESSAGE);
 
   // ── chat.png — completed run: user question + clean prose reply + sessions ─
   // The message names no built-in tool, so the mock runs no tool step (no
   // working block) and returns the authored draft verbatim. Assert the prose
-  // reply rendered — and that the old tool-JSON dump is gone.
+  // reply rendered — and that no tool-JSON dump did.
   await expect(page.getByText(/sent a secure reset link/i).first()).toBeVisible({
     timeout: RUN_TIMEOUT_MS,
   });
@@ -280,21 +278,57 @@ test("capture the seven product screenshots", async ({ page, browser }) => {
   ).toBeVisible();
   await expect(page.getByText(/Used todo/i)).toHaveCount(0);
   await expect(page.getByText(/"todos"|"counts"/)).toHaveCount(0);
-  // Session list on the left carries the session row with its status dot; the
-  // run has settled to Idle (no pending working block).
+  // Session list on the left carries the agent-named session row with its
+  // status dot; the run has settled to Idle (no pending working block).
   const sessionsPanel = page.locator('[aria-label="Chat sessions"]');
   await expect(
-    sessionsPanel.getByRole("button", { name: new RegExp(WORKFLOW_NAME) }),
+    sessionsPanel.getByRole("button", { name: new RegExp(AGENT_NAME) }),
   ).toBeVisible();
   await expect(sessionsPanel.getByRole("img", { name: "Idle" })).toBeVisible();
   await shoot(page, "chat.png");
 
-  // ── copilot.png — rail open, un-applied suggestion with a diff preview ─────
+  // ── workflow.png — the delegation editor: trigger → agent → instructions ───
+  await openNewWorkflow(page, WORKFLOW_NAME);
+  await setFormTriggerWithTwoFields(page, [
+    { key: "email", label: "Customer email" },
+    { key: "topic", label: "Topic" },
+  ]);
+  await selectWorkflowAgent(page, AGENT_NAME);
+  // The lead references @notes inline (a real connection ref on the SELECTED
+  // agent's context), then the helper exercises the live `@trigger.`
+  // autocomplete pick for the field ref — two resolved @refs land in the
+  // instructions. Note: no "\n" may be typed right after an `@` word or the
+  // open autocomplete would eat Enter.
+  await writeInstructionsWithTriggerRef(page, {
+    lead:
+      "Triage each inbound support request and draft a concise, friendly reply.\n\n" +
+      "Check @notes for related history, then note the sender ",
+    triggerField: "email",
+  });
+
+  // All three sections populated; instant publish flips the header chip to
+  // the green "Published" state for the shot.
+  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+  await expect(editor).toContainText("@trigger.email");
+  await expect(editor).toContainText("@notes");
+  // The autocomplete tooltip must be gone (the pick closes it).
+  await expect(page.locator(".cm-tooltip-autocomplete")).toHaveCount(0);
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await publishWorkflow(page);
+  await expect(page.getByText("Published", { exact: true }).first()).toBeVisible();
+  // The instructions editor focused — the shot shows it as the active surface.
+  await editor.focus();
+  await expect(editor).toBeFocused();
+  await shoot(page, "workflow.png");
+
+  // ── copilot.png — dock open, un-applied suggestion with a diff preview ─────
   // Fresh workflow so the scripted scaffold conversation applies cleanly
-  // (same fake-LLM script as copilot.e2e.ts). Apply the first two proposals;
-  // the third (instructions + inline diff) stays UN-APPLIED for the shot.
+  // (same fake-LLM script as copilot.e2e.ts — its setAgent step targets the
+  // seeded "General Purpose" agent, so wait for its background build first).
+  // Apply the first two proposals; the third (instructions + inline diff)
+  // stays UN-APPLIED for the shot.
+  await waitForAgentPublished(page, SCAFFOLD_AGENT_NAME);
   await openNewWorkflow(page, "Copilot scaffold workflow");
-  await expect(railCard(page, "Trigger")).toContainText("Manual");
   await openCopilotAndSend(page, SCAFFOLD_PROMPT);
 
   const triggerCard = page.getByRole("group", {
@@ -302,16 +336,22 @@ test("capture the seven product screenshots", async ({ page, browser }) => {
   });
   await expect(triggerCard).toBeVisible();
   await triggerCard.getByRole("button", { name: "Apply" }).click();
-  await expect(railCard(page, "Trigger")).toContainText("Form");
+  await expect(
+    page
+      .getByRole("radiogroup", { name: "Trigger type" })
+      .getByRole("radio", { name: "Form" }),
+  ).toHaveAttribute("aria-checked", "true");
 
-  const contextCard = page.getByRole("group", {
-    name: `Suggestion: Add connection: ${SCAFFOLD_CONNECTION_NAME}`,
+  const agentCard = page.getByRole("group", {
+    name: `Suggestion: Set agent: ${SCAFFOLD_AGENT_NAME}`,
   });
-  await expect(contextCard).toBeVisible();
-  await contextCard.getByRole("button", { name: "Apply" }).click();
-  await expect(railCard(page, "Context")).toContainText(
-    SCAFFOLD_CONNECTION_NAME,
-  );
+  await expect(agentCard).toBeVisible();
+  await agentCard.getByRole("button", { name: "Apply" }).click();
+  await expect(
+    page
+      .getByRole("radiogroup", { name: "Agent" })
+      .getByRole("radio", { name: new RegExp(`^${SCAFFOLD_AGENT_NAME}\\b`) }),
+  ).toHaveAttribute("aria-checked", "true");
 
   const instructionsCard = page.getByRole("group", {
     name: "Suggestion: Write instructions",

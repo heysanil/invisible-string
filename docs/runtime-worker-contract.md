@@ -1,9 +1,16 @@
-# Runtime ⇄ worker / compiler contract (Phase 1)
+# Runtime ⇄ worker / compiler contract
 
 Reconciled at the Integrate stage — this document describes what the code
 actually does on BOTH sides (apps/control-plane ⇄ apps/worker ⇄
 packages/compiler). The end-to-end proof is
 `tests/integration/phase1-acceptance.test.ts`.
+
+Agents-first (2026-07-10 redesign): the **Agent is the compile unit** — an
+**agent version** (immutable published snapshot, identified by content hash)
+is what gets built, stored, ensured, and dispatched. Workflows are standing
+delegations (trigger → agent → instructions) and compile NOTHING; compiled
+agents expose only eve's default channel, and every dispatch path speaks
+eve's session API.
 
 ## Worker HTTP surface the control plane calls
 
@@ -41,14 +48,16 @@ callbacks (public `/agents/<hash>/.well-known/…` → 403).
 
 Calls onto `/eve/v1/*` carry `authorization: Bearer <HS256 JWT>` minted per
 call with `iss=invisible-string`, exp ≤ 120 s (`src/runtime/jwt.ts`), and a
-VERSION-BOUND contract: audience `workflow-agent:<contentHash>` and signing
+VERSION-BOUND contract: audience `agent-version:<contentHash>` and signing
 secret `derivePlatformJwtSecret(PLATFORM_JWT_SECRET, contentHash)` — the
 compiler bakes the matching audience into the generated verifier and the
 agent env receives only the derived secret, so a leaked agent env or token
-is useless against any other workflow version. Compiled channels verify via
+is useless against any other agent version. Compiled channels verify via
 eve's `verifyJwtHmac`.
 
-Used today by the control plane:
+Used today by the control plane (this is the ONLY dispatch surface — there
+are no per-trigger channels; chat, webhook, form, Slack, schedule, and manual
+"Run now" all speak eve's session API):
 
 - `POST .../eve/v1/session` `{message}` → **202** `{sessionId, continuationToken}`
 - `POST .../eve/v1/session/:id` `{continuationToken, message}` → 202
@@ -58,20 +67,31 @@ Used today by the control plane:
 
 ## Env injected per agent (ensure-agent `env`)
 
+The env map is **identical across all dispatch paths** — no per-trigger env
+injection exists. In particular `SLACK_BOT_TOKEN` is NOT agent env anymore:
+Slack replies are posted by the control-plane DeliveryService (below), so bot
+tokens never reach a worker or an agent process. (`WORKFLOW_*` names are the
+eve world package's contract — never rename them to match platform nouns.)
+
 | Var | Value |
 |---|---|
 | `WORKFLOW_POSTGRES_URL` | the version's **dedicated world database** (below) |
 | `WORKFLOW_POSTGRES_JOB_PREFIX` | contentHash — observability ONLY, does not isolate |
 | `WORKFLOW_POSTGRES_MAX_POOL_SIZE` / `WORKFLOW_POSTGRES_WORKER_CONCURRENCY` | per-agent connection budget (defaults 5/5 — REPORT finding 15) |
 | `PLATFORM_JWT_SECRET` | channel-auth secret, **derived per version** (`derivePlatformJwtSecret(master, contentHash)`) — never the platform master |
-| `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | exactly ONE, matching the version's resolved provider (`workflow_versions.model_provider`) |
+| `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | exactly ONE, matching the version's resolved provider (`agent_versions.model_provider`) |
 | `OPENROUTER_BASE_URL` | passthrough when set (test harnesses) |
-| `MCP_<NAME>_TOKEN` | decrypted MCP connection tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time |
+| `MCP_<NAME>_TOKEN` | decrypted MCP connection bearer tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time. Header-auth connections get one `MCP_<NAME>_HEADER_<H>` per header instead (`mcpHeaderEnvName`, same drift guard) |
 | `EVE_MOCK_AUTHORED_MODELS` | TEST HARNESS ONLY passthrough (set on the control plane → forwarded per agent); eve serves turns with its built-in mock model |
-| `SLACK_BOT_TOKEN` | Slack-triggered versions ONLY: the team's decrypted bot token, injected by the dispatcher at ensure-agent time so the compiled Slack channel (`agent/lib/slack.ts`) can post the terminal reply via `chat.postMessage`. Never baked into generated code. |
-| `SLACK_API_BASE_URL` | Slack-triggered versions in non-production deployments: redirects the agent's outbound Slack calls at a stub (`SLACK_API_BASE_URL` on the control plane, forwarded only when non-default). |
 
-## Phase-3 trigger ingress (control-plane public surface)
+The supervisor adds `PORT`, `NODE_ENV=production` (REPORT finding 5) and
+`WORKFLOW_LOCAL_BASE_URL=${publicUrl}/agents/<hash>` (its own proxy base —
+REPORT finding 9; caller env may override) itself, plus the ambient
+PATH/HOME/LANG/TMPDIR. Worker registration:
+`POST /internal/workers/{register,heartbeat,deregister}` on the control
+plane, `x-worker-secret`-guarded (`src/runtime/workers.ts`).
+
+## Trigger ingress + dispatch (control-plane public surface)
 
 Trigger ingress lives on the control plane, not the worker. Public endpoints
 authenticate by token/signature (no session):
@@ -80,27 +100,47 @@ authenticate by token/signature (no session):
   ONCE at mint) is SHA-256-hashed and matched against `triggers.token_hash`
   (constant-time indexed lookup; plaintext is never stored). Per-token +
   per-IP rate limits and a 256 KiB payload cap run BEFORE parsing. → 202
-  `{accepted, runId, sessionId}`; the dispatcher POSTs a `TriggerEvent` to the
-  compiled agent's `/eve/v1/platform/<trigger>` channel.
+  `{accepted, runId, sessionId}`.
 - `POST /integrations/slack/events` — Slack Events API. Missing auth headers,
   per-IP rate limit, and a 256 KiB body cap are checked BEFORE the HMAC;
   signature (`v0` HMAC) + 5-min replay window next; `event_id` dedup makes
   Slack retries idempotent; a `message` twin of an `app_mention` (one channel
-  mention arrives as BOTH, with different event_ids) is dropped by its leading
-  bot-mention prefix; routed by `team_id` → integration → bound workflows;
+  mention arrives as BOTH, with different event_ids) is dropped whenever the
+  message text contains the bot mention ANYWHERE (Slack fires `app_mention`
+  for mid-text mentions too — a leading-only check would double-dispatch
+  them); routed by `team_id` → integration → bound workflows;
   `thread_ts ↔ agent_session` continuation via the indexed
   `agent_sessions.slack_thread_key` column (partial unique per workflow — two
-  racing first-messages of a new thread resolve to one session). DMs
-  (`channel_type: im`) key the session on the IM channel itself, so a 1:1
-  conversation keeps one ongoing session without threading.
+  racing first-messages of a new thread resolve to one session, the loser's
+  `session_busy` is logged and dropped). A session that reaches a TERMINAL
+  status (closed/error) RELEASES its thread key (`markSession` nulls it, and
+  the new-session re-check evicts any legacy terminal holder), so the next
+  message in that thread mints a fresh session instead of being silently
+  dropped forever. DMs (`channel_type: im`) key the session on the IM channel
+  itself, so a 1:1 conversation keeps one ongoing session without threading.
+- `GET /integrations/slack/callback` — single platform Slack app OAuth
+  redirect-back (state-signed); per-team bot token stored envelope-encrypted,
+  keyed by `team_id`. The install kickoff is workspace-scoped:
+  `GET /workspaces/:id/integrations/slack/install`.
+
+**Dispatch (agents-first contract, `runtime/dispatch.ts`).** Every non-chat
+path (webhook / form / Slack / schedule / manual "Run now") resolves the
+workflow's published snapshot + the delegated agent's CURRENT published
+version (FLOATING binding — a new session runs the agent's current version;
+a continuation always runs the session's PINNED version), renders the
+workflow's instructions against the event (`renderTaskMessage`,
+`packages/shared`) and sends THAT string as the eve session message —
+`createEveSession` for a new session, `continueEveSession` for a thread
+reply. **The `TriggerEvent` envelope is never sent to the agent**; it is
+persisted on the run purely as provenance (`runs.trigger_event`, alongside
+the rendered `task_message`). There is no compiled trigger channel and no
+per-trigger agent env.
 
 **One run per eve session at a time (hole closed):** `waiting` (parked HITL)
 counts as busy alongside queued/running — a new message into a parked session
 is 409 `session_busy` ("answer the pending approval first"), and
 `POST /runs/:id/input` refuses while any OTHER run of the session is
 dispatching. Exactly one tail per eve NDJSON stream at any instant.
-- `GET /integrations/slack/{install,callback}` — single platform Slack app
-  OAuth; per-team bot token stored envelope-encrypted, keyed by `team_id`.
 
 `POST /runs/:id/cancel` stops the tailer and marks the run `canceled`
 (idempotent). Best-effort re: eve's turn — eve exposes no session-cancel HTTP
@@ -112,24 +152,69 @@ dispatcher re-checks the version's COMPILED model against the CURRENT workspace
 allowlist; a now-disallowed model FAILS the run (a visible failed run, never
 executed) rather than dispatching.
 
-The supervisor adds `PORT`, `NODE_ENV=production` (REPORT finding 5) and
-`WORKFLOW_LOCAL_BASE_URL=${publicUrl}/agents/<hash>` (its own proxy base —
-REPORT finding 9; caller env may override) itself, plus the ambient
-PATH/HOME/LANG/TMPDIR. Worker registration:
-`POST /internal/workers/{register,heartbeat,deregister}` on the control
-plane, `x-worker-secret`-guarded (`src/runtime/workers.ts`).
+## Outbound reply delivery (control-plane DeliveryService)
+
+Slack replies are posted by the control plane, never by the agent
+(`runs/delivery.ts` — the compiled Slack channel + `SLACK_BOT_TOKEN` agent-env
+injection are gone):
+
+- dispatch marks slack-origin runs `delivery_status = pending` (born owing a
+  reply);
+- the run tailer's finished-hook posts the run's final assistant reply
+  (`message.completed` with `finishReason: "stop"`) as a threaded
+  `chat.postMessage` with the team's decrypted bot token, then settles the
+  marker (`delivered` / `failed` with a reason);
+- paths that mark a run terminal OUTSIDE the tailer hook (`failDispatch`, the
+  dispatch-time allowlist failure, cancel of an untailed run, the sweeper's
+  no-eve-session fail) call `deliver()` themselves, so the marker settles at
+  the moment of failure instead of lingering `pending`;
+- boot recovery (`reconcileInterruptedRuns` → `recoverPending`) finds
+  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal event
+  and post) recover the reply from persisted `run_events` and deliver late;
+  failed/canceled ones settle the ledger.
+
+Semantics are **at-least-once** (documented residual): the Slack post happens
+before the marker flips, so a crash in between re-delivers on recovery. The
+marker itself is CAS'd (only `pending` settles), so racing settlers resolve to
+one ledger write and a second `deliver()` is a no-op. Failed/canceled runs owe
+no reply — their marker settles `failed` so the sweep never reconsiders them.
+Bot tokens are decrypted in-process at delivery time and never logged.
+`SLACK_API_BASE_URL` (non-production stubs) now applies to the control plane's
+own Slack client only.
+
+## Schedule ticker (control-plane cron)
+
+Compiled schedule codegen is gone — it only ever fired under `eve start`,
+which workers never run (spike finding 6). Scheduling is a platform concern
+(`runtime/schedule-ticker.ts`):
+
+- workflow publish syncs the trigger row's `cron` + `next_fire_at`;
+- every `SCHEDULE_TICK_MS` (default 30 s) the ticker scans for DUE triggers
+  (`next_fire_at <= now`, trigger enabled, workflow enabled + published);
+- each due trigger is CLAIMED in its own transaction under a per-trigger
+  `pg_advisory_xact_lock`: re-read + re-check, then advance `next_fire_at`
+  from NOW (**no backfill** — a control plane down over three windows fires
+  ONCE, then resumes cadence) BEFORE dispatching. The advisory lock makes
+  claims safe under concurrent tickers;
+- the dispatch is the ordinary workflow dispatch (origin/trigger type
+  `schedule`, `data.scheduledFor` = the window that fired, empty message —
+  the instructions carry the task). Scheduled runs are ordinary sessions and
+  can park on HITL approvals;
+- a dispatch failure never un-advances the cursor (one failed run per window,
+  never a hot loop); an unparseable cron clears `next_fire_at`, disarming the
+  trigger until the next publish rewrites it.
 
 ## World isolation (design correction #10)
 
-Contract: one world **Postgres database per workflow version**, named
-`ws_v_<first 12 hash chars>`, provisioned + bootstrapped on the first build of
+Contract: one world **Postgres database per agent version**, named
+`ag_v_<first 12 hash chars>`, provisioned + bootstrapped on the first build of
 a version (`src/build/world.ts`).
 
 ### ⚠️ Single writer per version hash (cross-WORKER constraint)
 
 Database-per-version isolates VERSIONS from each other, but it does NOT make
 it safe to run TWO agent processes of the SAME hash against one
-`ws_v_<hash12>` database. Verified against `@workflow/world-postgres`
+`ag_v_<hash12>` database. Verified against `@workflow/world-postgres`
 @5.0.0-beta.20:
 
 - run-replay mutual exclusion is an in-process Map (`inflightWorkflowRuns` in
@@ -141,7 +226,10 @@ it safe to run TWO agent processes of the SAME hash against one
   and side-effecting tool calls execute twice; the run event log races).
 
 **Hard constraint: at most one live agent process per version hash,
-fleet-wide.** The platform enforces it operationally:
+fleet-wide.** Note the agents-first pivot CONCENTRATES load on this
+constraint: all of an agent's chat sessions AND all workflows delegating to
+it ride its one published version hash — one world DB, one writer. The
+platform enforces it operationally:
 
 - the scheduler prefers the warm worker for a hash (affinity → warm → cold),
   and in-flight placement RESERVATIONS (runtime/scheduler.ts) keep a burst of
@@ -165,9 +253,8 @@ Why a database and not a `search_path` schema: `@workflow/world-postgres`
 queries are schema-qualified and `search_path` cannot redirect them — a
 per-version schema would LOOK isolated while every version still shared
 `workflow.*` (the exact cross-agent re-enqueue bug from REPORT finding 11).
-`packages/compiler/WORLD-ISOLATION.md` documents the same contract (both
-built to it independently; reconciled at Integrate — `ws_v_<hash12>`
-everywhere) and its gated test proves both halves live.
+`packages/compiler/WORLD-ISOLATION.md` documents the same contract
+(`ag_v_<hash12>` everywhere) and its gated test proves both halves live.
 
 ## Artifacts
 
@@ -187,7 +274,8 @@ everywhere) and its gated test proves both halves live.
 The control plane resolves preset→model and validates the model allowlist
 BEFORE compiling (typed 422s), then calls an injected
 `compile({definition, model, connections, skills, workspaceSlug,
-workflowSlug}) → {files, hash, compilerVersion, eveVersion}`
+agentSlug}) → {files, hash, compilerVersion, eveVersion}` where `definition`
+is a pure `AgentDefinition` — no trigger, no instructions
 (`src/build/compiler-contract.ts`). The production implementation is
 `src/build/compiler-adapter.ts` over `@invisible-string/compiler` (wired as
 the default in `createAppStack`); tests inject stubs.
@@ -205,7 +293,8 @@ the default in `createAppStack`); tests inject stubs.
 (default = the heartbeat TTL), `WORKER_AUTH_MODE` (`shared-secret` default |
 `worker-token`), `LOG_LEVEL` (debug|info|warn|error, default info),
 `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
-`TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), and the Slack app
+`TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
+(default 30000 — the schedule ticker's scan cadence), and the Slack app
 (`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
 `SLACK_APP_REDIRECT_URL`, optional `SLACK_API_BASE_URL`).
 
@@ -319,10 +408,12 @@ Startup emits ONE `*.ready` line with the resolved (non-secret) config.
 shared `InternalMetricsResponse`: `queueDepth`, `activeRuns`, `runsByStatus`,
 `activeSessions`, a run-duration histogram (`runDuration`, bucket edges in ms),
 `workers[]` fleet utilization (running/max agents, `utilization` = running/max),
-per-trigger-type `triggers{received,dispatched,failed}`, and
+per-trigger-type `triggers{received,dispatched,failed}`,
+`deliveries{delivered,failed}` (outbound Slack replies),
+`schedule{due,dispatched,failed}` (ticker mechanics), and
 `buildCache{hits,misses,hitRate}`. In-memory counters (no Prometheus dep; reset
-on restart), fed by the dispatch path (trigger counts), the run tailer
-(durations), and publish (cache hits). `?format=text` (or `Accept: text/plain`)
+on restart), fed by the dispatch path (trigger counts), the DeliveryService,
+the schedule ticker, the run tailer (durations), and publish (cache hits). `?format=text` (or `Accept: text/plain`)
 returns a minimal Prometheus-style exposition (`is_*` metric names) instead of
 JSON.
 
@@ -348,8 +439,9 @@ in-flight proxied requests, stops its agents, then deregisters.
   Slack event dedup, and OAuth nonce single-use are all in-process. A second
   replica would double-tail runs (the (run_id, seq) PK then crash-loops one
   tail), double-sweep failovers, and split SSE subscribers from their run's
-  tail. HA needs leader election / shared state first — do not scale this
-  process horizontally.
+  tail. (The schedule ticker alone IS multi-instance-safe — its claims ride
+  per-trigger advisory locks — but nothing else is.) HA needs leader
+  election / shared state first — do not scale this process horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface
   (register/heartbeat/deregister, `/internal/metrics`) is mounted on the same
   listener as the tenant API and guarded only by worker credentials; restrict

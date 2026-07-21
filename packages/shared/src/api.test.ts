@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import {
   addModelAllowlistEntryRequestSchema,
+  agentDtoSchema,
   agentSessionSummaryDtoSchema,
-  createAgentPresetRequestSchema,
+  agentSummaryDtoSchema,
+  agentVersionDtoSchema,
+  createAgentRequestSchema,
   createMcpConnectionRequestSchema,
   createSessionRequestSchema,
   createSkillRequestSchema,
   createWorkflowRequestSchema,
+  deliveryStatusSchema,
   dryRunCompileResponseSchema,
   installMcpConnectionRequestSchema,
   isRunStreamTerminalStatus,
@@ -15,17 +19,22 @@ import {
   mcpAuthWriteSchema,
   mcpConnectionDtoSchema,
   modelIdShapeProblem,
-  parseWorkflowDraft,
+  parseAgentDefinition,
+  parseWorkflowConfig,
   postMessageRequestSchema,
+  publishAgentResponseSchema,
   registryServerSummarySchema,
   RUN_STREAM_EVENT_NAMES,
   runDtoSchema,
   runInputRequestSchema,
-  updateAgentPresetRequestSchema,
+  runWorkflowRequestSchema,
+  updateAgentRequestSchema,
   updateMcpConnectionRequestSchema,
   updateModelPresetRequestSchema,
   updateSkillRequestSchema,
   updateWorkflowRequestSchema,
+  workflowDiagnosticsSchema,
+  workflowDtoSchema,
   type RunEventFrame,
   type RunStatus,
 } from "./api";
@@ -78,8 +87,7 @@ const UUID_2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 const validDraft = {
   trigger: { type: "manual" },
-  context: { mcpConnectionIds: [], skillIds: [] },
-  agent: { agentPresetId: UUID },
+  agentId: UUID,
   instructions: { markdown: "Do the thing." },
 };
 
@@ -98,43 +106,113 @@ describe("workflow CRUD schemas", () => {
     ).toBe(false);
   });
 
-  test("update requires at least one field", () => {
+  test("update requires at least one field; enabled toggles alone", () => {
     expect(updateWorkflowRequestSchema.safeParse({}).success).toBe(false);
     expect(updateWorkflowRequestSchema.safeParse({ name: "Renamed" }).success).toBe(true);
     expect(updateWorkflowRequestSchema.safeParse({ draft: validDraft }).success).toBe(true);
+    expect(updateWorkflowRequestSchema.safeParse({ enabled: false }).success).toBe(true);
   });
 
-  test("parseWorkflowDraft guards shape and nulls legacy blobs", () => {
-    expect(parseWorkflowDraft(validDraft)?.trigger.type).toBe("manual");
-    expect(parseWorkflowDraft({})).toBeNull();
-    expect(parseWorkflowDraft({ legacy: true })).toBeNull();
+  test("parseWorkflowConfig guards shape and nulls legacy blobs", () => {
+    expect(parseWorkflowConfig(validDraft)?.trigger.type).toBe("manual");
+    expect(parseWorkflowConfig({})).toBeNull();
+    expect(parseWorkflowConfig({ legacy: true })).toBeNull();
+  });
+
+  test("workflow DTO carries draft + published snapshot + enabled", () => {
+    const parsed = workflowDtoSchema.safeParse({
+      id: UUID,
+      name: "Ops bot",
+      draft: validDraft,
+      published: null,
+      enabled: true,
+      publishedAt: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+    expect(parsed.success).toBe(true);
+    expect(
+      workflowDtoSchema.safeParse({
+        id: UUID,
+        name: "Ops bot",
+        draft: validDraft,
+        published: validDraft,
+        enabled: false,
+        publishedAt: NOW,
+        createdAt: NOW,
+        updatedAt: NOW,
+      }).success,
+    ).toBe(true);
+  });
+
+  test("diagnostics carry path/message/severity", () => {
+    expect(
+      workflowDiagnosticsSchema.safeParse([
+        { path: "agentId", message: "pick a published agent", severity: "error" },
+        {
+          path: "instructions.markdown",
+          message: '"@linear" is no longer in the agent\'s context',
+          severity: "warning",
+        },
+      ]).success,
+    ).toBe(true);
+    expect(
+      workflowDiagnosticsSchema.safeParse([
+        { path: "agentId", message: "x", severity: "fatal" },
+      ]).success,
+    ).toBe(false);
   });
 });
 
 describe("sessions list schemas", () => {
-  test("query accepts optional workflowId + status", () => {
+  test("query accepts optional agentId + workflowId + status", () => {
     expect(listSessionsQuerySchema.safeParse({}).success).toBe(true);
     expect(
-      listSessionsQuerySchema.safeParse({ workflowId: UUID, status: "waiting" }).success,
+      listSessionsQuerySchema.safeParse({ agentId: UUID, status: "waiting" }).success,
+    ).toBe(true);
+    expect(
+      listSessionsQuerySchema.safeParse({ agentId: UUID, workflowId: UUID_2 }).success,
     ).toBe(true);
     expect(listSessionsQuerySchema.safeParse({ status: "bogus" }).success).toBe(false);
   });
 
   test("summary DTO extends the session DTO with list fields", () => {
-    const parsed = agentSessionSummaryDtoSchema.safeParse({
-      id: UUID,
-      workflowId: UUID_2,
-      workflowVersionId: UUID,
-      origin: "chat",
-      status: "active",
-      eveSessionId: null,
-      createdAt: NOW,
-      updatedAt: NOW,
-      workflowName: "Ops bot",
-      lastRunStatus: "running",
-      lastActivityAt: NOW,
-    });
-    expect(parsed.success).toBe(true);
+    // Direct chat: no workflow provenance.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        id: UUID,
+        agentId: UUID_2,
+        agentVersionId: UUID,
+        workflowId: null,
+        origin: "chat",
+        status: "active",
+        eveSessionId: null,
+        createdAt: NOW,
+        updatedAt: NOW,
+        agentName: "General Purpose",
+        workflowName: null,
+        lastRunStatus: "running",
+        lastActivityAt: NOW,
+      }).success,
+    ).toBe(true);
+    // Trigger-origin: workflow provenance present.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        id: UUID,
+        agentId: UUID_2,
+        agentVersionId: UUID,
+        workflowId: UUID_2,
+        origin: "webhook",
+        status: "active",
+        eveSessionId: "eve_1",
+        createdAt: NOW,
+        updatedAt: NOW,
+        agentName: "General Purpose",
+        workflowName: "Ops bot",
+        lastRunStatus: "succeeded",
+        lastActivityAt: NOW,
+      }).success,
+    ).toBe(true);
   });
 });
 
@@ -333,19 +411,148 @@ describe("model preset + allowlist schemas", () => {
   });
 });
 
-describe("agent preset schemas", () => {
-  test("create applies reasoning/preset defaults", () => {
-    const parsed = createAgentPresetRequestSchema.parse({
-      name: "General Purpose",
-      basePrompt: "You are a helpful generalist.",
-    });
-    expect(parsed.reasoningEffort).toBe("medium");
-    expect(parsed.modelPreset).toBe("balanced");
+describe("agent schemas", () => {
+  const validAgentDraft = {
+    persona: "You are a helpful generalist.",
+    model: { preset: "balanced", reasoning: "medium" },
+    context: { mcpConnectionIds: [], skillIds: [] },
+  };
+
+  test("create requires a name; draft is optional but shape-checked", () => {
+    expect(createAgentRequestSchema.safeParse({ name: "General Purpose" }).success).toBe(
+      true,
+    );
+    expect(
+      createAgentRequestSchema.safeParse({
+        name: "General Purpose",
+        draft: validAgentDraft,
+      }).success,
+    ).toBe(true);
+    expect(createAgentRequestSchema.safeParse({ name: "  " }).success).toBe(false);
+    expect(
+      createAgentRequestSchema.safeParse({
+        name: "General Purpose",
+        draft: { model: { preset: "turbo" }, context: {} },
+      }).success,
+    ).toBe(false);
   });
 
-  test("update requires at least one field; null clears model override", () => {
-    expect(updateAgentPresetRequestSchema.safeParse({}).success).toBe(false);
-    expect(updateAgentPresetRequestSchema.safeParse({ modelId: null }).success).toBe(true);
+  test("update requires at least one field; null clears description", () => {
+    expect(updateAgentRequestSchema.safeParse({}).success).toBe(false);
+    expect(updateAgentRequestSchema.safeParse({ description: null }).success).toBe(true);
+    expect(
+      updateAgentRequestSchema.safeParse({ draft: validAgentDraft }).success,
+    ).toBe(true);
+  });
+
+  test("parseAgentDefinition guards shape and nulls legacy blobs", () => {
+    expect(parseAgentDefinition(validAgentDraft)?.model.preset).toBe("balanced");
+    expect(parseAgentDefinition({ basePrompt: "legacy preset" })).toBeNull();
+  });
+
+  test("agent DTO carries the published definition (null while unpublished)", () => {
+    const base = {
+      id: UUID,
+      name: "General Purpose",
+      description: null,
+      runAsUserId: "user_1",
+      draft: validAgentDraft,
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    expect(
+      agentDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: null,
+        publishedDefinition: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      agentDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: UUID_2,
+        publishedDefinition: validAgentDraft,
+      }).success,
+    ).toBe(true);
+    // The field is part of the contract — clients mirror dispatch through it.
+    expect(
+      agentDtoSchema.safeParse({ ...base, publishedVersionId: null }).success,
+    ).toBe(false);
+  });
+
+  test("run-workflow request: message and data both optional (schedule fires send {})", () => {
+    expect(runWorkflowRequestSchema.safeParse({}).success).toBe(true);
+    expect(
+      runWorkflowRequestSchema.safeParse({ message: "go", data: { a: 1 } }).success,
+    ).toBe(true);
+    expect(runWorkflowRequestSchema.safeParse({ data: [] }).success).toBe(false);
+  });
+
+  test("summary DTO distinguishes published from draft-only agents", () => {
+    const base = {
+      id: UUID,
+      name: "General Purpose",
+      description: null,
+      runAsUserId: "user_1",
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    expect(
+      agentSummaryDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: null,
+        publishedAt: null,
+        buildStatus: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      agentSummaryDtoSchema.safeParse({
+        ...base,
+        publishedVersionId: UUID_2,
+        publishedAt: NOW,
+        buildStatus: "succeeded",
+      }).success,
+    ).toBe(true);
+  });
+
+  test("version DTO carries the compiled snapshot + resolved model", () => {
+    expect(
+      agentVersionDtoSchema.safeParse({
+        id: UUID,
+        agentId: UUID_2,
+        definition: validAgentDraft,
+        contentHash: "abc123",
+        compilerVersion: "3.0.0",
+        eveVersion: "0.6.0",
+        modelProvider: "openrouter",
+        modelId: "deepseek/deepseek-v4-flash",
+        buildStatus: "building",
+        createdAt: NOW,
+      }).success,
+    ).toBe(true);
+  });
+
+  test("publish response mirrors the build-triggering publish shape", () => {
+    expect(
+      publishAgentResponseSchema.safeParse({
+        agentId: UUID,
+        versionId: UUID_2,
+        contentHash: "abc123",
+        buildStatus: "pending",
+        cached: false,
+        buildError: null,
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe("delivery status", () => {
+  test("mirrors the delivery_status pgEnum values", () => {
+    expect(deliveryStatusSchema.options).toEqual([
+      "pending",
+      "delivered",
+      "failed",
+    ]);
   });
 });
 
@@ -357,22 +564,49 @@ describe("stream helpers + dto parsing", () => {
     for (const status of live) expect(isRunStreamTerminalStatus(status)).toBe(false);
   });
 
-  test("runDtoSchema parses a wire run payload", () => {
+  test("runDtoSchema parses a wire run payload (chat: no task message/delivery)", () => {
     const parsed = runDtoSchema.safeParse({
       id: UUID,
       agentSessionId: UUID_2,
       status: "waiting",
       triggerEvent: {
-        workflowId: UUID,
+        agentId: UUID_2,
+        workflowId: null,
         triggerType: "manual",
         message: "hello",
         data: {},
         principal: { workspaceId: "org_1", userId: "user_1", source: "chat" },
       },
+      taskMessage: null,
+      deliveryStatus: null,
       eveRunId: null,
       error: null,
       startedAt: NOW,
       completedAt: null,
+      createdAt: NOW,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  test("runDtoSchema parses a dispatched run (task message + slack delivery)", () => {
+    const parsed = runDtoSchema.safeParse({
+      id: UUID,
+      agentSessionId: UUID_2,
+      status: "succeeded",
+      triggerEvent: {
+        agentId: UUID_2,
+        workflowId: UUID,
+        triggerType: "slack",
+        message: "help please",
+        data: { channel: "C1", ts: "1.2", thread_ts: "1.2", text: "help please" },
+        principal: { workspaceId: "org_1", source: "slack:U777" },
+      },
+      taskMessage: "<workflow-task>\nTriage the request.\n</workflow-task>",
+      deliveryStatus: "delivered",
+      eveRunId: "run_9",
+      error: null,
+      startedAt: NOW,
+      completedAt: NOW,
       createdAt: NOW,
     });
     expect(parsed.success).toBe(true);

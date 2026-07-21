@@ -39,7 +39,7 @@ What the manifest declares, and why:
 | `oauth_config.redirect_urls` | `<origin>/integrations/slack/callback` | `slackRedirectUri()` — the OAuth v2 callback |
 | `oauth_config.scopes.bot` | `app_mentions:read chat:write im:history im:read channels:history groups:history` | `DEFAULT_SLACK_BOT_SCOPES` (`integrations/config.ts`) |
 | `settings.event_subscriptions.bot_events` | `app_mention`, `message.channels`, `message.groups`, `message.im` | Exactly the events those scopes permit — Slack rejects a manifest subscribing to `message.<surface>` without `<surface>:history` |
-| `socket_mode_enabled` / `interactivity` / `token_rotation_enabled` | all `false` | Events arrive over HTTP; no interactivity handler exists; stored bot tokens are static (rotation would break decrypt-at-dispatch) |
+| `socket_mode_enabled` / `interactivity` / `token_rotation_enabled` | all `false` | Events arrive over HTTP; no interactivity handler exists; stored bot tokens are static (rotation would break decrypt-at-delivery) |
 
 ## 2. Wire the credentials
 
@@ -89,7 +89,7 @@ different workspace is rejected.
 
 ## 6. Bind a trigger
 
-In the builder, set the workflow's TRIGGER pillar to **Slack** and pick the
+In the workflow editor, set the workflow's trigger to **Slack** and pick the
 connected integration. The binding offers:
 
 - `channelId` — restrict to one channel (empty = any channel the bot is in);
@@ -98,9 +98,13 @@ connected integration. The binding offers:
 - `includeDirectMessages` (default **false**) — DMs to the bot start runs.
 
 The bot only receives events from channels it's a **member** of — `/invite
-@YourBot` in each channel that should fire the trigger. Replies post back to
-the originating thread via `chat.postMessage` with the per-team bot token,
-which the dispatcher injects into the compiled agent as `SLACK_BOT_TOKEN`.
+@YourBot` in each channel that should fire the trigger. When the run
+completes, the **control plane** posts the agent's final reply back to the
+originating thread via `chat.postMessage` with the per-team bot token
+(DeliveryService, `apps/control-plane/src/runs/delivery.ts`) — the token is
+decrypted at delivery time and never enters agent env or a worker. Delivery
+is at-least-once: a control-plane crash between the run's terminal event and
+the Slack post re-delivers the reply on the next boot's recovery sweep.
 
 ## Local development
 
@@ -133,3 +137,4 @@ scopes land on their tokens.
 | Mentions don't fire runs | Bot not invited to the channel; trigger disabled; `channelId` set to a different channel; workspace not connected |
 | DMs don't fire runs | `includeDirectMessages` is off by default — enable it on the binding |
 | Duplicate deliveries | Handled: Slack retries are acknowledged and deduped by `event_id`; an @mention's `app_mention`/`message` twin is suppressed |
+| A reply posted twice after a control-plane restart | Expected residual: outbound delivery is at-least-once — a crash between the Slack post and the ledger marker settling re-delivers on boot recovery |

@@ -1,5 +1,5 @@
 /**
- * Playwright config for the Phase-2 acceptance harness.
+ * Playwright config for the browser acceptance harness.
  *
  * One real chromium browser drives the built SPA against the full compose
  * stack (see global-setup.ts). A single worker runs the specs serially: the

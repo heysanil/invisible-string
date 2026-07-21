@@ -9,12 +9,12 @@ import {
 } from "./world";
 
 describe("worldNameForHash", () => {
-  test("ws_v_ + first 12 hash chars (a stable pg identifier)", () => {
-    expect(worldNameForHash("abcdef0123456789deadbeef")).toBe("ws_v_abcdef012345");
+  test("ag_v_ + first 12 hash chars (a stable pg identifier)", () => {
+    expect(worldNameForHash("abcdef0123456789deadbeef")).toBe("ag_v_abcdef012345");
   });
 
   test("normalizes case and strips non-alphanumerics", () => {
-    expect(worldNameForHash("ABCDEF-01234_56789")).toBe("ws_v_abcdef012345");
+    expect(worldNameForHash("ABCDEF-01234_56789")).toBe("ag_v_abcdef012345");
   });
 
   test("rejects hashes too short to identify a version", () => {
@@ -25,14 +25,14 @@ describe("worldNameForHash", () => {
 describe("worldUrlFor", () => {
   test("swaps only the database path on the world server URL", () => {
     expect(
-      worldUrlFor("postgres://dev:dev@localhost:5432/world", "ws_v_abcdef012345"),
-    ).toBe("postgres://dev:dev@localhost:5432/ws_v_abcdef012345");
+      worldUrlFor("postgres://dev:dev@localhost:5432/world", "ag_v_abcdef012345"),
+    ).toBe("postgres://dev:dev@localhost:5432/ag_v_abcdef012345");
   });
 
   test("preserves query parameters (e.g. sslmode)", () => {
     expect(
-      worldUrlFor("postgres://u:p@db.example.com:5432/world?sslmode=require", "ws_v_000000000000"),
-    ).toBe("postgres://u:p@db.example.com:5432/ws_v_000000000000?sslmode=require");
+      worldUrlFor("postgres://u:p@db.example.com:5432/world?sslmode=require", "ag_v_000000000000"),
+    ).toBe("postgres://u:p@db.example.com:5432/ag_v_000000000000?sslmode=require");
   });
 });
 
@@ -70,7 +70,7 @@ describe.skipIf(!TEST_DATABASE_URL)("createWorldProvisioner ownership guard", ()
 
     expect(await worldDatabaseExists(TEST_DATABASE_URL!, hashA)).toBeFalse();
     const first = await provisioner.ensure(hashA, "/nonexistent-project");
-    expect(first.worldName).toBe(`ws_v_${PREFIX}`);
+    expect(first.worldName).toBe(`ag_v_${PREFIX}`);
     expect(await worldDatabaseExists(TEST_DATABASE_URL!, hashA)).toBeTrue();
 
     // Same version again: fine (idempotent).

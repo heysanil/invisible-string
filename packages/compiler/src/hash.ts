@@ -1,5 +1,5 @@
 /**
- * Deterministic workflow-version hash.
+ * Deterministic agent-version hash.
  *
  * PLAN.md Phase 1 asks for "canonicalized definition + compiler version +
  * versions.json content". We hash a strict SUPERSET: the FULL canonicalized
@@ -16,7 +16,7 @@
  */
 import { createHash } from "node:crypto";
 
-import type { WorkflowDefinition } from "@invisible-string/shared";
+import type { AgentDefinition } from "@invisible-string/shared";
 
 import type { CompileDeps } from "./types";
 import { COMPILER_VERSION } from "./version";
@@ -59,8 +59,8 @@ export function canonicalJson(value: unknown): string {
  * from compile() so the control plane can cheaply pre-compute the version
  * hash for build-cache lookups.
  */
-export function computeWorkflowHash(
-  definition: WorkflowDefinition,
+export function computeAgentHash(
+  definition: AgentDefinition,
   deps: CompileDeps,
   compilerVersion: string = COMPILER_VERSION,
 ): string {
@@ -72,7 +72,7 @@ export function computeWorkflowHash(
     compilerVersion,
     definition,
     resolved: {
-      agentPreset: deps.agentPreset,
+      agentSlug: deps.agentSlug,
       // Resolved-entry array order is an input artifact, not semantics —
       // normalize by slug so equivalent inputs hash identically.
       connections: [...deps.connections].sort((a, b) =>
@@ -81,7 +81,9 @@ export function computeWorkflowHash(
       options: { dev: deps.options?.dev === true },
       resolvedModel: deps.resolvedModel,
       skills: [...deps.skills].sort((a, b) => (a.slug < b.slug ? -1 : 1)),
-      workflowSlug: deps.workflowSlug,
+      // workspaceSlug participates DELIBERATELY (tenant isolation):
+      // identical agent configs in two workspaces must never share an
+      // artifact, world database, or JWT audience.
       workspaceSlug: deps.workspaceSlug,
     },
     versions: deps.versions,

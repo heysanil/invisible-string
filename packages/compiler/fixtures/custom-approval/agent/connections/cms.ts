@@ -11,14 +11,14 @@ const DENY_TOOLS: readonly string[] = ["cms__delete_page"];
 const ASK_TOOLS: readonly string[] = ["cms__publish_page"];
 const ALLOW_TOOLS: readonly string[] = ["cms__get_page"];
 
-/** MCP connection "cms" (workflow CONTEXT pillar). */
+/** MCP connection "cms" (agent context). */
 export default defineMcpClientConnection({
   url: "https://cms.example.com/mcp",
   description: "Company CMS: create, update, publish, and delete pages.",
-  auth: {
-    // Lazy: probed per tool call, so keyless builds/boots never crash.
-    getToken: async () => ({ token: requireEnv("MCP_CMS_TOKEN") }),
-  },
+  // Lazy callback: env vars are read per request, never at module load.
+  headers: () => ({
+    "X-Api-Key": requireEnv("MCP_CMS_API_KEY"),
+  }),
   tools: { allow: ["get_page", "create_draft", "publish_page", "delete_page"] },
   approval: ({ toolName }) => {
     if (DENY_TOOLS.includes(toolName)) return "denied";

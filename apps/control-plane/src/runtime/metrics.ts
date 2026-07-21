@@ -4,8 +4,10 @@
  * Two halves:
  * - {@link MetricsRegistry} — in-process counters/gauges the hot paths poke:
  *   per-trigger-type counts (dispatch), run-duration histogram (tailer on run
- *   finish), and build-cache hits/misses (publish). No Prometheus dependency;
- *   plain in-memory counters. Reset only on process restart (documented).
+ *   finish), build-cache hits/misses (agent publish), outbound-reply delivery
+ *   tallies (runs/delivery.ts), and schedule-ticker tallies
+ *   (runtime/schedule-ticker.ts). No Prometheus dependency; plain in-memory
+ *   counters. Reset only on process restart (documented).
  * - {@link collectMetrics} — folds the registry with a DB read
  *   ({@link MetricsDbReader}: scheduler queue depth, active runs, runs-by-status,
  *   active sessions, per-worker utilization across the fleet) into the shared
@@ -44,6 +46,27 @@ import type { Db } from "../db";
 /** Outcome bucket a trigger observation lands in. */
 export type TriggerOutcome = keyof TriggerCounts; // "received" | "dispatched" | "failed"
 
+/** Outbound-reply delivery tallies (runs/delivery.ts settles each `pending`). */
+export interface DeliveryCounts {
+  delivered: number;
+  failed: number;
+}
+
+/**
+ * Schedule-ticker tallies (runtime/schedule-ticker.ts): `due` rows scanned,
+ * windows `dispatched`, claim/dispatch `failed`. Scheduled dispatches ALSO
+ * land in the `triggers` map under type "schedule" (the shared contract);
+ * these count the ticker mechanics themselves.
+ */
+export interface ScheduleCounts {
+  due: number;
+  dispatched: number;
+  failed: number;
+}
+
+export type DeliveryOutcomeBucket = keyof DeliveryCounts;
+export type ScheduleOutcomeBucket = keyof ScheduleCounts;
+
 /**
  * Process-lifetime counters/gauges. All mutations are cheap and synchronous;
  * the histogram is stored as the immutable shared value and replaced on record.
@@ -53,11 +76,23 @@ export class MetricsRegistry {
   private readonly triggers = new Map<string, TriggerCounts>();
   private cacheHits = 0;
   private cacheMisses = 0;
+  private deliveries: DeliveryCounts = { delivered: 0, failed: 0 };
+  private schedule: ScheduleCounts = { due: 0, dispatched: 0, failed: 0 };
 
-  /** One trigger observation, keyed by type (manual|form|webhook|slack|…). */
+  /** One trigger observation, keyed by type (manual|form|webhook|slack|schedule|…). */
   recordTrigger(triggerType: string, outcome: TriggerOutcome): void {
     const current = this.triggers.get(triggerType) ?? emptyTriggerCounts();
     this.triggers.set(triggerType, { ...current, [outcome]: current[outcome] + 1 });
+  }
+
+  /** One settled outbound reply (Slack delivery). */
+  recordDelivery(outcome: DeliveryOutcomeBucket): void {
+    this.deliveries = { ...this.deliveries, [outcome]: this.deliveries[outcome] + 1 };
+  }
+
+  /** One schedule-ticker observation (due scan hit / dispatch / failure). */
+  recordSchedule(outcome: ScheduleOutcomeBucket): void {
+    this.schedule = { ...this.schedule, [outcome]: this.schedule[outcome] + 1 };
   }
 
   /** One completed-run wall-clock observation (ms). NaN is ignored (see shared). */
@@ -87,6 +122,14 @@ export class MetricsRegistry {
       misses: this.cacheMisses,
       hitRate: buildCacheHitRate(this.cacheHits, this.cacheMisses),
     };
+  }
+
+  deliveryCounts(): DeliveryCounts {
+    return { ...this.deliveries };
+  }
+
+  scheduleCounts(): ScheduleCounts {
+    return { ...this.schedule };
   }
 }
 
@@ -171,12 +214,25 @@ function workerDto(row: MetricsWorkerRow): WorkerUtilizationDto {
   };
 }
 
-/** Fold the registry + a DB read into the shared metrics contract. */
+/**
+ * The control plane's metrics snapshot: the shared contract plus the
+ * agents-first delivery/schedule counters (additive keys — clients parsing
+ * with `internalMetricsResponseSchema` simply strip them; promote to the
+ * shared schema when the web surface starts consuming them).
+ */
+export interface ControlPlaneMetricsSnapshot extends InternalMetricsResponse {
+  /** Outbound Slack reply deliveries settled by runs/delivery.ts. */
+  deliveries: DeliveryCounts;
+  /** Schedule-ticker mechanics (runtime/schedule-ticker.ts). */
+  schedule: ScheduleCounts;
+}
+
+/** Fold the registry + a DB read into the metrics snapshot. */
 export async function collectMetrics(opts: {
   registry: MetricsRegistry;
   reader: MetricsDbReader;
   now?: Date;
-}): Promise<InternalMetricsResponse> {
+}): Promise<ControlPlaneMetricsSnapshot> {
   const { registry, reader } = opts;
   const now = opts.now ?? new Date();
   const [runsByStatus, activeSessions, workerRows] = await Promise.all([
@@ -194,6 +250,8 @@ export async function collectMetrics(opts: {
     workers: workerRows.map(workerDto),
     triggers: registry.triggerCounts(),
     buildCache: registry.buildCache(),
+    deliveries: registry.deliveryCounts(),
+    schedule: registry.scheduleCounts(),
   };
 }
 
@@ -205,7 +263,7 @@ export async function collectMetrics(opts: {
  * TYPE preamble) — enough for a scrape or an eyeball. The JSON body is the
  * authoritative contract; this is a convenience.
  */
-export function renderMetricsText(snapshot: InternalMetricsResponse): string {
+export function renderMetricsText(snapshot: ControlPlaneMetricsSnapshot): string {
   const lines: string[] = [];
   lines.push(`is_scheduler_queue_depth ${snapshot.queueDepth}`);
   lines.push(`is_active_runs ${snapshot.activeRuns}`);
@@ -231,6 +289,11 @@ export function renderMetricsText(snapshot: InternalMetricsResponse): string {
   lines.push(`is_build_cache_hits_total ${snapshot.buildCache.hits}`);
   lines.push(`is_build_cache_misses_total ${snapshot.buildCache.misses}`);
   lines.push(`is_build_cache_hit_rate ${snapshot.buildCache.hitRate}`);
+  lines.push(`is_deliveries_total{outcome="delivered"} ${snapshot.deliveries.delivered}`);
+  lines.push(`is_deliveries_total{outcome="failed"} ${snapshot.deliveries.failed}`);
+  lines.push(`is_schedule_fires_total{outcome="due"} ${snapshot.schedule.due}`);
+  lines.push(`is_schedule_fires_total{outcome="dispatched"} ${snapshot.schedule.dispatched}`);
+  lines.push(`is_schedule_fires_total{outcome="failed"} ${snapshot.schedule.failed}`);
   for (const w of snapshot.workers) {
     const labels = `worker="${w.workerId}",status="${w.status}"`;
     lines.push(`is_worker_running_agents{${labels}} ${w.runningAgents}`);

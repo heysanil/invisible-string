@@ -44,14 +44,8 @@ export const errors = {
     new RuntimeApiError(
       422,
       "draft_invalid",
-      "workflow draft is not a valid four-pillar definition",
+      "draft is not a valid agent definition",
       issues,
-    ),
-  agentPresetNotFound: (agentPresetId: string) =>
-    new RuntimeApiError(
-      422,
-      "agent_preset_not_found",
-      `agent preset ${agentPresetId} does not exist in this workspace`,
     ),
   modelPresetNotFound: (slug: string) =>
     new RuntimeApiError(
@@ -75,10 +69,10 @@ export const errors = {
     new RuntimeApiError(
       422,
       "context_resource_not_found",
-      `${kind === "skill" ? "skill" : "MCP connection"} ${id} is not available to this workflow`,
+      `${kind === "skill" ? "skill" : "MCP connection"} ${id} is not available to this agent`,
     ),
   compileFailed: (issues: unknown) =>
-    new RuntimeApiError(422, "compile_failed", "workflow failed to compile", issues),
+    new RuntimeApiError(422, "compile_failed", "agent failed to compile", issues),
   skillFilesUnavailable: (skillName: string) =>
     new RuntimeApiError(
       500,
@@ -111,12 +105,15 @@ export const errors = {
       "tool_filter_conflict",
       "set a tool allowlist OR a blocklist on a connection, not both",
     ),
-  connectionInUse: (workflowNames: string[]) =>
+  connectionInUse: (agentNames: string[]) =>
     new RuntimeApiError(
       409,
       "connection_in_use",
-      `connection is referenced by ${workflowNames.length} workflow(s): ${workflowNames.join(", ")}`,
-      { workflows: workflowNames },
+      `connection is referenced by ${agentNames.length} agent(s): ${agentNames.join(", ")}`,
+      // Plain name array: the SPA's blocker parser reads bare arrays and
+      // keyed shapes alike — a bare array stays truthful now that the
+      // referencing entities are agents, not workflows.
+      agentNames,
     ),
   skillFileTooLarge: (maxBytes: number) =>
     new RuntimeApiError(
@@ -141,12 +138,13 @@ export const errors = {
       `attachment "${fileName}" is not a UTF-8 text file — skill reference files must be text (compilation would corrupt binary data)`,
       { fileName },
     ),
-  modelReferencedByPreset: (slugs: string[]) =>
+  /** References = model-preset slugs AND/OR agent names (draft model overrides). */
+  modelReferencedByPreset: (references: string[]) =>
     new RuntimeApiError(
       409,
       "model_referenced_by_preset",
-      `model is used by the ${slugs.join(", ")} preset(s) — repoint them before removing it`,
-      { presets: slugs },
+      `model is used by ${references.length} preset(s) or agent(s): ${references.join(", ")} — repoint them before removing it`,
+      { references },
     ),
   modelAllowlistDuplicate: () =>
     new RuntimeApiError(
@@ -192,6 +190,40 @@ export const errors = {
       409,
       "workflow_not_published",
       "workflow has no published version — publish it first",
+    ),
+  /** Chat/dispatch against an agent that has never been published. */
+  agentNotPublished: () =>
+    new RuntimeApiError(
+      409,
+      "agent_not_published",
+      "agent has no published version — publish it first",
+    ),
+  /** DELETE guard: workflows or sessions still depend on this agent. */
+  agentInUse: (workflowNames: string[], sessionCount: number) =>
+    new RuntimeApiError(
+      409,
+      "agent_in_use",
+      [
+        "agent is still in use:",
+        workflowNames.length > 0
+          ? `${workflowNames.length} workflow(s) (${workflowNames.join(", ")})`
+          : null,
+        sessionCount > 0 ? `${sessionCount} session(s)` : null,
+      ]
+        .filter((part): part is string => part !== null)
+        .join(" "),
+      { workflows: workflowNames, sessions: sessionCount },
+    ),
+  /**
+   * A published workflow snapshot whose agent cannot be resolved anymore
+   * (deleted despite RESTRICT / never set) — republish the workflow with a
+   * valid agent.
+   */
+  workflowAgentMissing: () =>
+    new RuntimeApiError(
+      409,
+      "workflow_agent_missing",
+      "the workflow's agent no longer exists — pick an agent and republish",
     ),
   versionNotReady: (buildStatus: string) =>
     new RuntimeApiError(

@@ -1,8 +1,8 @@
 /**
- * MCP connection CRUD (CONTEXT pillar), both scopes. Secrets are encrypted at
+ * MCP connection CRUD (agent CONTEXT), both scopes. Secrets are encrypted at
  * rest and NEVER echoed (read DTOs carry `hasCredentials` only). A connection
- * cannot be deleted while any workflow draft or published version references
- * it (409, with the referencing workflow names).
+ * cannot be deleted while any agent draft or published agent version
+ * references it (409, with the referencing agent names).
  */
 import { randomUUID } from "node:crypto";
 
@@ -44,12 +44,12 @@ async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
 }
 
 /**
- * Workflow names (draft OR any published version) that reference this
- * connection id — the delete guard. The query is constrained to the SAME
- * scope as the connection, mirroring how compile-service resolves refs
- * (workspace connections resolve only against same-org workflows; user
- * connections only against workflows whose run-as user owns them). This keeps
- * the guard from ever reading or reporting workflow names outside the owner's
+ * Agent names (draft OR any published version definition) that reference
+ * this connection id — the delete guard. The query is constrained to the
+ * SAME scope as the connection, mirroring how compile-service resolves refs
+ * (workspace connections resolve only against same-org agents; user
+ * connections only against agents whose run-as user owns them). This keeps
+ * the guard from ever reading or reporting agent names outside the owner's
  * scope. jsonb `@>` containment matches the id inside the
  * `context.mcpConnectionIds` array.
  */
@@ -61,19 +61,19 @@ export async function connectionReferences(
   const idJson = JSON.stringify(connectionId);
   const scopeCond =
     scope.kind === "workspace"
-      ? sql`w.organization_id = ${scope.organizationId}`
-      : sql`w.run_as_user_id = ${scope.userId}`;
+      ? sql`a.organization_id = ${scope.organizationId}`
+      : sql`a.run_as_user_id = ${scope.userId}`;
   const result = await db.execute(sql`
-    SELECT DISTINCT w.name AS name
-    FROM ${schema.workflows} w
+    SELECT DISTINCT a.name AS name
+    FROM ${schema.agents} a
     WHERE ${scopeCond}
-      AND (w.draft -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
+      AND (a.draft -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
     UNION
-    SELECT DISTINCT w.name AS name
-    FROM ${schema.workflows} w
-    JOIN ${schema.workflowVersions} v ON v.workflow_id = w.id
+    SELECT DISTINCT a.name AS name
+    FROM ${schema.agents} a
+    JOIN ${schema.agentVersions} v ON v.agent_id = a.id
     WHERE ${scopeCond}
-      AND (v.config -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
+      AND (v.definition -> 'context' -> 'mcpConnectionIds') @> ${idJson}::jsonb
     ORDER BY name
   `);
   const rows = result as unknown as Array<{ name: unknown }>;

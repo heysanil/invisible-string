@@ -29,12 +29,13 @@ private Compose bridge.
 - **`web`** serves the built SPA and reverse-proxies the control-plane API on
   the same origin (no CORS, first-party cookies). It is the only service
   attached to the hoster's external proxy network (`dokploy-network`).
-- **`control-plane`** is the API host: auth, pillar CRUD, `eve build` +
-  artifact upload, scheduler, trigger ingress, SSE, copilot WS.
+- **`control-plane`** is the API host: auth, agent + workflow CRUD,
+  `eve build` + artifact upload, scheduler, trigger ingress + schedule
+  ticker, outbound Slack reply delivery, SSE, copilot WS.
 - **`worker`** boots compiled agents (Node 24) and reverse-proxies runs. It
   mounts `/var/run/docker.sock` so eve sandboxes run as sibling containers.
 - **`postgres`** holds the `product` DB (control plane + Better Auth) and the
-  `world` DB (eve durability, plus per-version `ws_v_*` databases).
+  `world` DB (eve durability, plus per-agent-version `ag_v_*` databases).
 - **`garage`** is the S3-compatible object store for build-artifact tarballs
   and trigger file payloads.
 - **`migrate`** is a one-shot that applies migrations before `control-plane`
@@ -180,11 +181,16 @@ docker compose --env-file /tmp/prod-smoke.env \
   -f docker-compose.prod.yml -f docker-compose.prod.build.yml down -v
 ```
 
-The automated version of this smoke — plus a full workflow publish through the
+The automated version of this smoke — plus a full agent publish through the
 gateway, with `eve build` running inside the control-plane container — is
 `tests/integration/prod-compose-smoke.test.ts` (`PROD_SMOKE=1`, compose
 project `psmoke`; CI runs it in the `prod-compose` job). Run it after any
-change to the Dockerfiles, the compose files, or the build steps.
+change to the Dockerfiles, the compose files, or the build steps. The harness
+scrubs every compose-interpolated variable from the environment it spawns
+`docker compose` with: compose gives OS-env values — even empty strings —
+precedence over `--env-file`, and `bun test` auto-loads the repo `.env`, so
+without the scrub a stray `OPENROUTER_API_KEY=` line (or a real host key)
+would override the throwaway smoke secrets.
 
 ---
 
@@ -208,8 +214,8 @@ Requirements:
   `POSTGRES_PASSWORD` / `GARAGE_RPC_SECRET` (which this file never references).
 - The managed Postgres role **must have `CREATEDB`** unless the `product` and
   `world` databases are pre-created — the migrate one-shot creates missing
-  databases, and the world provisioner creates a per-version `ws_v_*` database
-  for every workflow version.
+  databases, and the world provisioner creates a per-version `ag_v_*` database
+  for every agent version.
 - The S3 endpoint must support **SigV4 presigned GET** URLs, and those URLs must
   be reachable from the `worker` container (it fetches artifacts by plain
   `fetch`). `S3_BUCKET` (default `artifacts`) and `S3_REGION` (default
@@ -237,8 +243,8 @@ profile-off deploys do not need it.
 ## 9. Backups
 
 Postgres is the critical state; Garage artifacts are re-buildable from the
-pillar config — **but back the two up as a pair**: the build cache
-(`workflow_builds`) trusts its `succeeded` rows without re-checking that the
+stored agent definitions — **but back the two up as a pair**: the build cache
+(`builds`) trusts its `succeeded` rows without re-checking that the
 tarball still exists in the store, so restoring Postgres *without* the matching
 `garage-data` volume strands those builds pointing at missing artifacts (runs
 fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
@@ -254,7 +260,7 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
   restore; the `product` DB is the one that must survive.)
 - **Garage** — snapshot the `garage-data` volume alongside every Postgres
   backup. If you must restore Postgres without it, clear the stale cache first:
-  `DELETE FROM workflow_builds;` — builds then re-run and re-populate the store.
+  `DELETE FROM builds;` — builds then re-run and re-populate the store.
 
 ---
 
@@ -286,10 +292,11 @@ Run against the deployed domain after every deploy:
 
    Expect `200` with a `set-cookie` header (same-origin cookie through the
    gateway).
-4. In the UI: build a workflow, **Publish** it (real `eve build` → artifact
-   upload to Garage → worker presigned pull), and run it from chat — the working
+4. In the UI: create an Agent, **Publish** it (real `eve build` → artifact
+   upload to Garage → worker presigned pull), and chat with it — the working
    block should stream and complete.
-5. Fire a webhook trigger to confirm ingress:
+5. Fire a webhook trigger to confirm ingress (needs a published workflow
+   delegating to the agent, with a minted webhook token):
    `curl -sS -X POST https://<domain>/t/<token> -H 'content-type: application/json' -d '{}'`.
 
 ---

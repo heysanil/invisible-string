@@ -46,7 +46,8 @@ function runRow(status: RunStatus, message = "hello") {
     status,
     error: null,
     triggerEvent: {
-      workflowId: "wf",
+      agentId: "agent",
+      workflowId: null,
       triggerType: "manual",
       message,
       data: {},

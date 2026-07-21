@@ -1,21 +1,21 @@
 import { describe, expect, test } from "bun:test";
 
-import type { WorkflowDefinition } from "@invisible-string/shared";
+import type { AgentDefinition } from "@invisible-string/shared";
 
 import { compile } from "./compile";
 import { CompileError, type CompileErrorCode } from "./errors";
 import {
+  anthropicModelFixture,
+  basicFixture,
   customApprovalFixture,
-  formMcpSkillFixture,
-  manualOnlyFixture,
-  scheduleFixture,
-  slackFixture,
+  mcpSkillFixture,
+  ALL_FIXTURES,
 } from "./test-fixtures";
 import type { CompileDeps } from "./types";
 
 function expectCompileError(
   code: CompileErrorCode,
-  definition: WorkflowDefinition,
+  definition: AgentDefinition,
   deps: CompileDeps,
 ): CompileError {
   try {
@@ -29,16 +29,16 @@ function expectCompileError(
   throw new Error(`expected compile() to throw CompileError ${code}`);
 }
 
-function withInstructions(
-  definition: WorkflowDefinition,
-  markdown: string,
-): WorkflowDefinition {
-  return { ...definition, instructions: { markdown } };
+function withPersona(
+  definition: AgentDefinition,
+  persona: string,
+): AgentDefinition {
+  return { ...definition, persona };
 }
 
 describe("emitted file sets", () => {
-  test("manual-only: eve channel only, no trigger/env libs", () => {
-    const { files } = compile(manualOnlyFixture.definition, manualOnlyFixture.deps);
+  test("basic: eve channel only, no env lib", () => {
+    const { files } = compile(basicFixture.definition, basicFixture.deps);
     expect([...files.keys()].sort()).toEqual([
       "agent/agent.ts",
       "agent/channels/eve.ts",
@@ -49,42 +49,41 @@ describe("emitted file sets", () => {
     ]);
   });
 
-  test("form fixture: trigger channel + libs + connection + flat skill", () => {
-    const { files } = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps);
+  test("mcp-skill: env lib + connection + packaged skill directory", () => {
+    const { files } = compile(mcpSkillFixture.definition, mcpSkillFixture.deps);
     expect([...files.keys()].sort()).toEqual([
       "agent/agent.ts",
       "agent/channels/eve.ts",
-      "agent/channels/form.ts",
       "agent/connections/deepwiki.ts",
       "agent/instructions.md",
       "agent/lib/env.ts",
       "agent/lib/platform-auth.ts",
-      "agent/lib/trigger-event.ts",
-      "agent/skills/release-notes.md",
+      "agent/skills/release-notes/SKILL.md",
+      "agent/skills/release-notes/references/rota.md",
       "package.json",
       "tsconfig.json",
     ]);
+    expect(files.has("agent/skills/release-notes.md")).toBe(false);
   });
 
-  test("slack fixture: packaged skill directory + slack channel", () => {
-    const { files } = compile(slackFixture.definition, slackFixture.deps);
-    expect(files.has("agent/channels/slack.ts")).toBe(true);
-    expect(files.has("agent/skills/triage/SKILL.md")).toBe(true);
-    expect(files.has("agent/skills/triage/references/rota.md")).toBe(true);
-    expect(files.has("agent/skills/triage.md")).toBe(false);
-  });
-
-  test("schedule fixture: schedules file, no trigger channel or trigger lib", () => {
-    const { files } = compile(scheduleFixture.definition, scheduleFixture.deps);
-    expect(files.has("agent/schedules/schedule.ts")).toBe(true);
-    expect(files.has("agent/lib/trigger-event.ts")).toBe(false);
-    expect([...files.keys()].some((path) => path.startsWith("agent/channels/") && path !== "agent/channels/eve.ts")).toBe(false);
+  test("artifacts are trigger-agnostic: no fixture emits trigger channels, schedules, or outbound libs", () => {
+    for (const fixture of ALL_FIXTURES) {
+      const { files } = compile(fixture.definition, fixture.deps);
+      const paths = [...files.keys()];
+      expect(
+        paths.filter((path) => path.startsWith("agent/channels/")),
+        fixture.name,
+      ).toEqual(["agent/channels/eve.ts"]);
+      expect(paths.some((path) => path.startsWith("agent/schedules/")), fixture.name).toBe(false);
+      expect(files.has("agent/lib/trigger-event.ts"), fixture.name).toBe(false);
+      expect(files.has("agent/lib/slack.ts"), fixture.name).toBe(false);
+    }
   });
 });
 
 describe("generated content invariants", () => {
   test("secrets discipline: generated code reads env, never values", () => {
-    for (const fixture of [formMcpSkillFixture, slackFixture, customApprovalFixture]) {
+    for (const fixture of [mcpSkillFixture, customApprovalFixture]) {
       const { files } = compile(fixture.definition, fixture.deps);
       const connectionFiles = [...files.entries()].filter(([path]) =>
         path.startsWith("agent/connections/"),
@@ -95,17 +94,17 @@ describe("generated content invariants", () => {
         expect(content).toContain("defineMcpClientConnection");
       }
     }
-    const bearer = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
+    const bearer = compile(mcpSkillFixture.definition, mcpSkillFixture.deps)
       .files.get("agent/connections/deepwiki.ts")!;
     expect(bearer).toContain('requireEnv("MCP_DEEPWIKI_TOKEN")');
-    const headers = compile(slackFixture.definition, slackFixture.deps)
-      .files.get("agent/connections/docs.ts")!;
-    expect(headers).toContain('"X-Api-Key": requireEnv("MCP_DOCS_API_KEY")');
+    const headers = compile(customApprovalFixture.definition, customApprovalFixture.deps)
+      .files.get("agent/connections/cms.ts")!;
+    expect(headers).toContain('"X-Api-Key": requireEnv("MCP_CMS_API_KEY")');
     expect(headers).toContain("headers: () =>");
   });
 
-  test("agent.ts: explicit model, reasoning, world-postgres world", () => {
-    const openrouter = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
+  test("agent.ts: explicit model, definition reasoning, world-postgres world", () => {
+    const openrouter = compile(mcpSkillFixture.definition, mcpSkillFixture.deps)
       .files.get("agent/agent.ts")!;
     expect(openrouter).toContain('const MODEL_ID = "deepseek/deepseek-v4-flash";');
     expect(openrouter).toContain("createOpenRouter({");
@@ -113,54 +112,38 @@ describe("generated content invariants", () => {
     expect(openrouter).toContain('reasoning: "high",');
     expect(openrouter).toContain('world: "@workflow/world-postgres"');
 
-    const anthropic = compile(slackFixture.definition, slackFixture.deps)
+    const anthropic = compile(anthropicModelFixture.definition, anthropicModelFixture.deps)
       .files.get("agent/agent.ts")!;
     expect(anthropic).toContain('anthropic("claude-opus-4-8")');
     expect(anthropic).not.toContain("createOpenRouter");
-    // No reasoning override and no preset default on this fixture.
-    expect(anthropic).not.toContain("reasoning:");
-  });
-
-  test("preset default reasoning applies when the definition has no override", () => {
-    const agent = compile(scheduleFixture.definition, scheduleFixture.deps)
-      .files.get("agent/agent.ts")!;
-    expect(agent).toContain('reasoning: "medium",');
+    // Reasoning always comes from the definition — no preset fallback chain.
+    expect(anthropic).toContain('reasoning: "low",');
   });
 
   test("localDev() is emitted ONLY on dev builds", () => {
-    const prod = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
+    const prod = compile(basicFixture.definition, basicFixture.deps)
       .files.get("agent/lib/platform-auth.ts")!;
     expect(prod).not.toContain("localDev");
-    const dev = compile(slackFixture.definition, slackFixture.deps)
+    const dev = compile(anthropicModelFixture.definition, anthropicModelFixture.deps)
       .files.get("agent/lib/platform-auth.ts")!;
     expect(dev).toContain("localDev");
     expect(dev).toContain("[platformJwt(), localDev()]");
   });
 
-  test("trigger channels mount at /eve/v1/platform/<trigger> and pass the continuation token through", () => {
-    const form = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
-      .files.get("agent/channels/form.ts")!;
-    expect(form).toContain('POST("/eve/v1/platform/form"');
-    expect(form).toContain("event.continuationToken ??");
-    expect(form).toContain("routeAuth(req, platformAuth())");
-    expect(form).toContain("PLATFORM_CALLBACK_URL");
-
-    const compiledSlack = compile(slackFixture.definition, slackFixture.deps);
-    const slack = compiledSlack.files.get("agent/channels/slack.ts")!;
-    expect(slack).toContain('POST<SlackReplyTarget>("/eve/v1/platform/slack"');
-    // Outbound delivery lives in the standalone, testable agent/lib/slack.ts
-    // (slack-outbound.test.ts drives it against a stub Slack server).
-    expect(slack).toContain("postSlackReply(channel.state, data.message)");
-    const slackLib = compiledSlack.files.get("agent/lib/slack.ts")!;
-    expect(slackLib).toContain("chat.postMessage");
-    expect(slackLib).toContain("SLACK_BOT_TOKEN");
-    expect(slackLib).toContain("SLACK_API_BASE_URL");
+  test("platform-auth bakes the version-bound agent-version audience", () => {
+    const { files, hash } = compile(basicFixture.definition, basicFixture.deps);
+    const auth = files.get("agent/lib/platform-auth.ts")!;
+    expect(auth).toContain(`PLATFORM_JWT_AUDIENCE = "agent-version:${hash}"`);
+    expect(auth).toContain('PLATFORM_JWT_ISSUER = "invisible-string"');
   });
 
-  test("trigger ref markers are baked into the channel", () => {
-    const form = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
-      .files.get("agent/channels/form.ts")!;
-    expect(form).toContain('const TRIGGER_REFS: readonly string[] = ["repo", "audience", "notes"];');
+  test("eve channel carries the agent identity line", () => {
+    const channel = compile(basicFixture.definition, basicFixture.deps)
+      .files.get("agent/channels/eve.ts")!;
+    expect(channel).toContain(
+      'Platform agent \\"general-purpose\\" in workspace \\"acme\\" (invisible-string).',
+    );
+    expect(channel).toContain("defaultEveAuth(ctx)");
   });
 
   test("custom approval compiles to a qualified-name policy", () => {
@@ -176,81 +159,83 @@ describe("generated content invariants", () => {
     expect(deepwiki).not.toContain("auth:");
   });
 
-  test("package.json pins exactly per provider and never emits a lockfile", () => {
-    const { files } = compile(slackFixture.definition, slackFixture.deps);
+  test("package.json pins exactly per provider, names agent--<ws>--<agent>, never emits a lockfile", () => {
+    const { files } = compile(anthropicModelFixture.definition, anthropicModelFixture.deps);
     const manifest = JSON.parse(files.get("package.json")!) as {
+      name: string;
       engines: { node: string };
       dependencies: Record<string, string>;
     };
+    expect(manifest.name).toBe("agent--acme--support-triage");
     expect(manifest.engines.node).toBe("24.x");
     expect(manifest.dependencies["@ai-sdk/anthropic"]).toBe(
-      slackFixture.deps.versions.anthropicProvider,
+      anthropicModelFixture.deps.versions.anthropicProvider,
     );
     expect(manifest.dependencies["@openrouter/ai-sdk-provider"]).toBeUndefined();
-    expect(manifest.dependencies.eve).toBe(slackFixture.deps.versions.eve);
+    expect(manifest.dependencies.eve).toBe(anthropicModelFixture.deps.versions.eve);
     expect(files.has("package-lock.json")).toBe(false);
     expect(files.has("bun.lock")).toBe(false);
   });
 });
 
 describe("instructions rendering", () => {
-  test("compile-time refs become literal text; trigger refs become {{markers}}", () => {
-    const instructions = compile(formMcpSkillFixture.definition, formMcpSkillFixture.deps)
+  test("persona refs become literal text; the appendix routes discovery", () => {
+    const instructions = compile(mcpSkillFixture.definition, mcpSkillFixture.deps)
       .files.get("agent/instructions.md")!;
-    expect(instructions).toContain("{{trigger.repo}}");
-    expect(instructions).toContain("{{trigger.audience}}");
     expect(instructions).toContain('the "deepwiki" connection');
     expect(instructions).toContain('the "release-notes" skill');
     expect(instructions).not.toContain("@deepwiki");
     expect(instructions).not.toContain("@skill.release-notes");
-    // Persona block + descriptions appendix.
     expect(instructions).toContain("pragmatic senior software engineer");
     expect(instructions).toContain("## Workspace context");
     expect(instructions).toContain("connection_search");
     expect(instructions).toContain("load_skill");
+    // Trigger machinery is gone from compiled instructions entirely.
+    expect(instructions).not.toContain("{{trigger");
+    expect(instructions).not.toContain("Trigger data");
+  });
+
+  test("no appendix when the agent has no context", () => {
+    const instructions = compile(basicFixture.definition, basicFixture.deps)
+      .files.get("agent/instructions.md")!;
+    expect(instructions).not.toContain("## Workspace context");
+    expect(instructions.trim().endsWith("rather than guessing.")).toBe(true);
   });
 
   test("email addresses and escaped @ prose survive untouched", () => {
-    const definition = withInstructions(
-      manualOnlyFixture.definition,
+    const definition = withPersona(
+      basicFixture.definition,
       "Contact hi@sanil.co when done. Mention no refs.",
     );
-    const instructions = compile(definition, manualOnlyFixture.deps)
+    const instructions = compile(definition, basicFixture.deps)
       .files.get("agent/instructions.md")!;
     expect(instructions).toContain("hi@sanil.co");
   });
 });
 
 describe("typed CompileError cases", () => {
-  const base = formMcpSkillFixture;
+  const base = mcpSkillFixture;
 
   test("INVALID_DEFINITION: malformed definition shape", () => {
     const bad = {
       ...base.definition,
-      trigger: { type: "form", fields: [] },
-    } as unknown as WorkflowDefinition;
+      model: { preset: "galaxy-brain" },
+    } as unknown as AgentDefinition;
     expectCompileError("INVALID_DEFINITION", bad, base.deps);
   });
 
-  test("EMPTY_INSTRUCTIONS", () => {
+  test("EMPTY_PERSONA", () => {
     expectCompileError(
-      "EMPTY_INSTRUCTIONS",
-      withInstructions(base.definition, "   \n"),
+      "EMPTY_PERSONA",
+      withPersona(base.definition, "   \n"),
       base.deps,
     );
   });
 
-  test("AGENT_PRESET_MISMATCH", () => {
-    expectCompileError("AGENT_PRESET_MISMATCH", base.definition, {
-      ...base.deps,
-      agentPreset: { ...base.deps.agentPreset, id: "11111111-2222-4333-8444-555555555555" },
-    });
-  });
-
   test("MODEL_MISMATCH: definition override differs from resolved model", () => {
-    const withOverride: WorkflowDefinition = {
+    const withOverride: AgentDefinition = {
       ...base.definition,
-      agent: { ...base.definition.agent, modelId: "z-ai/glm-5.2" },
+      model: { ...base.definition.model, modelId: "z-ai/glm-5.2" },
     };
     expectCompileError("MODEL_MISMATCH", withOverride, base.deps);
   });
@@ -266,7 +251,11 @@ describe("typed CompileError cases", () => {
     });
     expectCompileError("INVALID_SLUG", base.definition, {
       ...base.deps,
-      workflowSlug: "Release Notes",
+      agentSlug: "Software Engineer",
+    });
+    expectCompileError("INVALID_SLUG", base.definition, {
+      ...base.deps,
+      workspaceSlug: "Acme Inc",
     });
   });
 
@@ -289,11 +278,11 @@ describe("typed CompileError cases", () => {
         slug: "same",
       })),
     };
-    // The duplicated slug also orphans the instructions refs, so use a
-    // definition without connection refs to isolate the slug check.
+    // The duplicated slug also orphans the persona refs, so use a persona
+    // without connection refs to isolate the slug check.
     expectCompileError(
       "DUPLICATE_SLUG",
-      withInstructions(customApprovalFixture.definition, "Sync the payload."),
+      withPersona(customApprovalFixture.definition, "Sync the payload."),
       dupDeps,
     );
   });
@@ -346,9 +335,9 @@ describe("typed CompileError cases", () => {
   });
 
   test("INVALID_HEADER: bad env var name (secrets discipline gate)", () => {
-    expectCompileError("INVALID_HEADER", slackFixture.definition, {
-      ...slackFixture.deps,
-      connections: slackFixture.deps.connections.map((connection) => ({
+    expectCompileError("INVALID_HEADER", customApprovalFixture.definition, {
+      ...customApprovalFixture.deps,
+      connections: customApprovalFixture.deps.connections.map((connection) => ({
         ...connection,
         auth: { kind: "headers" as const, headers: { "X-Api-Key": "sk-live-SECRETVALUE" } },
       })),
@@ -406,9 +395,9 @@ describe("typed CompileError cases", () => {
 
   test("INVALID_SKILL_FILE: escaping paths rejected", () => {
     for (const path of ["../evil.md", "refs/../../evil.md", "/abs.md", "SKILL.md", ""]) {
-      expectCompileError("INVALID_SKILL_FILE", slackFixture.definition, {
-        ...slackFixture.deps,
-        skills: slackFixture.deps.skills.map((skill) => ({
+      expectCompileError("INVALID_SKILL_FILE", base.definition, {
+        ...base.deps,
+        skills: base.deps.skills.map((skill) => ({
           ...skill,
           files: { [path]: "boom" },
         })),
@@ -418,12 +407,12 @@ describe("typed CompileError cases", () => {
 });
 
 describe("@reference edge cases through compile()", () => {
-  const base = manualOnlyFixture;
+  const base = basicFixture;
 
   test("UNRESOLVED_REFERENCE: unknown connection (prose @word)", () => {
     const error = expectCompileError(
       "UNRESOLVED_REFERENCE",
-      withInstructions(base.definition, "Ping @linear when done."),
+      withPersona(base.definition, "Ping @linear when done."),
       base.deps,
     );
     expect(error.details.name).toBe("linear");
@@ -432,82 +421,45 @@ describe("@reference edge cases through compile()", () => {
   test("UNRESOLVED_REFERENCE: unknown and bare skill refs", () => {
     expectCompileError(
       "UNRESOLVED_REFERENCE",
-      withInstructions(base.definition, "Follow @skill.nope."),
+      withPersona(base.definition, "Follow @skill.nope."),
       base.deps,
     );
     expectCompileError(
       "UNRESOLVED_REFERENCE",
-      withInstructions(base.definition, "Follow @skill please."),
+      withPersona(base.definition, "Follow @skill please."),
       base.deps,
     );
   });
 
-  test("UNRESOLVED_REFERENCE: bare @trigger", () => {
-    expectCompileError(
-      "UNRESOLVED_REFERENCE",
-      withInstructions(formMcpSkillFixture.definition, "Use @trigger to decide."),
-      formMcpSkillFixture.deps,
-    );
-  });
-
-  test("TRIGGER_REF_NOT_ALLOWED: manual and schedule triggers carry no data", () => {
-    expectCompileError(
-      "TRIGGER_REF_NOT_ALLOWED",
-      withInstructions(base.definition, "Read @trigger.email."),
-      base.deps,
-    );
-    expectCompileError(
-      "TRIGGER_REF_NOT_ALLOWED",
-      withInstructions(scheduleFixture.definition, "Read @trigger.email."),
-      scheduleFixture.deps,
-    );
-  });
-
-  test("TRIGGER_REF_UNKNOWN_FIELD: form refs must match a field key", () => {
+  test("TRIGGER_REF_NOT_ALLOWED: any @trigger reference — agents are trigger-agnostic", () => {
     const error = expectCompileError(
-      "TRIGGER_REF_UNKNOWN_FIELD",
-      withInstructions(formMcpSkillFixture.definition, "Read @trigger.missing_field."),
-      formMcpSkillFixture.deps,
+      "TRIGGER_REF_NOT_ALLOWED",
+      withPersona(base.definition, "Read @trigger.email and reply."),
+      base.deps,
     );
-    expect(error.details.fieldKey).toBe("missing_field");
-  });
-
-  test("form refs may address nested paths under a known field key", () => {
-    const { files } = compile(
-      withInstructions(formMcpSkillFixture.definition, "Read @trigger.notes.extra of @trigger.repo."),
-      formMcpSkillFixture.deps,
+    expect(error.message).toContain("agents are trigger-agnostic");
+    // Bare @trigger is rejected the same way — no trigger vocabulary exists
+    // in a persona at all.
+    expectCompileError(
+      "TRIGGER_REF_NOT_ALLOWED",
+      withPersona(base.definition, "Use @trigger to decide."),
+      base.deps,
     );
-    expect(files.get("agent/instructions.md")).toContain("{{trigger.notes.extra}}");
-  });
-
-  test("webhook refs accept arbitrary payload paths", () => {
-    const { files } = compile(
-      withInstructions(customApprovalFixture.definition, "Handle @trigger.payload.items.0.sku via @cms and @deepwiki."),
-      customApprovalFixture.deps,
-    );
-    expect(files.get("agent/instructions.md")).toContain("{{trigger.payload.items.0.sku}}");
-    const webhook = files.get("agent/channels/webhook.ts")!;
-    expect(webhook).toContain('["payload.items.0.sku"]');
-  });
-
-  test("duplicate trigger refs bake into the channel once", () => {
-    const { files } = compile(
-      withInstructions(
-        formMcpSkillFixture.definition,
-        "Use @trigger.repo, then re-check @trigger.repo.",
-      ),
-      formMcpSkillFixture.deps,
-    );
-    expect(files.get("agent/channels/form.ts")).toContain(
-      'const TRIGGER_REFS: readonly string[] = ["repo"];',
+    // Even with context attached (rules out any interplay with resolution).
+    expectCompileError(
+      "TRIGGER_REF_NOT_ALLOWED",
+      withPersona(mcpSkillFixture.definition, "Use @deepwiki on @trigger.repo."),
+      mcpSkillFixture.deps,
     );
   });
 
   test("trailing dots and adjacent punctuation stay out of refs", () => {
     const { files } = compile(
-      withInstructions(formMcpSkillFixture.definition, "Check @trigger.repo. Then stop."),
-      formMcpSkillFixture.deps,
+      withPersona(mcpSkillFixture.definition, "Check @deepwiki. Then stop."),
+      mcpSkillFixture.deps,
     );
-    expect(files.get("agent/instructions.md")).toContain("{{trigger.repo}}. Then stop.");
+    expect(files.get("agent/instructions.md")).toContain(
+      'the "deepwiki" connection. Then stop.',
+    );
   });
 });

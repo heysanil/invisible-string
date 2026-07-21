@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import { isModelAllowlisted, slackThreadKey } from "./dispatch";
-import { shouldStartNewSlackSession } from "../integrations/routes";
+import { mapIngressBody, shouldStartNewSlackSession } from "../integrations/routes";
+import { isRuntimeApiError } from "./errors";
 import type { SlackInnerEvent, SlackTriggerBinding } from "@invisible-string/shared";
 
 describe("isModelAllowlisted (dispatch-time re-validation core)", () => {
@@ -33,6 +34,75 @@ describe("slackThreadKey", () => {
   test("namespaces thread_ts by integration + channel", () => {
     expect(slackThreadKey("int-1", "C1", "1.0")).toBe("int-1:C1:1.0");
     expect(slackThreadKey("int-1", "C2", "1.0")).not.toBe(slackThreadKey("int-1", "C1", "1.0"));
+  });
+});
+
+describe("mapIngressBody (trigger-row formSchema is authoritative)", () => {
+  // The persisted `form_schema` envelope, as setTriggerToken /
+  // syncTriggerForPublish write it.
+  const formSchema = {
+    fields: [
+      { key: "repo", label: "Repo", type: "text", required: true },
+      { key: "message", label: "Message", type: "textarea", required: false },
+    ],
+  };
+
+  test("webhook: passes the object through; message defaults", () => {
+    expect(mapIngressBody("webhook", { repo: "acme/app" }, null)).toEqual({
+      message: "Incoming webhook event.",
+      data: { repo: "acme/app" },
+    });
+    expect(mapIngressBody("webhook", { message: "run it" }, null).message).toBe("run it");
+  });
+
+  test("webhook: non-object bodies are rejected", () => {
+    for (const bad of [null, [], "text", 42]) {
+      expect(() => mapIngressBody("webhook", bad, null)).toThrow(
+        "webhook body must be a JSON object",
+      );
+    }
+  });
+
+  test("form: validates values against the PERSISTED form schema", () => {
+    const mapped = mapIngressBody(
+      "form",
+      { values: { repo: "acme/app", message: "hello" } },
+      formSchema,
+    );
+    expect(mapped).toEqual({
+      message: "hello",
+      data: { repo: "acme/app", message: "hello" },
+    });
+  });
+
+  test("form: missing required field → form_validation_failed", () => {
+    try {
+      mapIngressBody("form", { values: { message: "hi" } }, formSchema);
+      expect.unreachable("should have thrown");
+    } catch (error) {
+      if (!isRuntimeApiError(error)) throw error;
+      expect(error.code).toBe("form_validation_failed");
+      expect(error.message).toContain("repo");
+    }
+  });
+
+  test("form: a trigger row with no synced schema is rejected (republish to sync)", () => {
+    for (const missing of [null, undefined, [], "nope"]) {
+      try {
+        mapIngressBody("form", { values: {} }, missing);
+        expect.unreachable("should have thrown");
+      } catch (error) {
+        if (!isRuntimeApiError(error)) throw error;
+        expect(error.code).toBe("form_validation_failed");
+        expect(error.message).toContain("no form schema");
+      }
+    }
+  });
+
+  test("form: body must be { values: {…} }", () => {
+    expect(() => mapIngressBody("form", { repo: "x" }, formSchema)).toThrow(
+      "form body must be { values: { ... } }",
+    );
   });
 });
 

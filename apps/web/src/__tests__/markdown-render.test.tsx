@@ -89,6 +89,21 @@ test("javascript: links are stripped", async () => {
   expect(view.container.querySelector("a")).toBeNull();
 });
 
+test("a mermaid fence renders without crashing and keeps its source", async () => {
+  // The plugin loads dynamically, and happy-dom has no real layout — the
+  // diagram itself never renders here, so assert only that the block is
+  // handled and the source survives. Diagram rendering is an e2e concern.
+  const view = render(
+    <Markdown text={"```mermaid\ngraph TD;\n  A-->B;\n```"} />,
+  );
+  expect(await view.findByText(/graph TD/)).not.toBeNull();
+});
+
+test("markdown with no mermaid fence renders normally", async () => {
+  const view = render(<Markdown text={"```ts\nconst x = 1;\n```"} />);
+  expect(await view.findByText(/const x = 1;/)).not.toBeNull();
+});
+
 test("the caret shows only while streaming", async () => {
   // NOTE: the fixture must NOT end mid-fence — streamdown suppresses the
   // caret while the last block is an incomplete code fence.

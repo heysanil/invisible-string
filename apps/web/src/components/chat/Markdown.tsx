@@ -11,13 +11,16 @@
  * stamps the `data-block` marker that drives it — overriding either collapses
  * every fenced block into inline code. Inline code has its own key.
  */
-import type { ComponentProps } from "react";
+import { useEffect, useMemo, useState, type ComponentProps } from "react";
 import { Streamdown } from "streamdown";
 import type {
   Components,
   ControlsConfig,
+  DiagramPlugin,
   ExtraProps,
   LinkSafetyConfig,
+  MermaidErrorComponentProps,
+  MermaidOptions,
   PluginConfig,
   ThemeInput,
 } from "streamdown";
@@ -33,7 +36,76 @@ import { cn } from "../../lib/cn";
  */
 const SHIKI_THEMES: [ThemeInput, ThemeInput] = ["min-light", "min-dark"];
 
-const PLUGINS: PluginConfig = { code };
+const CODE_ONLY_PLUGINS: PluginConfig = { code };
+
+/** A fence opening a mermaid block, at the start of any line. */
+const MERMAID_FENCE = /^```mermaid\b/m;
+
+/**
+ * @streamdown/mermaid imports the mermaid library STATICALLY, so importing it
+ * at module scope would put multiple megabytes in the SPA entry chunk. Load it
+ * on demand instead. Module-level promise = one fetch per session, shared by
+ * every Markdown instance.
+ */
+let mermaidPluginPromise: Promise<DiagramPlugin> | null = null;
+function loadMermaidPlugin(): Promise<DiagramPlugin> {
+  mermaidPluginPromise ??= import("@streamdown/mermaid").then((m) => m.mermaid);
+  return mermaidPluginPromise;
+}
+
+/**
+ * Streamdown's Mermaid component reads the plugin from context and lists it in
+ * its effect deps, so a diagram that mounted before the plugin arrived
+ * re-renders out of its "plugin unavailable" state on its own.
+ */
+function useMarkdownPlugins(text: string): PluginConfig {
+  const needsMermaid = MERMAID_FENCE.test(text);
+  const [mermaidPlugin, setMermaidPlugin] = useState<DiagramPlugin | null>(null);
+
+  useEffect(() => {
+    if (!needsMermaid || mermaidPlugin !== null) return;
+    let alive = true;
+    void loadMermaidPlugin().then((plugin) => {
+      if (alive) setMermaidPlugin(plugin);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [needsMermaid, mermaidPlugin]);
+
+  return useMemo(
+    () =>
+      mermaidPlugin === null
+        ? CODE_ONLY_PLUGINS
+        : { code, mermaid: mermaidPlugin },
+    [mermaidPlugin],
+  );
+}
+
+/**
+ * Streamdown's default mermaid error card is hardcoded `bg-red-50 text-red-700`
+ * — raw palette colors, which E1 forbids (color only as meaning; `--err` is the
+ * sanctioned error token). Mirrors the error banner in `RunMessage.tsx`.
+ */
+function MermaidError({ error, retry }: MermaidErrorComponentProps) {
+  return (
+    <div
+      role="alert"
+      className="my-1.5 flex items-start gap-2 rounded-card border border-err/35 bg-err/[0.05] px-3 py-2 text-[13px] text-ink"
+    >
+      <span className="min-w-0">Diagram failed to render: {error}</span>
+      <button
+        type="button"
+        onClick={retry}
+        className="lift shrink-0 rounded-capsule px-2 py-0.5 text-[12px] font-medium text-ink-3 hover:bg-black/[0.05] hover:text-ink"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+const MERMAID_OPTIONS: MermaidOptions = { errorComponent: MermaidError };
 
 /** Copy only — download, fullscreen and panZoom are not E1-styled surfaces. */
 const CONTROLS: ControlsConfig = {
@@ -157,13 +229,15 @@ export interface MarkdownProps {
 }
 
 export function Markdown({ text, className, streaming }: MarkdownProps) {
+  const plugins = useMarkdownPlugins(text);
   return (
     <Streamdown
       mode="streaming"
       isAnimating={streaming ?? false}
       caret="block"
-      plugins={PLUGINS}
+      plugins={plugins}
       shikiTheme={SHIKI_THEMES}
+      mermaid={MERMAID_OPTIONS}
       controls={CONTROLS}
       linkSafety={LINK_SAFETY}
       lineNumbers={false}

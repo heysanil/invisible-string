@@ -352,15 +352,30 @@ export function createAgentManager(options: {
     handle.state = "stopping";
     running.delete(hash);
     inflightTotal -= handle.inflight;
-    cache.touch(hash);
-    killTree(handle, "SIGTERM");
-    const stopped = await waitExit(handle, config.agentStopTimeoutMs);
-    if (!stopped) {
-      log(`agent ${hash}: SIGTERM timeout — escalating to SIGKILL`);
-      killTree(handle, "SIGKILL");
-      await waitExit(handle, 5_000);
+    // Everything from here to the release runs under `finally` so the port is
+    // returned on ANY exit path. No current callee throws — killTree swallows
+    // both kill attempts, `handle.exited` is resolve-only so waitExit cannot
+    // reject, and cache.touch is a map write — so this changes nothing today.
+    // It makes the invariant structural rather than contingent: once the
+    // handle leaves `running`, the crash-cleanup in bootAgent's `exited`
+    // handler is guarded on the handle still being there and will NOT release
+    // the port, so anything that throws in this window would strand it for
+    // the process lifetime.
+    //
+    // Returning a port whose process may still be alive is safe: allocatePort
+    // bind-probes and burns an occupied port rather than handing it out.
+    try {
+      cache.touch(hash);
+      killTree(handle, "SIGTERM");
+      const stopped = await waitExit(handle, config.agentStopTimeoutMs);
+      if (!stopped) {
+        log(`agent ${hash}: SIGTERM timeout — escalating to SIGKILL`);
+        killTree(handle, "SIGKILL");
+        await waitExit(handle, 5_000);
+      }
+    } finally {
+      ports.release(handle.port);
     }
-    ports.release(handle.port);
     log(`agent ${hash}: stopped`);
   }
 

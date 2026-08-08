@@ -28,7 +28,8 @@ compiler receives the already-resolved `{ provider, modelId }`.
 
 The reference implementation for everything emitted here is the Phase-0
 spike (`spike/agent-project` + `spike/REPORT.md`); the templates mirror what
-it proved works against `eve@0.19.0`.
+it proved works against `eve@0.31.3` (the spike suites are the upgrade gate
+for every eve bump — AGENTS.md).
 
 ## Emitted project layout
 
@@ -41,13 +42,43 @@ firing and Slack reply delivery live in the control plane.
 |---|---|
 | `package.json` | name `agent--<ws>--<agent>`, `engines.node "24.x"`, EXACT pins from `versions.json`, per-provider dependency. **No lockfile** — the build service owns `npm install`. |
 | `tsconfig.json` | strict NodeNext config (mirrors the spike). |
-| `agent/agent.ts` | explicit `model` (never eve's default), `reasoning` from `definition.model.reasoning`, `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set** (construction throws keyless — spike friction 4), with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
+| `agent/agent.ts` | explicit `model` (never eve's default), `reasoning` from `definition.model.reasoning`, an explicit `limits` block (below), `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set**, with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string, which is what makes eve bake **gateway** routing so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
 | `agent/instructions.md` | the persona with compile-time refs resolved, then — only when the agent has context — a `---`-separated generated "Workspace context" appendix (connection/skill descriptions for `connection_search`/`load_skill` routing). Nothing else — workflow instructions never appear here. |
 | `agent/lib/platform-auth.ts` | `platformJwt()` AuthFn (`verifyJwtHmac`, HS256, `PLATFORM_JWT_SECRET`, iss `invisible-string` / version-bound aud `agent-version:<hash>`) + `localDev()` **only on `options.dev` builds**. |
 | `agent/lib/env.ts` | `requireEnv()` helper (only when a connection needs env credentials). |
 | `agent/channels/eve.ts` | default HTTP channel — the ONLY channel — with platform-JWT route auth and an `onMessage` hook injecting platform context blocks (identity line `Platform agent "<agent>" in workspace "<ws>"`; context is an onMessage **return**, never a `send()` option — PLAN correction 2). |
 | `agent/connections/<slug>.ts` | `defineMcpClientConnection`: literal `url`/`description`; auth via env-token `getToken` or lazy `headers` callback; `tools` exactly-one `allow`/`block`; approval `never()`/`once()`/`always()` or a generated per-tool policy matching **qualified** names (`<slug>__<tool>`). |
 | `agent/skills/<slug>.md` or `<slug>/SKILL.md` (+files) | SKILL.md convention with `description` frontmatter. |
+
+### Explicit runtime limits
+
+`agent/agent.ts` emits a `limits` block pinning the two defaults eve 0.31
+applies **whether or not an agent configures them**:
+
+| Field | Emitted | Why |
+|---|---|---|
+| `maxInputTokensPerSession` | `40_000_000` | eve's own root-session default. Crossing it is not fatal: a conversation-mode session parks on a deterministic Approve/Stop prompt (`input.requested`, `kind: "session-limit"`), answered through the normal HITL path; a task-mode run with no input channel fails the next model call with `SESSION_TOKEN_LIMIT_REACHED`. |
+| `sessionTimeoutMs` | `2_592_000_000` (30 days) | eve's own default session lifetime. The deadline starts at session creation and survives restarts/redeploys; an in-flight turn settles, then eve emits `session.completed` and the next message starts a fresh session. |
+| `maxOutputTokensPerSession` | *omitted* | eve applies **no** default (unset ≡ uncapped), so there is no silent default to pin. Omission and `false` are different values. |
+
+Pinning them makes the runtime envelope part of the artifact: without the
+block a future eve release could move every published agent's budget with no
+`COMPILER_VERSION` bump, no rebuild, and no hash change. These are **platform
+constants** — per-agent spend limits in the agent editor are out of scope.
+
+### The keyless OpenRouter guard (do not simplify it)
+
+`resolveModel()` builds the provider model only when `OPENROUTER_API_KEY` is
+set and otherwise returns the model-id **string**. That conditional is
+load-bearing and is no longer backstopped by a build-time failure:
+`@openrouter/ai-sdk-provider@3.0.0` resolves the key **lazily**, so
+`openrouter("<id>")` constructs fine without a key and raises
+`AI_LoadAPIKeyError` only at the first model call. (The 6.0.0-alpha.1 line
+threw at construction — that is what spike friction 4 recorded, and it no
+longer holds.) Drop the guard and a keyless build would emit a provider model
+with **external** routing baked in, `eve build` would exit 0, the agent would
+boot — and its first turn would die. With the guard, keyless builds bake
+**gateway** routing and are genuinely servable.
 
 ## @reference semantics
 
@@ -102,6 +133,11 @@ UPDATE_GOLDEN=1 bun test packages/compiler/src/golden.test.ts   # then review th
 `AgentDefinition`, trigger channels/schedules/outbound libs deleted, JWT
 audience `workflow-agent:` → `agent-version:`, hash inputs re-keyed — every
 version hash changes.
+
+**3.1.0 is the eve 0.31.3 minor**: the explicit `limits` block plus the
+corrected keyless-guard comment (which ships inside the generated file, so it
+is an emitted-bytes change, not a source-only edit). Semantics and env
+contract are unchanged — the emitted limits equal what eve already enforced.
 
 The bump is enforced MECHANICALLY: `fixtures/.golden-digest.json` commits a
 sha256 over every fixture's emitted bytes paired with the `COMPILER_VERSION`

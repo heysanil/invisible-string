@@ -9,6 +9,23 @@ import { defineAgent } from "eve";
 export default defineAgent({
   model: anthropic("claude-opus-4-8"),
   reasoning: "low",
+  limits: {
+    // eve's own default (40M). Crossing it does NOT kill the session: a
+    // conversation-mode session parks on a deterministic Approve/Stop
+    // prompt (input.requested with kind "session-limit", answered through
+    // the normal HITL path); a task-mode run with no input channel instead
+    // fails the next model call with SESSION_TOKEN_LIMIT_REACHED.
+    maxInputTokensPerSession: 40_000_000,
+    // eve's own default (30 days). The deadline starts at session creation
+    // and survives restarts/redeploys; an in-flight turn is allowed to
+    // settle, then eve emits session.completed and the next message starts
+    // a fresh session.
+    sessionTimeoutMs: 2_592_000_000,
+    // maxOutputTokensPerSession is deliberately OMITTED: eve applies no
+    // default for it (unset === uncapped), so there is no silent default to
+    // pin. Omission and `false` are different values; this is the hook a
+    // future per-agent output cap would fill.
+  },
   experimental: {
     workflow: {
       // Durability: all session/run state lives in Postgres, not local disk.

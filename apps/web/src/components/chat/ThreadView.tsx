@@ -11,6 +11,7 @@ import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
 import { Composer } from "./Composer";
+import { ContextDivider, type ContextMarkerKind } from "./ContextDivider";
 import { RunMessage } from "./RunMessage";
 import { ThreadHeader, type ThreadHeaderProps } from "./ThreadHeader";
 
@@ -19,10 +20,17 @@ export interface ThreadViewProps {
   runs: readonly RunView[];
   isChatOrigin: boolean;
   onRespond: (runId: string, response: RunInputRequest) => void;
-  /** Cancel an in-flight run (stable identity). */
+  /** Stop an in-flight run (stable identity). */
   onCancel?: (runId: string) => void;
-  /** The run whose cancel is in flight (disables its button). */
+  /** The run whose stop request is in flight (disables its button). */
   cancelingRunId?: string | null;
+  /**
+   * A clear/compact that just landed. eve emits `context.cleared` /
+   * `compaction.*` on the SESSION stream, which nothing is tailing when the
+   * session is idle, so the marker is rendered from the acknowledged
+   * mutation rather than waiting for an event that may never be persisted.
+   */
+  contextMarker?: ContextMarkerKind | null;
   pendingInput?: {
     runId: string;
     requestId: string;
@@ -44,6 +52,7 @@ export function ThreadView({
   onRespond,
   onCancel,
   cancelingRunId,
+  contextMarker,
   pendingInput,
   inputError,
   onSend,
@@ -145,6 +154,14 @@ export function ThreadView({
       </div>
 
       <div className="mx-auto w-full max-w-3xl">
+        {/* Sits between the transcript and the composer — the boundary the
+            marker actually describes: everything above is still readable, but
+            the next message starts from a changed memory. */}
+        {contextMarker != null ? (
+          <div className="px-5">
+            <ContextDivider kind={contextMarker} />
+          </div>
+        ) : null}
         <Composer
           onSend={onSend}
           disabledReason={composerDisabledReason}

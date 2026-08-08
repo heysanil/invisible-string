@@ -17,9 +17,13 @@
  * - POST /workspaces/:workspaceId/workflows/:wfId/run {message?, data?}
  *     manual "Run now": dispatch the workflow's published snapshot through
  *     the shared trigger-dispatch path (renders the task message).
- * - POST /sessions/:id/messages {message} — continuation token, new run.
+ * - POST /sessions/:id/messages {message} — ID-addressed follow-up, new run.
  * - GET  /sessions/:id — session + runs.
- * - POST /runs/:id/input — HITL answer; POST /runs/:id/cancel — abort.
+ * - POST /runs/:id/input — HITL answer; POST /runs/:id/cancel — Stop (fronts
+ *     eve's real `POST /eve/v1/session/:id/cancel`).
+ * - POST /sessions/:id/clear | /compact — eve context controls (in place).
+ * - POST /sessions/:id/reset — DESTRUCTIVE: retires the eve session id and
+ *     mints a replacement `agent_sessions` row.
  * - GET  /runs/:id/stream — resumable SSE (Last-Event-ID) over run_events.
  *
  * OWNERSHIP (PLAN correction 8): eve does not enforce session ownership.
@@ -35,6 +39,7 @@ import { schema } from "@invisible-string/db";
 import {
   createSessionRequestSchema,
   postMessageRequestSchema,
+  resetSessionRequestSchema,
   runCancelRequestSchema,
   runInputRequestSchema,
   runWorkflowRequestSchema,
@@ -43,8 +48,11 @@ import {
   type BuildStatusResponse,
   type EveInputResponse,
   type PublishAgentResponse,
+  type ResetSessionResponse,
   type RunCancelResponse,
   type RunDto,
+  type SessionContextControlResponse,
+  type SessionContextControlStatus,
   type Logger,
   type TriggerEvent,
   type MasterKey,
@@ -81,7 +89,7 @@ import {
   type MetricsRegistry,
 } from "./metrics";
 import { selectWorker } from "./scheduler";
-import type { WorkerClient } from "./worker-client";
+import { isEveSessionNotActiveError, type WorkerClient } from "./worker-client";
 import { workerRegistryPlugin } from "./workers";
 
 export interface RuntimeDeps {
@@ -324,7 +332,10 @@ export function startTail(
   deps.tailers.start({
     runId,
     agentSessionId,
-    openStream: async (startIndex, signal) =>
+    // `options` carries the tailer's per-connect stream flags (today:
+    // includeTailIndex for the bounded catch-up read). The DECISION is the
+    // tailer's — call sites stay ignorant of it.
+    openStream: async (startIndex, signal, streamOptions) =>
       deps.workerClient.openEventStream(
         workerAddress,
         contentHash,
@@ -334,7 +345,24 @@ export function startTail(
         eveSessionId,
         startIndex,
         signal,
+        streamOptions,
       ),
+    // Real remote cancellation (eve 0.31): the tailer calls this before it
+    // stops reading so the agent's turn actually ends instead of burning
+    // tokens against a stream nobody is consuming.
+    cancelRemoteTurn: async (options) => {
+      await deps.workerClient.cancelEveTurn(
+        workerAddress,
+        contentHash,
+        await mintPlatformJwt(secret, { audience, claims: { runId } }),
+        eveSessionId,
+        // Forward the tail's observed turn id as eve's stale-request guard.
+        // Without it a late cancel can stop a follow-up turn instead of the
+        // one the user stopped — the run is finalized without awaiting this
+        // request, which frees the session's run slot immediately.
+        options?.turnId === undefined ? undefined : { turnId: options.turnId },
+      );
+    },
   });
 }
 
@@ -370,6 +398,146 @@ export async function failDispatch(
   });
   if (isRuntimeApiError(error)) throw error;
   throw errors.workerDispatchFailed(detail);
+}
+
+/**
+ * `failDispatch` for the eve session plane: the same failure bookkeeping, plus
+ * the EVE-DRIVEN EVICTION that eve 0.31 makes necessary.
+ *
+ * eve answers 409 `session_not_active` for unknown, terminal, timed-out AND
+ * reset sessions — permanently, and its truth can diverge from
+ * `agent_sessions.status` indefinitely (a 30-day session timeout emits
+ * `session.completed` into a stream nobody is tailing; a `reset` retires the
+ * id). Left alone, that 409 would collapse into a generic 502
+ * `worker_dispatch_failed` and the platform row would stay `active` forever:
+ * a chat thread that can never send again, or a Slack thread whose key is
+ * never released.
+ *
+ * So: mark the session `closed` (which also frees `slack_thread_key`) and fail
+ * the run with the typed, permanent {@link errors.sessionNotActive}. Never
+ * `session_busy` — that code's drop-and-retry recovery is exactly wrong here.
+ */
+export async function failEveDispatch(
+  deps: RuntimeDeps,
+  runId: string,
+  agentSessionId: string,
+  error: unknown,
+  options: { failSessionId?: string } = {},
+): Promise<never> {
+  if (isEveSessionNotActiveError(error)) {
+    await deps.runStore.markSession(agentSessionId, "closed");
+    deps.logger.warn("dispatch.session_not_active", {
+      fields: { runId, sessionId: agentSessionId, evicted: true },
+    });
+    return failDispatch(deps, runId, errors.sessionNotActive());
+  }
+  return failDispatch(deps, runId, error, options);
+}
+
+/**
+ * Everything an eve CONTROL call needs: the session's pinned version ensured
+ * on a live worker, plus a freshly minted platform JWT for that hash.
+ *
+ * Control routes ensure-agent exactly like a dispatch does — a session whose
+ * agent has been reaped (idle stop) must boot again before it can be told to
+ * clear/compact/reset, otherwise the call 404s at the worker proxy.
+ *
+ * `ensure: false` is the CANCEL exception. Cancelling asks a RUNNING turn to
+ * stop; if the agent is not up, there is by definition no turn to cancel, so
+ * booting one (artifact pull + extract + node boot, up to 60 s x 2 attempts)
+ * only to have eve answer `no_active_turn` makes the user's Stop hang for a
+ * minute to accomplish nothing. Without the ensure, an absent agent simply
+ * 404s at the proxy and the best-effort caller swallows it — the correct
+ * outcome, reached immediately.
+ */
+async function sessionControlTarget(
+  deps: RuntimeDeps,
+  organizationId: string,
+  session: SessionRow,
+  options: { ensure?: boolean } = {},
+): Promise<{ workerId: string; workerAddress: string; hash: string; token: string }> {
+  const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
+  const hash = ready.version.contentHash;
+  const { worker } = await selectWorker(deps.db, {
+    heartbeatTtlMs: deps.runtime.workerHeartbeatTtlMs,
+    defaultMaxAgents: deps.runtime.maxAgentsPerWorker,
+    versionHash: hash,
+    affinityWorkerId: session.affinityWorkerId,
+  });
+  if (options.ensure !== false) {
+    await ensureAgentOnWorker(deps, worker, ready, organizationId);
+  }
+  const jwt = agentJwtParams(deps.runtime.platformJwtSecret, hash);
+  return {
+    workerId: worker.id,
+    workerAddress: worker.address,
+    hash,
+    token: await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+  };
+}
+
+/**
+ * Fire eve's turn cancel for a session, swallowing every failure.
+ *
+ * Used on the no-live-tail cancel path. Deliberately best-effort: the
+ * platform-side cancellation is authoritative for the run row, and a
+ * dead/unreachable worker must not turn a user's Stop into a 502. A session
+ * that never reached eve (`eve_session_id` null) has nothing to cancel.
+ */
+async function cancelEveTurnBestEffort(
+  deps: RuntimeDeps,
+  session: SessionRow,
+): Promise<void> {
+  if (!session.eveSessionId) return;
+  try {
+    const target = await sessionControlTarget(
+      deps,
+      session.organizationId,
+      session,
+      { ensure: false },
+    );
+    await deps.workerClient.cancelEveTurn(
+      target.workerAddress,
+      target.hash,
+      target.token,
+      session.eveSessionId,
+    );
+  } catch (error) {
+    deps.logger.warn("run.cancel_remote_failed", {
+      fields: {
+        sessionId: session.id,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+}
+
+/**
+ * Guard shared by the three context-control routes: the session must be live
+ * (non-terminal, with an eve session id) and QUIET.
+ *
+ * Quiet matters — clearing or compacting mid-turn would race the running turn
+ * and land `context.cleared`/`compaction.*` inside another run's event log,
+ * and resetting mid-turn would retire the very session id the live tail is
+ * reading. `session_busy` is the right code here: it is the platform's own
+ * transient serialization guard, and the recovery genuinely is "Stop the run
+ * (or wait), then try again".
+ */
+async function requireQuietControllableSession(
+  deps: RuntimeDeps,
+  session: SessionRow,
+): Promise<string> {
+  if (
+    !session.eveSessionId ||
+    session.status === "closed" ||
+    session.status === "error"
+  ) {
+    throw errors.sessionNotContinuable();
+  }
+  if ((await countDispatchingRuns(deps.db, session.id)) > 0) {
+    throw errors.sessionBusy();
+  }
+  return session.eveSessionId;
 }
 
 /**
@@ -690,7 +858,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
               agentVersionId: ready.version.id,
               workflowId: null,
               eveSessionId: null,
-              continuationToken: null,
+              // `continuation_token` is a LEGACY column (eve 0.31 sessions are
+              // ID-addressed); it is never written again and is left to its
+              // NULL default so it does not read as live state.
               origin: "chat",
               principal,
               affinityWorkerId: worker.id,
@@ -727,13 +897,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
         await db
           .update(schema.agentSessions)
-          .set({
-            eveSessionId: created.sessionId,
-            continuationToken: created.continuationToken,
-          })
+          .set({ eveSessionId: created.sessionId })
           .where(eq(schema.agentSessions.id, session.id));
         session.eveSessionId = created.sessionId;
-        session.continuationToken = created.continuationToken;
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
         deps.metrics.recordTrigger("manual", "dispatched");
@@ -810,16 +976,17 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.sessionId,
         );
-        if (
-          !session.eveSessionId ||
-          !session.continuationToken ||
-          session.status === "closed" ||
-          session.status === "error"
-        ) {
+        // 0.31: continuable iff the row is not terminal. A `continuationToken`
+        // term here would reject EVERY follow-up (the column is never written
+        // anymore) — chat would be dead after the first message.
+        //
+        // A row with NO eve session id is continuable too: it is the state a
+        // `reset` leaves behind (the retired eve id can never take another
+        // message, so the replacement row starts empty). This message OPENS
+        // its eve session, exactly as dispatch.ts's create branch does.
+        if (session.status === "closed" || session.status === "error") {
           throw errors.sessionNotContinuable();
         }
-        const eveSessionId = session.eveSessionId;
-        const continuationToken = session.continuationToken;
         // Sessions pin their agent version at creation — a follow-up always
         // rides the SAME compiled artifact, even after a republish.
         const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
@@ -841,7 +1008,6 @@ export function runtimePlugin(deps: RuntimeDeps) {
             userId: workspace.userId,
             source: "chat",
           },
-          continuationToken,
         };
 
         // One advisory-locked transaction: session-serialization guard (two
@@ -871,26 +1037,43 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
         const hash = ready.version.contentHash;
         const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
-        let result;
+        let eveSessionId: string;
         try {
           await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
-          result = await deps.workerClient.continueEveSession(
-            worker.address,
-            hash,
-            await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-            eveSessionId,
-            { continuationToken, message },
-          );
+          if (session.eveSessionId) {
+            // "send" form — `{message}` alone. eve rejects a body carrying
+            // BOTH message and inputResponses, and 400s on a
+            // `continuationToken` key.
+            eveSessionId = session.eveSessionId;
+            await deps.workerClient.continueEveSession(
+              worker.address,
+              hash,
+              await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+              eveSessionId,
+              { message },
+            );
+          } else {
+            // Post-reset (or never-acked) row: open a fresh eve session.
+            const created = await deps.workerClient.createEveSession(
+              worker.address,
+              hash,
+              await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+              message,
+            );
+            eveSessionId = created.sessionId;
+            await db
+              .update(schema.agentSessions)
+              .set({ eveSessionId })
+              .where(eq(schema.agentSessions.id, session.id));
+            session.eveSessionId = eveSessionId;
+          }
         } catch (error) {
           deps.metrics.recordTrigger("manual", "failed");
-          await failDispatch(deps, run.id, error);
-          throw error; // unreachable — failDispatch always throws
-        }
-        if (result.continuationToken) {
-          await deps.runStore.updateSessionContinuation(
-            session.id,
-            result.continuationToken,
-          );
+          // A terminal/reset eve session surfaces as the typed, PERMANENT
+          // `session_not_active` (and closes the row) rather than a 502 the
+          // client would retry forever.
+          await failEveDispatch(deps, run.id, session.id, error);
+          throw error; // unreachable — failEveDispatch always throws
         }
         await db
           .update(schema.agentSessions)
@@ -935,16 +1118,17 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.runId,
         );
+        // Same 0.31 predicate as the follow-up route: an eve session id and a
+        // non-terminal row. Gating on a continuation token would 409 every
+        // HITL answer and park every gated run permanently.
         if (
           !session.eveSessionId ||
-          !session.continuationToken ||
           session.status === "closed" ||
           session.status === "error"
         ) {
           throw errors.sessionNotContinuable();
         }
         const eveSessionId = session.eveSessionId;
-        const continuationToken = session.continuationToken;
         const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
         const { worker } = await selectWorker(db, {
           heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
@@ -991,25 +1175,21 @@ export function runtimePlugin(deps: RuntimeDeps) {
             ...(input.text !== undefined ? { text: input.text } : {}),
           },
         ];
-        let result;
         try {
           await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
-          result = await deps.workerClient.continueEveSession(
+          // "respond" form — `{inputResponses}` alone. 0.31 made send and
+          // respond mutually exclusive: a body carrying `message` too is a
+          // 400, as is any `continuationToken` key.
+          await deps.workerClient.continueEveSession(
             worker.address,
             hash,
             await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
             eveSessionId,
-            { continuationToken, inputResponses },
+            { inputResponses },
           );
         } catch (error) {
-          await failDispatch(deps, run.id, error);
-          throw error; // unreachable — failDispatch always throws
-        }
-        if (result.continuationToken) {
-          await deps.runStore.updateSessionContinuation(
-            session.id,
-            result.continuationToken,
-          );
+          await failEveDispatch(deps, run.id, session.id, error);
+          throw error; // unreachable — failEveDispatch always throws
         }
         await db
           .update(schema.agentSessions)
@@ -1050,19 +1230,36 @@ export function runtimePlugin(deps: RuntimeDeps) {
       { requireWorkspace: true },
     )
 
-    // ── run cancel ─────────────────────────────────────────────────────────
+    // ── run cancel (the Stop button) ───────────────────────────────────────
     //
-    // Abort an in-flight run: stop the tailer and mark the run `canceled`
-    // (freeing its concurrency slot). Idempotent — cancelling an
-    // already-terminal run returns its current state. Best-effort re: eve's
-    // turn: eve exposes no session-cancel HTTP route (runs/tailer.ts header),
-    // so the platform stops streaming and records the cancellation while eve's
-    // own turn parks/caps out server-side.
+    // Abort an in-flight run and mark it `canceled` (freeing its concurrency
+    // slot). Idempotent — cancelling an already-terminal run returns its
+    // current state.
+    //
+    // eve 0.31 ships a REAL remote cancel (`POST /eve/v1/session/:id/cancel`),
+    // so this is no longer platform-side bookkeeping over a turn that keeps
+    // burning tokens: the tailer issues the remote cancel before it stops
+    // reading (see startTail's `cancelRemoteTurn` and the tailer's cancel
+    // path), and eve ends the turn with `turn.cancelled` → `session.waiting`.
+    // Two properties of eve's cancel that shape this route:
+    //   * it is COOPERATIVE, at durable step boundaries — a tool call already
+    //     in flight runs to completion, so "stopped" never means "undone";
+    //   * `202 accepted` does not prove a turn was stopped and `200
+    //     no_active_turn` does not mean "nothing was running" (eve renders a
+    //     DEAD session under that name too). So a cancel response is never
+    //     used to infer liveness, and a failure to reach eve never blocks the
+    //     platform-side cancellation.
+    // Cancellation is a user decision, never an error: the run lands
+    // `canceled`, and the session stays usable for the next message.
     .post(
       "/runs/:runId/cancel",
       async ({ workspace, params, body }): Promise<RunCancelResponse> => {
         const input = parseBody(runCancelRequestSchema, body ?? {}) ?? {};
-        const { run } = await loadRunOwned(db, workspace.organizationId, params.runId);
+        const { run, session } = await loadRunOwned(
+          db,
+          workspace.organizationId,
+          params.runId,
+        );
         const reason = input.reason ?? "canceled by user";
 
         // Idempotent: a run that already reached a terminal status is returned
@@ -1076,10 +1273,18 @@ export function runtimePlugin(deps: RuntimeDeps) {
         }
 
         // A live tail (running run) is aborted and marked canceled by the
-        // tailer; a parked (`waiting`) or not-yet-tailed (`queued`) run has no
-        // live tail — mark it canceled directly.
+        // tailer (which owns the remote cancel); a parked (`waiting`) or
+        // not-yet-tailed (`queued`) run has no live tail — mark it canceled
+        // directly and make a best-effort remote cancel ourselves so a turn
+        // eve is still running for this session does not outlive the run row.
         const hadTail = await deps.tailers.cancelRun(run.id, reason);
         if (!hadTail) {
+          // Settle the ROW FIRST, then chase eve. The platform side is
+          // authoritative for the run row, so the user's Stop must not be
+          // held behind a remote leg that can be slow or unreachable — and
+          // the remote cancel is best-effort anyway. (Ordering matters here:
+          // when this ran first, a Stop on a reaped agent paid a full boot
+          // before the run was marked canceled.)
           await deps.runStore.markRun(run.id, {
             status: "canceled",
             error: reason,
@@ -1097,6 +1302,10 @@ export function runtimePlugin(deps: RuntimeDeps) {
             kind: "status",
             frame: { runId: run.id, status: "canceled", error: reason },
           });
+          // Best-effort: stop a turn eve may still be running for this
+          // session so it cannot outlive the run row. Never boots the agent
+          // (see sessionControlTarget's `ensure: false`).
+          await cancelEveTurnBestEffort(deps, session);
         }
 
         const updated = await db
@@ -1107,5 +1316,181 @@ export function runtimePlugin(deps: RuntimeDeps) {
         return { run: runDto(updated[0] ?? run) };
       },
       { requireWorkspace: true },
+    )
+
+    // ── eve context controls: clear / compact ──────────────────────────────
+    //
+    // Both mutate the session IN PLACE and keep its id, so the platform row is
+    // untouched — only eve's durable model history changes.
+    //
+    // AUTHZ: `requireWorkspace: true` (member) plus loadSessionOwned's
+    // organizationId check. Deliberately the same level as sending a message
+    // into the session: a member who can drive a session can manage its
+    // context. A caller outside the workspace never gets here — the macro 403s
+    // a foreign workspace path, and a foreign session id 404s
+    // (existence-hiding), so no one can clear another workspace's context.
+    //
+    // Success is keyed on eve's `status` field, NEVER on the HTTP code (202
+    // accepted vs 200 no_active_session), and `no_active_session` is NOT
+    // "nothing to do": it is the same dead-session condition a send reports as
+    // 409, so it closes the platform row too.
+    .post(
+      "/sessions/:sessionId/clear",
+      async ({ workspace, params }) => {
+        const session = await loadSessionOwned(
+          db,
+          workspace.organizationId,
+          params.sessionId,
+        );
+        const eveSessionId = await requireQuietControllableSession(deps, session);
+        const target = await sessionControlTarget(
+          deps,
+          workspace.organizationId,
+          session,
+        );
+        const result = await deps.workerClient.clearEveSession(
+          target.workerAddress,
+          target.hash,
+          target.token,
+          eveSessionId,
+        );
+        return finishContextControl(deps, session, result.status, target.workerId);
+      },
+      { requireWorkspace: true },
+    )
+    .post(
+      "/sessions/:sessionId/compact",
+      async ({ workspace, params }) => {
+        const session = await loadSessionOwned(
+          db,
+          workspace.organizationId,
+          params.sessionId,
+        );
+        const eveSessionId = await requireQuietControllableSession(deps, session);
+        const target = await sessionControlTarget(
+          deps,
+          workspace.organizationId,
+          session,
+        );
+        // A compact over an EMPTY/already-cleared context emits no
+        // `compaction.*` events at all — the 202 is the only acknowledgement.
+        // Never wait on `compaction.requested` here.
+        const result = await deps.workerClient.compactEveSession(
+          target.workerAddress,
+          target.hash,
+          target.token,
+          eveSessionId,
+        );
+        return finishContextControl(deps, session, result.status, target.workerId);
+      },
+      { requireWorkspace: true },
+    )
+
+    // ── eve context control: reset (DESTRUCTIVE) ───────────────────────────
+    //
+    // Retires the eve session id permanently — it can never accept another
+    // message — so the platform closes the old row and mints a REPLACEMENT
+    // `agent_sessions` row against the same agent + pinned version. The
+    // replacement starts with no eve session; its first message opens one (see
+    // the follow-up route). Clients must re-key their thread cache onto
+    // `session.id`.
+    //
+    // AUTHZ: same member-level rule as clear/compact. Reset destroys only the
+    // caller's own workspace's conversation context — never another
+    // workspace's data and never workspace configuration — so raising it to
+    // admin would block a member from resetting their own chat while leaving
+    // them free to delete it. The destructive gate is the UI confirm step.
+    .post(
+      "/sessions/:sessionId/reset",
+      async ({ workspace, params, body }): Promise<ResetSessionResponse> => {
+        const input = parseBody(resetSessionRequestSchema, body ?? {}) ?? {};
+        const session = await loadSessionOwned(
+          db,
+          workspace.organizationId,
+          params.sessionId,
+        );
+        const eveSessionId = await requireQuietControllableSession(deps, session);
+        const target = await sessionControlTarget(
+          deps,
+          workspace.organizationId,
+          session,
+        );
+        // Reset is the ONE control route that never answers 202: BOTH outcomes
+        // are HTTP 200, and the id field is `previousSessionId`.
+        const result = await deps.workerClient.resetEveSession(
+          target.workerAddress,
+          target.hash,
+          target.token,
+          eveSessionId,
+          input?.reason !== undefined ? { reason: input.reason } : {},
+        );
+
+        // Either way the old eve id is unusable: `reset` retired it, and
+        // `no_active_session` means it was already dead. Close the row (which
+        // also releases any slack_thread_key) — but only `reset` mints a
+        // replacement, so `no_active_session` leaves the caller on a closed
+        // row it must replace with a fresh chat.
+        await deps.runStore.markSession(session.id, "closed");
+        const previousSession = sessionDto({ ...session, status: "closed" });
+        if (result.status !== "reset") {
+          return { status: "no_active_session", previousSession };
+        }
+
+        const inserted = await db
+          .insert(schema.agentSessions)
+          .values({
+            organizationId: session.organizationId,
+            agentId: session.agentId,
+            // Pinned version is inherited: a reset continues the SAME compiled
+            // artifact, it does not silently migrate the thread to a newer
+            // publish.
+            agentVersionId: session.agentVersionId,
+            workflowId: session.workflowId,
+            eveSessionId: null,
+            origin: session.origin,
+            principal: session.principal,
+            // The Slack thread key is deliberately NOT carried over: the old
+            // row just released it, and a fresh thread claim is made by the
+            // next inbound message under the advisory lock.
+            slackThreadKey: null,
+            affinityWorkerId: target.workerId,
+            status: "active",
+          })
+          .returning();
+        return {
+          status: "reset",
+          previousSession,
+          session: sessionDto(inserted[0]!),
+        };
+      },
+      { requireWorkspace: true },
     );
+}
+
+/**
+ * Shared tail of clear/compact: reflect eve's outcome onto the platform row
+ * and answer with the (possibly updated) session DTO.
+ *
+ * `no_active_session` is eve telling us the id is dead — the same terminal
+ * condition a send answers with 409 `session_not_active` — so the row is
+ * closed rather than left looking live.
+ */
+async function finishContextControl(
+  deps: RuntimeDeps,
+  session: SessionRow,
+  status: SessionContextControlStatus,
+  workerId: string,
+): Promise<SessionContextControlResponse> {
+  if (status === "no_active_session") {
+    await deps.runStore.markSession(session.id, "closed");
+    return { session: sessionDto({ ...session, status: "closed" }), status };
+  }
+  await deps.db
+    .update(schema.agentSessions)
+    .set({ status: "active", affinityWorkerId: workerId })
+    .where(eq(schema.agentSessions.id, session.id));
+  return {
+    session: sessionDto({ ...session, status: "active" }),
+    status,
+  };
 }

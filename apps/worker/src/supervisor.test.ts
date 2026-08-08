@@ -590,7 +590,20 @@ describe("drain", () => {
         expect(((await slowRes.json()) as { slow: boolean }).slow).toBe(true);
 
         // Drain converges: agents stopped, ports freed, deregistered.
-        await waitFor(async () => (await getStatus(sup)).agents.length === 0, 8_000);
+        //
+        // Wait on BOTH, because they settle at different moments and the port
+        // is the later one. stopAgent() drops the handle from `running` up
+        // front (so the proxy 404s immediately and no new work routes to a
+        // dying agent), then awaits the child's exit, and only THEN releases
+        // its port — a port whose process is still alive must never go back in
+        // the pool, or the next agent binds a live port. So `agents.length`
+        // reaching 0 does not imply the pool has drained. Polling only the
+        // former passed locally, where SIGTERM wins the race, and failed on a
+        // loaded CI runner by ~1ms.
+        await waitFor(async () => {
+          const s = await getStatus(sup);
+          return s.agents.length === 0 && s.ports.allocated === 0;
+        }, 8_000);
         const status = await getStatus(sup);
         expect(status.draining).toBe(true);
         expect(status.ports.allocated).toBe(0);

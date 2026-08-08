@@ -15,10 +15,20 @@
  * `<buildRoot>/<hash>` path. NOTE(integration): reconcile buildRoot with
  * apps/worker's extract root (AGENT_BUILD_ROOT on both sides).
  *
- * ARTIFACT CONTENTS: `.output/` (the self-contained nitro server),
- * `.eve/compile/compiled-agent-manifest.json` (schedule manifest, when
- * present) and `manifest.json` (build metadata). node_modules is NOT shipped
- * — `.output` bundles its runtime deps. NOTE(integration): if the worker
+ * ARTIFACT CONTENTS: `.output/` (the self-contained nitro server) and
+ * `manifest.json` (build metadata). node_modules is NOT shipped — `.output`
+ * bundles its runtime deps.
+ *
+ * eve 0.31 MOVED the compiled-agent manifest: it used to sit at the project
+ * ROOT (`<project>/.eve/compile/compiled-agent-manifest.json`) and had to be
+ * added to the tarball explicitly; it now ships INSIDE the build output at
+ * `.output/.eve/compile/compiled-agent-manifest.json` (verified against a real
+ * 0.31.3 `eve build`: the legacy root path does not exist at all, there is no
+ * fallback). Since `.output` is already a tarball member the manifest travels
+ * with it for free — adding it again as a second member would only duplicate
+ * bytes. `<project>/.eve/` still exists on 0.31 but now holds BUILD-HOST state
+ * (`agent-summary.json`, `builds/<id>/`, `locks/`, `sandbox-cache/`) that the
+ * artifact must NOT carry. NOTE(integration): if the worker
  * supervisor ends up running the `eve start` CLI instead of
  * `node .output/server/index.mjs`, widen this tarball (or npm-install eve on
  * the worker) at the Integrate stage.
@@ -64,7 +74,7 @@ export interface BuildSteps {
  * The compiler's hash covers WHAT gets compiled (definition + resolved deps +
  * compiler/eve versions) but not HOW this file builds it. `eve build` bakes
  * environment-dependent state into the artifact — most critically the model
- * ROUTING in .eve/compile/compiled-agent-manifest.json, which flipped from
+ * ROUTING in .output/.eve/compile/compiled-agent-manifest.json, which flipped from
  * `{kind:"gateway"}` (broken: ignores the spawn-time OPENROUTER_API_KEY) to
  * `{kind:"external",provider:"openrouter"}` when the eve-build step gained
  * its placeholder key. Without an epoch, that fix would have kept serving
@@ -260,7 +270,8 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
           //
           // OPENROUTER_API_KEY placeholder (NOT a secret — a fixed public
           // sentinel): `eve build` EVALUATES agent.ts and bakes the model
-          // ROUTING into .eve/compile/compiled-agent-manifest.json. Built
+          // ROUTING into .output/.eve/compile/compiled-agent-manifest.json.
+          // Built
           // keyless, the generated resolveModel() falls back to the model-id
           // string and eve bakes `routing: {kind: "gateway"}` — the runtime
           // then routes every turn to Vercel AI Gateway and IGNORES the
@@ -271,7 +282,7 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
           // `routing: {kind: "external", provider: "openrouter"}` +
           // `source: agent.ts`, and the runtime re-evaluates resolveModel()
           // with the REAL spawn-time env. The placeholder value never
-          // reaches the artifact (verified: no occurrence in .output/.eve)
+          // reaches the artifact (verified: no occurrence in .output)
           // and never serves traffic. Anthropic needs no placeholder —
           // @ai-sdk/anthropic resolves its key lazily at request time, so
           // its builds already bake module-backed routing.
@@ -308,11 +319,12 @@ export function createBuildSteps(options: CreateBuildStepsOptions): BuildSteps {
         "utf8",
       );
 
+      // `.output` carries the compiled-agent manifest itself on eve 0.31
+      // (.output/.eve/compile/compiled-agent-manifest.json) — see the module
+      // header. Do NOT re-add it as a separate member: it would duplicate the
+      // file in the tarball, and the pre-0.31 ROOT path it used to live at no
+      // longer exists, so the old conditional was silently dead.
       const members = [".output", "manifest.json"];
-      const scheduleManifest = join(".eve", "compile", "compiled-agent-manifest.json");
-      if (existsSync(join(projectDir, scheduleManifest))) {
-        members.push(scheduleManifest);
-      }
 
       const tarball = join(projectDir, `artifact-${contentHash}.tar.gz`);
       const result = await run(

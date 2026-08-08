@@ -157,13 +157,18 @@ export function ChatShell({
             onSend={(message) => startSession(draftAgent, message)}
             onCancel={() => setDraftAgent(null)}
           />
-        ) : activeSession !== null ? (
+        ) : activeSessionId !== null ? (
+          // Keyed on the ID, not the list row: a session RESET mints a
+          // replacement whose summary has not reached the list query yet, and
+          // gating on `activeSession` would flash the empty state at the user
+          // in the middle of a deliberate action.
           <ThreadContainer
-            key={activeSession.id}
+            key={activeSessionId}
             workspaceId={workspaceId}
-            sessionId={activeSession.id}
-            agentName={activeSession.agentName}
-            workflowName={activeSession.workflowName}
+            sessionId={activeSessionId}
+            agentName={activeSession?.agentName}
+            workflowName={activeSession?.workflowName ?? null}
+            onSessionReplaced={setActiveSessionId}
           />
         ) : (
           <EmptyState

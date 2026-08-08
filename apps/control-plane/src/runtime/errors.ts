@@ -236,13 +236,37 @@ export const errors = {
     new RuntimeApiError(
       409,
       "session_not_continuable",
-      "session has no continuation token or is closed",
+      "session has no eve session id or is closed",
     ),
+  /**
+   * The PLATFORM's own one-tail-per-eve-stream guard. TRANSIENT: a run of this
+   * session is queued/running/waiting, so a second dispatch would put two
+   * tails on one NDJSON stream. Recovery is "wait for it to finish, then
+   * retry" — the Slack router deliberately logs-and-drops it.
+   *
+   * NOT the same thing as {@link sessionNotActive}. Keep the two codes
+   * distinct: they have opposite recoveries, and collapsing them turns a
+   * recoverable race into a permanently bricked Slack thread and a chat
+   * composer that promises a retry which can never succeed.
+   */
   sessionBusy: () =>
     new RuntimeApiError(
       409,
       "session_busy",
       "session already has an active run — wait for it to finish before sending another message",
+    ),
+  /**
+   * eve answered 409 `session_not_active` for this session's eve id.
+   * PERMANENT: 0.31 uses that one code for unknown, terminal, timed-out AND
+   * reset sessions, so the id can never accept another message. The caller
+   * releases the platform-side claim (marks the session closed, which also
+   * frees any `slack_thread_key`) and the next message mints a fresh session.
+   */
+  sessionNotActive: () =>
+    new RuntimeApiError(
+      409,
+      "session_not_active",
+      "the agent session has ended and can no longer accept messages — start a new one",
     ),
 
   // ── Phase-3 dispatch / trigger ingress / integrations ─────────────────────

@@ -11,6 +11,12 @@
  *   4. world-postgres bootstrap created the workflow_* tables.
  *   5. The Nitro schedule runner fires the 1-minute schedule under `eve start`.
  *
+ * eve 0.31 PROTOCOL: session creation is ID-addressed. The 202 body is
+ * `{ok: true, sessionId, status: "accepted"}` — there is NO continuationToken,
+ * and every session route 400s if the request body merely CONTAINS that key
+ * (`rejectSessionContinuationToken` is an `in` check, not a truthiness one).
+ * This suite pins both halves so a regression to the 0.19 shape fails here.
+ *
  * Gated on TEST_DATABASE_URL (docker compose provides Postgres on :5443).
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -21,8 +27,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   AGENT_PROJECT_DIR,
   ARTIFACTS_DIR,
+  COMPILED_MANIFEST_PATH,
   DB_GATE_AVAILABLE,
   DB_GATE_SKIP_REASON,
+  EVE_EVENT_ID_PATTERN,
+  LEGACY_COMPILED_MANIFEST_PATH,
   PROXY_URL,
   bootstrapWorld,
   ensurePostgres,
@@ -64,13 +73,21 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
     expect(existsSync(join(AGENT_PROJECT_DIR, ".output", "server", "index.mjs"))).toBe(true);
   });
 
+  test("compiled-agent manifest lives under .output/ on eve 0.31 (moved from the project root)", () => {
+    // eve 0.19 wrote <project>/.eve/compile/compiled-agent-manifest.json.
+    // 0.31 writes .output/.eve/compile/… and repurposes .eve/ for
+    // agent-summary.json + builds/<id>/. Asserting BOTH directions makes the
+    // move explicit rather than letting a reader assume a path fallback:
+    // apps/control-plane/src/build/steps.ts still reads the legacy path and
+    // silently finds nothing.
+    expect(existsSync(COMPILED_MANIFEST_PATH)).toBe(true);
+    expect(existsSync(LEGACY_COMPILED_MANIFEST_PATH)).toBe(false);
+  });
+
   test("schedule is registered in the compiled manifest (cron * * * * *)", () => {
-    const manifest = JSON.parse(
-      readFileSync(
-        join(AGENT_PROJECT_DIR, ".eve", "compile", "compiled-agent-manifest.json"),
-        "utf8",
-      ),
-    ) as { schedules?: { name: string; cron: string; hasRun: boolean }[] };
+    const manifest = JSON.parse(readFileSync(COMPILED_MANIFEST_PATH, "utf8")) as {
+      schedules?: { name: string; cron: string; hasRun: boolean }[];
+    };
     const heartbeat = manifest.schedules?.find((s) => s.name === "heartbeat");
     expect(heartbeat).toBeDefined();
     expect(heartbeat?.cron).toBe("* * * * *");
@@ -130,9 +147,23 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
       // workflow queue). Assert the exact observed success status instead of
       // the loose `not-401 && < 300` this test previously used.
       expect(res.status).toBe(202);
-      const body = (await res.json()) as { sessionId?: string; continuationToken?: string };
+      const body = (await res.json()) as {
+        ok?: boolean;
+        sessionId?: string;
+        status?: string;
+        continuationToken?: unknown;
+      };
+      expect(body.ok).toBe(true);
       expect(typeof body.sessionId).toBe("string");
-      expect(typeof body.continuationToken).toBe("string");
+      expect(body.status).toBe("accepted");
+      // 0.31 is ID-addressed: the create response carries NO continuation
+      // token. Asserting its ABSENCE (not just "we stopped reading it") is
+      // what makes this suite a real gate — the old assertion here was
+      // `typeof body.continuationToken === "string"`.
+      expect(body.continuationToken).toBeUndefined();
+      // eve also mirrors the id on a response header; the client reads
+      // whichever is present, so both must agree.
+      expect(res.headers.get("x-eve-session-id")).toBe(body.sessionId!);
 
       // Keyless: the turn itself fails at the model call, but the durable
       // session machinery (workflow callbacks THROUGH the proxy) still runs
@@ -152,6 +183,12 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
       expect(events.length).toBeGreaterThan(0);
       expect(events.map((e) => e.type)).toContain("session.started");
 
+      // eve 0.28+ stamps a stable evt_-prefixed ULID on EVERY event.
+      for (const event of events) {
+        const meta = event.meta as { id?: unknown } | undefined;
+        expect(String(meta?.id)).toMatch(EVE_EVENT_ID_PATTERN);
+      }
+
       mkdirSync(join(ARTIFACTS_DIR), { recursive: true });
       writeFileSync(
         join(ARTIFACTS_DIR, "keyless-observed-events.ndjson"),
@@ -161,8 +198,44 @@ describe.skipIf(!DB_GATE_AVAILABLE)("spike keyless acceptance", () => {
     120_000,
   );
 
+  test(
+    "a body carrying `continuationToken` is REJECTED with 400 on every session route",
+    async () => {
+      // 0.31's rejectSessionContinuationToken is a `key in body` check, not a
+      // truthiness check: `{continuationToken: null, message}` 400s just as
+      // hard as a real token. This is the single most likely way a partial
+      // migration fails — it reads as a malformed request, not a protocol
+      // mismatch — so pin it on the create route AND on a session-id route.
+      const token = await mintPlatformJwt();
+      const headers = {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      };
+
+      const onCreate = await fetch(`${PROXY_URL}/eve/v1/session`, {
+        body: JSON.stringify({ continuationToken: null, message: "hello" }),
+        headers,
+        method: "POST",
+      });
+      expect(onCreate.status).toBe(400);
+      expect(((await onCreate.json()) as { error?: string }).error).toContain(
+        "continuationToken",
+      );
+
+      const onFollowUp = await fetch(`${PROXY_URL}/eve/v1/session/does-not-exist`, {
+        body: JSON.stringify({ continuationToken: "ct_legacy", message: "hello" }),
+        headers,
+        method: "POST",
+      });
+      // 400 (bad body) wins over 409 (unknown session): the token is rejected
+      // before the session is ever looked up.
+      expect(onFollowUp.status).toBe(400);
+    },
+    60_000,
+  );
+
   test("world bootstrap created the workflow_* tables in Postgres", async () => {
-    // world-postgres@5.0.0-beta.20 creates its tables in the `workflow`
+    // world-postgres@5.0.0-beta.32 creates its tables in the `workflow`
     // schema (plus `workflow_drizzle` migrations and `graphile_worker`).
     const rows = await queryWorldDb<{ table_name: string }>(
       "select table_name from information_schema.tables where table_schema in ('workflow', 'public') and table_name like 'workflow_%' order by table_name",

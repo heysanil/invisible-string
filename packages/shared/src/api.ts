@@ -147,6 +147,28 @@ export const apiErrorInfoSchema = z.object({
 });
 export type ApiErrorInfo = z.infer<typeof apiErrorInfoSchema>;
 
+/**
+ * TRANSIENT 409 on session writes: the PLATFORM's own serialization guard —
+ * one run (one NDJSON tail) per session at a time, and `waiting` counts as
+ * busy. Recovery is "wait for the in-flight run, then retry"; the message is
+ * safe to keep in the composer.
+ */
+export const SESSION_BUSY_ERROR_CODE = "session_busy";
+
+/**
+ * PERMANENT 409 on session writes: EVE reports the session id is no longer
+ * usable. eve 0.31 widened this beyond "a turn is running" — it also covers
+ * terminal, timed-out and RESET sessions, and eve's truth can diverge from
+ * `agent_sessions.status` indefinitely (a 30-day session timeout emits
+ * `session.completed` into a stream nobody is tailing).
+ *
+ * Recovery is the OPPOSITE of {@link SESSION_BUSY_ERROR_CODE}: never retry —
+ * release the session claim (a Slack thread key must be freed) and start a new
+ * session. Collapsing the two codes turns a recoverable race into a
+ * permanently bricked thread and a composer that lies to the user.
+ */
+export const SESSION_NOT_ACTIVE_ERROR_CODE = "session_not_active";
+
 export const apiErrorBodySchema = z.object({ error: apiErrorInfoSchema });
 
 /** Uniform non-2xx body. `code` is a stable machine-readable slug. */
@@ -178,9 +200,13 @@ export type DeleteResourceResponse = z.infer<
 
 /**
  * One chat thread = one `agent_sessions` row = one durable eve session.
- * The eve continuation token is deliberately NOT exposed — it stays
- * server-side (the control plane owns session→workspace mapping and checks
- * it on every continue/stream/input/cancel; PLAN correction 8).
+ *
+ * eve 0.31 sessions are ID-ADDRESSED: `eveSessionId` is the whole handle, and
+ * follow-ups/controls address it in the route path. (0.19's continuation token
+ * is gone — the `agent_sessions.continuation_token` column survives unwritten
+ * as a documented residual, and eve 400s on the key's mere presence.) The id
+ * still stays server-side: the control plane owns session→workspace mapping
+ * and checks it on every continue/stream/input/cancel (PLAN correction 8).
  */
 export interface AgentSessionDto {
   id: string;
@@ -376,10 +402,16 @@ export type RunWorkflowRequest = z.infer<typeof runWorkflowRequestSchema>;
 // ── POST /sessions/:id/messages ─────────────────────────────────────────────
 
 /**
- * Follow-up message → continues the same eve session (new run). One run at a
- * time per session: while a run is queued/running the server answers 409
- * `session_busy` — the UI must surface this gracefully (disable composer /
- * offer retry), never crash.
+ * Follow-up message → continues the same eve session by ID (new run).
+ *
+ * TWO distinct 409s, with OPPOSITE recoveries — the UI must branch on `code`,
+ * never on the status alone:
+ * - {@link SESSION_BUSY_ERROR_CODE} — transient. A run is already queued/
+ *   running/waiting on this session. Keep the draft, offer "try again once it
+ *   finishes".
+ * - {@link SESSION_NOT_ACTIVE_ERROR_CODE} — permanent for this session (eve
+ *   says the id is terminal/reset/unknown). Never offer a retry; offer
+ *   starting a new chat.
  */
 export const postMessageRequestSchema = z.object({
   message: z.string().min(1),
@@ -392,6 +424,87 @@ export interface PostMessageResponse {
 }
 
 export const postMessageResponseSchema = z.object({ run: runDtoSchema });
+
+// ── Session context controls (eve 0.31) ─────────────────────────────────────
+//
+//   POST /sessions/:id/clear    → SessionContextControlResponse
+//   POST /sessions/:id/compact  → SessionContextControlResponse
+//   POST /sessions/:id/reset    → ResetSessionResponse
+//
+// Each fronts the matching eve control route
+// (`POST /eve/v1/session/:eveSessionId/{clear,compact,reset}`; contracts in
+// ./eve-session-api). All three take an optional body.
+//
+// STOPPING A TURN IS NOT HERE: the Stop button keeps using the existing
+// `POST /runs/:id/cancel` ({@link runCancelRequestSchema}), which now fronts
+// `POST /eve/v1/session/:id/cancel` instead of only stopping our tail. There
+// is deliberately no second session-scoped cancel route.
+
+/**
+ * Outcome of a clear/compact. `accepted` = eve queued the command (the stream
+ * emits `context.cleared` / `compaction.requested`, then `session.waiting`);
+ * `no_active_session` = eve has no live session behind this id — the same
+ * terminal condition a send would answer as `session_not_active`.
+ *
+ * Keyed on `status`, NOT on the HTTP code: eve answers 202 for accepted and
+ * 200 for no_active_session, and a missing `compaction.completed` means
+ * summarization was skipped/failed and history was PRESERVED — not an error.
+ */
+export const sessionContextControlStatusSchema = z.enum([
+  "accepted",
+  "no_active_session",
+]);
+export type SessionContextControlStatus = z.infer<
+  typeof sessionContextControlStatusSchema
+>;
+
+/** No body today; declared so the route has a schema to validate against. */
+export const sessionContextControlRequestSchema = z.object({}).optional();
+export type SessionContextControlRequest = z.infer<
+  typeof sessionContextControlRequestSchema
+>;
+
+export const sessionContextControlResponseSchema = z.object({
+  session: agentSessionDtoSchema,
+  status: sessionContextControlStatusSchema,
+});
+export type SessionContextControlResponse = z.infer<
+  typeof sessionContextControlResponseSchema
+>;
+
+/**
+ * Reset body. DESTRUCTIVE: the eve session id is retired permanently and can
+ * never accept another message, so the UI gates this behind a confirm step.
+ */
+export const resetSessionRequestSchema = z
+  .object({
+    /** Optional audit note (never shown to the model). */
+    reason: z.string().min(1).max(500).optional(),
+  })
+  .optional();
+export type ResetSessionRequest = z.infer<typeof resetSessionRequestSchema>;
+
+/**
+ * Reset outcome. On `reset`, the old row is closed and a NEW `agent_sessions`
+ * row is minted against the same agent — clients must re-key their thread
+ * cache and switch the active session to `session.id`. On
+ * `no_active_session` there was nothing live to retire, so no replacement is
+ * minted and the caller keeps using the existing row.
+ */
+export const resetSessionResponseSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("reset"),
+    /** The retired row (status "closed"). */
+    previousSession: agentSessionDtoSchema,
+    /** The fresh row that replaces it — the thread continues here. */
+    session: agentSessionDtoSchema,
+  }),
+  z.object({
+    status: z.literal("no_active_session"),
+    previousSession: agentSessionDtoSchema,
+  }),
+]);
+export type ResetSessionResponse = z.infer<typeof resetSessionResponseSchema>;
 
 // ── GET /sessions/:id ───────────────────────────────────────────────────────
 
@@ -421,8 +534,14 @@ export const getSessionResponseSchema = z.object({
 //
 // Resume: reconnect with `Last-Event-ID: <seq>` (or `?lastEventId=<seq>` for
 // native EventSource clients that cannot set headers); the server replays
-// only run_events with seq > Last-Event-ID (mirrors eve's own `?startIndex=`
-// NDJSON resume upstream).
+// only run_events with seq > Last-Event-ID.
+//
+// `seq` STAYS the resume cursor at both hops. Upstream, eve resumes on an
+// absolute `?startIndex=` (optionally bounded with `&includeTailIndex=1` →
+// `x-eve-stream-tail-index`); eve's `meta.id` is a stable dedupe KEY, not a
+// cursor — its ULIDs are time-ordered but not totally ordered across steps in
+// different processes, so `id > cursor` would silently drop events. That id
+// rides along as {@link RunEventFrame.eventId} for identity/dedupe only.
 
 export const RUN_STREAM_EVENT_NAMES = ["run_event", "run_status"] as const;
 export type RunStreamEventName = (typeof RUN_STREAM_EVENT_NAMES)[number];
@@ -436,6 +555,14 @@ export interface RunEventFrame {
   event: EveStreamEvent;
   /** ISO time the control plane persisted the event. */
   at: string;
+  /**
+   * eve's stable `meta.id` (`evt_` + ULID) when the event carried one — the
+   * dedupe key, NOT a cursor. Absent for events persisted by pre-0.28 (0.19-era)
+   * agents, which is permanent for historical rows, so clients must fall back
+   * to `seq`. Two frames can legitimately share an `eventId` under DIFFERENT
+   * `seq`s when a prior turn's leftovers are re-attributed to a later run.
+   */
+  eventId?: string;
 }
 
 /** `data` payload of an `event: run_status` frame. */
@@ -454,6 +581,21 @@ export interface RunStatusFrame {
  */
 export function isRunStreamTerminalStatus(status: RunStatus): boolean {
   return status !== "queued" && status !== "running";
+}
+
+/**
+ * The run is OVER — no later status can supersede this one.
+ *
+ * Deliberately NARROWER than {@link isRunStreamTerminalStatus}: `waiting` is
+ * stream-terminal (the server closes the tail) but NOT settled — a parked run
+ * still moves to `canceled`/`succeeded`/`failed` later, and it does so with no
+ * open stream to carry the news. That gap is why a stream-derived status must
+ * never outrank a settled row: the live cache for a parked run is frozen at
+ * `waiting` forever, so treating it as fresher strands the UI (a stopped run
+ * that never looks stopped). Callers resolving "row vs live" want THIS check.
+ */
+export function isRunSettledStatus(status: RunStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "canceled";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -631,9 +773,19 @@ export type ListSessionsResponse = z.infer<typeof listSessionsResponseSchema>;
 
 // ── POST /runs/:id/input — HITL response ────────────────────────────────────
 //
-// Answers an `input.requested` frame (approval card / question). Forwarded to
-// eve as `inputResponses: [{requestId, optionId? , text?}]`; the parked run
-// resumes and the client re-opens the SSE stream.
+// Answers an `input.requested` frame. Which card renders it is decided by the
+// request's own `EveInputRequest.kind` discriminator — `tool-approval` |
+// `question` | `session-limit` (see eve-events.ts); clients read it straight
+// off the frame, so it needs no mirror in this request DTO.
+//
+// Forwarded to eve as the RESPOND form of the follow-up route:
+// `POST /eve/v1/session/:id` with `{ inputResponses: [{requestId, optionId?,
+// text?}] }` alone — mutually exclusive with `message`. The parked run resumes
+// and the client re-opens the SSE stream.
+//
+// NOTE the exactly-one-of refinement below is a deliberate CONTROL-PLANE
+// tightening: eve's own `inputResponseSchema` permits neither and both.
+// Answers are stale once their turn is cancelled or the context is cleared.
 
 export const runInputRequestSchema = z
   .object({
@@ -1242,11 +1394,19 @@ export type ListWorkspaceMembersResponse = z.infer<
 // (docs/PLAN.md Phase 3; INITIAL-SPEC.md §8 dispatch path + §10 API surface)
 // ════════════════════════════════════════════════════════════════════════════
 
-// ── POST /runs/:id/cancel — abort a run ─────────────────────────────────────
+// ── POST /runs/:id/cancel — stop a run ──────────────────────────────────────
 //
-// Aborts a queued/running/waiting run (dispatcher issues eve cancel + flips
-// status to `canceled`). Idempotent: cancelling an already-terminal run
+// The Stop button. Cancels a queued/running/waiting run and lands it
+// `canceled` — never `failed`: eve is explicit that cancellation is a USER
+// DECISION, not an error. Idempotent: cancelling an already-terminal run
 // returns its current state without error. Body is optional.
+//
+// eve 0.31 gives this a real remote leg (`POST /eve/v1/session/:id/cancel`;
+// 202 accepted / 200 no_active_turn, both success). Cancellation is
+// COOPERATIVE at durable step boundaries — a tool call already in flight runs
+// to completion — and the turn then ends with `turn.cancelled` →
+// `session.waiting`, which is what settles the run. UI copy must not promise
+// that in-flight side effects are undone.
 
 export const runCancelRequestSchema = z
   .object({

@@ -10,14 +10,24 @@
  * mode. Frames are deduped + ordered by `seq` in {@link FrameStore} — seq is
  * authoritative (SSE resume can re-deliver frames; reducers never double
  * apply).
+ *
+ * CANCELLATION IS NOT FAILURE (eve 0.31). A stopped turn emits
+ * `turn.cancelled` → `session.waiting` and NEVER `turn.failed` /
+ * `session.failed`, so `turn.cancelled` must never reach the failure arm:
+ * it freezes the run's output in place (whatever streamed before the stop
+ * stays rendered), retires every unanswered input request, and lets the
+ * session accept the next message normally.
  */
-import type {
-  EveInputRequest,
-  EveJsonValue,
-  EveStreamEvent,
-  RunDto,
-  RunEventFrame,
-  RunStatus,
+import {
+  EVE_INPUT_REQUEST_KINDS,
+  isRunSettledStatus,
+  type EveInputRequest,
+  type EveInputRequestKind,
+  type EveJsonValue,
+  type EveStreamEvent,
+  type RunDto,
+  type RunEventFrame,
+  type RunStatus,
 } from "@invisible-string/shared";
 
 // ── Frame store (seq-deduped, ordered) ──────────────────────────────────────
@@ -57,7 +67,14 @@ export function addFrames(
 
 // ── View model ──────────────────────────────────────────────────────────────
 
-export type StepState = "pending" | "awaiting" | "ok" | "error" | "rejected";
+export type StepState =
+  | "pending"
+  | "awaiting"
+  | "ok"
+  | "error"
+  | "rejected"
+  /** The turn was stopped before this call settled — no result will arrive. */
+  | "canceled";
 
 export interface StepRowView {
   /** Tool call id — stable row identity. */
@@ -71,11 +88,24 @@ export interface StepRowView {
 export interface PendingInputView {
   requestId: string;
   prompt: string;
-  /** Tool the approval gates (null for pure questions). */
+  /**
+   * eve's framework-owned discriminator (0.31) — the ONLY thing presentation
+   * may route on. Never re-infer intent from `toolName`: a session-limit
+   * prompt rides a synthetic `session_limit_continuation` "tool" that must not
+   * render as a tool approval.
+   */
+  kind: EveInputRequestKind;
+  /** Tool the approval gates (null for questions and session-limit prompts). */
   toolName: string | null;
   /** Tool input args, pre-rendered as compact JSON for the card. */
   argsPreview: string | null;
-  options: readonly { id: string; label: string; style?: string }[];
+  options: readonly {
+    id: string;
+    label: string;
+    /** eve's per-option help text (used by the session-limit prompt). */
+    description?: string;
+    style?: string;
+  }[];
   allowFreeform: boolean;
   display: "confirmation" | "select" | "text";
 }
@@ -106,6 +136,18 @@ export interface RunView {
   error: string | null;
   /** Resolved model id from session.started (thread header chip). */
   modelId: string | null;
+  /**
+   * The run's turn was STOPPED by a user (`turn.cancelled`). Derived from the
+   * event stream, so it is true the instant the frame lands — a beat before
+   * the `run_status: canceled` frame — and it is never an error state.
+   */
+  canceled: boolean;
+  /**
+   * A `context.cleared` landed inside this run's frames: the agent's durable
+   * model history was dropped while this run's tail was attached. The
+   * transcript above stays readable; the agent simply no longer remembers it.
+   */
+  contextCleared: boolean;
 }
 
 // ── Reduction ───────────────────────────────────────────────────────────────
@@ -129,15 +171,53 @@ export function previewValue(value: EveJsonValue | undefined): string | null {
   return text.length > PREVIEW_MAX ? `${text.slice(0, PREVIEW_MAX)}…` : text;
 }
 
+const KNOWN_INPUT_KINDS: ReadonlySet<string> = new Set(EVE_INPUT_REQUEST_KINDS);
+
+/**
+ * eve's synthetic "tool" behind a session-limit continuation prompt
+ * (`session-limit-continuation.js`). It is an implementation detail of the
+ * budget guardrail, never a tool the user asked for, so it must not surface
+ * as a tool chip.
+ */
+const SESSION_LIMIT_TOOL_NAME = "session_limit_continuation";
+
+/**
+ * Read the request's `kind`. eve 0.31 makes it REQUIRED, but `run_events`
+ * rows persisted by 0.19-era agents are still replayed forever (SSE history,
+ * an old thread reopened), and those carry no discriminator — so fall back to
+ * the only signal those rows have rather than mislabelling every one of them
+ * as a tool approval.
+ */
+export function inputRequestKindOf(
+  request: EveInputRequest,
+): EveInputRequestKind {
+  const raw: unknown = (request as { kind?: unknown }).kind;
+  if (typeof raw === "string" && KNOWN_INPUT_KINDS.has(raw)) {
+    return raw as EveInputRequestKind;
+  }
+  return request.action?.toolName === "ask_question"
+    ? "question"
+    : "tool-approval";
+}
+
 function pendingInputFromRequest(request: EveInputRequest): PendingInputView {
+  const kind = inputRequestKindOf(request);
+  const toolName = request.action?.toolName ?? null;
+  // A question's gating "tool" is `ask_question` and a session-limit prompt's
+  // is eve's budget shim — neither is a tool call the user is approving, so
+  // neither gets the tool chip + args preview treatment.
+  const showsTool =
+    kind === "tool-approval" && toolName !== SESSION_LIMIT_TOOL_NAME;
   return {
     requestId: request.requestId,
     prompt: request.prompt,
-    toolName: request.action?.toolName ?? null,
-    argsPreview: previewValue(request.action?.input ?? null),
+    kind,
+    toolName: showsTool ? toolName : null,
+    argsPreview: showsTool ? previewValue(request.action?.input ?? null) : null,
     options: (request.options ?? []).map((option) => ({
       id: option.id,
       label: option.label,
+      description: option.description,
       style: option.style,
     })),
     allowFreeform: request.allowFreeform ?? false,
@@ -148,15 +228,27 @@ function pendingInputFromRequest(request: EveInputRequest): PendingInputView {
 /**
  * Reduce a run + its frames to the thread view model.
  *
- * `statusOverride` lets the live layer apply a fresher `run_status` frame
- * than the fetched row carries.
+ * `statusOverride` lets the live layer apply a fresher `run_status` frame than
+ * the fetched row carries — but ONLY while the row is unsettled. A SETTLED row
+ * always wins, because the live layer cannot be fresher than one: the server
+ * closes the tail at every stream-terminal status, so nothing can arrive after
+ * it.
+ *
+ * The case that forces this: a run parked on HITL input closes its stream at
+ * `waiting`, freezing the live status there permanently. Stopping that run
+ * settles the ROW to `canceled` with no stream left to announce it — so a
+ * naive `statusOverride ?? run.status` would keep rendering the stale
+ * `waiting` forever (approval card still answerable, composer stuck disabled,
+ * no stopped-notice) until the user navigates away. See isRunSettledStatus.
  */
 export function reduceRunView(
   run: Pick<RunDto, "id" | "status" | "triggerEvent" | "error">,
   store: FrameStore,
   statusOverride?: RunStatus,
 ): RunView {
-  const status = statusOverride ?? run.status;
+  const status = isRunSettledStatus(run.status)
+    ? run.status
+    : (statusOverride ?? run.status);
   const stepsByCall = new Map<string, StepRowView>();
   const narration: string[] = [];
   const pendingByRequest = new Map<
@@ -170,11 +262,22 @@ export function reduceRunView(
   let reply: { text: string; streaming: boolean } | null = null;
   let error: string | null = run.error;
   let modelId: string | null = null;
+  let canceled = false;
+  let contextCleared = false;
 
   const resolveInputsForCall = (callId: string) => {
     for (const [requestId, entry] of pendingByRequest) {
       if (entry.callId === callId) pendingByRequest.delete(requestId);
     }
+  };
+
+  /**
+   * Every unanswered request is stale once the turn is cancelled or the
+   * context is cleared — answering one would post a dead requestId that eve
+   * replays to the model as an ordinary user message.
+   */
+  const retirePendingInputs = () => {
+    pendingByRequest.clear();
   };
 
   for (const frame of store.frames) {
@@ -211,6 +314,25 @@ export function reduceRunView(
           }
         }
         break;
+      // Preliminary tool output while a long call is still running:
+      // last-write-wins per callId, never terminal for the step.
+      case "action.partial": {
+        const { result } = event.data;
+        const step = stepsByCall.get(result.callId);
+        // Never walk a settled step backwards. eve emits partials before the
+        // result, but a durable step RETRY re-emits the whole sequence, so a
+        // partial can legitimately arrive after this call already resolved.
+        if (step !== undefined && step.state !== "pending" && step.state !== "awaiting") {
+          break;
+        }
+        stepsByCall.set(result.callId, {
+          key: result.callId,
+          toolName: result.toolName,
+          state: step?.state ?? "pending",
+          resultPreview: previewValue(result.output),
+        });
+        break;
+      }
       case "action.result": {
         const { result, status: resultStatus, error: resultError } = event.data;
         const state: StepState =
@@ -253,6 +375,27 @@ export function reduceRunView(
         streamText = null;
         break;
       }
+      // A USER DECISION, NEVER AN ERROR — deliberately its own arm, far from
+      // the failure arm below, so it can never leak into `error`. eve stops
+      // at the next durable step boundary (a tool already in flight still
+      // lands its `action.result`), then emits `session.waiting`; whatever
+      // streamed before the stop stays on screen, frozen.
+      case "turn.cancelled": {
+        canceled = true;
+        retirePendingInputs();
+        for (const [callId, step] of stepsByCall) {
+          if (step.state === "pending" || step.state === "awaiting") {
+            stepsByCall.set(callId, { ...step, state: "canceled" });
+          }
+        }
+        break;
+      }
+      // Durable model history dropped (the Clear context action). The
+      // transcript stays readable; only the agent's memory of it is gone.
+      case "context.cleared":
+        contextCleared = true;
+        retirePendingInputs();
+        break;
       case "step.failed":
       case "turn.failed":
       case "session.failed":
@@ -264,11 +407,16 @@ export function reduceRunView(
   }
 
   // A stream still in flight at the end of the frames IS the reply so far.
+  // A cancelled turn's partial text is FINAL — freeze it (no blinking caret)
+  // the moment `turn.cancelled` lands, without waiting for the status frame.
   if (streamText !== null && reply === null) {
-    reply = { text: streamText, streaming: status === "running" || status === "queued" };
+    reply = {
+      text: streamText,
+      streaming: !canceled && (status === "running" || status === "queued"),
+    };
   }
 
-  const active = status === "queued" || status === "running";
+  const active = !canceled && (status === "queued" || status === "running");
   const steps = [...stepsByCall.values()];
   const hasBlock =
     steps.length > 0 || narration.length > 0 || reasoning !== null;
@@ -284,9 +432,10 @@ export function reduceRunView(
   }
 
   // Pending inputs only matter while the run is parked or still active —
-  // a terminal run has nothing left to answer.
+  // a terminal run has nothing left to answer. `turn.cancelled` already
+  // retired them above; this also covers a run whose status settled first.
   const pendingInputs =
-    status === "waiting" || active
+    !canceled && (status === "waiting" || active)
       ? [...pendingByRequest.values()].map((entry) => entry.view)
       : [];
 
@@ -300,8 +449,11 @@ export function reduceRunView(
     reply,
     pendingInputs,
     // Error surfaces only when the run actually failed — a step that failed
-    // mid-run but recovered must not leave a stale banner.
+    // mid-run but recovered must not leave a stale banner, and a CANCELLED
+    // run is not a failure at all (it emits no failure event to read).
     error: status === "failed" ? (error ?? "Run failed") : null,
     modelId,
+    canceled: canceled || status === "canceled",
+    contextCleared,
   };
 }

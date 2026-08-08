@@ -28,5 +28,21 @@
  * reached), and the digest guard requires a bump in the same commit as any
  * digest rewrite. (Baked JWT audiences shift anyway — the version
  * participates in every content hash.)
+ *
+ * 3.1.0 — MINOR: new optional behavior in `agent/agent.ts` for the eve
+ * 0.19.0 -> 0.31.3 bump. Both provider templates now emit an EXPLICIT
+ * `limits` block (`maxInputTokensPerSession: 40_000_000`,
+ * `sessionTimeoutMs: 2_592_000_000`) pinning the two defaults eve 0.31
+ * applies whether or not an agent asks for them, so the runtime envelope
+ * becomes part of the artifact instead of drifting with the runtime. The
+ * openrouter template's in-file doc comment was corrected in the same pass:
+ * under @openrouter/ai-sdk-provider@3.0.0 the missing-key
+ * AI_LoadAPIKeyError moved from model CONSTRUCTION to the first model CALL,
+ * which makes the keyless guard MORE load-bearing, not redundant — that
+ * comment ships inside the generated file, so correcting it changes emitted
+ * bytes. Generated-code semantics are otherwise unchanged (the emitted
+ * limits equal what eve already enforced) and the env contract is
+ * untouched, hence minor rather than major. Every version hash changes
+ * regardless — versions.json moved in the same commit.
  */
-export const COMPILER_VERSION = "3.0.1";
+export const COMPILER_VERSION = "3.1.0";

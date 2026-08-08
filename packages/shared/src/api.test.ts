@@ -24,10 +24,15 @@ import {
   postMessageRequestSchema,
   publishAgentResponseSchema,
   registryServerSummarySchema,
+  resetSessionRequestSchema,
+  resetSessionResponseSchema,
   RUN_STREAM_EVENT_NAMES,
   runDtoSchema,
   runInputRequestSchema,
   runWorkflowRequestSchema,
+  SESSION_BUSY_ERROR_CODE,
+  SESSION_NOT_ACTIVE_ERROR_CODE,
+  sessionContextControlResponseSchema,
   updateAgentRequestSchema,
   updateMcpConnectionRequestSchema,
   updateModelPresetRequestSchema,
@@ -62,20 +67,44 @@ describe("run stream contract", () => {
     expect(RUN_STREAM_EVENT_NAMES).toEqual(["run_event", "run_status"]);
   });
 
-  test("RunEventFrame carries frozen eve stream events", () => {
+  test("RunEventFrame carries frozen eve stream events + the stable event id", () => {
     // Compile-time contract check exercised at runtime with a live-observed shape.
     const event: EveStreamEvent = {
       type: "turn.started",
       data: { sequence: 0, turnId: "turn_0" },
-      meta: { at: "2026-07-02T00:00:00.000Z" },
+      meta: { at: "2026-08-08T02:46:16.164Z", id: "evt_01KZFM75B4GZBXHR68PTHPR01G" },
     };
     const frame: RunEventFrame = {
       runId: "run_1",
       seq: 0,
       event,
-      at: "2026-07-02T00:00:00.001Z",
+      at: "2026-08-08T02:46:16.165Z",
+      eventId: event.meta?.id,
     };
     expect(frame.event.type).toBe("turn.started");
+    expect(frame.eventId).toBe("evt_01KZFM75B4GZBXHR68PTHPR01G");
+  });
+
+  test("eventId is optional — legacy 0.19-era rows have no meta.id", () => {
+    const frame: RunEventFrame = {
+      runId: "run_1",
+      seq: 4,
+      event: {
+        type: "session.waiting",
+        data: { wait: "next-user-message" },
+        meta: { at: "2026-07-02T00:00:00.000Z" },
+      },
+      at: "2026-07-02T00:00:00.001Z",
+    };
+    expect(frame.eventId).toBeUndefined();
+  });
+});
+
+describe("session 409 codes", () => {
+  test("busy and not-active are DISTINCT codes with opposite recoveries", () => {
+    expect(SESSION_BUSY_ERROR_CODE).toBe("session_busy");
+    expect(SESSION_NOT_ACTIVE_ERROR_CODE).toBe("session_not_active");
+    expect(SESSION_BUSY_ERROR_CODE).not.toBe(SESSION_NOT_ACTIVE_ERROR_CODE);
   });
 });
 
@@ -230,6 +259,75 @@ describe("run input schema", () => {
         .success,
     ).toBe(false);
     expect(runInputRequestSchema.safeParse({ optionId: "approve" }).success).toBe(false);
+  });
+});
+
+describe("session context controls (eve 0.31)", () => {
+  const session = {
+    id: UUID,
+    agentId: UUID_2,
+    agentVersionId: UUID_2,
+    workflowId: null,
+    origin: "chat",
+    status: "active",
+    eveSessionId: "wrun_01KZFM7CCZWQ4SXBPVV0CGA9HN",
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+
+  test("clear/compact answer the session plus an eve-derived status", () => {
+    expect(
+      sessionContextControlResponseSchema.safeParse({ session, status: "accepted" })
+        .success,
+    ).toBe(true);
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "no_active_session",
+      }).success,
+    ).toBe(true);
+    // `no_active_turn` belongs to cancel, not to the context controls.
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "no_active_turn",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("reset mints a replacement session only on the `reset` arm", () => {
+    const replacement = { ...session, id: UUID_2, eveSessionId: null };
+    const parsed = resetSessionResponseSchema.safeParse({
+      status: "reset",
+      previousSession: session,
+      session: replacement,
+    });
+    expect(parsed.success).toBe(true);
+
+    // A reset without a replacement row would strand the thread on a retired
+    // eve session id that can never accept another message.
+    expect(
+      resetSessionResponseSchema.safeParse({
+        status: "reset",
+        previousSession: session,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resetSessionResponseSchema.safeParse({
+        status: "no_active_session",
+        previousSession: session,
+      }).success,
+    ).toBe(true);
+  });
+
+  test("reset body is optional and takes an audit reason only", () => {
+    expect(resetSessionRequestSchema.safeParse(undefined).success).toBe(true);
+    expect(resetSessionRequestSchema.safeParse({}).success).toBe(true);
+    expect(resetSessionRequestSchema.safeParse({ reason: "starting over" }).success).toBe(
+      true,
+    );
+    expect(resetSessionRequestSchema.safeParse({ reason: "" }).success).toBe(false);
   });
 });
 

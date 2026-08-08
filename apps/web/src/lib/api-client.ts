@@ -11,10 +11,22 @@
  *   never a silent `any`.
  * - Non-2xx responses are decoded from the uniform control-plane error
  *   envelope (`{error: {code, message, details?}}`) into {@link ApiError}
- *   with the machine-readable `code` preserved (e.g. "session_busy",
- *   "model_not_allowlisted") so UI states can branch on it.
+ *   with the machine-readable `code` preserved so UI states can branch on it.
+ *
+ * `code` is load-bearing, not decoration: the session routes answer TWO
+ * different 409s whose recoveries are opposites — `session_busy` (transient;
+ * a run holds the session's one slot — retry later) and `session_not_active`
+ * (permanent; eve retired the id, e.g. after a reset — start a new session,
+ * never retry). Branching on the status alone would brick the composer, so
+ * both live in packages/shared as {@link SESSION_BUSY_ERROR_CODE} /
+ * {@link SESSION_NOT_ACTIVE_ERROR_CODE} and are compared with
+ * {@link isApiErrorCode} rather than string literals.
  */
-import { apiErrorBodySchema } from "@invisible-string/shared";
+import {
+  apiErrorBodySchema,
+  SESSION_BUSY_ERROR_CODE,
+  SESSION_NOT_ACTIVE_ERROR_CODE,
+} from "@invisible-string/shared";
 import type { z } from "zod";
 
 /** Empty VITE_API_URL (prod same-origin builds) resolves to the page origin
@@ -56,6 +68,23 @@ export class ApiError extends Error {
 /** Narrow an unknown error to an ApiError with a specific code. */
 export function isApiErrorCode(error: unknown, code: string): error is ApiError {
   return error instanceof ApiError && error.code === code;
+}
+
+/**
+ * The session's one run slot is taken — TRANSIENT. Keep the draft; the same
+ * message will go through once the in-flight run settles.
+ */
+export function isSessionBusy(error: unknown): error is ApiError {
+  return isApiErrorCode(error, SESSION_BUSY_ERROR_CODE);
+}
+
+/**
+ * eve retired this session id — PERMANENT. It covers terminal, timed-out and
+ * RESET sessions, and no retry will ever succeed: the only recovery is a new
+ * session. Never surface this as "try again".
+ */
+export function isSessionNotActive(error: unknown): error is ApiError {
+  return isApiErrorCode(error, SESSION_NOT_ACTIVE_ERROR_CODE);
 }
 
 export type QueryParams = Record<string, string | number | boolean | undefined>;

@@ -28,16 +28,71 @@ export const STATE_FILE = join(RUNTIME_DIR, "state.json");
 export const COMPOSE_PROJECT = "p2e2e";
 
 // ── Ports (offset from dev :5432/:9000/:5556 and p1acceptance :5443) ────────
+/**
+ * Every port is env-overridable, defaulting to the historical value.
+ *
+ * These are fixed low ports (deliberately below the ephemeral range so the
+ * kernel never hands one out mid-run), which makes them collidable with ANY
+ * other docker project on the machine — not just this repo's other harnesses.
+ * A collision fails the whole suite in global setup with a bare "port is
+ * already allocated", so the escape hatch has to exist:
+ *   E2E_POSTGRES_PORT=5452 bunx playwright test
+ * Keep overrides below 32768 for the same reason the defaults are.
+ */
+function port(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`${envName} must be an integer port 1-65535, got ${raw}`);
+  }
+  return parsed;
+}
+
 export const PORTS = {
-  postgres: 5442,
-  garage: 3910,
-  dex: 5557,
-  controlPlane: 4310,
-  worker: 4311,
-  preview: 5173,
+  postgres: port("E2E_POSTGRES_PORT", 5442),
+  garage: port("E2E_GARAGE_PORT", 3910),
+  dex: port("E2E_DEX_PORT", 5557),
+  controlPlane: port("E2E_CONTROL_PLANE_PORT", 4310),
+  worker: port("E2E_WORKER_PORT", 4311),
+  preview: port("E2E_PREVIEW_PORT", 5173),
   /** Local stub MCP server the built agent's tools call. */
-  stubMcp: 4315,
+  stubMcp: port("E2E_STUB_MCP_PORT", 4315),
+  /** Pool the worker draws AGENT ports from — see the invariant below. */
+  agentMin: port("E2E_AGENT_PORT_MIN", 4320),
+  agentMax: port("E2E_AGENT_PORT_MAX", 4399),
 } as const;
+
+/**
+ * The agent pool must not contain any service port.
+ *
+ * This is enforced rather than merely commented because the failure is silent
+ * and expensive: the worker hands a booting agent a port a service already
+ * holds, the agent never answers /eve/v1/health, and every spec that needs a
+ * published agent dies 120 s later with "boot failed" — while the services
+ * themselves look perfectly healthy. Overriding the service ports upward
+ * (E2E_CONTROL_PLANE_PORT=4320) walks straight into it, so the check runs at
+ * import time and names the offender instead.
+ */
+{
+  const services: ReadonlyArray<[string, number]> = [
+    ["controlPlane", PORTS.controlPlane],
+    ["worker", PORTS.worker],
+    ["stubMcp", PORTS.stubMcp],
+    ["preview", PORTS.preview],
+  ];
+  const clashes = services
+    .filter(([, value]) => value >= PORTS.agentMin && value <= PORTS.agentMax)
+    .map(([name, value]) => `${name}=${value}`);
+  if (clashes.length > 0) {
+    throw new Error(
+      `e2e port config: ${clashes.join(", ")} fall inside the agent pool ` +
+        `${PORTS.agentMin}-${PORTS.agentMax}. Agents booted onto a service's ` +
+        `port never become healthy. Move the service ports below the pool, ` +
+        `or shift the pool with E2E_AGENT_PORT_MIN/E2E_AGENT_PORT_MAX.`,
+    );
+  }
+}
 
 // ── URLs ────────────────────────────────────────────────────────────────────
 export const API_BASE_URL = `http://localhost:${PORTS.controlPlane}`;
@@ -132,9 +187,11 @@ export function workerEnv(workerId: string): Record<string, string> {
     ARTIFACT_CACHE_DIR: AGENT_ROOT,
     HEARTBEAT_INTERVAL_MS: "1000",
     AGENT_READY_TIMEOUT_MS: "120000",
-    // Agent port pool MUST NOT overlap the control-plane (4310), worker (4311),
-    // or stub (4315) — the default 4310–4409 does.
-    AGENT_PORT_MIN: "4320",
-    AGENT_PORT_MAX: "4399",
+    // Agent port pool MUST NOT overlap the control-plane, worker, or stub
+    // ports — the worker's own default (4310–4409) does. The non-overlap is
+    // asserted at import time in this file, so these two stay in lockstep
+    // with the service ports even when both are overridden.
+    AGENT_PORT_MIN: String(PORTS.agentMin),
+    AGENT_PORT_MAX: String(PORTS.agentMax),
   };
 }

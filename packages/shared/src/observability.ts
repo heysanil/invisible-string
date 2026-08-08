@@ -174,7 +174,7 @@ export const SECRET_FIELD_PATTERNS = [
   "passwd",
   "passphrase",
   "secret",
-  "token", // apiToken, continuationToken, x-worker-token, csrfToken…
+  "token", // apiToken, accessToken, x-worker-token, csrfToken…
   "apikey",
   "api_key",
   "accesskey",

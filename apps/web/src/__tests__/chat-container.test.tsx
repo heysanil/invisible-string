@@ -1,10 +1,14 @@
 /**
  * ThreadContainer integration (happy-dom + real query hooks + mocked fetch):
- * the 409 session_busy composer flow (keep the draft, show a notice) and the
- * HITL approval POST /runs/:id/input round-trip that re-opens the stream.
+ * BOTH 409 composer flows (transient `session_busy` vs permanent
+ * `session_not_active` — opposite recoveries, so opposite copy), the HITL
+ * approval POST /runs/:id/input round-trip that re-opens the stream, and the
+ * eve 0.31 context controls (clear fires straight off the menu; reset is
+ * destructive and must pass a confirm step first).
  *
  * The SSE layer is mocked (useThreadStreams) so frames are injected directly;
- * everything else — useSession, usePostMessage, usePostRunInput — is real.
+ * everything else — useSession, usePostMessage, usePostRunInput, the context
+ * controls — is real.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -15,6 +19,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
+import { ToastProvider } from "../components/ui/Toast";
 // The real implementation, bound at THIS file's evaluation, so the module
 // mock below can delegate to it when use-thread-streams.test.tsx flips the
 // shared flag (see test/stream-mock-flag.ts for the full story).
@@ -172,15 +177,40 @@ afterEach(() => {
   cleanup();
 });
 
-function renderContainer() {
+function renderContainer(
+  props: { onSessionReplaced?: (id: string) => void } = {},
+) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return renderWithRouter(
     <QueryClientProvider client={client}>
-      <ThreadContainer workspaceId={WS} sessionId={SESSION_ID} agentName="Report bot" />
+      {/* The container toasts the outcome of every context control. */}
+      <ToastProvider>
+        <ThreadContainer
+          workspaceId={WS}
+          sessionId={SESSION_ID}
+          agentName="Report bot"
+          onSessionReplaced={props.onSessionReplaced}
+        />
+      </ToastProvider>
     </QueryClientProvider>,
   );
+}
+
+/** The session DTO shape the control plane returns for a fresh/reset row. */
+function sessionDto(id: string) {
+  return {
+    id,
+    agentId: AGENT_ID,
+    agentVersionId: AGV_ID,
+    workflowId: null,
+    origin: "chat",
+    status: "active",
+    eveSessionId: `eve_${id}`,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
 }
 
 test("409 session_busy keeps the draft and shows a notice", async () => {
@@ -231,6 +261,7 @@ test("answering an approval POSTs to /runs/:id/input and reopens the stream", as
           requests: [
             {
               requestId: "req1",
+              kind: "tool-approval",
               prompt: "Approve tool call: gmail_send",
               action: { callId: "c1", kind: "tool-call", toolName: "gmail_send", input: { to: "x" } },
               options: [
@@ -281,4 +312,111 @@ test("answering an approval POSTs to /runs/:id/input and reopens the stream", as
   const inputCall = requests.find((r) => r.url.includes(`/runs/${RUN_ID}/input`));
   expect(inputCall?.body).toEqual({ requestId: "req1", optionId: "approve" });
   await waitFor(() => expect(reopenCalls).toContain(RUN_ID));
+});
+
+test("409 session_not_active offers a NEW chat, never a retry", async () => {
+  // The opposite recovery from session_busy: eve retired this id (terminal,
+  // timed out, or reset), so "try again once it finishes" would be a lie the
+  // user could follow forever.
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("succeeded"));
+    }
+    if (method === "POST" && url.includes(`/sessions/${SESSION_ID}/messages`)) {
+      return json(
+        {
+          error: {
+            code: "session_not_active",
+            message: "The session is no longer active.",
+          },
+        },
+        409,
+      );
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+
+  const view = renderContainer();
+  const box = await view.findByLabelText("Message");
+  fireEvent.input(box, { target: { value: "still there?" } });
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(view.getByText(/retired/i)).toBeTruthy());
+  // Crucially NOT the transient copy.
+  expect(view.queryByText(/try again once it finishes/i)).toBeNull();
+  // The text is still recoverable by the user even though retrying is futile.
+  expect((view.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(
+    "still there?",
+  );
+});
+
+// ── context controls ────────────────────────────────────────────────────────
+
+test("Clear context fires straight off the menu — no nagging confirm", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("succeeded"));
+    }
+    if (method === "POST" && url.includes(`/sessions/${SESSION_ID}/clear`)) {
+      return json({ session: sessionDto(SESSION_ID), status: "accepted" });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+
+  const view = renderContainer();
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  fireEvent.click(view.getByText("Clear context"));
+
+  await waitFor(() =>
+    expect(
+      requests.some(
+        (r) => r.method === "POST" && r.url.endsWith(`/sessions/${SESSION_ID}/clear`),
+      ),
+    ).toBe(true),
+  );
+  // Non-destructive, so it just happens — and then says so.
+  await waitFor(() => expect(view.getAllByText(/Context cleared/).length).toBeGreaterThan(0));
+});
+
+test("Reset asks first, then swaps the thread onto the replacement session", async () => {
+  const NEW_SESSION_ID = "55555555-5555-4555-8555-555555555555";
+  const replaced: string[] = [];
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("succeeded"));
+    }
+    if (method === "POST" && url.includes(`/sessions/${SESSION_ID}/reset`)) {
+      return json({
+        status: "reset",
+        previousSession: { ...sessionDto(SESSION_ID), status: "closed" },
+        session: sessionDto(NEW_SESSION_ID),
+      });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+
+  const view = renderContainer({ onSessionReplaced: (id) => replaced.push(id) });
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  fireEvent.click(view.getByText("Reset session"));
+
+  // DESTRUCTIVE: the retired eve session id can never take another message,
+  // so nothing may be sent before the user confirms.
+  expect(await view.findByText("Reset this session?")).toBeTruthy();
+  expect(
+    requests.some((r) => r.url.includes(`/sessions/${SESSION_ID}/reset`)),
+  ).toBe(false);
+
+  fireEvent.click(view.getByRole("button", { name: "Reset session" }));
+  await waitFor(() =>
+    expect(
+      requests.some(
+        (r) => r.method === "POST" && r.url.endsWith(`/sessions/${SESSION_ID}/reset`),
+      ),
+    ).toBe(true),
+  );
+  // The user must land on the REPLACEMENT row, or every later send 409s.
+  await waitFor(() => expect(replaced).toEqual([NEW_SESSION_ID]));
 });

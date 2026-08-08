@@ -45,7 +45,15 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
   rendered task message.
 - **chat-approval** — an agent is equipped with an MCP connection gated
   "Always ask"; a chat run parks on an inline HITL card; responding to it
-  resumes the run — exercising `POST /runs/:id/input` through the UI.
+  resumes the run — exercising `POST /runs/:id/input` through the UI. Then the
+  eve 0.31 session surface: the card must name itself a **question** (eve's
+  `kind` discriminator survives eve → tailer → SSE → reducer → card, rather
+  than being inferred from a tool name); a second parked run is **stopped**
+  and must settle as a user decision (neutral notice, *no* `role="alert"`
+  anywhere — `turn.cancelled` is never a failure); **Clear context** fires
+  straight off the session-actions menu (`POST /sessions/:id/clear`); and
+  **Reset session** must ask first, because the retired eve session id can
+  never take another message.
 - **webhook-trigger** — publish a minimal agent, bind a webhook workflow to
   it, publish (instant), reveal the ingress token ONCE, fire `/t/:token` with
   a plain HTTP POST, and watch the run surface in Chat as a webhook-origin

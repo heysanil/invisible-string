@@ -8,8 +8,16 @@ const MODEL_ID = "deepseek/deepseek-v4-flash";
  * Explicit platform-resolved model. With OPENROUTER_API_KEY set the agent
  * calls OpenRouter directly (OPENROUTER_BASE_URL optionally redirects the
  * provider, e.g. at a mock gateway in tests). Without the key the model-id
- * STRING keeps keyless `eve build` / `eve start` alive:
- * `openrouter("<id>")` throws AI_LoadAPIKeyError at model construction.
+ * STRING is returned instead, eve bakes GATEWAY routing at build time, and
+ * keyless `eve build` / `eve start` stay alive.
+ *
+ * The branch is REQUIRED — do not simplify it to a bare
+ * `createOpenRouter({}).`. @openrouter/ai-sdk-provider@3.0.0 resolves the
+ * key LAZILY, so `openrouter("<id>")` constructs fine without one and
+ * raises AI_LoadAPIKeyError only on the first model call. Dropping the guard
+ * would therefore NOT fail loudly at build: it would emit a provider model
+ * with EXTERNAL routing baked in, build clean, boot clean, and die on the
+ * agent's first turn.
  */
 function resolveModel(): LanguageModel {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -36,6 +44,23 @@ export default defineAgent({
   // build (spike/agent-project documented this escape hatch).
   modelContextWindowTokens: 1048576,
   reasoning: "high",
+  limits: {
+    // eve's own default (40M). Crossing it does NOT kill the session: a
+    // conversation-mode session parks on a deterministic Approve/Stop
+    // prompt (input.requested with kind "session-limit", answered through
+    // the normal HITL path); a task-mode run with no input channel instead
+    // fails the next model call with SESSION_TOKEN_LIMIT_REACHED.
+    maxInputTokensPerSession: 40_000_000,
+    // eve's own default (30 days). The deadline starts at session creation
+    // and survives restarts/redeploys; an in-flight turn is allowed to
+    // settle, then eve emits session.completed and the next message starts
+    // a fresh session.
+    sessionTimeoutMs: 2_592_000_000,
+    // maxOutputTokensPerSession is deliberately OMITTED: eve applies no
+    // default for it (unset === uncapped), so there is no silent default to
+    // pin. Omission and `false` are different values; this is the hook a
+    // future per-agent output cap would fill.
+  },
   experimental: {
     workflow: {
       // Durability: all session/run state lives in Postgres, not local disk.

@@ -959,7 +959,7 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
       const slackSession = await until(
         async () => {
           const rows = await db
-            .select({ id: schema.agentSessions.id, continuationToken: schema.agentSessions.continuationToken })
+            .select({ id: schema.agentSessions.id, eveSessionId: schema.agentSessions.eveSessionId })
             .from(schema.agentSessions)
             .where(
               and(
@@ -967,10 +967,13 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
                 eq(schema.agentSessions.origin, "slack"),
               ),
             );
-          const ready = rows.find((r) => r.continuationToken);
+          // eve 0.31 is ID-addressed: `eve_session_id` is the readiness
+          // signal. Polling the (never-written) continuation_token column
+          // would hang for the full timeout and then blame Slack.
+          const ready = rows.find((r) => r.eveSessionId);
           return ready ?? undefined;
         },
-        "slack session with continuation token",
+        "slack session with an eve session id",
         4 * 60_000,
       );
 
@@ -1007,8 +1010,10 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
 
       // ── follow-up in the SAME thread continues the SAME session ──
       // Wait for the mention's run to fully finish first: a thread reply that
-      // lands while the first turn is still in flight is rejected 409
-      // session_busy (one run per session) and dropped by the Slack router.
+      // lands while the first turn is still in flight is rejected by the
+      // PLATFORM's own transient 409 `session_busy` (one run per session) and
+      // dropped by the Slack router. That is a different code from eve's
+      // permanent `session_not_active`, which instead evicts the thread claim.
       await until(
         async () => {
           const rows = await db

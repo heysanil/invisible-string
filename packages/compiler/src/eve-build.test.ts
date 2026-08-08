@@ -155,9 +155,21 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
       );
       expect(build.exitCode, `eve build failed:\n${build.output.slice(-4000)}`).toBe(0);
       expect(existsSync(join(projectDir, ".output", "server", "index.mjs"))).toBe(true);
+      // eve 0.31 RELOCATED the compiled-agent manifest into the build output:
+      // it is `.output/.eve/compile/compiled-agent-manifest.json` now, and the
+      // legacy project-root `.eve/compile/…` path is simply absent (no
+      // fallback copy). `<project>/.eve/` still exists on 0.31 but holds
+      // agent-summary.json / builds/ / locks/ / sandbox-cache/ instead, so
+      // probing the directory is not enough — assert BOTH directions or a
+      // future relocation slips through silently.
+      expect(
+        existsSync(
+          join(projectDir, ".output", ".eve", "compile", "compiled-agent-manifest.json"),
+        ),
+      ).toBe(true);
       expect(
         existsSync(join(projectDir, ".eve", "compile", "compiled-agent-manifest.json")),
-      ).toBe(true);
+      ).toBe(false);
     },
     1_200_000,
   );

@@ -1,11 +1,31 @@
 /**
- * Inline HITL card for an `input.requested` frame — the exact approve/deny
- * capsule pattern from the mockups (amber-bordered glass). Handles both
- * option-based approvals/questions and free-form text requests, with an
- * optimistic pending state while `POST /runs/:id/input` is in flight.
+ * Inline HITL card for an `input.requested` frame — the approve/deny capsule
+ * pattern from the mockups (amber-bordered glass; amber is E1's "waiting on
+ * you", the same meaning StatusDot's waiting dot carries).
+ *
+ * Three kinds ride this ONE event, and they are told apart by eve 0.31's
+ * `kind` discriminator — never by tool name (see run-view's
+ * `inputRequestKindOf`):
+ *
+ * - `tool-approval` — a gate in front of a real side effect. Shows the tool
+ *   chip + argument preview, because *what* is about to run is the decision.
+ * - `question`      — the agent asking (`ask_question`). No tool chip: the
+ *   gating "tool" is plumbing, and showing it reads as a scary approval.
+ * - `session-limit` — eve's 40M-input-token guardrail (NEW in 0.31). A
+ *   deterministic Approve/Stop prompt: Approve grants a fresh budget window,
+ *   Stop cancels the turn through the normal `turn.cancelled` path. Its
+ *   backing "tool" (`session_limit_continuation`) and raw token counters are
+ *   suppressed; eve's own per-option descriptions carry the consequence.
+ *
+ * An optimistic pending state holds while `POST /runs/:id/input` is in flight.
  */
 import { useState } from "react";
-import { AlertTriangle } from "lucide-react";
+import {
+  AlertTriangle,
+  Gauge,
+  MessageCircleQuestion,
+  type LucideIcon,
+} from "lucide-react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
@@ -19,6 +39,32 @@ import { Chip } from "./Chip";
 // both props ride the same native `input` event in real browsers — so this is
 // deliberate, not a fragile fork. See components/ui/Input.tsx for the rationale.
 function noopChange() {}
+
+/**
+ * Per-kind presentation. The accessible group name is part of the contract —
+ * a screen-reader user must hear which of the three decisions this is before
+ * the prompt text, and the E2E specs address the card by it.
+ */
+const KIND_PRESENTATION: Record<
+  PendingInputView["kind"],
+  { icon: LucideIcon; groupLabel: string; eyebrow: string }
+> = {
+  "tool-approval": {
+    icon: AlertTriangle,
+    groupLabel: "Approval requested",
+    eyebrow: "Approval",
+  },
+  question: {
+    icon: MessageCircleQuestion,
+    groupLabel: "Question from the agent",
+    eyebrow: "Question",
+  },
+  "session-limit": {
+    icon: Gauge,
+    groupLabel: "Session limit reached",
+    eyebrow: "Session limit",
+  },
+};
 
 export interface ApprovalCardProps {
   input: PendingInputView;
@@ -41,22 +87,30 @@ export function ApprovalCard({
   const isPending = pending != null;
   const showFreeform = input.allowFreeform || input.display === "text";
   const hasOptions = input.options.length > 0;
+  const { icon: KindIcon, groupLabel, eyebrow } = KIND_PRESENTATION[input.kind];
+  // Only the budget prompt earns per-option help text — eve authors it there
+  // ("Grant a fresh token budget" / "Stop now") and nowhere else.
+  const showOptionDescriptions = input.kind === "session-limit";
 
   return (
     <div
       role="group"
-      aria-label="Approval requested"
+      aria-label={groupLabel}
+      data-input-kind={input.kind}
       className="my-2 rounded-card border border-warn/45 bg-warn/[0.06] p-3.5"
     >
       <div className="flex items-start gap-2.5">
-        <AlertTriangle
+        <KindIcon
           size={15}
           strokeWidth={2}
           aria-hidden="true"
           className="mt-0.5 shrink-0 text-warn"
         />
         <div className="min-w-0 flex-1">
-          <p className="text-[13px] font-medium leading-snug text-ink">
+          <p className="text-[11px] font-medium uppercase tracking-[0.06em] text-ink-4">
+            {eyebrow}
+          </p>
+          <p className="mt-0.5 text-[13px] font-medium leading-snug text-ink">
             {input.prompt}
           </p>
           {input.toolName !== null ? (
@@ -73,11 +127,22 @@ export function ApprovalCard({
       </div>
 
       {hasOptions ? (
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div
+          className={cn(
+            "mt-3 flex flex-wrap gap-2",
+            showOptionDescriptions && "flex-col items-stretch sm:flex-row",
+          )}
+        >
           {input.options.map((option) => {
             const active = pending?.optionId === option.id;
-            const danger = option.style === "danger";
+            // eve marks the session-limit "Stop" option `danger`, but stopping
+            // is the same user decision the Stop button makes — and this whole
+            // surface refuses to paint that in error red (E1: colour only as
+            // meaning). Solid red stays for a real refusal, like denying a
+            // side-effecting tool call.
+            const danger = option.style === "danger" && input.kind !== "session-limit";
             const primary = option.style === "primary" || option.id === "approve";
+            const description = showOptionDescriptions ? option.description : undefined;
             return (
               <button
                 key={option.id}
@@ -86,7 +151,12 @@ export function ApprovalCard({
                 aria-busy={active || undefined}
                 onClick={() => onRespond({ requestId: input.requestId, optionId: option.id })}
                 className={cn(
-                  "lift inline-flex h-8 items-center gap-1.5 rounded-capsule px-4 text-[13px] font-medium",
+                  // `gap` lives in the variant, NOT the base: `cn` is a plain
+                  // join with no tailwind-merge, so a base `gap-1.5` would
+                  // still be emitted alongside the stacked variant's `gap-0`
+                  // and win on source order.
+                  "lift inline-flex items-center justify-center rounded-capsule px-4 text-[13px] font-medium",
+                  description === undefined ? "h-8 gap-1.5" : "min-h-8 flex-col py-1.5",
                   "disabled:pointer-events-none disabled:opacity-55",
                   danger
                     ? "bg-err text-white"
@@ -97,6 +167,11 @@ export function ApprovalCard({
                 )}
               >
                 {option.label}
+                {description !== undefined ? (
+                  <span className="text-[11px] font-normal opacity-75">
+                    {description}
+                  </span>
+                ) : null}
               </button>
             );
           })}

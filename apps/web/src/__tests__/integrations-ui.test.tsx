@@ -121,7 +121,7 @@ test("LiveTriggerConfig mints a webhook token, revealing it ONCE with a hash not
   expect(view.getByText(/we store only a hash/i)).toBeTruthy();
 });
 
-// ── Chat cancel button ───────────────────────────────────────────────────────
+// ── Chat Stop button ─────────────────────────────────────────────────────────
 
 function runningRunView(runId: string): RunView {
   return {
@@ -133,10 +133,12 @@ function runningRunView(runId: string): RunView {
     pendingInputs: [],
     error: null,
     modelId: null,
+    canceled: false,
+    contextCleared: false,
   };
 }
 
-test("RunMessage renders a Cancel button on an active run and fires onCancel", () => {
+test("RunMessage renders a Stop button on an active run and fires onCancel", () => {
   const onCancel = mock((_runId: string) => {});
   const view = renderWithProviders(
     <RunMessage
@@ -146,12 +148,12 @@ test("RunMessage renders a Cancel button on an active run and fires onCancel", (
       onCancel={onCancel}
     />,
   );
-  fireEvent.click(view.getByText("Cancel run"));
+  fireEvent.click(view.getByRole("button", { name: "Stop" }));
   expect(onCancel).toHaveBeenCalledTimes(1);
   expect(onCancel.mock.calls[0]![0]).toBe("run_1");
 });
 
-test("RunMessage shows no Cancel button on a settled run", () => {
+test("RunMessage shows no Stop button on a settled run", () => {
   const view = renderWithProviders(
     <RunMessage
       run={{ ...runningRunView("run_2"), status: "succeeded", reply: { text: "done", streaming: false } }}
@@ -160,5 +162,5 @@ test("RunMessage shows no Cancel button on a settled run", () => {
       onCancel={() => {}}
     />,
   );
-  expect(view.queryByText("Cancel run")).toBeNull();
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
 });

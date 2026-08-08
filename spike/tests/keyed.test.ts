@@ -11,8 +11,20 @@
  *      session.waiting); `eve start` is SIGKILLed; a fresh process resumes the
  *      parked run from Postgres via inputResponses and completes it. This is
  *      the durability bet.
- *   4. A follow-up via continuation token shares session memory.
+ *   4. An ID-addressed follow-up (POST /eve/v1/session/:sessionId) shares
+ *      session memory.
  *   5. The docker() sandbox executes bash and writes a /workspace file.
+ *
+ * eve 0.31 PROTOCOL: sessions are ID-addressed. Create returns
+ * `{ok, sessionId, status:"accepted"}` at 202 with no continuation token;
+ * follow-ups POST to /eve/v1/session/:sessionId carrying `message` XOR
+ * `inputResponses`; any body containing a `continuationToken` key is a hard
+ * 400. This suite also re-proves, against a REAL model call, that
+ * @openrouter/ai-sdk-provider@3.0.0 keeps the
+ * createOpenRouter({apiKey}) -> openrouter(slug) call style the compiler
+ * emits — its key loading is now LAZY (the construction-time
+ * AI_LoadAPIKeyError is gone), so a broken keyless guard would surface here
+ * as a failing first turn rather than a failing build.
  */
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
@@ -45,11 +57,6 @@ if (!KEY_GATE_AVAILABLE) {
   console.warn(`[spike] skipping keyed suite: ${DB_GATE_SKIP_REASON}`);
 }
 
-interface SessionRef {
-  sessionId: string;
-  continuationToken: string;
-}
-
 async function postJson(
   path: string,
   body: unknown,
@@ -65,12 +72,6 @@ async function postJson(
   });
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   return { json, status: res.status };
-}
-
-function tokenOf(json: Record<string, unknown>, previous: string): string {
-  return typeof json.continuationToken === "string" && json.continuationToken.length > 0
-    ? json.continuationToken
-    : previous;
 }
 
 function finalAssistantText(events: NdjsonEvent[]): string {
@@ -182,7 +183,6 @@ describe.skipIf(!RUN)("spike keyed acceptance (requires OPENROUTER_API_KEY)", ()
         jwt,
       );
       const sessionId = json.sessionId as string;
-      let continuationToken = tokenOf(json, "");
 
       // Park: input.requested carrying the approval request, then session.waiting.
       const parked = await readNdjson(`${PROXY_URL}/eve/v1/session/${sessionId}/stream`, {
@@ -211,16 +211,16 @@ describe.skipIf(!RUN)("spike keyed acceptance (requires OPENROUTER_API_KEY)", ()
       eve = await startEve();
       expect(await eve.serverPid()).not.toBe(oldServerPid);
 
+      // 0.31 `respond`: addressed by session id in the path, inputResponses
+      // ALONE in the body (mutually exclusive with `message`). The old
+      // `{continuationToken, inputResponses}` body is now a hard 400.
       const resume = await postJson(
         `/eve/v1/session/${sessionId}`,
-        {
-          continuationToken,
-          inputResponses: [{ optionId: "approve", requestId }],
-        },
+        { inputResponses: [{ optionId: "approve", requestId }] },
         jwt,
       );
-      expect(resume.status).toBeLessThan(300);
-      continuationToken = tokenOf(resume.json, continuationToken);
+      expect(resume.status).toBe(202);
+      expect(resume.json.sessionId).toBe(sessionId);
 
       const resumed = await streamUntilTerminal(sessionId, {
         startIndex: parked.length,
@@ -237,27 +237,25 @@ describe.skipIf(!RUN)("spike keyed acceptance (requires OPENROUTER_API_KEY)", ()
   );
 
   test(
-    "follow-up via continuation token shares session memory",
+    "ID-addressed follow-up shares session memory",
     async () => {
       const first = await postJson(
         "/eve/v1/session",
         { message: "Remember the codeword: ottoman. Reply OK." },
         jwt,
       );
+      expect(first.status).toBe(202);
+      expect(first.json.continuationToken).toBeUndefined();
       const sessionId = first.json.sessionId as string;
-      let continuationToken = tokenOf(first.json, "");
       const firstEvents = await streamUntilTerminal(sessionId);
       expect(firstEvents.map((e) => e.type).at(-1)).toBe("session.waiting");
 
       const second = await postJson(
         `/eve/v1/session/${sessionId}`,
-        {
-          continuationToken,
-          message: "What is the codeword? Reply with just the word.",
-        },
+        { message: "What is the codeword? Reply with just the word." },
         jwt,
       );
-      expect(second.status).toBeLessThan(300);
+      expect(second.status).toBe(202);
       const followUp = await streamUntilTerminal(sessionId, {
         startIndex: firstEvents.length,
       });

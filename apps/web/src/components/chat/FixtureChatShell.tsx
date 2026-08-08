@@ -21,6 +21,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Panel } from "../ui/Panel";
 import { AgentPicker, agentModelLabel } from "./AgentPicker";
 import { NewChatComposer } from "./ChatShell";
+import type { ContextMarkerKind } from "./ContextDivider";
 import { SessionList, type SessionListItem } from "./SessionList";
 import { ThreadView } from "./ThreadView";
 import type { ThreadHeaderProps } from "./ThreadHeader";
@@ -138,17 +139,30 @@ function FixtureThread({
   answered: Set<string>;
   onAnswer: (requestId: string) => void;
 }) {
+  // Locally stopped runs + locally applied context controls. Same pattern as
+  // `answered`: fixture mode has no backend, so the transitions the Stop
+  // button and the session-actions menu produce are simulated in component
+  // state — otherwise neither would be reachable for design or E2E review.
+  const [stopped, setStopped] = useState<Set<string>>(new Set());
+  const [contextMarker, setContextMarker] = useState<ContextMarkerKind | null>(null);
+
   const runViews = session.runs.map((fixtureRun) => {
     const view = reduceRunView(fixtureRun.run, {
       frames: fixtureRun.frames,
       maxSeq: fixtureRun.frames.length - 1,
     });
-    // Drop locally-answered approvals to show the resolved state.
+    const isStopped = stopped.has(view.runId);
     return {
       ...view,
-      pendingInputs: view.pendingInputs.filter(
-        (input) => !answered.has(input.requestId),
-      ),
+      // A stop lands as `canceled`, NEVER `failed` — the fixture must not
+      // model it as an error or the preview would teach the wrong thing.
+      status: isStopped ? ("canceled" as const) : view.status,
+      canceled: view.canceled || isStopped,
+      // Drop locally-answered approvals to show the resolved state; a stopped
+      // turn retires every unanswered request outright.
+      pendingInputs: isStopped
+        ? []
+        : view.pendingInputs.filter((input) => !answered.has(input.requestId)),
     };
   });
 
@@ -166,6 +180,15 @@ function FixtureThread({
     workflowName: summary.workflowName,
     sessionStatus: summary.status,
     lastRunStatus: lastRun?.status ?? null,
+    onContextAction: (action) => {
+      if (action === "reset") return; // ConfirmDialog lives in ThreadContainer
+      setContextMarker(action === "clear" ? "cleared" : "compacted");
+    },
+    contextActionPending: null,
+    contextActionsBlockedReason:
+      lastRun?.status === "queued" || lastRun?.status === "running"
+        ? "Wait for the current run to finish, or stop it first."
+        : null,
   };
 
   return (
@@ -174,12 +197,14 @@ function FixtureThread({
       runs={runViews}
       isChatOrigin={summary.origin === "chat"}
       onRespond={(_runId, response) => onAnswer(response.requestId)}
+      onCancel={(runId) => setStopped((prev) => new Set(prev).add(runId))}
+      contextMarker={contextMarker}
       onSend={() => undefined}
       composerDisabledReason={
         lastRun?.status === "running"
           ? "Working… (fixture mode)"
           : lastRun?.status === "waiting"
-            ? "Waiting for your approval above."
+            ? "Waiting for your response above."
             : null
       }
     />

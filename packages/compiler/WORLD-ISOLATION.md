@@ -12,12 +12,14 @@ observability only — it does **not** isolate.
 
 The plan of record was a schema `ws_v_<hash12>` (the pre-agents-first
 prefix) pinned via the connection
-string's `search_path`. Verified against the shipped package
-(`spike/agent-project/node_modules/@workflow/world-postgres@5.0.0-beta.20`),
-world-postgres does not honor it:
+string's `search_path`. Verified against the shipped package —
+originally `@workflow/world-postgres@5.0.0-beta.20`, **re-verified on
+2026-08-07 against the pinned `@5.0.0-beta.32`** in
+`spike/agent-project/node_modules/` — world-postgres does not honor it:
 
 1. **Drizzle schema is hard-qualified.**
-   `dist/drizzle/schema.js:13` → `export const schema = pgSchema('workflow')`.
+   `dist/drizzle/schema.js` → `export const schema = pgSchema('workflow')`
+   (line 13 under beta.20, line 7 under beta.32 — unchanged in substance).
    Every query the world issues references `"workflow"."workflow_runs"` etc.
    with an explicit schema qualifier; `search_path` is never consulted for
    qualified identifiers.
@@ -45,13 +47,29 @@ So the two candidate fallbacks resolved as:
 
 ## Why isolation is load-bearing (not hygiene)
 
-`eve start` re-enqueues **ALL** `pending`/`running` runs found in the
-connected world storage on every boot: `dist/index.js:47` calls
-`reenqueueActiveRuns(storage.runs, queue.queue, 'world-postgres')` from
+Every agent process re-enqueues **ALL** `pending`/`running` runs found in the
+connected world storage on boot — whether started via `eve start` or, as the
+worker pool does, by running the compiled `.output/server/index.mjs`
+directly. `world-postgres`'s `dist/index.js` calls
+`reenqueueActiveRuns(storage.runs, queue.queue, 'world-postgres', …)` from
 `@workflow/world`, which lists active runs **with no job-prefix filter** and
-re-drives them under the booting process's own queue prefix. Two different
-agents sharing one world DB therefore steal each other's runs at boot
-(observed live — spike/REPORT.md finding 11). A database boundary is the
+re-drives them under the booting process's own queue prefix.
+
+⚠️ **beta.32 did NOT fix this — do not read the new `namespace` option as
+isolation.** Re-verified 2026-08-07 against the pinned
+`@workflow/world-postgres@5.0.0-beta.32` + `@workflow/world@5.0.0-beta.25`:
+world-postgres now passes `config.namespace` as a fourth argument to
+`reenqueueActiveRuns`, but `@workflow/world`'s `dist/recovery.js` uses it for
+exactly one thing — `getQueueTopicPrefix('workflow', resolveQueueNamespace(
+namespace))`, i.e. the **queue topic prefix**. The storage read directly
+above it is still `runs.list({ status, resolveData: 'none', pagination })`,
+**unfiltered**. A booting agent therefore still enumerates and re-enqueues
+every active run in the database it is pointed at; the namespace only changes
+which topic those jobs land on. `spike/REPORT.md` finding 11 stands, and the
+same applies to `WORKFLOW_QUEUE_NAMESPACE`.
+
+Two different agents sharing one world DB therefore steal each other's runs
+at boot (observed live — spike/REPORT.md finding 11). A database boundary is the
 unit Postgres actually enforces and the only input world-postgres accepts.
 
 The **gated test proves the fix** (part 2): two databases on one server are
@@ -83,7 +101,8 @@ database can never see (or re-drive) another version's runs.
   truncation collision must never silently share a world.
 - Same-version processes: ⚠️ **at most ONE live agent process per version
   hash, fleet-wide** (corrected — the earlier "homogeneous is safe" claim was
-  wrong). world-postgres @5.0.0-beta.20 serializes run replays with an
+  wrong). world-postgres (checked at @5.0.0-beta.20 and again at the pinned
+  @5.0.0-beta.32) serializes run replays with an
   in-PROCESS map only, and `reenqueueActiveRuns` enqueues graphile jobs with
   no idempotencyKey/queueName — a second process booting against the same
   `ag_v_<hash12>` creates duplicate jobs for runs actively executing on the
@@ -103,6 +122,13 @@ TEST_DATABASE_URL=postgres://dev:dev@localhost:5432/product \
 (Needs `@workflow/world-postgres` installed — `npm ci` in
 `spike/agent-project`, or point `WORLD_POSTGRES_PACKAGE_DIR` at any install —
 and a DB user allowed to `CREATE DATABASE`.) If a future world-postgres
-gains a real schema/namespace option or a prefix-filtered re-enqueue,
-revisit this contract; until then database-per-version is the plan of
-record.
+gains a real schema option, or a re-enqueue whose **storage read** is
+filtered (not merely its queue topic), revisit this contract; until then
+database-per-version is the plan of record.
+
+**Bump log** — every entry re-derived from the shipped package, not assumed:
+
+| Pin | Verdict |
+|---|---|
+| `@5.0.0-beta.20` (eve 0.19.0) | Original finding. Schema-per-version impossible; database-per-version required. |
+| `@5.0.0-beta.32` (eve 0.31.3, 2026-08-07) | **Unchanged — still required.** `pgSchema('workflow')` still hard-qualifies; `PostgresWorldConfig` still exposes no schema option; the new `namespace` / `WORKFLOW_QUEUE_NAMESPACE` knob prefixes the **queue topic only** and leaves `runs.list({ status })` unfiltered. |

@@ -1,12 +1,13 @@
 /**
  * Chat thread component tests (happy-dom): working-block collapse/expand,
- * the streamed reply, inline approval round-trip, error banner, and the
- * composer's disabled-with-reason + send behavior.
+ * the streamed reply, the HITL card's three `kind` routes, the Stop control
+ * and its NON-failure cancelled state, the session-actions menu, the error
+ * banner, and the composer's disabled-with-reason + send behavior.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
@@ -51,6 +52,8 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
     pendingInputs: [],
     error: null,
     modelId: "deepseek/deepseek-v4-pro",
+    canceled: false,
+    contextCleared: false,
     ...overrides,
   };
 }
@@ -140,6 +143,7 @@ test("an approval card round-trips an optionId to onRespond", () => {
     pendingInputs: [
       {
         requestId: "req1",
+        kind: "tool-approval",
         prompt: "Approve tool call: gmail_send",
         toolName: "gmail_send",
         argsPreview: '{"to":"team@acme.com"}',
@@ -155,11 +159,71 @@ test("an approval card round-trips an optionId to onRespond", () => {
   const view = render(
     <RunMessage run={run} isChatOrigin onRespond={onRespond} />,
   );
+  // The card names its kind to assistive tech and shows the gated tool.
+  expect(view.getByRole("group", { name: "Approval requested" })).toBeTruthy();
   expect(view.getByText("Approve tool call: gmail_send")).toBeTruthy();
   expect(view.getByText("gmail_send")).toBeTruthy();
   fireEvent.click(view.getByRole("button", { name: "Approve" }));
   expect(onRespond).toHaveBeenCalledTimes(1);
   expect(onRespond.mock.calls[0]).toEqual(["run1", { requestId: "req1", optionId: "approve" }]);
+});
+
+test("a question routes on kind, not on its gating tool name", () => {
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "q9",
+        kind: "question",
+        prompt: "Which mailbox should I use?",
+        // run-view suppresses the tool for a question; assert the card agrees.
+        toolName: null,
+        argsPreview: null,
+        options: [{ id: "work", label: "Work" }],
+        allowFreeform: true,
+        display: "select",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={() => {}} />);
+  expect(view.getByRole("group", { name: "Question from the agent" })).toBeTruthy();
+  expect(view.getByText("Which mailbox should I use?")).toBeTruthy();
+  // No approval framing on a plain question.
+  expect(view.queryByText("ask_question")).toBeNull();
+});
+
+test("a session-limit prompt renders as its own decision, not a tool approval", () => {
+  const onRespond = mock((_runId: string, _response: RunInputRequest) => {});
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "s1:limit:input:40120433",
+        kind: "session-limit",
+        prompt:
+          "This session has hit the input-token limit (40M) per session. This is a guardrail against defective long-running sessions.",
+        toolName: null,
+        argsPreview: null,
+        options: [
+          { id: "continue", label: "Approve", description: "Grant a fresh token budget", style: "primary" },
+          { id: "stop", label: "Stop", description: "Stop now", style: "danger" },
+        ],
+        allowFreeform: false,
+        display: "confirmation",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={onRespond} />);
+  expect(view.getByRole("group", { name: "Session limit reached" })).toBeTruthy();
+  // eve's synthetic budget "tool" must never surface as something approved.
+  expect(view.queryByText("session_limit_continuation")).toBeNull();
+  // eve's own per-option consequences are shown on this card only.
+  expect(view.getByText("Grant a fresh token budget")).toBeTruthy();
+  fireEvent.click(view.getByRole("button", { name: /Approve/ }));
+  expect(onRespond.mock.calls[0]).toEqual([
+    "run1",
+    { requestId: "s1:limit:input:40120433", optionId: "continue" },
+  ]);
 });
 
 test("a free-form input request submits text to onRespond", () => {
@@ -169,6 +233,7 @@ test("a free-form input request submits text to onRespond", () => {
     pendingInputs: [
       {
         requestId: "q1",
+        kind: "question",
         prompt: "What subject line?",
         toolName: null,
         argsPreview: null,
@@ -210,6 +275,118 @@ test("a streaming reply renders markdown with a caret", () => {
   expect(strong?.textContent).toBe("live");
   // Streaming replies carry the blinking caret marker class.
   expect(view.container.querySelector(".stream-caret")).not.toBeNull();
+});
+
+// ── Stop (eve 0.31 turn cancellation) ───────────────────────────────────────
+
+test("a stopped run reads as a user decision, never as a failure", () => {
+  const view = render(
+    <RunMessage
+      run={baseRun({
+        status: "canceled",
+        canceled: true,
+        reply: { text: "I pulled 142 open issues", streaming: false },
+      })}
+      isChatOrigin
+      onRespond={() => {}}
+      onCancel={() => {}}
+    />,
+  );
+  // No error banner: eve emits NO failure event for a cancelled turn.
+  expect(view.queryByRole("alert")).toBeNull();
+  expect(view.getByText(/You stopped this run/)).toBeTruthy();
+  // Whatever streamed before the stop stays readable.
+  expect(view.getByText(/142 open issues/)).toBeTruthy();
+  // Nothing left to stop.
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+});
+
+test("the Stop button hides the instant turn.cancelled lands, before the status frame", () => {
+  // `canceled` is derived from the event stream, so it flips a beat ahead of
+  // the run_status frame — the row must settle immediately, not linger.
+  const view = render(
+    <RunMessage
+      run={baseRun({ status: "running", canceled: true })}
+      isChatOrigin
+      onRespond={() => {}}
+      onCancel={() => {}}
+    />,
+  );
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  expect(view.getByText(/You stopped this run/)).toBeTruthy();
+});
+
+test("Stop shows a busy state while the request is in flight", () => {
+  const view = render(
+    <RunMessage
+      run={baseRun({ status: "running" })}
+      isChatOrigin
+      onRespond={() => {}}
+      onCancel={() => {}}
+      canceling
+    />,
+  );
+  const button = view.getByRole("button", { name: /Stopping/ });
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  expect((button as HTMLButtonElement).disabled).toBe(true);
+});
+
+// ── session-actions menu (context controls) ─────────────────────────────────
+
+test("the session-actions menu offers clear/compact/reset and reports the action", async () => {
+  const onContextAction = mock((_action: string) => {});
+  const view = renderWithRouter(
+    <ThreadView
+      header={{ ...HEADER, onContextAction }}
+      runs={[baseRun()]}
+      isChatOrigin
+      onRespond={() => {}}
+      onSend={() => {}}
+    />,
+  );
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  const menu = view.getByRole("dialog", { name: "Session actions" });
+  expect(within(menu).getByText("Clear context")).toBeTruthy();
+  expect(within(menu).getByText("Compact context")).toBeTruthy();
+  expect(within(menu).getByText("Reset session")).toBeTruthy();
+
+  fireEvent.click(within(menu).getByText("Clear context"));
+  expect(onContextAction.mock.calls[0]).toEqual(["clear"]);
+});
+
+test("the context controls are blocked with a reason while a run is in flight", async () => {
+  const view = renderWithRouter(
+    <ThreadView
+      header={{
+        ...HEADER,
+        onContextAction: () => {},
+        contextActionsBlockedReason: "Wait for the current run to finish, or stop it first.",
+      }}
+      runs={[baseRun({ status: "running" })]}
+      isChatOrigin
+      onRespond={() => {}}
+      onSend={() => {}}
+    />,
+  );
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  const menu = view.getByRole("dialog", { name: "Session actions" });
+  expect(within(menu).getByText(/Wait for the current run to finish/)).toBeTruthy();
+  const clear = within(menu).getByText("Clear context").closest("button");
+  expect((clear as HTMLButtonElement).disabled).toBe(true);
+});
+
+test("a landed clear renders the neutral context marker", async () => {
+  const view = renderWithRouter(
+    <ThreadView
+      header={HEADER}
+      runs={[baseRun()]}
+      isChatOrigin
+      onRespond={() => {}}
+      onSend={() => {}}
+      contextMarker="cleared"
+    />,
+  );
+  expect(await view.findByText("Context cleared")).toBeTruthy();
 });
 
 test("composer sends on click and clears; disabled reason blocks input", () => {

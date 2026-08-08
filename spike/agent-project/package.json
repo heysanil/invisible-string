@@ -5,7 +5,7 @@
   "engines": {
     "node": "24.x"
   },
-  "comment": "PINS ARE DERIVED, NOT AUTHORED. Every version below must match packages/compiler/versions.json exactly — that file is the single source of truth for the runtime matrix the compiler emits, and this project exists to prove that matrix empirically. spike/tests/pins.test.ts fails (ungated, in the default `bun test` lane) the moment the two drift, which is what stops the spike from silently gating a matrix nobody ships. To repin: edit versions.json, then run `bun run spike/tests/sync-pins.ts` and `mise exec node@24 -- npm install --package-lock-only --ignore-scripts` in this directory. Never hand-edit package-lock.json.",
+  "comment": "PINS ARE DERIVED, NOT AUTHORED. Every version below must match packages/compiler/versions.json exactly — that file is the single source of truth for the runtime matrix the compiler emits, and this project exists to prove that matrix empirically. spike/tests/pins.test.ts fails (ungated, in the default `bun test` lane) the moment the two drift, which is what stops the spike from silently gating a matrix nobody ships. To repin: edit versions.json, then run `bun run spike/tests/sync-pins.ts` and `mise exec -- npm install --package-lock-only --ignore-scripts` in this directory. Never hand-edit package-lock.json.",
   "scripts": {
     "build": "eve build",
     "start": "eve start",

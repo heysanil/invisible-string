@@ -4,7 +4,7 @@
  * rather than a retype. Run it after any versions.json change:
  *
  *   bun run spike/tests/sync-pins.ts
- *   cd spike/agent-project && mise exec node@24 -- npm install --package-lock-only --ignore-scripts
+ *   cd spike/agent-project && mise exec -- npm install --package-lock-only --ignore-scripts
  *
  * The second step is mandatory: `pins.test.ts` also checks the committed
  * package-lock.json, because a package.json the lockfile disagrees with is
@@ -57,6 +57,6 @@ if (before === after) {
   }
   console.log(`  engines.node ${expected.enginesNode}`);
   console.log(
-    "[spike] NOW REGENERATE THE LOCKFILE: cd spike/agent-project && mise exec node@24 -- npm install --package-lock-only --ignore-scripts",
+    "[spike] NOW REGENERATE THE LOCKFILE: cd spike/agent-project && mise exec -- npm install --package-lock-only --ignore-scripts",
   );
 }

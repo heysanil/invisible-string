@@ -38,9 +38,12 @@ import {
   type ManagedProcess,
 } from "./support/process.ts";
 
-/** `<mise install dir for node@24>/bin`, or null if it can't be resolved. */
+/** `<mise install dir for the node pinned in mise.toml>/bin`, or null if it
+ *  can't be resolved. Config-driven (`where node`), never fuzzy
+ *  (`where node@24`) — the fuzzy form resolves to the newest 24.x mise knows
+ *  about, which may not be the version mise.toml pins. */
 function resolveNode24Bin(): string | null {
-  const result = spawnSync("mise", ["where", "node@24"], { encoding: "utf8" });
+  const result = spawnSync("mise", ["where", "node"], { encoding: "utf8" });
   const dir = result.status === 0 ? result.stdout.trim() : "";
   return dir ? `${dir}/bin` : null;
 }
@@ -85,13 +88,16 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   console.log("[e2e:setup] docker compose up (postgres, garage, dex)…");
   compose(["up", "-d", "--wait", "postgres", "garage", "dex"]);
 
-  // node@24 powers the eve build + agent runtime (mise). Warm it (idempotent),
-  // then resolve its bin dir so we can pin it on the control-plane + worker
-  // PATH. `mise exec node@24` is what the build actually invokes, but pinning
-  // node 24 FIRST on PATH makes the whole subtree deterministic — a bare
-  // `node`/`npx` (e.g. a nested spawn) can never fall through to a system
-  // node 22 (eve requires >=24, and mise-exec activation proved flaky).
-  run("mise", ["install", "node@24"], { cwd: REPO_ROOT });
+  // Node powers the eve build + agent runtime. Warm the version mise.toml
+  // pins (idempotent), then resolve its bin dir so we can pin it on the
+  // control-plane + worker PATH. Pinning node 24 FIRST on PATH makes the whole
+  // subtree deterministic — a bare `node`/`npx` (e.g. a nested spawn) can never
+  // fall through to a system node 22 (eve requires >=24). `install node` reads
+  // the version from mise.toml; `install node@24` would resolve to the newest
+  // 24.x instead, which the build steps' "newest installed 24.x" resolver would
+  // then prefer over the pin. Untrusted config fails loudly here — run
+  // `mise trust` once per checkout.
+  run("mise", ["install", "node"], { cwd: REPO_ROOT });
   const node24Bin = resolveNode24Bin();
 
   console.log("[e2e:setup] resetting product DB + migrating + seeding (bun)…");

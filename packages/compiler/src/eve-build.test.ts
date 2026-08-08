@@ -13,7 +13,7 @@
  *
  *   SPIKE_EVE_BUILD=1 bun test packages/compiler/src/eve-build.test.ts
  *
- * Requires: `mise install node@24` (or SPIKE_NODE24_BIN) + network for npm.
+ * Requires: `mise install` (or SPIKE_NODE24_BIN) + network for npm.
  * No provider keys required — keyless builds are part of the contract
  * (spike/REPORT.md friction 4).
  */
@@ -44,7 +44,7 @@ function node24Bin(): string {
       .at(-1);
     if (v24 !== undefined) return join(installs, v24, "bin", "node");
   }
-  throw new Error("Node 24 not found. Run `mise install node@24` or set SPIKE_NODE24_BIN.");
+  throw new Error("Node 24 not found. Run `mise install` or set SPIKE_NODE24_BIN.");
 }
 
 async function run(

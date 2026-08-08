@@ -297,7 +297,7 @@ export function resolveNodeBin(env: Env, problems: string[]): string {
   if (onPath !== null) return onPath;
 
   problems.push(
-    "no Node runtime found for agent processes (set WORKER_NODE_BIN, `mise install node@24`, or put node 24 on PATH)",
+    "no Node runtime found for agent processes (set WORKER_NODE_BIN, `mise install`, or put node 24 on PATH)",
   );
   return "node";
 }

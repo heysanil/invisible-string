@@ -6,7 +6,7 @@
  * click.
  */
 import { useEffect, useMemo, useState } from "react";
-import { Check, ChevronRight, Loader2, Pause, X } from "lucide-react";
+import { Check, ChevronRight, Loader2, Minus, Pause, X } from "lucide-react";
 
 import type { StepRowView, WorkingBlockView } from "../../lib/chat/run-view";
 import { cn } from "../../lib/cn";
@@ -21,6 +21,9 @@ function StepIcon({ state }: { state: StepRowView["state"] }) {
       return <X size={13} strokeWidth={2.4} className="text-ink-4" aria-hidden="true" />;
     case "awaiting":
       return <Pause size={13} strokeWidth={2.2} className="text-warn" aria-hidden="true" />;
+    // Stopped before it settled — a user decision, so neutral ink, never red.
+    case "canceled":
+      return <Minus size={13} strokeWidth={2.4} className="text-ink-4" aria-hidden="true" />;
     default:
       return (
         <Loader2 size={13} className="animate-spin text-ink-4" aria-hidden="true" />
@@ -33,6 +36,7 @@ const STEP_STATE_LABEL: Record<StepRowView["state"], string> = {
   error: "failed",
   rejected: "rejected",
   awaiting: "awaiting approval",
+  canceled: "stopped",
   pending: "running",
 };
 

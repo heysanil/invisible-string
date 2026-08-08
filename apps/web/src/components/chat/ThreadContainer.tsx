@@ -17,7 +17,11 @@ import type {
   RunStatus,
 } from "@invisible-string/shared";
 
-import { isApiErrorCode } from "../../lib/api-client";
+import {
+  isApiErrorCode,
+  isSessionBusy,
+  isSessionNotActive,
+} from "../../lib/api-client";
 import {
   EMPTY_FRAME_STORE,
   reduceRunView,
@@ -30,14 +34,20 @@ import { errorMessage } from "../../lib/forms";
 import {
   invalidateSessionLists,
   useCancelRun,
+  useClearSessionContext,
+  useCompactSessionContext,
   usePostMessage,
   usePostRunInput,
+  useResetSession,
   useSession,
 } from "../../lib/queries";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { EmptyState } from "../ui/EmptyState";
 import { Spinner } from "../ui/Spinner";
+import { useToast } from "../ui/Toast";
+import type { ContextMarkerKind } from "./ContextDivider";
 import { ThreadView } from "./ThreadView";
-import type { ThreadHeaderProps } from "./ThreadHeader";
+import type { SessionContextAction, ThreadHeaderProps } from "./ThreadHeader";
 
 export interface ThreadContainerProps {
   workspaceId: string;
@@ -46,6 +56,13 @@ export interface ThreadContainerProps {
   agentName?: string;
   /** Workflow provenance for trigger-origin sessions (null for direct chat). */
   workflowName?: string | null;
+  /**
+   * A reset RETIRED this session and minted a replacement row. The owner of
+   * the active-session state must switch to the new id — the retired eve
+   * session id can never accept another message, so staying put means every
+   * send 409s `session_not_active` forever.
+   */
+  onSessionReplaced?: (newSessionId: string) => void;
 }
 
 interface PendingInput {
@@ -67,22 +84,45 @@ function isActiveStatus(status: RunStatus): boolean {
   return status === "queued" || status === "running";
 }
 
+/**
+ * The session can never take another message. Two codes mean this, with the
+ * SAME recovery (start a new chat) and the opposite recovery from
+ * `session_busy`:
+ * - `session_not_active` — eve retired the id (terminal / timed out / reset).
+ * - `session_not_continuable` — the platform row is closed or lost its eve
+ *   session id. Control-plane-only, so there is no shared constant for it.
+ */
+function isSessionOver(error: unknown): boolean {
+  return (
+    isSessionNotActive(error) || isApiErrorCode(error, "session_not_continuable")
+  );
+}
+
 export function ThreadContainer({
   workspaceId,
   sessionId,
   agentName,
   workflowName,
+  onSessionReplaced,
 }: ThreadContainerProps) {
   const queryClient = useQueryClient();
+  const { toast } = useToast();
   const { data, isLoading, isError, error } = useSession(sessionId);
   const postMessage = usePostMessage(workspaceId);
   const postInput = usePostRunInput(workspaceId);
   const cancelRun = useCancelRun(workspaceId);
+  const clearContext = useClearSessionContext(workspaceId);
+  const compactContext = useCompactSessionContext(workspaceId);
+  const resetSession = useResetSession(workspaceId);
 
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [failedDraft, setFailedDraft] = useState<string | undefined>(undefined);
   const [busyNotice, setBusyNotice] = useState<string | null>(null);
+  /** Set once eve reports this session id permanently unusable. */
+  const [sessionRetired, setSessionRetired] = useState(false);
+  const [contextMarker, setContextMarker] = useState<ContextMarkerKind | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   const runRows = useMemo(() => data?.runs ?? [], [data?.runs]);
 
@@ -121,11 +161,40 @@ export function ThreadContainer({
   }, [runRows, streams.runs]);
 
   const lastRun = runViews[runViews.length - 1];
-  const anyActive = runViews.some((run) => isActiveStatus(run.status));
-  const awaitingApproval = lastRun?.status === "waiting";
+  // `canceled` comes off the event stream and lands BEFORE the run_status
+  // frame. Without it here, a stopped run would keep the composer disabled
+  // ("Working…") and the context menu blocked for a whole round trip after
+  // the user already saw the run stop.
+  const anyActive = runViews.some(
+    (run) => !run.canceled && isActiveStatus(run.status),
+  );
+  // Two sources, deliberately: `pendingInputs` is FRAME-derived, so on a
+  // freshly opened parked thread it is empty until the stream hydrates —
+  // leaving the composer enabled for that window, and a message sent into it
+  // 409s behind the parked run. The row's `waiting` covers the gap.
+  //
+  // Gating on the row alone was the original bug this replaced: a STOPPED
+  // turn retires its requests, so "Waiting for your response above" pointed
+  // at nothing. `!lastRun.canceled` plus reduceRunView's settled-row rule
+  // (which resolves a stopped parked run to `canceled`, not the frozen live
+  // `waiting`) is what makes reading the row safe again here.
+  const awaitingApproval =
+    lastRun !== undefined &&
+    !lastRun.canceled &&
+    (lastRun.pendingInputs.length > 0 || lastRun.status === "waiting");
+  // The session's one run slot, as the control plane counts it: `waiting`
+  // counts as busy because a parked run still owns the eve turn. Messages AND
+  // context controls both serialize behind this.
+  const slotHeld = runViews.some(
+    (run) => !run.canceled && (isActiveStatus(run.status) || run.status === "waiting"),
+  );
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
 
+  // The two 409s have OPPOSITE recoveries and must never share copy:
+  // `session_busy` is transient (the draft is worth keeping — retry shortly),
+  // `session_not_active` is permanent for this id (eve retired it; retrying
+  // can never succeed, so the only honest offer is a new chat).
   const send = useCallback(
     (message: string) => {
       setBusyNotice(null);
@@ -133,13 +202,17 @@ export function ThreadContainer({
         { sessionId, message },
         {
           onError: (mutationError) => {
-            if (isApiErrorCode(mutationError, "session_busy")) {
-              setFailedDraft(message);
+            setFailedDraft(message);
+            if (isSessionBusy(mutationError)) {
               setBusyNotice(
                 "This session is still working. Your message will be kept — try again once it finishes.",
               );
+            } else if (isSessionOver(mutationError)) {
+              setSessionRetired(true);
+              setBusyNotice(
+                "This session has been retired and can’t take new messages. Start a new chat to keep going — your text is still here to copy.",
+              );
             } else {
-              setFailedDraft(message);
               setBusyNotice(errorMessage(mutationError));
             }
           },
@@ -200,6 +273,95 @@ export function ThreadContainer({
     [postInputMutate, reopenStream],
   );
 
+  // ── context controls ──────────────────────────────────────────────────────
+  const clearMutate = clearContext.mutate;
+  const compactMutate = compactContext.mutate;
+  const resetMutate = resetSession.mutate;
+
+  const runContextControl = useCallback(
+    (action: "clear" | "compact") => {
+      const marker: ContextMarkerKind = action === "clear" ? "cleared" : "compacted";
+      const mutate = action === "clear" ? clearMutate : compactMutate;
+      mutate(
+        { sessionId },
+        {
+          onSuccess: (result) => {
+            // Keyed on `status`, not the HTTP code. `no_active_session` is
+            // eve saying there is nothing live behind this id — the same
+            // terminal condition a send reports as `session_not_active`, so
+            // reporting it as success would be a lie.
+            if (result.status === "no_active_session") {
+              setSessionRetired(true);
+              toast({
+                variant: "error",
+                message:
+                  "This session has been retired, so there was no context to change. Start a new chat.",
+              });
+              return;
+            }
+            setContextMarker(marker);
+            toast({
+              variant: "success",
+              message:
+                action === "clear"
+                  ? "Context cleared — the agent starts fresh from your next message."
+                  : "Context compacted — earlier messages were summarized.",
+            });
+          },
+          onError: (mutationError) => {
+            if (isSessionOver(mutationError)) setSessionRetired(true);
+            toast({ variant: "error", message: errorMessage(mutationError) });
+          },
+        },
+      );
+    },
+    [clearMutate, compactMutate, sessionId, toast],
+  );
+
+  const performReset = useCallback(() => {
+    resetMutate(
+      { sessionId },
+      {
+        onSuccess: (result) => {
+          setConfirmReset(false);
+          if (result.status !== "reset") {
+            setSessionRetired(true);
+            toast({
+              variant: "error",
+              message:
+                "There was no live session left to reset. Start a new chat instead.",
+            });
+            return;
+          }
+          toast({
+            variant: "success",
+            message: "Session reset — this is a fresh conversation.",
+          });
+          // The retired id is dead forever; move the user onto the
+          // replacement row the control plane just minted.
+          onSessionReplaced?.(result.session.id);
+        },
+        onError: (mutationError) => {
+          setConfirmReset(false);
+          toast({ variant: "error", message: errorMessage(mutationError) });
+        },
+      },
+    );
+  }, [onSessionReplaced, resetMutate, sessionId, toast]);
+
+  const onContextAction = useCallback(
+    (action: SessionContextAction) => {
+      setContextMarker(null);
+      // Reset only ASKS here — it retires the eve session id permanently.
+      if (action === "reset") {
+        setConfirmReset(true);
+        return;
+      }
+      runContextControl(action);
+    },
+    [runContextControl],
+  );
+
   if (isLoading) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -222,6 +384,14 @@ export function ThreadContainer({
   const title = titleFromMessage(runRows[0]?.triggerEvent.message ?? "");
   const versionLabel = shortId(session.agentVersionId);
 
+  const contextActionPending: SessionContextAction | null = clearContext.isPending
+    ? "clear"
+    : compactContext.isPending
+      ? "compact"
+      : resetSession.isPending
+        ? "reset"
+        : null;
+
   const header: ThreadHeaderProps = {
     title,
     agentName: agentName ?? "Agent",
@@ -231,29 +401,76 @@ export function ThreadContainer({
     workflowName: workflowName ?? null,
     sessionStatus: session.status,
     lastRunStatus: lastRun?.status ?? null,
+    onContextAction,
+    contextActionPending,
+    // The control plane serializes context controls behind the session's one
+    // run slot exactly as it does messages — and `waiting` counts as busy,
+    // because a parked run still owns the turn. Say why up front instead of
+    // offering a click that can only come back as a 409.
+    contextActionsBlockedReason: sessionRetired
+      ? "This session has been retired — start a new chat."
+      : anyActive
+        ? "Wait for the current run to finish, or stop it first."
+        : slotHeld
+          ? "Answer the request above, or stop the run first."
+          : null,
   };
 
   const composerDisabledReason = anyActive
     ? "Working… you can send a follow-up when this run finishes."
     : awaitingApproval
-      ? "Waiting for your approval above."
+      ? "Waiting for your response above."
       : busyNotice;
 
   return (
-    <ThreadView
-      header={header}
-      runs={runViews}
-      isChatOrigin={session.origin === "chat"}
-      onRespond={respond}
-      onCancel={onCancel}
-      cancelingRunId={cancelRun.isPending ? (cancelRun.variables?.runId ?? null) : null}
-      pendingInput={pendingInput}
-      inputError={inputError}
-      onSend={send}
-      composerDisabledReason={composerDisabledReason ?? null}
-      sending={postMessage.isPending}
-      failedDraft={failedDraft}
-    />
+    <>
+      <ThreadView
+        header={header}
+        runs={runViews}
+        isChatOrigin={session.origin === "chat"}
+        onRespond={respond}
+        onCancel={onCancel}
+        cancelingRunId={cancelRun.isPending ? (cancelRun.variables?.runId ?? null) : null}
+        // Never two dividers for one clear. The optimistic marker exists for
+        // a clear performed while the session is IDLE, where no run is
+        // tailing and eve's `context.cleared` reaches nobody. If the newest
+        // run did observe that event, it already drew its own divider inline,
+        // so the acknowledged-mutation copy is redundant. The UI blocks
+        // context actions while a run is live, so this only collides on a
+        // narrow race — another tab clearing, or a run starting between the
+        // click and the mutation landing.
+        contextMarker={lastRun?.contextCleared === true ? null : contextMarker}
+        pendingInput={pendingInput}
+        inputError={inputError}
+        onSend={send}
+        composerDisabledReason={composerDisabledReason ?? null}
+        sending={postMessage.isPending}
+        failedDraft={failedDraft}
+      />
+      {/* Reset is the one control that destroys something: the eve session id
+          is retired for good, so the dialog names that consequence rather
+          than asking a generic "are you sure?". */}
+      <ConfirmDialog
+        open={confirmReset}
+        onClose={() => setConfirmReset(false)}
+        onConfirm={performReset}
+        destructive
+        loading={resetSession.isPending}
+        title="Reset this session?"
+        description="The agent starts over with no memory of this conversation."
+        confirmLabel="Reset session"
+      >
+        <p className="text-[13px] leading-relaxed text-ink-2">
+          This retires the current session for good — it can never take another
+          message — and starts a fresh one in its place. The messages above stay
+          readable here.
+        </p>
+        <p className="mt-2 text-[13px] leading-relaxed text-ink-3">
+          To keep the conversation and only drop the agent’s memory of it, use{" "}
+          <span className="font-medium text-ink-2">Clear context</span> instead.
+        </p>
+      </ConfirmDialog>
+    </>
   );
 }
 

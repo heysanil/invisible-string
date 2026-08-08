@@ -1,11 +1,17 @@
 /**
- * Chat/agent session hooks (list, detail, create, follow-up message).
+ * Chat/agent session hooks (list, detail, create, follow-up message, and the
+ * eve 0.31 context controls).
  *
  * `agent_sessions` are chat/eve sessions — NOT Better Auth login sessions.
- * One run at a time per session: a follow-up while a run is queued/running
- * answers 409 `session_busy` — surface it via
- * `isApiErrorCode(error, "session_busy")` (disable the composer, offer
- * retry); it is an expected state, not a crash.
+ *
+ * TWO 409s with OPPOSITE recoveries ride these routes; branch on `code`,
+ * never on the status:
+ * - `SESSION_BUSY_ERROR_CODE` — TRANSIENT. One run (one NDJSON tail) at a
+ *   time per session, and `waiting` counts as busy. Keep the draft, offer
+ *   "try again once it finishes".
+ * - `SESSION_NOT_ACTIVE_ERROR_CODE` — PERMANENT for this session. eve says
+ *   the id is terminal/timed-out/RESET. Never offer a retry — offer a new
+ *   chat. Collapsing the two makes the composer lie to the user.
  */
 import {
   useMutation,
@@ -18,7 +24,11 @@ import {
   getSessionResponseSchema,
   listSessionsResponseSchema,
   postMessageResponseSchema,
+  resetSessionResponseSchema,
+  sessionContextControlResponseSchema,
   type GetSessionResponse,
+  type ResetSessionResponse,
+  type SessionContextControlResponse,
 } from "@invisible-string/shared";
 
 import { api } from "../api-client";
@@ -110,7 +120,13 @@ export function useCreateSession(workspaceId: string) {
   });
 }
 
-/** Follow-up message → new run in the same eve session (409 session_busy while one is active). */
+/**
+ * Follow-up message → new run in the same ID-addressed eve session.
+ *
+ * Fails 409 `session_busy` while a run is active (retry later) or 409
+ * `session_not_active` once eve has retired the id (never retry — start a new
+ * chat). See the module header.
+ */
 export function usePostMessage(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -128,6 +144,83 @@ export function usePostMessage(workspaceId: string) {
             : { ...current, runs: [...current.runs, data.run] },
       );
       await invalidateSessionLists(queryClient, workspaceId);
+    },
+  });
+}
+
+// ── context controls (eve 0.31) ─────────────────────────────────────────────
+
+/**
+ * Clear or compact the agent's durable model history for a session.
+ *
+ * NON-DESTRUCTIVE: the session id survives, the thread keeps every run, and
+ * only the agent's memory of them changes — so neither needs a confirm step.
+ * The response is keyed on `status`, not the HTTP code: `no_active_session`
+ * means eve had nothing live behind the id (the same terminal condition a
+ * follow-up reports as 409 `session_not_active`), so it is NOT a silent
+ * success — the caller must say so.
+ */
+function useSessionContextControl(
+  workspaceId: string,
+  control: "clear" | "compact",
+) {
+  const queryClient = useQueryClient();
+  return useMutation<SessionContextControlResponse, Error, { sessionId: string }>({
+    mutationFn: (input) =>
+      api.post(
+        `/sessions/${input.sessionId}/${control}`,
+        sessionContextControlResponseSchema,
+        { body: {} },
+      ),
+    onSuccess: async (_data, input) => {
+      await Promise.all([
+        invalidateSession(queryClient, input.sessionId),
+        invalidateSessionLists(queryClient, workspaceId),
+      ]);
+    },
+  });
+}
+
+export function useClearSessionContext(workspaceId: string) {
+  return useSessionContextControl(workspaceId, "clear");
+}
+
+export function useCompactSessionContext(workspaceId: string) {
+  return useSessionContextControl(workspaceId, "compact");
+}
+
+/**
+ * Reset a session — DESTRUCTIVE, and the only control that changes identity.
+ *
+ * eve retires the session id permanently (it can never accept another
+ * message), so the control plane mints a REPLACEMENT `agent_sessions` row and
+ * returns both. The caller must switch its active session to
+ * `data.session.id`; leaving the user on the retired row means every send
+ * 409s `session_not_active` forever. The replacement's detail cache is seeded
+ * here so the new thread renders instantly (empty, no runs yet).
+ */
+export function useResetSession(workspaceId: string) {
+  const queryClient = useQueryClient();
+  return useMutation<
+    ResetSessionResponse,
+    Error,
+    { sessionId: string; reason?: string }
+  >({
+    mutationFn: (input) =>
+      api.post(`/sessions/${input.sessionId}/reset`, resetSessionResponseSchema, {
+        body: input.reason === undefined ? {} : { reason: input.reason },
+      }),
+    onSuccess: async (data, input) => {
+      if (data.status === "reset") {
+        queryClient.setQueryData<GetSessionResponse>(
+          queryKeys.sessions.detail(data.session.id),
+          { session: data.session, runs: [] },
+        );
+      }
+      await Promise.all([
+        invalidateSession(queryClient, input.sessionId),
+        invalidateSessionLists(queryClient, workspaceId),
+      ]);
     },
   });
 }

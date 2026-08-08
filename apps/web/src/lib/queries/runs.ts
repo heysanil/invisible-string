@@ -34,10 +34,19 @@ export function usePostRunInput(workspaceId: string) {
 }
 
 /**
- * Cancel an in-flight run (`POST /runs/:id/cancel`). The server stops the
- * tailer and marks the run `canceled` (idempotent for already-terminal runs);
- * best-effort re: eve's turn (it exposes no cancel route, so the turn parks /
- * caps out server-side).
+ * Stop an in-flight run — the Stop button (`POST /runs/:id/cancel`, which now
+ * fronts eve's real `POST /eve/v1/session/:id/cancel`). Idempotent for
+ * already-terminal runs.
+ *
+ * eve 0.31 semantics the UI depends on:
+ * - Cancellation is a USER DECISION, NEVER AN ERROR. The turn ends with
+ *   `turn.cancelled` → `session.waiting` and emits NO failure event, so the
+ *   run settles `canceled` and must never render as failed.
+ * - It is cooperative, at durable step boundaries: a tool call already in
+ *   flight runs to completion and still lands its `action.result`. "Stop"
+ *   therefore cannot undo a side effect already underway — the UI copy says
+ *   so rather than promising an instant halt.
+ * - The SESSION stays usable afterwards; the next message just continues.
  */
 export function useCancelRun(workspaceId: string) {
   const queryClient = useQueryClient();

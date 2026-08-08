@@ -65,11 +65,17 @@ export interface RunStreamHandle {
 }
 
 // Wire guards: cheap structural checks; `event` keeps its frozen TS type.
+// The schema is strict-by-omission (unknown keys are dropped), so every field
+// the UI reads must be declared here — including eve's stable `meta.id`
+// passthrough, which is an identity/dedupe KEY only. `seq` stays the resume
+// cursor: eve's `evt_` ULIDs are time-ordered but not TOTALLY ordered across
+// steps in different processes, so an id cursor would silently drop events.
 const runEventFrameSchema = z.object({
   runId: z.string().min(1),
   seq: z.number().int().nonnegative(),
   event: z.looseObject({ type: z.string().min(1) }),
   at: z.string().min(1),
+  eventId: z.string().min(1).optional(),
 });
 
 const runStatusFrameSchema = z.object({

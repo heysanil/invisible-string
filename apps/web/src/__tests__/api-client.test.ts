@@ -6,7 +6,14 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
-import { api, ApiError, buildApiUrl, isApiErrorCode } from "../lib/api-client";
+import {
+  api,
+  ApiError,
+  buildApiUrl,
+  isApiErrorCode,
+  isSessionBusy,
+  isSessionNotActive,
+} from "../lib/api-client";
 
 const okSchema = z.object({ hello: z.string() });
 
@@ -101,6 +108,35 @@ describe("api-client", () => {
     expect(apiError.code).toBe("session_busy");
     expect(isApiErrorCode(error, "session_busy")).toBe(true);
     expect(isApiErrorCode(error, "other_code")).toBe(false);
+    expect(isSessionBusy(error)).toBe(true);
+    // The two session 409s have OPPOSITE recoveries, so the narrowings must
+    // stay mutually exclusive — a busy session is NOT a retired one.
+    expect(isSessionNotActive(error)).toBe(false);
+  });
+
+  test("409 session_not_active is a DIFFERENT code from session_busy", async () => {
+    const { fetchFn } = stubFetch(() =>
+      jsonResponse(
+        {
+          error: {
+            code: "session_not_active",
+            message: "The session is no longer active.",
+          },
+        },
+        409,
+      ),
+    );
+    const error = await api
+      .post("/sessions/s1/messages", okSchema, {
+        fetchFn,
+        baseUrl: "http://api.test",
+        body: { message: "hi" },
+      })
+      .catch((caught: unknown) => caught);
+    expect((error as ApiError).status).toBe(409);
+    expect(isSessionNotActive(error)).toBe(true);
+    // Never route this into the "wait and retry" branch: eve retired the id.
+    expect(isSessionBusy(error)).toBe(false);
   });
 
   test("non-envelope failure falls back to http_<status>", async () => {

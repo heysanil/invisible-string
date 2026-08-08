@@ -1,16 +1,23 @@
 /**
  * One run rendered in the thread: the inbound user/trigger message bubble
  * (ink), the collapsible working block, the streamed assistant reply
- * (markdown), inline HITL approval cards, and a failure banner.
+ * (markdown), inline HITL cards, a failure banner — and the Stop control.
+ *
+ * STOP IS NOT A FAILURE. eve 0.31 answers a stop with `turn.cancelled` →
+ * `session.waiting`, never a failure event, so a stopped run renders in
+ * neutral ink (E1: color only as meaning) with whatever it had already
+ * produced left intact and readable.
  */
 import { memo, useCallback } from "react";
-import { AlertCircle, Ban, X } from "lucide-react";
+import { AlertCircle, Ban, Square } from "lucide-react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
 import { cn } from "../../lib/cn";
+import { Button } from "../ui/Button";
 import { ApprovalCard } from "./ApprovalCard";
+import { ContextDivider } from "./ContextDivider";
 import { Markdown } from "./Markdown";
 import { WorkingBlock } from "./WorkingBlock";
 
@@ -20,9 +27,9 @@ export interface RunMessageProps {
   isChatOrigin: boolean;
   /** Stable across renders so memoized rows bail out (runId is passed back). */
   onRespond: (runId: string, response: RunInputRequest) => void;
-  /** Cancel an in-flight run (queued/running/waiting). Stable identity. */
+  /** Stop the in-flight turn (queued/running/waiting). Stable identity. */
   onCancel?: (runId: string) => void;
-  /** True while this run's cancel request is in flight (disables the button). */
+  /** True while this run's stop request is in flight (disables the button). */
   canceling?: boolean;
   /** requestId → the response being submitted (optimistic). */
   pendingInput?: { requestId: string; optionId?: string; text?: string } | null;
@@ -39,9 +46,19 @@ function RunMessageImpl({
   inputError,
 }: RunMessageProps) {
   const showReply = run.reply !== null;
-  const isActive = run.status === "queued" || run.status === "running";
-  // A parked (waiting) run can also be cancelled — it holds a slot until answered.
-  const cancelable = isActive || run.status === "waiting";
+  // `run.canceled` comes off the event stream, so it flips a beat BEFORE the
+  // run_status frame — the spinner, caret and Stop button all settle together
+  // rather than lingering for a round trip.
+  const isActive = !run.canceled && (run.status === "queued" || run.status === "running");
+  // A parked (waiting) run can also be stopped — it holds the session's one
+  // run slot until it is answered. The ONE exception is a session-limit
+  // prompt: its own "Stop" option already cancels this turn through the same
+  // path, and two adjacent Stops that mean the same thing is worse than one.
+  const onLimitPrompt = run.pendingInputs.some(
+    (input) => input.kind === "session-limit",
+  );
+  const cancelable =
+    !run.canceled && !onLimitPrompt && (isActive || run.status === "waiting");
   const handleRespond = useCallback(
     (response: RunInputRequest) => onRespond(run.runId, response),
     [onRespond, run.runId],
@@ -106,18 +123,23 @@ function RunMessageImpl({
           </div>
         ) : null}
 
-        {/* Cancellation is a deliberate user action, not an error — confirm it
-            in neutral ink (E1: color only as meaning) with the best-effort
-            caveat, so "everything disappeared" never reads as a glitch. */}
-        {run.status === "canceled" ? (
+        {/* Stopping is a deliberate user action, not an error — confirm it in
+            neutral ink (E1: color only as meaning) so a half-finished reply
+            never reads as a glitch. eve stops at the next durable step
+            boundary, so a tool already running finishes; the session itself
+            stays usable, which is the reassurance that matters here. */}
+        {run.canceled ? (
           <div className="my-1.5 flex items-start gap-2 rounded-card border border-black/[0.08] bg-black/[0.03] px-3 py-2 text-[13px] text-ink-2">
             <Ban size={15} className="mt-0.5 shrink-0 text-ink-3" aria-hidden="true" />
             <span className="min-w-0">
-              Run canceled. The agent may finish its current step in the
-              background, but nothing more will appear here.
+              You stopped this run. A step already underway finished, and
+              anything above is kept — send another message to carry on.
             </span>
           </div>
         ) : null}
+
+        {/* Clear/compact landed while this run's tail was attached. */}
+        {run.contextCleared ? <ContextDivider kind="cleared" /> : null}
 
         {/* An active run with no output yet still needs a presence cue. */}
         {run.block === null && !showReply && run.pendingInputs.length === 0 && run.error === null &&
@@ -127,18 +149,10 @@ function RunMessageImpl({
 
         {onCancel && cancelable ? (
           <div className="pt-1">
-            <button
-              type="button"
-              onClick={handleCancel}
-              disabled={canceling}
-              className={cn(
-                "lift inline-flex items-center gap-1.5 rounded-capsule border border-black/10 bg-white/60 px-2.5 py-1 text-[12px] font-medium text-ink-2",
-                "hover:border-err/40 hover:text-err disabled:pointer-events-none disabled:opacity-50",
-              )}
-            >
-              <X size={12} aria-hidden="true" />
-              {canceling ? "Cancelling…" : "Cancel run"}
-            </button>
+            <Button variant="ghost" size="sm" loading={canceling} onClick={handleCancel}>
+              {!canceling ? <Square size={11} strokeWidth={2.6} aria-hidden="true" /> : null}
+              {canceling ? "Stopping…" : "Stop"}
+            </Button>
           </div>
         ) : null}
       </div>

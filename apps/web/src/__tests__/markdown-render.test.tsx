@@ -5,7 +5,7 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, test } from "bun:test";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 
 import { Markdown } from "../components/chat/Markdown";
 
@@ -42,9 +42,23 @@ test("inline code keeps the E1 mono-chip treatment", async () => {
   expect(code.className).toContain("mono-chip");
 });
 
+/**
+ * Shiki splits highlighted source across one span per token, so `findByText`
+ * on the code itself only works while the highlighter is still cold — it turns
+ * order-dependent the moment another test in the file warms it. Read the block's
+ * textContent instead, which holds in both states.
+ */
+async function findCodeText(container: HTMLElement): Promise<string> {
+  return await waitFor(() => {
+    const text = container.querySelector("pre code")?.textContent ?? "";
+    expect(text.length).toBeGreaterThan(0);
+    return text;
+  });
+}
+
 test("a fenced block renders as a block, not inline code", async () => {
   const view = render(<Markdown text={"```ts\nconst x = 1;\n```"} />);
-  await view.findByText(/const x = 1;/);
+  expect(await findCodeText(view.container)).toContain("const x = 1;");
   // Guards the components.code / components.pre footgun: overriding either
   // collapses fenced blocks into inline code.
   expect(view.container.querySelector("pre")).not.toBeNull();
@@ -52,6 +66,28 @@ test("a fenced block renders as a block, not inline code", async () => {
     "mono-chip",
   );
 });
+
+test(
+  "code blocks highlight with the configured min themes, not shiki's default",
+  async () => {
+    // Streamdown resolves the theme as `plugins.code.getThemes() ?? shikiTheme`
+    // — the PROP is only a fallback, so a plugin built without themes silently
+    // wins and renders github-light's full-saturation palette. That is dead
+    // config plus an E1 rule-5 violation (color only as meaning), and it is
+    // invisible without an assertion on the emitted colors.
+    const view = render(<Markdown text={"```ts\nconst x = 1;\n```"} />);
+    // Shiki highlights asynchronously; until it lands every token carries the
+    // placeholder `--sdm-c: inherit`.
+    await waitFor(
+      () => expect(view.container.innerHTML).toContain("--sdm-c: #"),
+      { timeout: 10_000, interval: 50 },
+    );
+    const html = view.container.innerHTML;
+    expect(html).toContain("#1976D2"); // min-light's keyword blue
+    expect(html).not.toContain("#D73A49"); // github-light's keyword red
+  },
+  15_000,
+);
 
 test("agent headings never enter the document outline as real headings", async () => {
   const view = render(<Markdown text={"# Title\n\n## Sub"} />);
@@ -101,7 +137,7 @@ test("a mermaid fence renders without crashing and keeps its source", async () =
 
 test("markdown with no mermaid fence renders normally", async () => {
   const view = render(<Markdown text={"```ts\nconst x = 1;\n```"} />);
-  expect(await view.findByText(/const x = 1;/)).not.toBeNull();
+  expect(await findCodeText(view.container)).toContain("const x = 1;");
 });
 
 test("the caret shows only while streaming", async () => {

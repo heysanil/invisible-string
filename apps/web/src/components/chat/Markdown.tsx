@@ -24,7 +24,7 @@ import type {
   PluginConfig,
   ThemeInput,
 } from "streamdown";
-import { code } from "@streamdown/code";
+import { createCodePlugin } from "@streamdown/code";
 
 import { cn } from "../../lib/cn";
 
@@ -36,7 +36,17 @@ import { cn } from "../../lib/cn";
  */
 const SHIKI_THEMES: [ThemeInput, ThemeInput] = ["min-light", "min-dark"];
 
-const CODE_ONLY_PLUGINS: PluginConfig = { code };
+/**
+ * The themes MUST be built into the plugin. Streamdown resolves them as
+ * `plugins.code.getThemes() ?? shikiTheme`, so the prop is only a fallback for
+ * when no code plugin is configured — the stock `code` export carries shiki's
+ * github-light/github-dark defaults and silently wins, painting agent replies
+ * in a full-saturation palette E1 does not sanction. The prop below stays as
+ * the documented fallback. Guard: `__tests__/markdown-render.test.tsx`.
+ */
+const CODE_PLUGIN = createCodePlugin({ themes: SHIKI_THEMES });
+
+const CODE_ONLY_PLUGINS: PluginConfig = { code: CODE_PLUGIN };
 
 /** A fence opening a mermaid block, at the start of any line. */
 const MERMAID_FENCE = /^```mermaid\b/m;
@@ -77,7 +87,7 @@ function useMarkdownPlugins(text: string): PluginConfig {
     () =>
       mermaidPlugin === null
         ? CODE_ONLY_PLUGINS
-        : { code, mermaid: mermaidPlugin },
+        : { code: CODE_PLUGIN, mermaid: mermaidPlugin },
     [mermaidPlugin],
   );
 }

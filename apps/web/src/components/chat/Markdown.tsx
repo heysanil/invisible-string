@@ -1,163 +1,179 @@
 /**
- * Streaming-friendly markdown renderer for agent replies. Parses via
- * lib/chat/markdown (typed AST, no HTML passthrough) and renders ink-styled
- * prose; code blocks get ui-monospace + a copy button.
+ * Streaming markdown renderer for agent replies and copilot messages.
+ *
+ * Streamdown handles parsing, GFM, Shiki highlighting and incomplete-markdown
+ * "remend" while a reply streams. Its default styling reaches the E1 system
+ * through the shadcn→ink token bridge in index.css; only the four keys below
+ * are overridden, so new markdown elements stay styled without new code.
+ *
+ * DO NOT override `code` or `pre`. `code` is streamdown's block dispatcher
+ * (language detection, the mermaid dispatch, the Shiki CodeBlock) and `pre`
+ * stamps the `data-block` marker that drives it — overriding either collapses
+ * every fenced block into inline code. Inline code has its own key.
  */
-import { useMemo, useState, type ReactNode } from "react";
-import { Check, Copy } from "lucide-react";
+import type { ComponentProps } from "react";
+import { Streamdown } from "streamdown";
+import type {
+  Components,
+  ControlsConfig,
+  ExtraProps,
+  LinkSafetyConfig,
+  PluginConfig,
+  ThemeInput,
+} from "streamdown";
+import { code } from "@streamdown/code";
 
-import {
-  parseMarkdown,
-  type MdBlock,
-  type MdInline,
-} from "../../lib/chat/markdown";
 import { cn } from "../../lib/cn";
 
-function renderInline(nodes: MdInline[], keyPrefix: string): ReactNode[] {
-  return nodes.map((node, index) => {
-    const key = `${keyPrefix}-${index}`;
-    switch (node.kind) {
-      case "text":
-        return <span key={key}>{node.text}</span>;
-      case "code":
-        return (
-          <code key={key} className="mono-chip">
-            {node.text}
-          </code>
-        );
-      case "strong":
-        return (
-          <strong key={key} className="font-semibold text-ink">
-            {renderInline(node.children, key)}
-          </strong>
-        );
-      case "em":
-        return <em key={key}>{renderInline(node.children, key)}</em>;
-      case "link":
-        return (
-          <a
-            key={key}
-            href={node.href}
-            target="_blank"
-            rel="noreferrer noopener"
-            className="rounded-sm font-medium text-ink underline decoration-black/25 underline-offset-2 transition-colors duration-150 hover:decoration-black/60"
-          >
-            {renderInline(node.children, key)}
-          </a>
-        );
-    }
-  });
-}
+/**
+ * Streamdown's outer memo compares `shikiTheme`, `plugins` and `linkSafety`
+ * BY IDENTITY, and its inner Block memo compares each `components` value the
+ * same way. Inline literals would defeat per-block memoization and re-highlight
+ * every code block on every streamed token — these MUST stay at module scope.
+ */
+const SHIKI_THEMES: [ThemeInput, ThemeInput] = ["min-light", "min-dark"];
 
-function CodeBlock({ lang, text }: { lang: string | null; text: string }) {
-  const [copied, setCopied] = useState(false);
+const PLUGINS: PluginConfig = { code };
 
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard unavailable (permissions/insecure context) — quietly skip.
-    }
-  }
+/** Copy only — download, fullscreen and panZoom are not E1-styled surfaces. */
+const CONTROLS: ControlsConfig = {
+  code: { copy: true, download: false },
+  table: { copy: true, download: false, fullscreen: false },
+  mermaid: { copy: true, download: false, fullscreen: false, panZoom: false },
+};
 
+/**
+ * Explicitly off. The custom `a` below already replaces the default anchor
+ * (which renders external links as a confirm-modal <button>), so link safety
+ * is disabled in practice — saying so here keeps behavior from silently
+ * flipping if that override is ever removed.
+ */
+const LINK_SAFETY: LinkSafetyConfig = { enabled: false };
+
+/** remend's placeholder for a link whose href has not finished streaming. */
+const INCOMPLETE_LINK = "streamdown:incomplete-link";
+
+/**
+ * `ExtraProps` is not decoration: `Components` carries an index signature
+ * requiring every value to accept `Record<string, unknown> & ExtraProps`, so a
+ * bare `ComponentProps<"code">` fails to typecheck. react-markdown also passes
+ * the hast `node` at runtime — destructure it away rather than spreading it
+ * onto the element, where it serializes as `node="[object Object]"`.
+ */
+function InlineCode({
+  children,
+  className,
+  node: _node,
+  ...props
+}: ComponentProps<"code"> & ExtraProps) {
   return (
-    <div className="group relative my-2 overflow-hidden rounded-card border border-black/[0.07] bg-black/[0.035]">
-      <div className="flex h-8 items-center justify-between border-b border-black/[0.05] pl-3 pr-1.5">
-        <span className="font-mono text-[11px] text-ink-4">{lang ?? "code"}</span>
-        <button
-          type="button"
-          onClick={copy}
-          aria-label={copied ? "Copied" : "Copy code"}
-          className="lift flex h-6 items-center gap-1 rounded-capsule px-2 text-[11px] font-medium text-ink-3 hover:bg-black/[0.05] hover:text-ink"
-        >
-          {copied ? (
-            <>
-              <Check size={12} aria-hidden="true" className="text-ok" />
-              Copied
-            </>
-          ) : (
-            <>
-              <Copy size={12} aria-hidden="true" />
-              Copy
-            </>
-          )}
-        </button>
-      </div>
-      <pre className="overflow-x-auto p-3 font-mono text-[12.5px] leading-relaxed text-ink">
-        <code>{text}</code>
-      </pre>
-    </div>
+    <code {...props} className={cn("mono-chip", className)}>
+      {children}
+    </code>
   );
 }
 
-function renderBlock(block: MdBlock, index: number): ReactNode {
-  const key = `b-${index}`;
-  switch (block.kind) {
-    case "p":
-      return (
-        <p key={key} className="my-1.5 leading-relaxed">
-          {renderInline(block.inline, key)}
-        </p>
-      );
-    case "h": {
-      const sizes = { 1: "text-[17px]", 2: "text-[15px]", 3: "text-sm", 4: "text-[13px]" } as const;
-      return (
-        <p
-          key={key}
-          role="heading"
-          aria-level={block.level + 2}
-          className={cn("mb-1 mt-3 font-semibold tracking-tight text-ink", sizes[block.level])}
-        >
-          {renderInline(block.inline, key)}
-        </p>
-      );
-    }
-    case "code":
-      return <CodeBlock key={key} lang={block.lang} text={block.text} />;
-    case "list": {
-      const Tag = block.ordered ? "ol" : "ul";
-      return (
-        <Tag
-          key={key}
-          className={cn(
-            "my-1.5 flex list-outside flex-col gap-1 pl-5 leading-relaxed",
-            block.ordered ? "list-decimal" : "list-disc",
-          )}
-        >
-          {block.items.map((item, itemIndex) => (
-            <li key={`${key}-${itemIndex}`} className="marker:text-ink-4">
-              {renderInline(item, `${key}-${itemIndex}`)}
-            </li>
-          ))}
-        </Tag>
-      );
-    }
-    case "quote":
-      return (
-        <blockquote
-          key={key}
-          className="my-2 border-l-2 border-black/15 pl-3 text-ink-2"
-        >
-          {renderInline(block.inline, key)}
-        </blockquote>
-      );
-    case "hr":
-      return <hr key={key} className="my-3 border-black/[0.08]" aria-hidden="true" />;
+function MarkdownLink({
+  href,
+  children,
+  className,
+  node: _node,
+  ...props
+}: ComponentProps<"a"> & ExtraProps) {
+  // A half-streamed link, or one the sanitizer stripped, renders as its text
+  // rather than a dead anchor.
+  if (href === undefined || href === INCOMPLETE_LINK) {
+    return <span className={className}>{children}</span>;
   }
+  return (
+    <a
+      {...props}
+      href={href}
+      target="_blank"
+      rel="noreferrer noopener"
+      className={cn(
+        "rounded-sm font-medium text-ink underline decoration-black/25 underline-offset-2 transition-colors duration-150 hover:decoration-black/60",
+        className,
+      )}
+    >
+      {children}
+    </a>
+  );
 }
+
+const HEADING_SIZES: Record<number, string> = {
+  1: "text-[17px]",
+  2: "text-[15px]",
+  3: "text-sm",
+  4: "text-[13px]",
+  5: "text-[13px]",
+  6: "text-[13px]",
+};
+
+/**
+ * Agent replies are untrusted content inside a page that owns its own heading
+ * outline, so markdown headings render as ARIA headings offset two levels
+ * down — never real <h1>–<h6>, which would hijack landmark navigation.
+ * Called at module scope, so each component identity is stable.
+ */
+function makeHeading(level: number) {
+  const ariaLevel = Math.min(level + 2, 6);
+  return function MarkdownHeading({
+    children,
+    className,
+  }: ComponentProps<"h1"> & ExtraProps) {
+    return (
+      <p
+        role="heading"
+        aria-level={ariaLevel}
+        className={cn(
+          "mb-1 mt-3 font-semibold tracking-tight text-ink",
+          HEADING_SIZES[level],
+          className,
+        )}
+      >
+        {children}
+      </p>
+    );
+  };
+}
+
+const COMPONENTS: Components = {
+  inlineCode: InlineCode,
+  a: MarkdownLink,
+  h1: makeHeading(1),
+  h2: makeHeading(2),
+  h3: makeHeading(3),
+  h4: makeHeading(4),
+  h5: makeHeading(5),
+  h6: makeHeading(6),
+};
 
 export interface MarkdownProps {
   text: string;
   className?: string;
+  /** Drives the streaming caret and suppresses copy controls mid-stream. */
+  streaming?: boolean;
 }
 
-export function Markdown({ text, className }: MarkdownProps) {
-  const blocks = useMemo(() => parseMarkdown(text), [text]);
+export function Markdown({ text, className, streaming }: MarkdownProps) {
   return (
-    <div className={cn("text-sm text-ink [overflow-wrap:anywhere]", className)}>
-      {blocks.map(renderBlock)}
-    </div>
+    <Streamdown
+      mode="streaming"
+      isAnimating={streaming ?? false}
+      caret="block"
+      plugins={PLUGINS}
+      shikiTheme={SHIKI_THEMES}
+      controls={CONTROLS}
+      linkSafety={LINK_SAFETY}
+      lineNumbers={false}
+      components={COMPONENTS}
+      className={cn(
+        "space-y-2 text-sm text-ink [overflow-wrap:anywhere]",
+        className,
+      )}
+    >
+      {text}
+    </Streamdown>
   );
 }

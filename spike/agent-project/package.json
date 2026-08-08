@@ -5,21 +5,22 @@
   "engines": {
     "node": "24.x"
   },
+  "comment": "PINS ARE DERIVED, NOT AUTHORED. Every version below must match packages/compiler/versions.json exactly — that file is the single source of truth for the runtime matrix the compiler emits, and this project exists to prove that matrix empirically. spike/tests/pins.test.ts fails (ungated, in the default `bun test` lane) the moment the two drift, which is what stops the spike from silently gating a matrix nobody ships. To repin: edit versions.json, then run `bun run spike/tests/sync-pins.ts` and `mise exec node@24 -- npm install --package-lock-only --ignore-scripts` in this directory. Never hand-edit package-lock.json.",
   "scripts": {
     "build": "eve build",
     "start": "eve start",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "4.0.7",
-    "@openrouter/ai-sdk-provider": "6.0.0-alpha.1",
-    "@workflow/world-postgres": "5.0.0-beta.20",
-    "ai": "7.0.14",
-    "eve": "0.19.0",
+    "@ai-sdk/anthropic": "4.0.36",
+    "@openrouter/ai-sdk-provider": "3.0.0",
+    "@workflow/world-postgres": "5.0.0-beta.32",
+    "ai": "7.0.58",
+    "eve": "0.31.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "26.1.0",
-    "typescript": "6.0.3"
+    "typescript": "7.0.2"
   }
 }

@@ -9,7 +9,7 @@
  * TEST_DATABASE_URL is unset. Keyed tests additionally require
  * OPENROUTER_API_KEY.
  */
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { SQL, type Subprocess } from "bun";
@@ -20,6 +20,35 @@ export const SPIKE_DIR = resolve(import.meta.dir, "..");
 export const REPO_ROOT = resolve(SPIKE_DIR, "..");
 export const AGENT_PROJECT_DIR = join(SPIKE_DIR, "agent-project");
 export const ARTIFACTS_DIR = join(SPIKE_DIR, ".artifacts");
+
+/**
+ * eve 0.31 MOVED the compiled-agent manifest. Under 0.19 it sat at
+ * `<project>/.eve/compile/compiled-agent-manifest.json`; 0.31 emits it under
+ * the build output at `.output/.eve/compile/…` and leaves `.eve/` holding
+ * `agent-summary.json` + `builds/<id>/`. Anything still reading the old root
+ * path silently finds nothing — including
+ * apps/control-plane/src/build/steps.ts.
+ */
+export const COMPILED_MANIFEST_PATH = join(
+  AGENT_PROJECT_DIR,
+  ".output",
+  ".eve",
+  "compile",
+  "compiled-agent-manifest.json",
+);
+export const LEGACY_COMPILED_MANIFEST_PATH = join(
+  AGENT_PROJECT_DIR,
+  ".eve",
+  "compile",
+  "compiled-agent-manifest.json",
+);
+
+/**
+ * eve 0.28+ stamps every stream event with `meta.id` = `evt_` + a Crockford
+ * base32 ULID (26 chars, excluding I/L/O/U). Stable across reconnects,
+ * rewinds and replays: it is written once, before the durable write.
+ */
+export const EVE_EVENT_ID_PATTERN = /^evt_[0-9A-HJKMNP-TV-Z]{26}$/;
 
 export const AGENT_PORT = 4101;
 export const PROXY_PORT = 4100;
@@ -146,16 +175,60 @@ let agentBuilt = false;
 let agentDepsInstalled = false;
 
 /**
+ * Version actually installed under agent-project/node_modules, or null when
+ * the package is absent.
+ */
+function installedVersion(pkg: string): string | null {
+  const manifest = join(AGENT_PROJECT_DIR, "node_modules", ...pkg.split("/"), "package.json");
+  if (!existsSync(manifest)) return null;
+  try {
+    return (JSON.parse(readFileSync(manifest, "utf8")) as { version?: string }).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * `npm ci` the spike agent project (exact pins via its committed
- * package-lock.json) with Node 24 when node_modules is missing — a fresh
- * checkout has no spike deps. PATH is prefixed with the Node 24 bin dir so
- * npm and its `#!/usr/bin/env node` shebang both resolve to Node 24.
+ * package-lock.json) with Node 24 when node_modules is missing OR STALE — a
+ * fresh checkout has no spike deps, and a checkout that predates a matrix
+ * bump has the WRONG ones. PATH is prefixed with the Node 24 bin dir so npm
+ * and its `#!/usr/bin/env node` shebang both resolve to Node 24.
+ *
+ * The staleness check is the runtime half of the upgrade gate: the old
+ * "does node_modules/eve/bin/eve.js exist?" probe happily reused an eve 0.19
+ * install after package.json moved to 0.31.3, so the suites went green
+ * against a runtime the compiler no longer emits. spike/tests/pins.test.ts
+ * guards package.json/package-lock.json against versions.json; this guards
+ * the installed tree against package.json.
  */
 export async function ensureAgentDeps(): Promise<void> {
   if (agentDepsInstalled) return;
-  if (existsSync(join(AGENT_PROJECT_DIR, "node_modules", "eve", "bin", "eve.js"))) {
+  const declared = (
+    JSON.parse(readFileSync(join(AGENT_PROJECT_DIR, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    }
+  );
+  const wanted = { ...declared.dependencies, ...declared.devDependencies };
+  const stale = Object.entries(wanted).filter(([pkg, version]) => {
+    const found = installedVersion(pkg);
+    return found !== null && found !== version;
+  });
+  if (
+    stale.length === 0 &&
+    existsSync(join(AGENT_PROJECT_DIR, "node_modules", "eve", "bin", "eve.js"))
+  ) {
     agentDepsInstalled = true;
     return;
+  }
+  if (stale.length > 0) {
+    console.warn(
+      `[spike] agent-project node_modules is stale, reinstalling: ${stale
+        .map(([pkg, version]) => `${pkg} ${installedVersion(pkg)} -> ${version}`)
+        .join(", ")}`,
+    );
+    rmSync(join(AGENT_PROJECT_DIR, "node_modules"), { force: true, recursive: true });
   }
   const nodeBinDir = resolve(node24Bin(), "..");
   const result = await run(["npm", "ci", "--no-audit", "--no-fund"], {

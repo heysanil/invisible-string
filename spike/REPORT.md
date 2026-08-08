@@ -2,6 +2,11 @@
 
 Date: 2026-07-02 · eve **0.19.0** · Node **24.18.0** (mise) · Bun **1.3.5** (tests/proxy)
 
+> This header and findings 1–20 are the original 0.19.0 record and are kept
+> verbatim (later docs cite the numbers). The suite now runs against eve
+> **0.31.3** — see **[appended findings 21–28](#appended-findings--eve-0313-upgrade-2026-08-07)**,
+> which supersede the version matrix below plus findings 3 and 4.
+
 ## Verdict
 
 **The runtime bet holds.** A hand-written eve agent self-hosts cleanly
@@ -198,6 +203,158 @@ Event inventory frozen in `packages/shared/src/eve-events.ts` (14 types live-obs
     via the compiler adapter so build-env changes like this one can never
     cache-hit stale (gateway-routed) artifacts again. Verified end-to-end by
     tests/integration/keyed-acceptance.test.ts under a real key.
+
+---
+
+## Appended findings — eve 0.31.3 upgrade (2026-08-07)
+
+Findings 1–20 above are the 0.19.0 record and are **not rewritten** (later docs
+cite them by number). The items below are numbered continuations; where one
+supersedes an earlier statement it says so explicitly. Design:
+`docs/superpowers/specs/2026-08-07-eve-0.31-upgrade-design.md`. All of these
+were produced by the ported spike suites running green against a real
+eve 0.31.3 install (28 pass / 8 skip — the keyed suite skipped, no key).
+
+21. **SUPERSEDES findings 3 and 4 — `@openrouter/ai-sdk-provider@3.0.0`: a
+    stable `ai@7` line exists, and key loading is now LAZY.** Finding 3's
+    "the working line is `6.0.0-alpha.1`" no longer holds: 3.0.0 is npm latest,
+    declares peer `ai@^7.0.0`, installs with zero ERESOLVE and has no runtime
+    deps. It preserves the `createOpenRouter({apiKey})` → `openrouter('slug')`
+    call style our codegen emits, and moves `specificationVersion` v3 → v4
+    (ai@7.0.58 drives it; a real `generateText()` round-trip against a stubbed
+    endpoint completed). Finding 4 is now WRONG on its central claim:
+    **`openrouter('slug')` no longer throws `AI_LoadAPIKeyError` at model
+    CONSTRUCTION** — construction succeeds and the error is raised lazily at
+    the first model call (`doGenerate`/`doStream`). Consequence: the codegen
+    guard (construct the provider model only when `OPENROUTER_API_KEY` is set,
+    otherwise emit the model-id STRING) is **more** load-bearing than under
+    0.19, not less — dropping it would no longer fail the build, it would
+    silently emit a model whose first turn fails at runtime. Proven end-to-end:
+    a cold keyless build's manifest records
+    `"routing":{"kind":"gateway","target":"deepseek"}` — the fallback branch —
+    and that artifact then booted, served, streamed, parked, resumed after
+    SIGKILL, cancelled a turn and ran the docker sandbox. Unproven and
+    deliberately left open: the KEYED round-trip against real OpenRouter under
+    3.0.0 (the keyed lane costs money and was not run); because the throw is
+    lazy, a keyed-path break would surface only at the first turn.
+
+22. **The compiled-agent manifest MOVED.** eve 0.31 emits it at
+    `.output/.eve/compile/compiled-agent-manifest.json`; the 0.19 path
+    `<project>/.eve/compile/compiled-agent-manifest.json` is simply ABSENT
+    after a cold build (asserted in both directions in `keyless.test.ts`).
+    `<project>/.eve/` now holds `agent-summary.json` (schemaVersion 3),
+    `builds/<id>/`, `locks/`, `sandbox-cache/`. This supersedes the manifest
+    paths quoted in the keyless proof list above and in finding 17 — schedule
+    registration still lands in the manifest, just at the new location. Any
+    reader of that file (build steps, artifact packaging, tests) must use the
+    new path; there is no fallback copy.
+
+23. **Session API v2 is ID-addressed — supersedes every "follow-up via
+    `continuationToken`" statement above** (the keyless-mocked and keyed proof
+    lists). Create answers **202** `{ok, sessionId, status:"accepted"}` with an
+    `x-eve-session-id` header and **no continuation token**; follow-ups POST to
+    `/eve/v1/session/:sessionId` with `message` **XOR** `inputResponses`
+    (both → 400 "mutually exclusive", neither → 400, `inputResponses` on create
+    → 400). An unknown or terminal id answers **409**
+    `{ok:false, code:"session_not_active"}` — the only stable machine-readable
+    code on this surface. Every session route (create, follow-up, cancel,
+    clear, compact, reset) returns 400 if the body merely CONTAINS a
+    `continuationToken` key: the guard is `"continuationToken" in body`, so
+    `{continuationToken: null}` fails too (both directions asserted in
+    `keyless.test.ts`). The durability gate was re-proven on this protocol —
+    approval park → SIGKILL → fresh PID → resume by posting `{inputResponses}`
+    alone to the session id, with the tool's on-disk side effect landing from
+    the new process.
+
+24. **Control routes: `cancel` / `clear` / `compact` / `reset`, and what their
+    statuses actually mean.** All four accept a zero-byte POST body. Traps,
+    all observed:
+    - `no_active_turn` (cancel) and `no_active_session` (clear/compact/reset)
+      do **not** mean "nothing was running". eve renders ONE condition — a dead
+      session command hook — as `session_not_active` (send), `no_active_turn`
+      and `no_active_session`. A cancel against a live-but-IDLE session answers
+      **202 `accepted`**, so 202 never proves a turn was stopped and 200 is the
+      same terminal condition a send reports as 409.
+    - **Cancellation is cooperative at durable step boundaries.** A tool call
+      in flight when the cancel lands runs to completion and still emits its
+      `action.result`; the turn then ends with `turn.cancelled` INSTEAD of
+      `turn.completed`, and `turn.cancelled` → `session.waiting` is the
+      terminal pair (`turn.failed`/`session.failed` are absent — cancellation
+      is a user decision, not an error). The session takes the next message
+      normally. Capture: `spike/tests/fixtures/mocked-cancelled-events.ndjson`.
+    - A cancel posted BEFORE `turn.started` is accepted (202) and consumed as a
+      no-op; it does not arm a pending cancellation.
+    - **Compacting an empty or already-cleared context emits no `compaction.*`
+      events at all** — just `session.waiting`. The documented
+      `compaction.requested → compaction.completed → session.waiting` sequence
+      is the non-empty case; the 202 is the only reliable acknowledgement.
+    - `reset` is the only route that never returns 202 (both outcomes are 200)
+      and its id field is `previousSessionId`. The retired id afterwards 409s
+      `session_not_active` on send and degrades to
+      `no_active_turn`/`no_active_session` on all four control routes.
+
+25. **NDJSON stream is version 21, and every event carries `meta.id`.**
+    `x-eve-stream-version: 21` (was 16). `meta.id` is an `evt_`-prefixed ULID
+    (`/^evt_[0-9A-HJKMNP-TV-Z]{26}$/`), unique within a session and **identical
+    across a full rewind to `startIndex=0`** — that stability is what a
+    tailer's dedupe depends on, and it is asserted in `mocked.test.ts`. It is a
+    dedupe KEY, not a cursor: ULIDs are time-ordered but not totally ordered
+    across steps, and a retried durable step re-emits under NEW ids with the
+    same `turnId`/`stepIndex`/`sequence`, so `startIndex` stays authoritative.
+    Also new/changed on the wire: `turn.cancelled`, `context.cleared` and
+    `action.partial` event types; `input.requested` gained a REQUIRED `kind`
+    discriminator (`tool-approval` | `question` | `session-limit` — the parked
+    approval capture shows `"kind":"tool-approval"`); `session.waiting.data`
+    still carries a `continuationToken`, but it is literally the session id
+    echoed back for compatibility and is never accepted on any request — do not
+    resurrect token persistence from it. `?startIndex=` resume is unchanged and
+    now also accepts negative (tail-relative) values plus `includeTailIndex=1`,
+    which adds an `x-eve-stream-tail-index` response header (`-1` on an empty
+    stream) for bounded catch-up reads. Read from the shipped serializer (not
+    yet exercised by a spike assertion): the response body opens with a bare LF
+    before the first event, so a line splitter must skip empty lines and must
+    not count them toward its cursor. Fresh 0.31.3 captures replace the 0.19
+    ones in `spike/tests/fixtures/*.ndjson`; every event in them carries
+    `meta.id` and every capture reports `eveVersion 0.31.3`.
+
+26. **Finding 11 STILL HOLDS at `@workflow/world-postgres@5.0.0-beta.32` —
+    upstream has NOT fixed it.** beta.32 now passes a *namespace* into
+    `@workflow/world`'s `reenqueueActiveRuns`, which looks like the fix, but
+    `@workflow/world@5.0.0-beta.25`'s `dist/recovery.js` only uses that
+    namespace to prefix the QUEUE TOPIC — the `runs.list({status})` scan behind
+    it remains unfiltered, so a booting agent still re-enqueues ALL active runs
+    found in the world database. One world **database** per agent version
+    (`ag_v_<hash12>`) is still required, and `WORKFLOW_POSTGRES_JOB_PREFIX`
+    still does not isolate. (`WORKFLOW_QUEUE_NAMESPACE` is new in this line and
+    unused by the platform — it is the topic prefix, not an isolation
+    boundary.) This cross-references finding 11; that finding is unchanged.
+
+27. **SUPERSEDES the version-matrix table at the top of this report.** That
+    table is the frozen 0.19.0 record. The live matrix is
+    `packages/compiler/versions.json` (with rationale in its `notes`): eve
+    0.31.3 · ai 7.0.58 · `@workflow/world-postgres` 5.0.0-beta.32 (its
+    `@workflow/*` deps — world beta.25, world-local beta.34, errors beta.16,
+    utils beta.8 — match eve 0.31.3's bundled set exactly; the neighbours
+    beta.30/.31 do not, so the pin is forced) · `@openrouter/ai-sdk-provider`
+    3.0.0 · `@ai-sdk/anthropic` 4.0.36 · zod 4.4.3 · typescript 7.0.2 ·
+    `@types/node` 26.1.0 · node 24.19.0. `spike/agent-project/package.json` is
+    now GENERATED from that file (`spike/tests/sync-pins.ts`) and the drift is
+    enforced by the ungated `spike/tests/pins.test.ts`, which runs in the
+    default `bun test` lane — a repin is a regeneration, not a retype. Known
+    and accepted: world-postgres declares `zod@~4.3.6` while the agent pins
+    4.4.3, so npm installs a nested zod copy under
+    `@workflow/world-postgres` — benign; do not "fix" it.
+
+28. **Under `EVE_MOCK_AUTHORED_MODELS` the mock ignores prompted tool ARGUMENT
+    values** and emits a stock schema-satisfying one (observed: `seconds: 1`
+    regardless of the message). Raising a zod `min` above that stock value
+    makes the mock's tool call fail validation, after which the model silently
+    answers in prose and the tool is never called — the test then times out
+    with a misleading message. Spike tools therefore keep wide schema bounds
+    and enforce floors inside `execute()` (see `agent/tools/slow_task.ts`,
+    added so a turn can be held open long enough to cancel one in flight —
+    every other mocked flow settles in ~200 ms, and an approval park emits
+    `turn.completed`, so a parked session has no active turn to cancel).
 
 ## How to run
 

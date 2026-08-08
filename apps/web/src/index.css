@@ -42,3 +42,13 @@
   --color-primary: var(--ink);
   --color-primary-foreground: #ffffff;
 }
+
+/* Streamdown's caret is a static `content:` glyph. E1 signals streaming with
+   a blinking ink caret (see .stream-caret in the design tokens, still used by
+   apps/site) — take streamdown's inline placement, restore our motion.
+   `caret-blink` is defined in @invisible-string/design-tokens/tokens.css. */
+@media (prefers-reduced-motion: no-preference) {
+  [style*="--streamdown-caret"] > *:last-child::after {
+    animation: caret-blink 1s steps(1) infinite;
+  }
+}

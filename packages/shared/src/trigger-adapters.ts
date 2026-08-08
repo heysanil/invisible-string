@@ -22,8 +22,10 @@ import type { FormField } from "./workflow-config";
 
 /**
  * The source-agnostic slice of a {@link TriggerEvent} a mapper produces. The
- * dispatcher completes the envelope with `agentId`/`workflowId`, `principal`,
- * and (for Slack) resolves `continuationToken` from the thread mapping.
+ * dispatcher completes the envelope with `agentId`/`workflowId` and
+ * `principal`. Thread continuity (Slack) is resolved to an existing
+ * `agent_sessions` row and its `eveSessionId` — eve 0.31 sessions are
+ * ID-addressed, so no token ever rides on the envelope.
  */
 export interface MappedTriggerData {
   /** Model-facing prompt / primary input. */

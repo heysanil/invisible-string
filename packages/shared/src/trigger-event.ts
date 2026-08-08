@@ -100,8 +100,6 @@ export const triggerEventSchema = z.object({
   data: z.record(z.string(), z.unknown()),
   files: z.array(triggerFileSchema).optional(),
   principal: triggerPrincipalSchema,
-  /** Maps conversational/threaded triggers onto an existing agent session. */
-  continuationToken: z.string().min(1).optional(),
   /**
    * Extra platform context blocks. `renderTaskMessage` folds them into the
    * task message's `<trigger-context>` block after the resolved trigger
@@ -118,9 +116,14 @@ export interface TriggerEvent {
   data: Record<string, unknown>;
   files?: TriggerFile[];
   principal: TriggerPrincipal;
-  continuationToken?: string;
   context?: string[];
 }
+
+// NOTE (eve 0.31 upgrade): `continuationToken` was REMOVED from this envelope.
+// eve sessions are ID-addressed — conversational/threaded triggers map onto an
+// existing `agent_sessions` row (and its `eveSessionId`), never onto a token,
+// and eve 400s on the key's mere presence in any request body. Nothing was
+// populating it once dispatch stopped reading the legacy column.
 
 // Compile-time guard: the hand-written interface (kept for the `TriggerType`
 // alias + doc comments) must stay mutually assignable with the zod schema.

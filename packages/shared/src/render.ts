@@ -1,7 +1,7 @@
 /**
  * Dispatch-time rendering: workflow instructions + trigger event → the task
  * message. `renderTaskMessage` produces the EXACT string the control plane
- * sends to the agent's eve session (`createEveSession`/`continueEveSession`)
+ * sends to the agent's eve session (create, then ID-addressed follow-ups)
  * and persists on `runs.task_message` — agents never see the TriggerEvent
  * envelope itself (trigger-event.ts is storage/provenance only). Shared so
  * the SPA can preview a rendered task message without a round-trip.

@@ -24,8 +24,18 @@ describe("triggerEventSchema", () => {
     expect(parsed.agentId).toBe(minimalEvent.agentId);
     expect(parsed.workflowId).toBe(minimalEvent.workflowId);
     expect(parsed.files).toBeUndefined();
-    expect(parsed.continuationToken).toBeUndefined();
     expect(parsed.context).toBeUndefined();
+  });
+
+  test("continuationToken is gone (eve 0.31 sessions are ID-addressed)", () => {
+    // The envelope must not resurrect the field: eve 400s on the key's mere
+    // presence in any session request body, and thread continuity resolves to
+    // an agent_sessions row instead.
+    const parsed = triggerEventSchema.parse({
+      ...minimalEvent,
+      continuationToken: "ct_abc",
+    });
+    expect("continuationToken" in parsed).toBe(false);
   });
 
   test("workflowId is null for direct chat sessions", () => {
@@ -49,7 +59,7 @@ describe("triggerEventSchema", () => {
     expect(triggerEventSchema.safeParse(rest).success).toBe(false);
   });
 
-  test("parses a full envelope (files, principal user, continuation, context)", () => {
+  test("parses a full envelope (files, principal user, context)", () => {
     const full = {
       ...minimalEvent,
       triggerType: "slack",
@@ -63,7 +73,6 @@ describe("triggerEventSchema", () => {
         },
       ],
       principal: { workspaceId: "org_123", userId: "user_9", source: "slack:U777" },
-      continuationToken: "ct_abc",
       context: ["block one", "block two"],
     } satisfies TriggerEvent;
 

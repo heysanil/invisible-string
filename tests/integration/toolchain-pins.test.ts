@@ -8,8 +8,16 @@
  *     (eve's engines check refuses < 24). If mise.toml pins a different node,
  *     CI proves a runtime nobody ships — the exact failure mode
  *     spike/tests/pins.test.ts exists to prevent for the eve matrix.
- *  2. The prod images bake their own `oven/bun` base and carry NO mise, so a
- *     bun major/minor bump in mise.toml leaves the images a lane behind.
+ *  2. The prod images carry NO mise — they bake an `oven/bun` base and COPY a
+ *     bare node out of `node:<version>-bookworm-slim` — so a bump in mise.toml
+ *     or versions.json leaves them a lane behind. The node pin is the sharper
+ *     of the two: production `eve build` runs under the IMAGE's node, the
+ *     content hash does not encode a node version, and host lanes always build
+ *     under the mise pin — so an image on a different patch is invisible drift
+ *     between what CI proves and what production ships. (Aligning them is not
+ *     a BUILD_ENV_EPOCH event: the epoch re-keys every version to abandon
+ *     functionally poisoned artifacts, and matching an already-dominant node
+ *     patch does not poison anything.)
  *  3. A new workflow (or a new job in an existing one) can reach for
  *     `oven-sh/setup-bun` / `actions/setup-node` out of habit, quietly
  *     reintroducing an unpinned second toolchain next to mise's.
@@ -68,6 +76,20 @@ function workflows(): { file: string; doc: Workflow }[] {
     }));
 }
 
+/** Every capture-group-1 match of `pattern` across the prod Dockerfiles. */
+function dockerfilePins(pattern: RegExp): { file: string; tag: string }[] {
+  const dir = join(ROOT, "infra", "docker");
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".Dockerfile"))
+    .sort()
+    .flatMap((file) =>
+      [...readFileSync(join(dir, file), "utf8").matchAll(pattern)].map((m) => ({
+        file,
+        tag: m[1] ?? "",
+      })),
+    );
+}
+
 /** True when a `run:` script invokes one of the mise-managed binaries. */
 function usesToolchain(script: string): boolean {
   // Command position only: start of a line, or after a shell operator. Keeps
@@ -96,23 +118,30 @@ describe("mise.toml is the single source of truth for host tools", () => {
     });
   });
 
+  test("the prod images' node matches packages/compiler/versions.json exactly", () => {
+    // The images COPY a bare node out of `node:<version>-bookworm-slim` and
+    // carry no mise, so this is the ONE node version mise.toml cannot pin.
+    // It must still be the matrix's node: production `eve build` runs under
+    // it, and the content hash does NOT encode the node version — so an image
+    // on a different patch than every host lane is invisible drift.
+    const expected = versions.node ?? "";
+    expect(expected).toMatch(EXACT_SEMVER); // versions.json really has a node pin
+    const pins = dockerfilePins(/^COPY --from=node:(\S+?)-bookworm-slim/gm);
+    expect(pins.length).toBeGreaterThan(0);
+    for (const { file, tag } of pins) {
+      expect({ file, tag }).toEqual({ file, tag: expected });
+    }
+  });
+
   test("bun major.minor matches the prod images' oven/bun tag", () => {
     // The images bake `oven/bun:<major.minor>` and carry no mise, so the two
     // toolchains only stay aligned if the minor line matches.
     const bun = mise.tools.bun ?? "";
     const line = bun.split(".").slice(0, 2).join(".");
-    const tags = readdirSync(join(ROOT, "infra", "docker"))
-      .filter((f) => f.endsWith(".Dockerfile"))
-      .flatMap((f) => {
-        const body = readFileSync(join(ROOT, "infra", "docker", f), "utf8");
-        return [...body.matchAll(/^FROM\s+oven\/bun:(\S+)/gm)].map((m) => ({
-          file: f,
-          tag: m[1],
-        }));
-      });
+    const pins = dockerfilePins(/^FROM\s+oven\/bun:(\S+)/gm);
 
-    expect(tags.length).toBeGreaterThan(0);
-    for (const { file, tag } of tags) {
+    expect(pins.length).toBeGreaterThan(0);
+    for (const { file, tag } of pins) {
       expect({ file, tag }).toEqual({ file, tag: line });
     }
   });

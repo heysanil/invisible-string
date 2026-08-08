@@ -3,8 +3,8 @@
 # engines check refuses Node < 24). Node pin: packages/compiler/versions.json.
 FROM oven/bun:1.3
 
-COPY --from=node:24.18.0-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=node:24.18.0-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node:24.19.0-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:24.19.0-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 

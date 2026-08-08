@@ -97,7 +97,7 @@ function node24Bin(): string {
     if (v24 !== undefined) return join(installs, v24, "bin", "node");
   }
   throw new Error(
-    "Node 24 not found. Run `mise install node@24` or set SPIKE_NODE24_BIN.",
+    "Node 24 not found. Run `mise install` or set SPIKE_NODE24_BIN.",
   );
 }
 

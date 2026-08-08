@@ -126,8 +126,10 @@ cd e2e && bunx playwright test --project=acceptance
 cd e2e && bunx playwright test agent-workflow --project=acceptance
 ```
 
-Requires Docker, `mise` (Node 24 is auto-installed), and a warm `~/.npm`
-(the first real eve build cold-installs the generated agent's deps).
+Requires Docker, `mise` (global-setup runs `mise install node`, so the Node
+pinned in the repo-root `mise.toml` is auto-installed — run `mise trust` once
+per checkout or that step fails), and a warm `~/.npm` (the first real eve build
+cold-installs the generated agent's deps).
 
 ### Fast iteration
 

@@ -226,10 +226,13 @@ async function reapLeftoverAgents(): Promise<void> {
   await proc.exited;
 }
 
-/** `<mise install dir for node@24>/bin`, or null. Pinned on every worker's PATH
- *  so the agent boot (`node .output/server/index.mjs`) always runs Node 24. */
+/** `<mise install dir for the node pinned in mise.toml>/bin`, or null. Pinned
+ *  on every worker's PATH so the agent boot (`node .output/server/index.mjs`)
+ *  always runs Node 24. Config-driven (`where node`), never fuzzy
+ *  (`where node@24`) — the fuzzy form resolves to the newest 24.x mise knows
+ *  about, which may not be the version mise.toml pins. */
 function resolveNode24Bin(): string | null {
-  const result = spawnSync("mise", ["where", "node@24"], { encoding: "utf8" });
+  const result = spawnSync("mise", ["where", "node"], { encoding: "utf8" });
   const dir = result.status === 0 ? result.stdout.trim() : "";
   return dir ? `${dir}/bin` : null;
 }

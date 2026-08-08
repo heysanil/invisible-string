@@ -65,7 +65,7 @@ async function node24Available(): Promise<boolean> {
   return (await probe.exited) === 0 && version.startsWith("v24.");
 }
 if (!(await node24Available())) {
-  warn("Node 24 not found (`mise install node@24`) — the worker will boot but cannot launch agents");
+  warn("Node 24 not found (`mise trust && mise install`) — the worker will boot but cannot launch agents");
 }
 
 // ── 3 · infra ───────────────────────────────────────────────────────────────

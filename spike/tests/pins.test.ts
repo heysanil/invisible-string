@@ -38,7 +38,7 @@ interface PackageLock {
 }
 
 const RESYNC =
-  "Run `bun run spike/tests/sync-pins.ts`, then `cd spike/agent-project && mise exec node@24 -- npm install --package-lock-only --ignore-scripts`. Do not hand-edit either file.";
+  "Run `bun run spike/tests/sync-pins.ts`, then `cd spike/agent-project && mise exec -- npm install --package-lock-only --ignore-scripts`. Do not hand-edit either file.";
 
 const matrix = readVersionsMatrix();
 const expected = expectedSpikePins(matrix);

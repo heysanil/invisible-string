@@ -104,10 +104,12 @@ The full control-plane ↔ worker protocol lives in
 
 ## Quickstart
 
-**Prerequisites:** [Bun](https://bun.sh) 1.3+, Docker, and Node 24 for eve
-agents (`mise install node@24` — harnesses invoke it themselves).
+**Prerequisites:** [mise](https://mise.jdx.dev) and Docker. `mise.toml` pins the
+whole host toolchain — Bun (the platform), Node 24 (eve builds + compiled
+agents), and wrangler (the site deploy):
 
 ```sh
+mise trust && mise install   # once per checkout
 bun install
 bun run typecheck
 bun test            # unit lane — DB-gated tests skip cleanly without TEST_DATABASE_URL

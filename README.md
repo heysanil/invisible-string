@@ -12,7 +12,7 @@ fired from webhooks, forms, Slack, or a schedule.
 [![CI](https://github.com/heysanil/invisible-string/actions/workflows/ci.yml/badge.svg)](https://github.com/heysanil/invisible-string/actions/workflows/ci.yml)
 ![Runtime: Bun 1.3+](https://img.shields.io/badge/runtime-Bun%201.3%2B-14151a?logo=bun&logoColor=white)
 ![TypeScript strict](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)
-![eve 0.19.0](https://img.shields.io/badge/eve-0.19.0-6e56cf)
+![eve 0.31.3](https://img.shields.io/badge/eve-0.31.3-6e56cf)
 ![Agents on Node 24](https://img.shields.io/badge/agents-Node%2024-5fa04e?logo=node.js&logoColor=white)
 
 [Quickstart](#quickstart) · [How it works](#how-it-works) · [Product tour](#product-tour) · [Copilot](#copilot-the-editor-assistant) · [Development](#development) · [Docs](#documentation)

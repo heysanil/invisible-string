@@ -59,11 +59,89 @@ Used today by the control plane (this is the ONLY dispatch surface — there
 are no per-trigger channels; chat, webhook, form, Slack, schedule, and manual
 "Run now" all speak eve's session API):
 
-- `POST .../eve/v1/session` `{message}` → **202** `{sessionId, continuationToken}`
-- `POST .../eve/v1/session/:id` `{continuationToken, message}` → 202
-- `POST .../eve/v1/session/:id` `{continuationToken, inputResponses:[{requestId,optionId?,text?}]}` → 202
-  (HITL resume — `POST /runs/:id/input` forwards a parked run's answer here)
-- `GET  .../eve/v1/session/:id/stream?startIndex=<n>` → NDJSON
+### eve session API v2 — ID-addressed (eve 0.31)
+
+0.31 retired continuation tokens: a session is addressed by its **id in the
+path**, and every route below returns 400 if the request body carries a
+`continuationToken` key at all — eve's guard is `"continuationToken" in body`,
+not a truthiness test, so `{continuationToken: null}` is a hard 400 while a
+key dropped by `JSON.stringify` is fine. Wire shapes, route builders and body
+guards live in `packages/shared/src/eve-session-api.ts` (cross-checked against
+eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
+
+| Call (through `<worker>/agents/<hash>`) | Body | Answer |
+|---|---|---|
+| `POST .../eve/v1/session` | `{message}` (+ optional `mode`, `capabilities`) | **202** `{ok, sessionId, status:"accepted"}` + `x-eve-session-id` |
+| `POST .../eve/v1/session/:id` | `{message}` **XOR** `{inputResponses:[{requestId,optionId?,text?}]}` | 202 `{ok, sessionId, status:"accepted"}` · **409** `{ok:false, code:"session_not_active"}` |
+| `POST .../eve/v1/session/:id/cancel` | optional `{turnId}` | 202 `{…status:"accepted"}` · 200 `{…status:"no_active_turn"}` |
+| `POST .../eve/v1/session/:id/clear` | optional, empty | 202 `accepted` · 200 `no_active_session` |
+| `POST .../eve/v1/session/:id/compact` | optional, empty | 202 `accepted` · 200 `no_active_session` |
+| `POST .../eve/v1/session/:id/reset` | optional `{reason}` | **always 200**: `{ok, previousSessionId, status:"reset"}` · `{ok, status:"no_active_session"}` |
+| `GET .../eve/v1/session/:id/stream` | `?startIndex=<n>&includeTailIndex=1` | 200 NDJSON (+ `x-eve-stream-tail-index` when asked) · 404 |
+
+- **Send XOR respond**: both fields present → 400, neither → 400.
+  `POST /runs/:id/input` forwards a parked run's answer as the
+  `inputResponses` form; `inputResponses` on *create* is also a 400.
+- **`reset` is the odd one out** — both outcomes are 200 (never 202) and its
+  id field is `previousSessionId`, not `sessionId`. The retired id can never
+  accept another message; a replacement needs a fresh create.
+- **`no_active_turn` / `no_active_session` do NOT mean "nothing was
+  running."** eve renders ONE condition — a dead session command hook — as
+  `session_not_active` (send), `no_active_turn` (cancel) and
+  `no_active_session` (clear/compact/reset). So a 200 there carries the same
+  terminal meaning as a 409 on send, and a 202 never proves a turn was
+  stopped: a cancel against a live-but-idle session answers 202 `accepted`
+  (REPORT finding 24).
+- **Cancellation is cooperative**, at durable step boundaries: a tool call
+  already in flight runs to completion and still emits its `action.result`;
+  the turn then ends `turn.cancelled` → `session.waiting`, never
+  `turn.failed`. A cancel posted before `turn.started` is accepted and
+  consumed as a no-op — it does not arm a pending cancellation.
+- **Session limits apply whether or not we configure them**: a 40,000,000
+  input-token budget per root session and a 30-day `sessionTimeoutMs`
+  (constants in `packages/shared/src/eve-events.ts`). The create body's `mode`
+  decides what a budget crossing does — `conversation` (the default, and what
+  `capabilities.requestInput` implies) parks on a deterministic Approve/Stop
+  prompt carrying `kind: "session-limit"`; `task` skips the prompt and fails
+  with `SESSION_TOKEN_LIMIT_REACHED`. A dispatch path with no human watching
+  wants the latter; a parked prompt nobody can answer hangs forever.
+- The **worker needs no change** for the four control routes: the proxy
+  forwards all of `/eve/` generically, and the sandbox reaper's activity
+  regex (`/^\/eve\/v1\/session\/([^/?]+)/`, `apps/worker/src/server.ts`)
+  already matches the sub-routes.
+
+### Event stream (NDJSON, stream version 21)
+
+`GET .../eve/v1/session/:id/stream` answers
+`content-type: application/x-ndjson`, `x-eve-stream-version: 21`,
+`cache-control: no-store, no-transform`, `x-accel-buffering: no`.
+
+- `startIndex` is an absolute event count; **negative values are
+  tail-relative** (`-1` = latest event). It stays the authoritative cursor.
+- `includeTailIndex=1` (or `true`) adds **`x-eve-stream-tail-index`**: the
+  zero-based index of the last durably recorded event, or `-1` for an empty
+  stream. Absent header ≠ `-1` — absent means the flag was not sent (or the
+  agent predates it); `-1` means there is nothing to catch up on. This is the
+  bounded catch-up read; there is **no `follow` query parameter** (`follow:
+  false` is an `eve/client` construct, and so is
+  `streamReconnectPolicy: {reconnect:false}` — the tailer speaks raw fetch and
+  therefore owns cursor recovery structurally. Any future `eve/client` usage
+  MUST pass `{reconnect:false}` or its internal reconnect loop contends with
+  ours and double-consumes).
+- Every event carries **`meta.id`** — an `evt_`-prefixed ULID, stable across
+  reconnects, rewinds and replays (REPORT finding 25). It is a dedupe KEY, not
+  a cursor: ULIDs are time-ordered but not totally ordered across steps, and a
+  retried durable step re-emits under NEW ids with the same
+  `turnId`/`stepIndex`/`sequence`.
+- New event types in 0.31: `turn.cancelled` (NOT a failure — always followed
+  by `session.waiting`), `context.cleared`, `action.partial`
+  (last-write-wins per `callId`). `input.requested` gained a required `kind`
+  discriminator (`tool-approval` | `question` | `session-limit`).
+- `session.waiting.data.continuationToken` survives as a compatibility echo of
+  the session id. It is never accepted on any request — do not read it back.
+- The serializer emits a **bare LF before the first event** (a proxy/header
+  flush primer, read from eve's `serializeAsNdjson`); a line splitter must skip
+  empty lines and must not count them toward the cursor.
 
 ## Env injected per agent (ensure-agent `env`)
 
@@ -116,8 +194,11 @@ authenticate by token/signature (no session):
   status (closed/error) RELEASES its thread key (`markSession` nulls it, and
   the new-session re-check evicts any legacy terminal holder), so the next
   message in that thread mints a fresh session instead of being silently
-  dropped forever. DMs (`channel_type: im`) key the session on the IM channel
-  itself, so a 1:1 conversation keeps one ongoing session without threading.
+  dropped forever. Since 0.31 that release has a SECOND trigger — an eve 409
+  `session_not_active` on a continue (below) — because the platform row can
+  lag eve's terminal truth indefinitely. DMs (`channel_type: im`) key the
+  session on the IM channel itself, so a 1:1 conversation keeps one ongoing
+  session without threading.
 - `GET /integrations/slack/callback` — single platform Slack app OAuth
   redirect-back (state-signed); per-team bot token stored envelope-encrypted,
   keyed by `team_id`. The install kickoff is workspace-scoped:
@@ -142,10 +223,52 @@ is 409 `session_busy` ("answer the pending approval first"), and
 `POST /runs/:id/input` refuses while any OTHER run of the session is
 dispatching. Exactly one tail per eve NDJSON stream at any instant.
 
-`POST /runs/:id/cancel` stops the tailer and marks the run `canceled`
-(idempotent). Best-effort re: eve's turn — eve exposes no session-cancel HTTP
-route, so the platform stops streaming and records the cancellation while eve's
-own turn parks/caps out server-side.
+**Two 409s with OPPOSITE recoveries — never collapse them** (constants:
+`SESSION_BUSY_ERROR_CODE` / `SESSION_NOT_ACTIVE_ERROR_CODE` in
+`packages/shared/src/api.ts`):
+
+| Code | Origin | Meaning | Recovery |
+|---|---|---|---|
+| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting | wait, retry; a racing Slack twin is logged and dropped |
+| `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
+
+`session_not_active` is a semantic *widening* of the 0.19 busy 409, not a
+rename, and it is why eve's truth can diverge from `agent_sessions.status`
+indefinitely: the default 30-day `sessionTimeoutMs` emits `session.completed`
+into a stream nobody is tailing, and a `reset` retires the id — in both the
+platform row stays `active`/`waiting`. (A task-mode token-budget breach would
+be a third cause, but the control plane never sends eve's session `mode` on
+any dispatch path, so every session runs in eve's default conversation mode
+and parks on a `session-limit` input request rather than failing. That is
+deliberate: chat, webhook, form, Slack and schedule runs are all observable
+and answerable in chat, so a budget prompt always has a human who can reach
+it. Sending `mode: "task"` would turn those into hard failures.)
+The status-driven Slack thread-key eviction alone can
+never fire for those rows, so the eve-driven eviction (a 409
+`session_not_active` on a continue) is the second release trigger and is what
+keeps a Slack thread from bricking forever.
+
+**Turn cancellation.** `POST /runs/:id/cancel` remains the single platform
+contract (there is deliberately no second session-scoped cancel route); it now
+fronts eve's real `POST /eve/v1/session/:id/cancel` instead of only stopping
+our tail. Cancellation is a user decision, never an error: the stream settles
+`turn.cancelled` → `session.waiting` and the run must land `canceled`, not
+`failed` — and not `succeeded`, which is where an unhandled `session.waiting`
+would classify it (that would also settle the run's Slack delivery obligation
+and post a truncated partial reply). The session stays usable afterwards.
+
+**Context controls.** `POST /sessions/:id/{clear,compact,reset}` front the
+matching eve control routes (DTOs: `sessionContextControlResponseSchema`,
+`resetSessionResponseSchema` in `packages/shared/src/api.ts`). Success is
+keyed on the body's `status`, not the HTTP code. An accepted `clear` emits
+`context.cleared` → `session.waiting`; an accepted `compact` emits
+`compaction.requested` → `compaction.completed` → `session.waiting`, except
+that a missing `compaction.completed` means summarization was skipped and
+history was PRESERVED (not an error) and compacting an empty/already-cleared
+context emits no `compaction.*` events at all — the 202 is the only reliable
+acknowledgement (REPORT finding 24). `reset` is destructive: the eve id is
+retired permanently, so the platform closes the row and mints a NEW
+`agent_sessions` row that the client must switch to.
 
 DISPATCH-TIME MODEL ALLOWLIST RE-VALIDATION (spec §7): before running, the
 dispatcher re-checks the version's COMPILED model against the CURRENT workspace
@@ -225,6 +348,13 @@ it safe to run TWO agent processes of the SAME hash against one
   two pollers then replay the same run concurrently (non-memoized model calls
   and side-effecting tool calls execute twice; the run event log races).
 
+Re-confirmed at `@workflow/world-postgres` @5.0.0-beta.32 (the eve 0.31.3
+pin): it now passes a *namespace* into `reenqueueActiveRuns`, but
+`@workflow/world` @5.0.0-beta.25 only uses it to prefix the QUEUE TOPIC — the
+`runs.list({status})` scan behind it is still unfiltered, so the re-enqueue
+still crosses agents sharing a world DB. Upstream has NOT fixed this; the
+database-per-version isolation below remains required (REPORT finding 26).
+
 **Hard constraint: at most one live agent process per version hash,
 fleet-wide.** Note the agents-first pivot CONCENTRATES load on this
 constraint: all of an agent's chat sessions AND all workflows delegating to
@@ -261,8 +391,11 @@ per-version schema would LOOK isolated while every version still shared
 - Key: `artifacts/<contentHash>.tar.gz` in the S3 bucket (`S3_BUCKET`,
   default `artifacts`).
 - Contents: `.output/` (self-contained nitro server), `manifest.json`
-  (`{contentHash, builtAt, appRoot, entry}`), and
-  `.eve/compile/compiled-agent-manifest.json` when present. **No
+  (`{contentHash, builtAt, appRoot, entry}`), and eve's compiled-agent
+  manifest when present — which **eve 0.31 moved** from
+  `<project>/.eve/compile/compiled-agent-manifest.json` to
+  `.output/.eve/compile/compiled-agent-manifest.json`, with no fallback copy
+  at the old path (REPORT finding 22). **No
   node_modules** — if the supervisor runs the `eve start` CLI instead of
   `node .output/server/index.mjs`, widen the tarball at integrate time.
 - NOT path-relocatable (REPORT finding 13): extract to the exact

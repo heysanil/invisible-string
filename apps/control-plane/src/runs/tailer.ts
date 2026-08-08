@@ -8,35 +8,74 @@
  * publishes frames on the in-process bus for SSE followers → marks the run's
  * status from terminal events → stops cleanly.
  *
- * RESUME: `startIndex` is eve's count of session events already consumed;
- * ours is exactly the number of run_events persisted across the session's
- * runs, so a reconnect (or a follow-up run) resumes without replays or gaps.
+ * CURSOR vs DEDUPE KEY — they are different things and must stay so:
+ * - `startIndex` is the CURSOR: eve's absolute count of session events already
+ *   consumed. Ours is the number of run_events persisted across the session's
+ *   runs. It is the only lossless resume mechanism eve offers.
+ * - eve 0.31's `meta.id` (an `evt_`-prefixed ULID, stamped once before the
+ *   durable write and therefore stable across reconnects, rewinds and full
+ *   replays) is the DEDUPE KEY. A re-read event is recognized and skipped
+ *   instead of being persisted a second time under a fresh `seq`.
+ *   It is NOT a cursor: ULIDs are time-ordered but not totally ordered across
+ *   steps running in different processes, so `where id > $cursor` is lossy.
+ *   It also does NOT suppress durable-step RETRIES — eve re-runs a step up to
+ *   four times and the retry emits NEW ids for the same logical work.
+ *
+ * BOUNDED CATCH-UP READ (0.27.7): the first connect of a tail asks for
+ * `includeTailIndex=1` and reads `x-eve-stream-tail-index` — eve's own count
+ * of durably recorded events at attach time. Two uses:
+ * - DRIFT REPAIR: if our persisted count is somehow ahead of eve's tail, the
+ *   cursor is clamped instead of sending a startIndex past the end (which eve
+ *   answers with an immediately-closed stream, i.e. an infinite reconnect
+ *   loop that ends in a spurious `failed`).
+ * - An explicit, LOGGED bound on the leftover drain below, instead of an
+ *   unlabeled prefix of the live read.
+ * `follow: false` and `streamReconnectPolicy: {reconnect:false}` are
+ * `eve/client` SDK constructs, not wire parameters — this tailer speaks raw
+ * HTTP and is the single owner of reconnection, which is what those options
+ * buy. Never introduce a second cursor owner on the same stream.
  *
  * TERMINAL MAPPING (REPORT finding 14: parks close the turn —
  * `turn.completed` then `session.waiting`; resumes run as a new turn):
  * - turn.failed / session.failed → run failed (session → error on
  *   session.failed)
+ * - turn.cancelled → NOT terminal on its own (eve always follows it with
+ *   `session.waiting`) but latches cancellation, so the following
+ *   `session.waiting` lands the run `canceled`, session stays `active`.
+ *   Cancellation is a USER DECISION, never an error: it must never classify
+ *   as `failed`, and — the likelier bug — never as `succeeded`, which would
+ *   settle the run's Slack delivery obligation and post a truncated reply.
  * - session.waiting + a pending input.requested in THIS run → run waiting
  *   (parked approval; session → waiting)
  * - session.waiting otherwise → run succeeded (chat sessions always park on
  *   next-user-message after a completed turn)
  * - session.completed → run succeeded, session closed (task-mode)
+ * - context.cleared → not terminal; invalidates any pending input request
+ *   (0.31 declares a response stale once its context is cleared).
  * - LEFTOVER events of a previous, early-stopped turn (drained by a fresh
  *   run's first connect) are persisted but never classified as terminals —
- *   see the `sawOwnTurn` gate in the consume loop.
+ *   see the `sawOwnTurn` gate in the consume loop. The tail-index bound
+ *   makes that drain observable but cannot replace the gate: eve may have
+ *   durably recorded THIS run's own `turn.started` before we attach, so the
+ *   bound alone would swallow our own turn.
  *
  * WALL-CLOCK CAP (task 6): MAX_RUN_WALL_CLOCK_MS starts when tailing starts;
- * expiry marks the run failed and aborts the tail. Best-effort abort: eve
- * 0.19.0 exposes no documented session-cancel HTTP route, so there is
- * nothing remote to call — the run keeps its failed status platform-side and
- * eve's own turn eventually parks or fails; real enforcement moves into the
- * eve limits config the compiler emits (deferred per plan; MAX-turns ditto).
+ * expiry marks the run failed and aborts the tail. It is no longer merely
+ * platform-side bookkeeping: eve 0.31 ships `POST /eve/v1/session/:id/cancel`,
+ * so the tail issues a REAL remote cancel (`cancelRemoteTurn`) before it stops
+ * reading — for the wall-clock cap and for a user Stop alike. That cancel is
+ * cooperative (it lands at the next durable step boundary, and an in-flight
+ * tool call still runs to completion), so it is fired and not awaited: the run
+ * row is finalized immediately and eve's trailing `turn.cancelled` /
+ * `session.waiting` are drained by the next tail on this session.
  */
-import type {
-  AgentSessionStatus,
-  EveStreamEvent,
-  Logger,
-  RunStatus,
+import {
+  EVE_STREAM_TAIL_INDEX_HEADER,
+  parseEveStreamTailIndex,
+  type AgentSessionStatus,
+  type EveStreamEvent,
+  type Logger,
+  type RunStatus,
 } from "@invisible-string/shared";
 
 import type { RunEventBus } from "./bus";
@@ -109,20 +148,45 @@ function parseLine(line: string): EveStreamEvent | null {
 // ── Terminal classification (pure) ──────────────────────────────────────────
 
 export interface TerminalDecision {
-  runStatus: Extract<RunStatus, "succeeded" | "failed" | "waiting">;
+  runStatus: Extract<RunStatus, "succeeded" | "failed" | "waiting" | "canceled">;
   sessionStatus: AgentSessionStatus;
   error?: string;
 }
 
+/** Latched observations that change what a boundary event MEANS. */
+export interface TerminalContext {
+  /**
+   * An input.requested was seen in THIS run without a subsequent action.result
+   * resolving it.
+   */
+  pendingInputRequest: boolean;
+  /**
+   * A `turn.cancelled` was seen in THIS run. eve always follows it with
+   * `session.waiting`, and that pair means CANCELED — not succeeded (the
+   * default reading of a bare `session.waiting`) and not failed.
+   */
+  canceledTurn?: boolean;
+}
+
 /**
  * Is `event` a tail-stopping boundary for the current run, and what does it
- * mean? `pendingInputRequest` = an input.requested was seen in THIS run
- * without a subsequent action.result resolving it.
+ * mean?
+ *
+ * Ordering inside `session.waiting` is load-bearing: cancellation outranks a
+ * pending approval, because 0.31 declares a parked input request STALE once
+ * its turn is cancelled — answering it would post a dead requestId, and
+ * leaving the run `waiting` would park it on an approval eve has discarded.
  */
 export function classifyTerminal(
   event: EveStreamEvent,
-  pendingInputRequest: boolean,
+  context: TerminalContext | boolean,
 ): TerminalDecision | null {
+  // Back-compat with the boolean-only signature used across the tests and the
+  // older call sites: a bare boolean is `pendingInputRequest`.
+  const { pendingInputRequest, canceledTurn = false } =
+    typeof context === "boolean"
+      ? { pendingInputRequest: context, canceledTurn: false }
+      : context;
   switch (event.type) {
     case "turn.failed":
       return {
@@ -139,35 +203,79 @@ export function classifyTerminal(
     case "session.completed":
       return { runStatus: "succeeded", sessionStatus: "closed" };
     case "session.waiting":
+      if (canceledTurn) {
+        // The session is untouched by a cancel and takes the next message
+        // normally — hence `active`, not `waiting`/`closed`. No `error`:
+        // cancellation is a user decision, and writing one here would render
+        // a red failure banner over a deliberate Stop.
+        return { runStatus: "canceled", sessionStatus: "active" };
+      }
       return pendingInputRequest
         ? { runStatus: "waiting", sessionStatus: "waiting" }
         : { runStatus: "succeeded", sessionStatus: "active" };
     default:
+      // Notably NOT `turn.cancelled`: it is not a boundary in eve's own sense
+      // either (`isCurrentTurnBoundaryEvent` covers only the three session.*
+      // events). Treating it as terminal would finish the run and drop the
+      // trailing `session.waiting`, desynchronizing the session's startIndex
+      // and corrupting the NEXT run's resume point.
       return null;
   }
 }
 
-/** Track whether an approval/input request is still unanswered in this run. */
+/**
+ * Track whether an approval/input request is still unanswered in this run.
+ *
+ * `turn.cancelled` and `context.cleared` both invalidate a parked request:
+ * eve declares a response stale once its turn is cancelled or its context
+ * cleared, so a run left `waiting` on one would park forever on an approval
+ * eve has already discarded.
+ */
 export function nextPendingInputRequest(
   current: boolean,
   event: EveStreamEvent,
 ): boolean {
   if (event.type === "input.requested") return true;
-  if (event.type === "action.result") return false;
+  if (
+    event.type === "action.result" ||
+    event.type === "turn.cancelled" ||
+    event.type === "context.cleared"
+  ) {
+    return false;
+  }
   return current;
 }
 
 // ── The tailer ──────────────────────────────────────────────────────────────
 
+export interface OpenRunStreamOptions {
+  /**
+   * Ask eve for the `x-eve-stream-tail-index` response header. Requested on
+   * the FIRST open of a tail only — re-requesting it on every reconnect
+   * re-pins the bound and turns a bounded read into a moving target.
+   */
+  includeTailIndex?: boolean;
+}
+
 export type OpenRunStream = (
   startIndex: number,
   signal: AbortSignal,
+  options?: OpenRunStreamOptions,
 ) => Promise<Response>;
+
+/**
+ * Ask eve to cancel this session's in-flight turn (`POST .../cancel`).
+ * Fire-and-forget: it is cooperative and its response never proves a turn was
+ * stopped, so the tail neither awaits its effect nor fails on its error.
+ */
+export type CancelRemoteTurn = () => Promise<void>;
 
 export interface TailRunOptions {
   runId: string;
   agentSessionId: string;
   openStream: OpenRunStream;
+  /** Optional so focused unit fixtures need not model the control plane. */
+  cancelRemoteTurn?: CancelRemoteTurn;
   store: RunStore;
   bus: RunEventBus;
   /** Per-run wall-clock cap in ms (MAX_RUN_WALL_CLOCK_MS). */
@@ -213,6 +321,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     runId,
     agentSessionId,
     openStream,
+    cancelRemoteTurn,
     store,
     bus,
     maxWallClockMs,
@@ -277,8 +386,29 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     });
   };
 
+  /**
+   * Fire eve's real turn cancel and forget it. Cooperative + idempotent, and
+   * its response cannot distinguish "stopped a turn" from "this session is
+   * dead", so nothing downstream may branch on it. Never allowed to reject
+   * into the tail: a Stop must not become a failure.
+   */
+  const requestRemoteCancel = (why: string): void => {
+    if (!cancelRemoteTurn) return;
+    void cancelRemoteTurn().catch((error: unknown) => {
+      log?.warn("run.remote_cancel_failed", {
+        fields: {
+          why,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      });
+    });
+  };
+
   const wallClockTimer = setTimeout(() => {
     cancelReason ??= `run exceeded the wall-clock cap (${maxWallClockMs}ms)`;
+    // Real enforcement now: stop eve's turn instead of only stopping to read
+    // it (which used to leave the turn burning tokens against nobody).
+    requestRemoteCancel("wall-clock cap");
     abort.abort();
   }, maxWallClockMs);
 
@@ -286,7 +416,18 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // Resume points derived from what is already persisted (crash-safe).
     let seq = await store.countRunEvents(runId);
     let startIndex = await store.countSessionEvents(agentSessionId);
+    // Stable eve event ids already persisted for THIS run. A reconnect that
+    // re-reads an overlapping window recognizes them and skips the write —
+    // the correctness guarantee index arithmetic alone could not give, since
+    // an unparseable line (or any event we consumed without persisting)
+    // silently undercounts `startIndex` forever and turns every later
+    // reconnect into a duplicate-row generator.
+    const seenEventIds = new Set(await store.listEventIds(runId));
     let pendingInput = false;
+    let canceledTurn = false;
+    // Tail index eve reported at attach (null = header absent/not requested).
+    let requestTailIndex = true;
+    let catchUpBound: number | null = null;
     // TERMINAL GATE: a FRESH run's tail may first drain leftover events of
     // the session's PREVIOUS turn (early-stopped tail: wall-clock abort,
     // cancel, reconnect exhaustion, crash — eve durably finishes the turn
@@ -323,31 +464,94 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       for (;;) {
         let consumedThisConnect = 0;
         try {
-          const response = await openStream(startIndex, abort.signal);
+          const response = await openStream(
+            startIndex,
+            abort.signal,
+            requestTailIndex ? { includeTailIndex: true } : undefined,
+          );
           if (!response.ok || response.body === null) {
             throw new Error(`stream returned ${response.status}`);
           }
+          if (requestTailIndex) {
+            requestTailIndex = false;
+            const tailIndex = parseEveStreamTailIndex(
+              response.headers.get(EVE_STREAM_TAIL_INDEX_HEADER),
+            );
+            // Absent header (older agent / proxy that drops it) → keep the
+            // count-derived cursor. `-1` is a REAL value meaning "empty
+            // stream", not "unknown".
+            if (tailIndex !== null) {
+              if (startIndex > tailIndex + 1) {
+                // Our persisted count is ahead of eve's durable truth (pruned
+                // rows, a restored DB, an impossible state). Sending a cursor
+                // past the end makes eve close the stream immediately, which
+                // this loop can only read as a drop — reconnect forever, then
+                // a spurious `failed`. Clamp to eve's truth and reconnect.
+                log?.warn("run.cursor_clamped", {
+                  fields: { from: startIndex, to: tailIndex + 1 },
+                });
+                startIndex = tailIndex + 1;
+                throw new Error("cursor ahead of eve tail index — reopening");
+              }
+              // Only a FRESH tail can be draining a previous turn's leftovers;
+              // a resuming tail's cursor already sits inside its own turn, so
+              // bounding it would suppress its own terminal.
+              if (seq === 0 && tailIndex >= startIndex) {
+                catchUpBound = tailIndex;
+                log?.info("run.catch_up", {
+                  fields: { from: startIndex, throughIndex: tailIndex },
+                });
+              }
+            }
+          }
           for await (const event of ndjsonEvents(response.body)) {
-            // Persist FIRST, count after: if appendEvent throws (transient
-            // Postgres error), the reconnect resumes from the same
-            // startIndex and re-consumes this event instead of silently
-            // skipping it forever.
-            const stored = await store.appendEvent(runId, seq, event);
+            // Absolute index of THIS event in eve's session stream.
+            const eventIndex = startIndex;
+            const eventId = event.meta?.id;
+            // Reconnect-overlap guard. A re-read of an already-persisted
+            // event advances the cursor and still drives the latches (the
+            // classification may not have run before the drop) but is never
+            // written or published twice.
+            const duplicate = eventId !== undefined && seenEventIds.has(eventId);
+
+            if (!duplicate) {
+              // Persist FIRST, count after: if appendEvent throws (transient
+              // Postgres error), the reconnect resumes from the same
+              // startIndex and re-consumes this event instead of silently
+              // skipping it forever.
+              const stored = await store.appendEvent(runId, seq, event);
+              if (eventId !== undefined) seenEventIds.add(eventId);
+              bus.publish(runId, {
+                kind: "event",
+                frame: {
+                  runId,
+                  seq,
+                  event,
+                  at: stored.at,
+                  ...(eventId !== undefined ? { eventId } : {}),
+                },
+              });
+              seq += 1;
+            }
             consumedThisConnect += 1;
             startIndex += 1;
-            bus.publish(runId, {
-              kind: "event",
-              frame: { runId, seq, event, at: stored.at },
-            });
-            seq += 1;
 
             if (event.type === "turn.started") {
               // This run's own turn boundary: leftover pending-input state
-              // from a drained previous turn is historical, not ours.
+              // from a drained previous turn is historical, not ours — and it
+              // ends the catch-up drain even if eve's tail index reached
+              // further (eve may already have recorded our own turn).
               sawOwnTurn = true;
               pendingInput = false;
+              canceledTurn = false;
+              catchUpBound = null;
             }
             pendingInput = nextPendingInputRequest(pendingInput, event);
+            if (sawOwnTurn && event.type === "turn.cancelled") {
+              // Latched, not terminal: `session.waiting` always follows and is
+              // what actually finishes the run.
+              canceledTurn = true;
+            }
             if (
               sawOwnTurn &&
               event.type === "message.completed" &&
@@ -357,9 +561,30 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               lastAssistantMessage = event.data.message;
             }
 
+            // The catch-up window closes either at eve's attach-time tail
+            // index or at our own `turn.started`, whichever comes first. It is
+            // logged, not enforced: the TURN gate below is what actually
+            // suppresses classification, because eve may already have durably
+            // recorded this run's own turn before we attached — a bound-only
+            // rule would swallow our own terminal and hang the run.
+            if (catchUpBound !== null && eventIndex >= catchUpBound) {
+              log?.info("run.catch_up_complete", {
+                fields: { drained: eventIndex - (catchUpBound ?? 0) + 1 },
+              });
+              catchUpBound = null;
+            }
+
+            // LEFTOVER GATE: until this run's own `turn.started` lands, every
+            // event is a previous turn's leftover — persisted (counts stay
+            // aligned) but never classified, or the drained
+            // `turn.completed`/`session.waiting` would instantly mark this run
+            // succeeded. `session.failed` is session-fatal and always counts.
             const terminal =
               sawOwnTurn || event.type === "session.failed"
-                ? classifyTerminal(event, pendingInput)
+                ? classifyTerminal(event, {
+                    pendingInputRequest: pendingInput,
+                    canceledTurn,
+                  })
                 : null;
             if (terminal) {
               await finishRun(
@@ -419,6 +644,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
       if (options?.status === "canceled") canceledByUser = true;
+      // Stop eve's turn for real (0.31), not just our reading of it. Fired
+      // before the abort so the request is issued even though the tail stops
+      // immediately; the trailing `turn.cancelled` → `session.waiting` are
+      // drained by the next tail on this session.
+      requestRemoteCancel(options?.status === "canceled" ? "user cancel" : "shutdown");
       abort.abort();
     },
     detach() {
@@ -466,6 +696,7 @@ export class RunTailerManager {
     runId: string;
     agentSessionId: string;
     openStream: OpenRunStream;
+    cancelRemoteTurn?: CancelRemoteTurn;
   }): RunTailHandle {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;
@@ -497,9 +728,13 @@ export class RunTailerManager {
    * Cancel a specific run's live tail (user abort), marking it `canceled` and
    * awaiting a clean stop. Returns true when a live tail was cancelled; false
    * when the run had no active tail (parked/queued/terminal — the caller marks
-   * the row directly). Best-effort re: eve's turn: eve exposes no session-
-   * cancel HTTP route (see the module header), so the platform stops streaming
-   * and records the cancellation; eve's own turn parks/caps out server-side.
+   * the row directly).
+   *
+   * eve's turn is genuinely cancelled too (0.31 `POST .../cancel`, issued by
+   * the tail before it stops reading) — but COOPERATIVELY, at the next durable
+   * step boundary, and a tool call already in flight still runs to completion.
+   * So "stopped" never means "undone", and the run row is finalized here
+   * without waiting for eve's `turn.cancelled`.
    */
   async cancelRun(runId: string, reason?: string): Promise<boolean> {
     const handle = this.handles.get(runId);

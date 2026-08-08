@@ -63,6 +63,14 @@ import {
 import { createSlackClient } from "./slack-client";
 import { createAppStack, type AppStack } from "../index";
 import { hashIngressToken } from "./tokens";
+import {
+  eveAccepted,
+  eveSessionNotActive,
+  eveStreamHeaders,
+  parseCreateBody,
+  parseFollowUpBody,
+  stampEveEvent,
+} from "../testing/fake-eve";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
@@ -76,7 +84,10 @@ const MASTER_KEY_B64 = generateMasterKeyBase64();
 
 interface FakeSession {
   id: string;
-  continuationToken: string;
+  /** Simulates an eve session that went terminal WITHOUT the platform
+   *  noticing (30-day timeout, reset, task-mode budget breach). Every later
+   *  follow-up answers the permanent 409 `session_not_active`. */
+  dead: boolean;
   events: string[];
   turns: number;
 }
@@ -131,7 +142,7 @@ class FakeWorker {
     const hold = message.includes("HOLD");
     const events: unknown[] = [];
     if (turn === 0) {
-      events.push({ type: "session.started", data: { runtime: { agentId: "fake", eveVersion: "0.19.0", modelId: "fake" } } });
+      events.push({ type: "session.started", data: { runtime: { agentId: "fake", eveVersion: "0.31.3", modelId: "fake" } } });
     }
     events.push(
       { type: "turn.started", data: { sequence: turn, turnId: `t${turn}` } },
@@ -140,10 +151,16 @@ class FakeWorker {
       { type: "turn.completed", data: { sequence: turn, turnId: `t${turn}` } },
     );
     if (!hold) events.push({ type: "session.waiting", data: { wait: "next-user-message" } });
-    for (const event of events) session.events.push(JSON.stringify(event));
+    for (const event of events) {
+      session.events.push(JSON.stringify(stampEveEvent(event as Record<string, unknown>)));
+    }
   }
 
-  private streamResponse(session: FakeSession, startIndex: number): Response {
+  private streamResponse(
+    session: FakeSession,
+    startIndex: number,
+    headers: Record<string, string>,
+  ): Response {
     const encoder = new TextEncoder();
     let index = startIndex;
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -173,7 +190,7 @@ class FakeWorker {
         if (timer) clearInterval(timer);
       },
     });
-    return new Response(stream, { status: 200, headers: { "content-type": "application/x-ndjson" } });
+    return new Response(stream, { status: 200, headers });
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -194,17 +211,19 @@ class FakeWorker {
       if (!(await this.verifyJwt(req, createMatch[1]!))) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
-      const body = (await req.json()) as { message?: string };
+      const parsed = parseCreateBody(await req.json().catch(() => ({})));
+      if (parsed instanceof Response) return parsed;
       const id = `eve-${++this.counter}`;
-      const session: FakeSession = { id, continuationToken: `ct-${id}`, events: [], turns: 0 };
+      const session: FakeSession = { id, dead: false, events: [], turns: 0 };
       this.sessions.set(id, session);
-      const message = String(body.message ?? "");
-      this.sessionMessages.push({ kind: "create", hash: createMatch[1]!, sessionId: id, message });
-      this.pushTurn(session, message);
-      return Response.json(
-        { sessionId: session.id, continuationToken: session.continuationToken },
-        { status: 202 },
-      );
+      this.sessionMessages.push({
+        kind: "create",
+        hash: createMatch[1]!,
+        sessionId: id,
+        message: parsed.message,
+      });
+      this.pushTurn(session, parsed.message);
+      return eveAccepted(session.id);
     }
 
     // eve default channel: continue session (202 async).
@@ -213,16 +232,18 @@ class FakeWorker {
       if (!(await this.verifyJwt(req, continueMatch[1]!))) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
+      const parsed = parseFollowUpBody(await req.json().catch(() => ({})));
+      if (parsed instanceof Response) return parsed;
       const session = this.sessions.get(continueMatch[2]!);
-      if (!session) return new Response("no session", { status: 404 });
-      const body = (await req.json()) as { continuationToken?: string; message?: string };
-      if (body.continuationToken !== session.continuationToken) {
-        return Response.json({ error: "bad continuation token" }, { status: 409 });
-      }
-      const message = String(body.message ?? "");
+      // Unknown OR terminal ⇒ 0.31's permanent 409 `session_not_active`.
+      if (!session || session.dead) return eveSessionNotActive();
+      const message =
+        parsed.kind === "send"
+          ? parsed.message
+          : `resume:${parsed.inputResponses[0]?.requestId ?? ""}`;
       this.sessionMessages.push({ kind: "continue", hash: continueMatch[1]!, sessionId: session.id, message });
       this.pushTurn(session, message);
-      return Response.json({}, { status: 202 });
+      return eveAccepted(session.id);
     }
 
     const streamMatch = path.match(/^\/agents\/([^/]+)\/eve\/v1\/session\/([^/]+)\/stream$/);
@@ -231,8 +252,14 @@ class FakeWorker {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
       const session = this.sessions.get(streamMatch[2]!);
-      if (!session) return new Response("no session", { status: 404 });
-      return this.streamResponse(session, Number(url.searchParams.get("startIndex") ?? "0"));
+      if (!session) {
+        return Response.json({ error: "Session not found.", ok: false }, { status: 404 });
+      }
+      return this.streamResponse(
+        session,
+        Number(url.searchParams.get("startIndex") ?? "0"),
+        eveStreamHeaders(url, session.events.length),
+      );
     }
     return new Response("not found", { status: 404 });
   }
@@ -802,10 +829,14 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const mention = await postSlackEvent({ type: "app_mention", user: "U777", text: "<@U0BOT> hello there", ts: rootTs, channel: "C-slack", team: "T-TEST" });
     expect(mention.status).toBe(200);
 
+    // Poll for the eve id, not just the row: session/run rows land BEFORE the
+    // eve dispatch (the 202-async window), so a row snapshot taken too early
+    // carries eve_session_id NULL and every later assertion against it
+    // silently compares to null.
     const session1 = await until(async () => {
       const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
-      return rows.find((s) => s.origin === "slack") ?? undefined;
-    }, "slack session created");
+      return rows.find((s) => s.origin === "slack" && s.eveSessionId) ?? undefined;
+    }, "slack session created with an eve session id");
 
     // AGENTS-FIRST: the mention became a RENDERED task message on eve's
     // default channel, and NO Slack secret ever entered agent env.
@@ -1023,6 +1054,69 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const closed = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, second.id)))[0]!;
     expect(closed.status).toBe("closed");
     expect(closed.slackThreadKey).toBeNull();
+  });
+
+  test("Slack: an eve session that died WITHOUT the platform noticing (409 session_not_active) evicts the thread claim and the next message recovers", async () => {
+    // The 0.31 failure mode the status-driven eviction above cannot reach.
+    // eve's truth can diverge from agent_sessions.status indefinitely — a
+    // 30-day sessionTimeoutMs emits session.completed into a stream nobody is
+    // tailing, a `reset` retires the id, a task-mode budget breach fails it.
+    // In all three the row stays `active`, findSlackThreadSession happily
+    // returns it, and the continuation 409s. Without an EVE-driven eviction
+    // the thread is bricked forever.
+    const wfId = await createWorkflow("Slack Dead-Eve WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    const rootTs = "1720000800.000800";
+    await postSlackEvent({ type: "app_mention", user: "U9", text: "<@U0BOT> open a thread", ts: rootTs, channel: "C-dead", team: "T-TEST" });
+    const first = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+      return rows.find((s) => s.eveSessionId) ?? undefined;
+    }, "dead-eve session created");
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "dead-eve first run done");
+
+    // Kill it INSIDE eve only. The platform row stays `active` and keeps its
+    // thread key — exactly the divergence 0.31 introduces.
+    worker.sessions.get(first.eveSessionId!)!.dead = true;
+
+    await postSlackEvent({ type: "message", channel: "C-dead", channel_type: "channel", user: "U9", text: "still there?", ts: "1720000810.000810", thread_ts: rootTs, team: "T-TEST" });
+
+    // The continuation fails with the PERMANENT code, and the dispatch evicts
+    // the claim: the row closes and releases its slack_thread_key.
+    const evicted = await until(async () => {
+      const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, first.id));
+      return rows[0]!.status === "closed" ? rows[0] : undefined;
+    }, "dead eve session evicted (row closed)");
+    expect(evicted.slackThreadKey).toBeNull();
+    // The failing run records the typed, permanent error — never the generic
+    // 502 worker_dispatch_failed, which would read as a transient outage.
+    // The eviction (markSession) lands a beat before the run is marked, so
+    // poll rather than read once.
+    const failed = await until(async () => {
+      const rows = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
+      return rows.find((r) => r.status === "failed") ?? undefined;
+    }, "the continuation run failed with the permanent code");
+    expect(failed.error ?? "").toContain("can no longer accept messages");
+
+    // RECOVERY: the NEXT message in the same thread mints a fresh session
+    // under the freed key and runs normally.
+    await postSlackEvent({ type: "app_mention", user: "U9", text: "<@U0BOT> try again", ts: "1720000820.000820", thread_ts: rootTs, channel: "C-dead", team: "T-TEST" });
+    const revived = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+      return rows.find((s) => s.id !== first.id) ?? undefined;
+    }, "fresh session minted after the eve-driven eviction");
+    expect(revived.slackThreadKey).toBe(first.slackThreadKey);
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, revived.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "recovered session run succeeded");
   });
 
   // ── disconnect ─────────────────────────────────────────────────────────────

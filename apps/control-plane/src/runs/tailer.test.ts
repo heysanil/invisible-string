@@ -85,10 +85,15 @@ function memoryStore(): MemoryStore {
     async markDelivery() {
       return true; // delivery settlement is covered in delivery.test.ts
     },
+    async listEventIds(runId) {
+      return store.events
+        .filter((e) => e.runId === runId)
+        .map((e) => e.event.meta?.id)
+        .filter((id): id is string => typeof id === "string");
+    },
     async markSession(_sessionId, status) {
       store.sessionStatus = status;
     },
-    async updateSessionContinuation() {},
   };
   return store;
 }
@@ -238,6 +243,58 @@ describe("classifyTerminal", () => {
 });
 
 // ── tailRun ─────────────────────────────────────────────────────────────────
+
+describe("classifyTerminal — eve 0.31 cancellation", () => {
+  const waiting = {
+    type: "session.waiting",
+    data: { wait: "next-user-message" },
+  } as unknown as EveStreamEvent;
+  const cancelled = {
+    type: "turn.cancelled",
+    data: { sequence: 0, turnId: "t0" },
+  } as unknown as EveStreamEvent;
+
+  test("turn.cancelled is NOT terminal on its own", () => {
+    // eve always follows it with session.waiting. Treating it as terminal
+    // would finish the run and drop that trailing event, desynchronizing the
+    // session's startIndex for the NEXT run.
+    expect(classifyTerminal(cancelled, { pendingInputRequest: false })).toBeNull();
+  });
+
+  test("a latched cancellation makes the following session.waiting `canceled`", () => {
+    expect(
+      classifyTerminal(waiting, { pendingInputRequest: false, canceledTurn: true }),
+    ).toEqual({ runStatus: "canceled", sessionStatus: "active" });
+  });
+
+  test("cancellation outranks a pending approval, and never carries an error", () => {
+    // 0.31 declares a parked input request STALE once its turn is cancelled:
+    // leaving the run `waiting` would park it on an approval eve discarded.
+    const decision = classifyTerminal(waiting, {
+      pendingInputRequest: true,
+      canceledTurn: true,
+    });
+    expect(decision).toEqual({ runStatus: "canceled", sessionStatus: "active" });
+    expect(decision?.error).toBeUndefined();
+  });
+
+  test("without the latch, session.waiting still means succeeded (regression guard)", () => {
+    expect(classifyTerminal(waiting, { pendingInputRequest: false })).toEqual({
+      runStatus: "succeeded",
+      sessionStatus: "active",
+    });
+  });
+
+  test("turn.cancelled and context.cleared clear a pending input request", () => {
+    expect(nextPendingInputRequest(true, cancelled)).toBeFalse();
+    expect(
+      nextPendingInputRequest(true, {
+        type: "context.cleared",
+        data: { sequence: 0, sessionId: "s", turnId: "t0" },
+      } as unknown as EveStreamEvent),
+    ).toBeFalse();
+  });
+});
 
 describe("tailRun", () => {
   test("full turn: persists every event with monotonic seq and marks the run succeeded", async () => {
@@ -544,6 +601,229 @@ describe("tailRun", () => {
 
     expect(store.runStatus).toBe("failed");
     expect(store.runPatches.at(-1)?.error).toBe("operator canceled");
+  });
+});
+
+describe("tailRun — eve 0.31 plumbing", () => {
+  const withId = (event: Record<string, unknown>, id: string): string =>
+    JSON.stringify({ ...event, meta: { at: new Date().toISOString(), id } });
+
+  test("a cancelled turn lands `canceled`, not succeeded — and owes no reply", async () => {
+    // The dangerous default is NOT `failed`: an unhandled turn.cancelled would
+    // fall through to the session.waiting arm and mark the run SUCCEEDED,
+    // settling its Slack delivery obligation and posting a truncated reply.
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"message.received","data":{"message":"hi","sequence":0,"turnId":"t0"}}`,
+      `{"type":"message.appended","data":{"messageDelta":"par","messageSoFar":"par","sequence":0,"stepIndex":0,"turnId":"t0"}}`,
+      `{"type":"turn.cancelled","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const bus = new RunEventBus();
+    const finishes: Array<{ status: string; lastAssistantMessage: string | null }> = [];
+
+    const handle = tailRun({
+      runId: "run-c",
+      agentSessionId: "sess-c",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus,
+      maxWallClockMs: 5_000,
+      onFinish: (info) => finishes.push(info),
+    });
+    await handle.done;
+
+    expect(store.runStatus).toBe("canceled");
+    // The session survives a cancel and takes the next message normally.
+    expect(store.sessionStatus).toBe("active");
+    // Cancellation is a user decision, not an error — no failure text.
+    expect(store.runPatches.at(-1)?.error).toBeNull();
+    expect(finishes[0]?.status).toBe("canceled");
+    // No `message.completed` with finishReason "stop" ⇒ nothing to deliver.
+    expect(finishes[0]?.lastAssistantMessage).toBeNull();
+  });
+
+  test("a cancelled turn parked on an approval does not stay `waiting`", async () => {
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"input.requested","data":{"requests":[{"requestId":"r1","kind":"tool-approval","prompt":"ok?","action":{"callId":"c1","kind":"tool-call","toolName":"rm","input":{}}}],"sequence":0,"stepIndex":0,"turnId":"t0"}}`,
+      `{"type":"turn.cancelled","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-cp",
+      agentSessionId: "sess-cp",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+    });
+    await handle.done;
+    expect(store.runStatus).toBe("canceled");
+  });
+
+  test("meta.id dedupes a reconnect that re-reads an already-persisted window", async () => {
+    // The drop happens AFTER two events; the reconnect deliberately replays
+    // from index 0 (a server that rewinds, or a cursor that undercounted).
+    // Without id dedupe those two land a SECOND time under fresh seqs.
+    const events = [
+      withId({ type: "turn.started", data: { sequence: 0, turnId: "t0" } }, "evt_A"),
+      withId(
+        { type: "message.received", data: { message: "hi", sequence: 0, turnId: "t0" } },
+        "evt_B",
+      ),
+      withId(
+        {
+          type: "message.completed",
+          data: { finishReason: "stop", message: "done", sequence: 0, stepIndex: 0, turnId: "t0" },
+        },
+        "evt_C",
+      ),
+      withId({ type: "session.waiting", data: { wait: "next-user-message" } }, "evt_D"),
+    ];
+    const store = memoryStore();
+    let connects = 0;
+    const handle = tailRun({
+      runId: "run-d",
+      agentSessionId: "sess-d",
+      openStream: async () => {
+        connects += 1;
+        // 1st connect: first two events then a hard end (no terminal → drop).
+        // 2nd connect: the WHOLE stream again from the beginning.
+        return ndjsonResponse(connects === 1 ? events.slice(0, 2) : events);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      reconnectDelayMs: 1,
+    });
+    await handle.done;
+
+    expect(connects).toBe(2);
+    expect(store.runStatus).toBe("succeeded");
+    // Four distinct events persisted exactly once, with contiguous seqs.
+    expect(store.events.map((e) => e.seq)).toEqual([0, 1, 2, 3]);
+    expect(store.events.map((e) => e.event.meta?.id)).toEqual([
+      "evt_A",
+      "evt_B",
+      "evt_C",
+      "evt_D",
+    ]);
+  });
+
+  test("requests includeTailIndex on the FIRST connect only", async () => {
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const seen: Array<boolean | undefined> = [];
+    let connects = 0;
+    const handle = tailRun({
+      runId: "run-t",
+      agentSessionId: "sess-t",
+      openStream: async (_startIndex, _signal, options) => {
+        seen.push(options?.includeTailIndex);
+        connects += 1;
+        // Force one reconnect: the second open must NOT re-pin the bound.
+        return ndjsonResponse(connects === 1 ? [] : lines);
+      },
+      store: memoryStore(),
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      reconnectDelayMs: 1,
+    });
+    await handle.done;
+    expect(seen).toEqual([true, undefined]);
+  });
+
+  test("clamps a cursor that runs ahead of eve's tail index instead of looping to failure", async () => {
+    // Persisted count says 5; eve's durable truth is 2 events (tail index 1).
+    // Sending startIndex=5 makes eve close the stream instantly, which the
+    // loop can only read as a drop — reconnect forever, then a spurious
+    // `failed`. The clamp reopens at eve's truth.
+    const store = memoryStore();
+    for (let seq = 0; seq < 5; seq += 1) {
+      await store.appendEvent("run-x", seq, {
+        type: "step.completed",
+        data: { finishReason: "stop", sequence: 0, stepIndex: seq, turnId: "t0" },
+      } as unknown as EveStreamEvent);
+    }
+    const requested: number[] = [];
+    const handle = tailRun({
+      runId: "run-x",
+      agentSessionId: "sess-x",
+      openStream: async (startIndex, _signal, options) => {
+        requested.push(startIndex);
+        const headers: Record<string, string> = {
+          "content-type": "application/x-ndjson",
+        };
+        if (options?.includeTailIndex) headers["x-eve-stream-tail-index"] = "1";
+        if (startIndex > 2) {
+          return new Response(new ReadableStream({ start: (c) => c.close() }), {
+            status: 200,
+            headers,
+          });
+        }
+        return ndjsonResponse([
+          `{"type":"turn.started","data":{"sequence":0,"turnId":"t9"}}`,
+          `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+        ]);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      reconnectDelayMs: 1,
+    });
+    await handle.done;
+
+    expect(requested[0]).toBe(5);
+    expect(requested[1]).toBe(2); // clamped to tailIndex + 1
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("a user cancel issues eve's REAL remote cancel before stopping the tail", async () => {
+    let remoteCancels = 0;
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-rc",
+      agentSessionId: "sess-rc",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        remoteCancels += 1;
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    handle.cancel("canceled by user", { status: "canceled" });
+    await handle.done;
+
+    expect(remoteCancels).toBe(1);
+    expect(store.runStatus).toBe("canceled");
+  });
+
+  test("the wall-clock cap cancels eve's turn too, and a failing remote cancel never fails the run harder", async () => {
+    let attempted = 0;
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-wc",
+      agentSessionId: "sess-wc",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        attempted += 1;
+        throw new Error("worker unreachable");
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 30,
+    });
+    await handle.done;
+
+    expect(attempted).toBe(1);
+    expect(store.runStatus).toBe("failed");
+    expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
   });
 });
 

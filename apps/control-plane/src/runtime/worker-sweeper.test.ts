@@ -97,7 +97,6 @@ describe.skipIf(!TEST_DATABASE_URL)("worker sweeper failover", () => {
         agentVersionId: versionId,
         workflowId: null,
         eveSessionId: opts.eveSessionId,
-        continuationToken: opts.eveSessionId ? "cont-token" : null,
         origin: "chat",
         principal: { workspaceId: orgId, source: "chat" },
         affinityWorkerId: opts.affinityWorkerId,

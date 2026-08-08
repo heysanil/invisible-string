@@ -52,6 +52,13 @@ import {
   platformJwtAudienceForHash,
 } from "../runtime/jwt";
 import { createAppStack, type AppStack } from "../index";
+import {
+  eveAccepted,
+  eveSessionNotActive,
+  eveStreamHeaders,
+  parseCreateBody,
+  parseFollowUpBody,
+} from "../testing/fake-eve";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
@@ -126,10 +133,13 @@ const stubRegistry: RegistryClient = {
 };
 
 // ── fake eve worker (parks on approval) ─────────────────────────────────────
+//
+// NOTE: this fake deliberately emits events WITHOUT `meta.id`, exercising the
+// tailer's id-less fallback (pre-0.31 history in run_events stays readable
+// forever). The runtime integration fake stamps ids and covers the dedupe path.
 
 interface FakeSession {
   id: string;
-  continuationToken: string;
   events: string[];
   parked: boolean;
 }
@@ -169,7 +179,7 @@ class FakeWorker {
   private startTurn(s: FakeSession, message: string): void {
     const turnId = "turn_0";
     s.events.push(
-      JSON.stringify({ type: "session.started", data: { runtime: { agentId: "f", eveVersion: "0.19.0", modelId: "m" } } }),
+      JSON.stringify({ type: "session.started", data: { runtime: { agentId: "f", eveVersion: "0.31.3", modelId: "m" } } }),
       JSON.stringify({ type: "turn.started", data: { sequence: 0, turnId } }),
       JSON.stringify({ type: "message.received", data: { message, sequence: 0, turnId } }),
     );
@@ -182,6 +192,8 @@ class FakeWorker {
             requests: [
               {
                 requestId: "req-1",
+                // 0.31 makes `kind` REQUIRED on every input request.
+                kind: "tool-approval",
                 prompt: "Approve tool call?",
                 action: { callId: "c1", kind: "tool-call", toolName: "delete_page", input: {} },
                 options: [
@@ -222,7 +234,11 @@ class FakeWorker {
     );
   }
 
-  private stream(s: FakeSession, startIndex: number): Response {
+  private stream(
+    s: FakeSession,
+    startIndex: number,
+    headers: Record<string, string>,
+  ): Response {
     const encoder = new TextEncoder();
     let i = startIndex;
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -253,7 +269,7 @@ class FakeWorker {
         if (timer) clearInterval(timer);
       },
     });
-    return new Response(stream, { status: 200, headers: { "content-type": "application/x-ndjson" } });
+    return new Response(stream, { status: 200, headers });
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -273,31 +289,42 @@ class FakeWorker {
     }
     const sub = m[2]!;
     if (sub === "session" && req.method === "POST") {
-      const body = (await req.json()) as { message: string };
+      const parsed = parseCreateBody(await req.json().catch(() => ({})));
+      if (parsed instanceof Response) return parsed;
       const id = `es-${++this.counter}`;
-      const s: FakeSession = { id, continuationToken: `ct-${id}`, events: [], parked: false };
+      const s: FakeSession = { id, events: [], parked: false };
       this.sessions.set(id, s);
-      this.startTurn(s, body.message);
-      return Response.json({ sessionId: id, continuationToken: s.continuationToken }, { status: 202 });
+      this.startTurn(s, parsed.message);
+      return eveAccepted(id);
     }
     const cont = sub.match(/^session\/([^/]+)$/);
     if (cont && req.method === "POST") {
+      // Enforces the real refusals: continuationToken present, message and
+      // inputResponses together, or neither, are all 400 — so a control-plane
+      // regression cannot sail through this double.
+      const parsed = parseFollowUpBody(await req.json().catch(() => ({})));
+      if (parsed instanceof Response) return parsed;
       const s = this.sessions.get(cont[1]!);
-      if (!s) return new Response("no session", { status: 404 });
-      const body = (await req.json()) as { inputResponses?: unknown[]; message?: string };
-      if (body.inputResponses) {
-        this.inputResponses.push(...body.inputResponses);
+      if (!s) return eveSessionNotActive();
+      if (parsed.kind === "respond") {
+        this.inputResponses.push(...parsed.inputResponses);
         this.resume(s);
-      } else if (body.message) {
-        this.startTurn(s, body.message);
+      } else {
+        this.startTurn(s, parsed.message);
       }
-      return Response.json({}, { status: 202 });
+      return eveAccepted(s.id);
     }
     const str = sub.match(/^session\/([^/]+)\/stream$/);
     if (str && req.method === "GET") {
       const s = this.sessions.get(str[1]!);
-      if (!s) return new Response("no session", { status: 404 });
-      return this.stream(s, Number(url.searchParams.get("startIndex") ?? "0"));
+      if (!s) {
+        return Response.json({ error: "Session not found.", ok: false }, { status: 404 });
+      }
+      return this.stream(
+        s,
+        Number(url.searchParams.get("startIndex") ?? "0"),
+        eveStreamHeaders(url, s.events.length),
+      );
     }
     return new Response("nf", { status: 404 });
   }

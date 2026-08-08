@@ -125,3 +125,119 @@ describe("GET /internal/status metrics block", () => {
     });
   });
 });
+
+// ── agent proxy: eve 0.31 session surface ───────────────────────────────────
+//
+// The proxy is generic (`/eve/` forwards verbatim), so the four control
+// subroutes 0.31 added need no code. These are GUARD tests: a future proxy
+// refactor that drops the query string, buffers the body, strips response
+// headers, or narrows the session-id regex would silently break the bounded
+// catch-up read and the sandbox reaper's idle signal — the same class of
+// failure as "proxies must forward both /eve/ and /.well-known/workflow/".
+
+interface UpstreamCall {
+  path: string;
+  search: string;
+  method: string;
+  contentLength: string | null;
+  body: string;
+}
+
+function startUpstreamAgent(calls: UpstreamCall[]): { port: number; stop: (force?: boolean) => void } {
+  const server = Bun.serve({
+    port: 0,
+    idleTimeout: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      calls.push({
+        path: url.pathname,
+        search: url.search,
+        method: request.method,
+        contentLength: request.headers.get("content-length"),
+        body: await request.text(),
+      });
+      return new Response("upstream-ok", {
+        status: 202,
+        headers: {
+          "x-eve-stream-tail-index": "7",
+          "x-eve-session-id": "wrun_1",
+          "x-accel-buffering": "no",
+        },
+      });
+    },
+  });
+  return { port: server.port!, stop: (force) => server.stop(force) };
+}
+
+describe("agent proxy — eve 0.31 session routes", () => {
+  const HASH = "a".repeat(64);
+
+  function startWithUpstream(upstreamPort: number, seen: string[]): WorkerServer {
+    live = createWorkerServer({
+      config: config(),
+      agents: {
+        get: () => ({ hash: HASH, port: upstreamPort }),
+        beginRequest: () => true,
+        endRequest: () => {},
+        list: () => [],
+        totalInflight: () => 0,
+      } as unknown as AgentManager,
+      cache: fakeCache,
+      ports: fakePorts,
+      callbackToken: "cb-token",
+      isDraining: () => false,
+      requestDrain: () => {},
+      onSessionActivity: (id) => seen.push(id),
+    });
+    return live;
+  }
+
+  test("forwards the four control subroutes with zero-byte bodies and counts them as session activity", async () => {
+    const calls: UpstreamCall[] = [];
+    const upstream = startUpstreamAgent(calls);
+    const seen: string[] = [];
+    const server = startWithUpstream(upstream.port, seen);
+    try {
+      for (const action of ["cancel", "clear", "compact", "reset"]) {
+        const res = await fetch(
+          `${server.url}/agents/${HASH}/eve/v1/session/wrun_1/${action}`,
+          { method: "POST" },
+        );
+        expect(res.status).toBe(202);
+        await res.text();
+      }
+      expect(calls.map((c) => c.path)).toEqual([
+        "/eve/v1/session/wrun_1/cancel",
+        "/eve/v1/session/wrun_1/clear",
+        "/eve/v1/session/wrun_1/compact",
+        "/eve/v1/session/wrun_1/reset",
+      ]);
+      // A body-less POST must survive the hop (eve accepts empty bodies on
+      // all four); nothing may reject it for a missing content-length.
+      expect(calls.every((c) => c.body === "")).toBeTrue();
+      // The sandbox reaper's idle signal keeps working for the new subroutes
+      // (`/^\/eve\/v1\/session\/([^/?]+)/` matches the sub-path too).
+      expect(seen).toEqual(["wrun_1", "wrun_1", "wrun_1", "wrun_1"]);
+    } finally {
+      upstream.stop(true);
+    }
+  });
+
+  test("forwards the stream query string and returns x-eve-stream-tail-index verbatim", async () => {
+    const calls: UpstreamCall[] = [];
+    const upstream = startUpstreamAgent(calls);
+    const server = startWithUpstream(upstream.port, []);
+    try {
+      const res = await fetch(
+        `${server.url}/agents/${HASH}/eve/v1/session/wrun_1/stream?startIndex=3&includeTailIndex=1`,
+      );
+      await res.text();
+      expect(calls[0]!.search).toBe("?startIndex=3&includeTailIndex=1");
+      // The bounded catch-up read is worthless if this header is dropped.
+      expect(res.headers.get("x-eve-stream-tail-index")).toBe("7");
+      expect(res.headers.get("x-accel-buffering")).toBe("no");
+    } finally {
+      upstream.stop(true);
+    }
+  });
+});

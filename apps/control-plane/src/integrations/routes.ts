@@ -763,10 +763,32 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         if (isRuntimeApiError(error) && error.code === "session_busy") {
           // Expected under fan-out (a racing twin/duplicate already owns the
           // thread's turn) — but never drop a Slack message with no trace.
+          // TRANSIENT by construction: the holder finishes and the next
+          // message in the thread goes through.
           logger.warn("dispatch.session_busy", {
             workspaceId: workflow.organizationId,
             workflowId: workflow.id,
             fields: { source: "slack", dropped: true },
+          });
+          continue;
+        }
+        if (isRuntimeApiError(error) && error.code === "session_not_active") {
+          // eve's PERMANENT 409: this thread's eve session is terminal, timed
+          // out, or reset. Deliberately NOT routed through the drop-and-log
+          // branch above — that recovery ("a twin owns the turn; the next
+          // message works") is exactly wrong here and would swallow an
+          // unrecoverable failure forever.
+          //
+          // The dispatch already evicted the claim (the session row is closed,
+          // which releases its slack_thread_key), so THIS message is lost but
+          // the thread is not: the next message finds no holder and mints a
+          // fresh session. Logged at error level because a user-visible
+          // message was dropped.
+          logger.error("dispatch.session_not_active", {
+            workspaceId: workflow.organizationId,
+            workflowId: workflow.id,
+            err: error,
+            fields: { source: "slack", dropped: true, threadClaimReleased: true },
           });
           continue;
         }

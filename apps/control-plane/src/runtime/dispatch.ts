@@ -57,6 +57,7 @@ import {
   countDispatchingRuns,
   ensureAgentOnWorker,
   failDispatch,
+  failEveDispatch,
   requireReadyAgentVersion,
   startTail,
   type ReadyAgentVersion,
@@ -200,6 +201,11 @@ export interface DispatchTriggerInput {
    * (active/waiting) holder blocks: a closed/error holder is evicted — its
    * key is released so the thread can start over (a terminal session can
    * never be continued). Ignored for continuations.
+   *
+   * That eviction is STATUS-driven and therefore only sees rows the platform
+   * already knows are dead. eve 0.31 adds a second case — a row that still
+   * reads `active` while its eve session is gone — which is released by the
+   * 409 `session_not_active` handler in `failEveDispatch` instead.
    */
   newSessionSlackThreadKey?: string;
 }
@@ -245,7 +251,6 @@ export async function dispatchTriggerRun(
     data: input.ingress.data,
   });
 
-  const continuationToken = input.existingSession?.continuationToken ?? undefined;
   const triggerEvent: TriggerEvent = {
     agentId: version.agentId,
     workflowId: input.workflow.id,
@@ -253,7 +258,6 @@ export async function dispatchTriggerRun(
     message: input.ingress.message,
     data: input.ingress.data,
     principal: input.principal,
-    ...(continuationToken ? { continuationToken } : {}),
   };
 
   // Session + run rows land BEFORE the eve dispatch (202-async window: a crash
@@ -335,7 +339,10 @@ export async function dispatchTriggerRun(
           agentVersionId: version.id,
           workflowId: input.workflow.id,
           eveSessionId: null,
-          continuationToken: null,
+          // NOTE: `continuation_token` is a LEGACY column — eve 0.31 sessions
+          // are ID-addressed and the column is never written again (it stays
+          // only because dropping it would need a destructive migration).
+          // Leaving it to its NULL default keeps it from reading as state.
           origin: input.origin,
           principal,
           slackThreadKey: input.newSessionSlackThreadKey ?? null,
@@ -403,7 +410,14 @@ export async function dispatchTriggerRun(
       input.agent,
       input.organizationId,
     );
-    if (isNewSession || !input.existingSession?.eveSessionId || !continuationToken) {
+    // 0.31: a session is continuable iff it HAS an eve session id and this
+    // dispatch is a continuation. The old third term (`!continuationToken`)
+    // must not come back: with the column unwritten it is permanently true, so
+    // every Slack thread reply would silently take the create branch — a brand
+    // new eve session with no history, overwriting `eve_session_id` on a row
+    // that keeps its `slack_thread_key`, while the tail resumes from a
+    // startIndex counted over the OLD session's events. Nothing throws.
+    if (isNewSession || !input.existingSession?.eveSessionId) {
       // New session (or a session eve never acked): the task message opens
       // the eve session (202 async).
       const created = await deps.workerClient.createEveSession(
@@ -417,33 +431,25 @@ export async function dispatchTriggerRun(
         .update(schema.agentSessions)
         .set({
           eveSessionId: created.sessionId,
-          continuationToken: created.continuationToken,
           status: "active",
           affinityWorkerId: worker.id,
         })
         .where(eq(schema.agentSessions.id, session.id));
       session.eveSessionId = created.sessionId;
-      session.continuationToken = created.continuationToken;
     } else {
       // Continuation (Slack thread reply): the task message rides the SAME
       // eve session as a follow-up turn — continuity is native to eve's
-      // session API, no custom channel involved.
+      // session API, no custom channel involved. Addressed by id alone; the
+      // body is exactly `{message}` (send XOR respond, and a stray
+      // `continuationToken` key would be a hard 400).
       eveSessionId = input.existingSession.eveSessionId;
-      const result = await deps.workerClient.continueEveSession(
+      await deps.workerClient.continueEveSession(
         worker.address,
         hash,
         await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
         eveSessionId,
-        { continuationToken, message: taskMessage },
+        { message: taskMessage },
       );
-      if (result.continuationToken) {
-        // eve may rotate the token on follow-ups.
-        await deps.runStore.updateSessionContinuation(
-          session.id,
-          result.continuationToken,
-        );
-        session.continuationToken = result.continuationToken;
-      }
       await db
         .update(schema.agentSessions)
         .set({ status: "active", affinityWorkerId: worker.id })
@@ -451,8 +457,24 @@ export async function dispatchTriggerRun(
     }
   } catch (error) {
     deps.metrics.recordTrigger(input.triggerType, "failed");
-    await failDispatch(deps, run.id, error, isNewSession ? { failSessionId: session.id } : {});
-    throw error; // unreachable — failDispatch always throws
+    // EVE-DRIVEN EVICTION (the 0.31 half of the stuck-claim story) lives in
+    // failEveDispatch: the status-driven eviction in the advisory-locked
+    // insert above only fires for rows the PLATFORM already knows are dead,
+    // and 0.31 lets eve's truth diverge from `agent_sessions.status`
+    // indefinitely (30-day session timeout, `reset`, task-mode budget
+    // breach — the row stays active/waiting in all three). Without an
+    // eve-driven release the continuation 409s forever and the Slack thread is
+    // bricked: exactly the failure the other eviction exists to prevent,
+    // relocated to "only eve knows". The NEXT message mints a fresh session
+    // under the freed key.
+    await failEveDispatch(
+      deps,
+      run.id,
+      session.id,
+      error,
+      isNewSession ? { failSessionId: session.id } : {},
+    );
+    throw error; // unreachable — failEveDispatch always throws
   }
 
   startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
@@ -481,9 +503,19 @@ export function slackThreadKey(
 /**
  * Find the continuable agent_session a Slack thread maps to (same workflow,
  * slack origin, matching the indexed `slack_thread_key` column, not
- * closed/errored, and carrying an eve continuation token). Null when the
- * thread is new. Indexed lookup — O(1) per inbound event, not a scan of the
- * org's slack sessions.
+ * closed/errored, and carrying an eve session id). Null when the thread is
+ * new. Indexed lookup — O(1) per inbound event, not a scan of the org's slack
+ * sessions.
+ *
+ * The predicate is `eve_session_id` + non-terminal status. It deliberately
+ * does NOT consult `continuation_token`: that column stopped being written
+ * with eve 0.31, so requiring it would return null for every thread and every
+ * reply would be treated as a NEW thread against the SAME key — hitting the
+ * live-holder check, throwing `session_busy`, and being silently dropped by
+ * Slack routing. First message works, every follow-up vanishes.
+ *
+ * A row that is live here but dead inside eve is caught one layer down: the
+ * dispatch's 409 `session_not_active` handler evicts the claim.
  */
 export async function findSlackThreadSession(
   db: Db,
@@ -506,7 +538,6 @@ export async function findSlackThreadSession(
   const row = rows[0];
   if (
     row &&
-    row.continuationToken &&
     row.eveSessionId &&
     row.status !== "closed" &&
     row.status !== "error"

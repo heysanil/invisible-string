@@ -3,7 +3,7 @@
  * Interface-first so the tailer unit-tests against an in-memory fake; the
  * drizzle implementation is the production path.
  */
-import { and, asc, count, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
   AgentSessionStatus,
@@ -31,6 +31,18 @@ export interface RunStore {
   appendEvent(runId: string, seq: number, event: EveStreamEvent): Promise<StoredRunEvent>;
   /** Events persisted for THIS run (seq base for a resuming tailer). */
   countRunEvents(runId: string): Promise<number>;
+  /**
+   * Stable eve `meta.id`s already persisted for THIS run — the tailer's
+   * resume-overlap dedupe key (eve 0.31 stamps an `evt_`-prefixed ULID on
+   * every event, identical across reconnects, rewinds and full replays).
+   *
+   * Id-less rows (pre-0.31 history) contribute nothing and are simply absent
+   * from the result; the tailer falls back to index arithmetic for those.
+   * Run-scoped on purpose: this answers "did THIS tail already persist this
+   * event", which is the reconnect-overlap question. Cross-run leftover
+   * drain is a different problem, handled by the turn gate in the tailer.
+   */
+  listEventIds(runId: string): Promise<string[]>;
   /** Events persisted across ALL runs of the session = eve `startIndex`. */
   countSessionEvents(agentSessionId: string): Promise<number>;
   listEventsAfter(runId: string, afterSeq: number): Promise<StoredRunEvent[]>;
@@ -68,13 +80,26 @@ export interface RunStore {
    * it), so keeping the key would permanently block the partial unique index
    * slot — every later message in that thread would 409 `session_busy` and be
    * silently dropped, with no recovery path.
+   *
+   * Under eve 0.31 that status-driven release is NO LONGER SUFFICIENT on its
+   * own: eve's truth can diverge from this column indefinitely (a 30-day
+   * `sessionTimeoutMs` emits `session.completed` into a stream nobody is
+   * tailing; a `reset` retires the id) — in both the row stays
+   * `active`/`waiting`. (A task-mode token-budget breach would be a third,
+   * but the platform never sends eve's session `mode`, so every session is
+   * conversation mode and parks on a `session-limit` input request instead of
+   * failing — see eveSessionModeSchema.) The SECOND release trigger
+   * is therefore eve's 409 `session_not_active` on a dispatch: the caller
+   * marks the session `closed` here, which frees the key (see
+   * runtime/routes.ts `failEveDispatch`).
    */
   markSession(agentSessionId: string, status: AgentSessionStatus): Promise<void>;
-  updateSessionContinuation(
-    agentSessionId: string,
-    continuationToken: string,
-  ): Promise<void>;
 }
+// NOTE: `updateSessionContinuation` is gone with eve 0.31's ID-addressed
+// session API. `agent_sessions.continuation_token` stays in the schema
+// (nullable, plus its partial index) and is simply never written again —
+// dropping it would need a destructive migration, which the additive-migrations
+// rule forbids. Tracked as a residual for a later cleanup pass.
 
 export function createDrizzleRunStore(db: Db): RunStore {
   return {
@@ -93,6 +118,22 @@ export function createDrizzleRunStore(db: Db): RunStore {
         .from(schema.runEvents)
         .where(eq(schema.runEvents.runId, runId));
       return rows[0]?.value ?? 0;
+    },
+
+    async listEventIds(runId) {
+      const rows = await db
+        .select({
+          // jsonb path — no extra column, no migration. NULL for events that
+          // carry no meta.id (pre-0.31 rows).
+          eventId: sql<
+            string | null
+          >`${schema.runEvents.event} -> 'meta' ->> 'id'`,
+        })
+        .from(schema.runEvents)
+        .where(eq(schema.runEvents.runId, runId));
+      return rows
+        .map((row) => row.eventId)
+        .filter((id): id is string => typeof id === "string" && id.length > 0);
     },
 
     async countSessionEvents(agentSessionId) {
@@ -184,13 +225,6 @@ export function createDrizzleRunStore(db: Db): RunStore {
             ? { slackThreadKey: null }
             : {}),
         })
-        .where(eq(schema.agentSessions.id, agentSessionId));
-    },
-
-    async updateSessionContinuation(agentSessionId, continuationToken) {
-      await db
-        .update(schema.agentSessions)
-        .set({ continuationToken })
         .where(eq(schema.agentSessions.id, agentSessionId));
     },
   };

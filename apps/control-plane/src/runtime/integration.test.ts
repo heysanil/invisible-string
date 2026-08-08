@@ -2,9 +2,11 @@
  * Runtime-API integration tests — gated on TEST_DATABASE_URL (skip cleanly
  * when unset; the compose integration stage provides it).
  *
- * Full loop against a FAKE agent/worker (one Bun.serve speaking the eve HTTP
- * contract verified in Phase 0: 202 session create, NDJSON stream with
- * `?startIndex=` resume, continuation-token follow-ups) with a stub compiler
+ * Full loop against a FAKE agent/worker (one Bun.serve speaking the eve 0.31
+ * session API v2: 202 ID-addressed session create, NDJSON stream with
+ * `?startIndex=` resume + the `includeTailIndex` bounded read, and send-XOR-
+ * respond follow-ups that REFUSE the shapes real eve refuses — see
+ * `src/testing/fake-eve.ts`) with a stub compiler
  * and fake build steps injected — agents-first: the AGENT is the compile
  * unit, chat targets agents, workflows dispatch rendered task messages:
  *
@@ -35,13 +37,16 @@ import {
   generateMasterKeyBase64,
   parseMasterKey,
   type AgentDefinitionInput,
+  type ApiErrorBody,
   type CreateSessionResponse,
   type GetAgentResponse,
   type GetSessionResponse,
   type PostMessageResponse,
   type PublishAgentResponse,
+  type ResetSessionResponse,
   type RunEventFrame,
   type RunStatusFrame,
+  type SessionContextControlResponse,
 } from "@invisible-string/shared";
 
 import { createMemoryArtifactStore } from "../artifacts";
@@ -59,6 +64,15 @@ import {
 } from "./jwt";
 import { reconcileInterruptedRuns } from "./reconcile";
 import { createAppStack, type AppStack } from "../index";
+import {
+  eveAccepted,
+  eveSessionNotActive,
+  eveStreamHeaders,
+  parseCreateBody,
+  parseFollowUpBody,
+  rejectContinuationToken,
+  stampEveEvent,
+} from "../testing/fake-eve";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
@@ -72,7 +86,8 @@ const MASTER_KEY_B64 = generateMasterKeyBase64();
 
 interface FakeEveSession {
   id: string;
-  continuationToken: string;
+  /** Set by `reset`: the id survives but refuses every later message. */
+  retired: boolean;
   /** NDJSON lines, appended per turn. */
   events: string[];
   turns: number;
@@ -100,7 +115,10 @@ class FakeWorker {
   readonly sessions = new Map<string, FakeEveSession>();
   readonly ensureCalls: EnsureCall[] = [];
   readonly streamCalls: StreamCall[] = [];
-  readonly continueTokens: string[] = [];
+  /** Every follow-up body the control plane sent, in order. */
+  readonly continueBodies: unknown[] = [];
+  /** Control-route calls: "cancel" | "clear" | "compact" | "reset". */
+  readonly controlCalls: Array<{ sessionId: string; action: string }> = [];
   jwtFailures = 0;
   private server: ReturnType<typeof Bun.serve> | null = null;
   private counter = 0;
@@ -151,7 +169,7 @@ class FakeWorker {
     if (turn === 0) {
       events.push({
         type: "session.started",
-        data: { runtime: { agentId: "fake-agent", eveVersion: "0.19.0", modelId: "fake" } },
+        data: { runtime: { agentId: "fake-agent", eveVersion: STUB_EVE_VERSION, modelId: "fake" } },
       });
     }
     events.push(
@@ -171,11 +189,19 @@ class FakeWorker {
     if (!hold) {
       events.push({ type: "session.waiting", data: { wait: "next-user-message" } });
     }
-    for (const event of events) session.events.push(JSON.stringify(event));
+    // 0.31 stamps a stable `evt_` id on every event before its durable write —
+    // the tailer's dedupe key.
+    for (const event of events) {
+      session.events.push(JSON.stringify(stampEveEvent(event as Record<string, unknown>)));
+    }
     session.receivedMessages.push(message);
   }
 
-  private streamResponse(session: FakeEveSession, startIndex: number): Response {
+  private streamResponse(
+    session: FakeEveSession,
+    startIndex: number,
+    headers: Record<string, string>,
+  ): Response {
     const encoder = new TextEncoder();
     let index = startIndex;
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -207,10 +233,7 @@ class FakeWorker {
         if (timer !== null) clearInterval(timer);
       },
     });
-    return new Response(stream, {
-      status: 200,
-      headers: { "content-type": "application/x-ndjson" },
-    });
+    return new Response(stream, { status: 200, headers });
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -245,44 +268,89 @@ class FakeWorker {
     const sub = proxyMatch[2]!;
 
     if (sub === "session" && req.method === "POST") {
-      const body = (await req.json()) as { message: string };
+      const parsed = parseCreateBody(await req.json().catch(() => ({})));
+      if (parsed instanceof Response) return parsed;
       const id = `eve-sess-${++this.counter}`;
       const session: FakeEveSession = {
         id,
-        continuationToken: `ct-${id}`,
+        retired: false,
         events: [],
         turns: 0,
         receivedMessages: [],
       };
       this.sessions.set(id, session);
-      this.pushTurn(session, body.message);
-      // eve acks asynchronously with 202 (Phase-0 fact).
-      return Response.json(
-        { sessionId: id, continuationToken: session.continuationToken },
-        { status: 202 },
-      );
+      this.pushTurn(session, parsed.message);
+      // eve acks asynchronously with 202 + the x-eve-session-id header.
+      return eveAccepted(id);
     }
 
     const continueMatch = sub.match(/^session\/([^/]+)$/);
     if (continueMatch && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      this.continueBodies.push(body);
+      const parsed = parseFollowUpBody(body);
+      if (parsed instanceof Response) return parsed;
       const session = this.sessions.get(continueMatch[1]!);
-      if (!session) return new Response("no session", { status: 404 });
-      const body = (await req.json()) as { continuationToken: string; message?: string };
-      this.continueTokens.push(body.continuationToken);
-      if (body.continuationToken !== session.continuationToken) {
-        return Response.json({ error: "bad continuation token" }, { status: 409 });
+      // Unknown OR retired ⇒ the same permanent 409 — 0.31 renders both as
+      // `session_not_active`.
+      if (!session || session.retired) return eveSessionNotActive();
+      if (parsed.kind === "send") this.pushTurn(session, parsed.message);
+      else this.pushTurn(session, `resume:${parsed.inputResponses[0]?.requestId ?? ""}`);
+      return eveAccepted(session.id);
+    }
+
+    const controlMatch = sub.match(/^session\/([^/]+)\/(cancel|clear|compact|reset)$/);
+    if (controlMatch && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const rejected = rejectContinuationToken(body);
+      if (rejected) return rejected;
+      const id = controlMatch[1]!;
+      const action = controlMatch[2]!;
+      this.controlCalls.push({ sessionId: id, action });
+      const session = this.sessions.get(id);
+      if (!session || session.retired) {
+        // eve renders ONE dead-session condition under three names.
+        return Response.json(
+          {
+            ok: true,
+            status: action === "cancel" ? "no_active_turn" : "no_active_session",
+          },
+          { status: 200 },
+        );
       }
-      if (body.message) this.pushTurn(session, body.message);
-      return Response.json({}, { status: 202 });
+      if (action === "reset") {
+        session.retired = true;
+        // Reset is the ONE control route that never answers 202, and its id
+        // field is `previousSessionId`.
+        return Response.json(
+          { ok: true, previousSessionId: id, status: "reset" },
+          { status: 200 },
+        );
+      }
+      if (action === "clear") {
+        session.events.push(
+          JSON.stringify(
+            stampEveEvent({
+              type: "context.cleared",
+              data: { sequence: session.turns, sessionId: id, turnId: `turn_${session.turns}` },
+            }),
+          ),
+        );
+      }
+      return Response.json({ ok: true, sessionId: id, status: "accepted" }, { status: 202 });
     }
 
     const streamMatch = sub.match(/^session\/([^/]+)\/stream$/);
     if (streamMatch && req.method === "GET") {
       const session = this.sessions.get(streamMatch[1]!);
-      if (!session) return new Response("no session", { status: 404 });
+      if (!session) return Response.json({ error: "Session not found.", ok: false }, { status: 404 });
       const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
       this.streamCalls.push({ sessionId: session.id, startIndex });
-      return this.streamResponse(session, startIndex);
+      return this.streamResponse(
+        session,
+        startIndex,
+        eveStreamHeaders(url, session.events.length),
+      );
     }
 
     return new Response("not found", { status: 404 });
@@ -291,7 +359,7 @@ class FakeWorker {
 
 // ── stub compiler + fake build steps ────────────────────────────────────────
 
-const STUB_EVE_VERSION = "0.19.0";
+const STUB_EVE_VERSION = "0.31.3";
 
 const stubCompile: CompileAgentFn = (request) => {
   if (request.definition.persona.trim() === "") {
@@ -835,8 +903,10 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       return rows[0]?.status === "succeeded" || undefined;
     }, "follow-up run to succeed");
 
-    // Continuation token round-tripped; second turn tailed from startIndex 8.
-    expect(fixture.continueTokens).toEqual(["ct-eve-sess-1"]);
+    // ID-addressed follow-up: the body is EXACTLY the "send" form. A stray
+    // `continuationToken` key (or `inputResponses` alongside `message`) would
+    // have been a 400 at the fake, mirroring real eve.
+    expect(fixture.continueBodies).toEqual([{ message: "follow-up question" }]);
     const session = fixture.sessions.get("eve-sess-1")!;
     expect(session.receivedMessages).toEqual(["hello agent", "follow-up question"]);
     expect(fixture.streamCalls.at(-1)).toEqual({ sessionId: "eve-sess-1", startIndex: 8 });
@@ -1019,6 +1089,183 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(anon.status).toBe(401);
   });
 
+  // ── eve 0.31 context controls (clear / compact / reset) ─────────────────
+
+  describe("session context controls", () => {
+    let controlSessionId: string;
+    let controlEveSessionId: string;
+
+    async function newQuietSession(): Promise<{ id: string; eveSessionId: string }> {
+      await freshWorkerHeartbeat();
+      const res = await api(
+        "POST",
+        `/workspaces/${orgId}/agents/${agentId}/sessions`,
+        { cookie: ownerCookie, body: { message: "context control seed" } },
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as CreateSessionResponse;
+      // Controls refuse a BUSY session, so wait for the seed run to settle.
+      await until(async () => {
+        const rows = await db
+          .select({ status: schema.runs.status })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, body.run.id));
+        return rows[0]?.status === "succeeded" || undefined;
+      }, "seed run to succeed");
+      return { id: body.session.id, eveSessionId: body.session.eveSessionId! };
+    }
+
+    test("clear and compact forward to eve and leave the session usable", async () => {
+      const session = await newQuietSession();
+      controlSessionId = session.id;
+      controlEveSessionId = session.eveSessionId;
+
+      for (const action of ["clear", "compact"] as const) {
+        const res = await api("POST", `/sessions/${controlSessionId}/${action}`, {
+          cookie: ownerCookie,
+        });
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as SessionContextControlResponse;
+        // Success is keyed on eve's `status`, not the HTTP code.
+        expect(body.status).toBe("accepted");
+        expect(body.session.status).toBe("active");
+      }
+      expect(
+        fixture.controlCalls.filter((c) => c.sessionId === controlEveSessionId),
+      ).toEqual([
+        { sessionId: controlEveSessionId, action: "clear" },
+        { sessionId: controlEveSessionId, action: "compact" },
+      ]);
+
+      // The session id is unchanged and still accepts messages.
+      await freshWorkerHeartbeat();
+      const follow = await api("POST", `/sessions/${controlSessionId}/messages`, {
+        cookie: ownerCookie,
+        body: { message: "after clear" },
+      });
+      expect(follow.status).toBe(201);
+    });
+
+    test("reset retires the eve session, closes the row, and mints a replacement that still works", async () => {
+      const session = await newQuietSession();
+
+      const res = await api("POST", `/sessions/${session.id}/reset`, {
+        cookie: ownerCookie,
+        body: { reason: "starting over" },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ResetSessionResponse;
+      expect(body.status).toBe("reset");
+      if (body.status !== "reset") throw new Error("unreachable");
+      expect(body.previousSession.id).toBe(session.id);
+      expect(body.previousSession.status).toBe("closed");
+      // The replacement pins the SAME agent version — a reset must not
+      // silently migrate the thread onto a newer publish.
+      expect(body.session.id).not.toBe(session.id);
+      expect(body.session.agentVersionId).toBe(body.previousSession.agentVersionId);
+      // It starts with NO eve session: the retired id can never be reused.
+      expect(body.session.eveSessionId).toBeNull();
+
+      // The retired eve id now answers eve's permanent 409 — a message to the
+      // OLD row must surface `session_not_continuable`, never a 502.
+      const oldRow = await api("POST", `/sessions/${session.id}/messages`, {
+        cookie: ownerCookie,
+        body: { message: "zombie" },
+      });
+      expect(oldRow.status).toBe(409);
+      expect(((await oldRow.json()) as ApiErrorBody).error.code).toBe(
+        "session_not_continuable",
+      );
+
+      // The REPLACEMENT row opens a fresh eve session on its first message.
+      await freshWorkerHeartbeat();
+      const revived = await api("POST", `/sessions/${body.session.id}/messages`, {
+        cookie: ownerCookie,
+        body: { message: "fresh start" },
+      });
+      expect(revived.status).toBe(201);
+      const rows = await db
+        .select({ eveSessionId: schema.agentSessions.eveSessionId })
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, body.session.id));
+      expect(rows[0]!.eveSessionId).not.toBeNull();
+      expect(rows[0]!.eveSessionId).not.toBe(session.eveSessionId);
+    });
+
+    test("authz: an outsider cannot clear, compact, or reset another workspace's session", async () => {
+      // A cancel/clear/reset route that leaks across workspaces is a security
+      // bug, not a UX one — assert every verb, not just one.
+      const stranger = await signUpWithOrg("Control Stranger");
+      const before = fixture.controlCalls.length;
+      for (const action of ["clear", "compact", "reset"] as const) {
+        const res = await api("POST", `/sessions/${controlSessionId}/${action}`, {
+          cookie: stranger.cookie,
+        });
+        // Existence-hiding: a foreign row is 404, never 403-with-detail.
+        expect(res.status).toBe(404);
+        await res.text();
+        // Anonymous callers never get past auth either.
+        const anon = await api("POST", `/sessions/${controlSessionId}/${action}`);
+        expect(anon.status).toBe(401);
+        await anon.text();
+      }
+      // Nothing reached the agent plane.
+      expect(fixture.controlCalls.length).toBe(before);
+    });
+
+    test("authz: a plain MEMBER of the owning workspace may drive every control", async () => {
+      // Deliberately member-level: these mutate only the conversation the
+      // member is already allowed to drive. Raising them to admin would block
+      // a member from resetting their own chat.
+      const session = await newQuietSession();
+      const member = await signUpWithOrg("Control Member");
+      await db.insert(schema.member).values({
+        id: `mem-${randomUUID()}`,
+        organizationId: orgId,
+        userId: member.userId,
+        role: "member",
+        createdAt: new Date(),
+      });
+      await stack.auth.api.setActiveOrganization({
+        body: { organizationId: orgId },
+        headers: new Headers({ cookie: member.cookie }),
+      });
+
+      const clear = await api("POST", `/sessions/${session.id}/clear`, {
+        cookie: member.cookie,
+      });
+      expect(clear.status).toBe(200);
+      const reset = await api("POST", `/sessions/${session.id}/reset`, {
+        cookie: member.cookie,
+      });
+      expect(reset.status).toBe(200);
+    });
+
+    test("a BUSY session refuses context controls with the transient session_busy code", async () => {
+      // Clearing mid-turn would race the running turn and land
+      // context.cleared inside another run's log; resetting mid-turn would
+      // retire the very id the live tail is reading.
+      await freshWorkerHeartbeat();
+      const held = await api(
+        "POST",
+        `/workspaces/${orgId}/agents/${agentId}/sessions`,
+        { cookie: ownerCookie, body: { message: "HOLD for controls" } },
+      );
+      expect(held.status).toBe(201);
+      const heldBody = (await held.json()) as CreateSessionResponse;
+      try {
+        const res = await api("POST", `/sessions/${heldBody.session.id}/clear`, {
+          cookie: ownerCookie,
+        });
+        expect(res.status).toBe(409);
+        // Transient — NOT eve's permanent session_not_active.
+        expect(((await res.json()) as ApiErrorBody).error.code).toBe("session_busy");
+      } finally {
+        await api("POST", `/runs/${heldBody.run.id}/cancel`, { cookie: ownerCookie });
+      }
+    });
+  });
+
   // ── caps ────────────────────────────────────────────────────────────────
 
   test("per-workspace concurrent-run cap returns 429 (sessions AND messages)", async () => {
@@ -1161,7 +1408,6 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
           agentVersionId: versionId,
           workflowId: null,
           eveSessionId,
-          continuationToken: eveSessionId ? `ct-${eveSessionId}` : null,
           origin: "chat",
           principal: { workspaceId: orgId, source: "chat" },
           affinityWorkerId: affinity,

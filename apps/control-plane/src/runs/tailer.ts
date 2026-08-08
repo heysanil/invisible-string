@@ -268,7 +268,21 @@ export type OpenRunStream = (
  * Fire-and-forget: it is cooperative and its response never proves a turn was
  * stopped, so the tail neither awaits its effect nor fails on its error.
  */
-export type CancelRemoteTurn = () => Promise<void>;
+export type CancelRemoteTurn = (options?: {
+  /**
+   * The turn this tail actually observed (`turn.started.data.turnId`), used as
+   * eve's stale-request guard.
+   *
+   * REQUIRED for correctness, not merely nice: the cancel is fire-and-forget
+   * and the run is finalized without awaiting it, so the request can still be
+   * in flight after the turn ends. Finalizing frees the session's one run
+   * slot, so a follow-up message can legitimately start a NEW turn in that
+   * window — and an unguarded cancel arriving then would stop the user's new
+   * turn instead of the one they asked to stop. With the guard, a late
+   * request is a no-op.
+   */
+  turnId?: string;
+}) => Promise<void>;
 
 export interface TailRunOptions {
   runId: string;
@@ -335,6 +349,14 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const tailStartedAt = Date.now();
   const abort = new AbortController();
   let cancelReason: string | null = null;
+  /**
+   * `turn.started.data.turnId` for the turn THIS tail is following, kept at
+   * function scope so it survives reconnects (the per-connection flags below
+   * are rebuilt on each attach). Null until the turn boundary is seen — a
+   * cancel fired before then is correctly unguarded, since there is no
+   * observed turn it could be confused with.
+   */
+  let observedTurnId: string | null = null;
   // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
   // unless a user cancel flipped this flag, which marks it "canceled".
   let canceledByUser = false;
@@ -394,14 +416,20 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    */
   const requestRemoteCancel = (why: string): void => {
     if (!cancelRemoteTurn) return;
-    void cancelRemoteTurn().catch((error: unknown) => {
-      log?.warn("run.remote_cancel_failed", {
-        fields: {
-          why,
-          reason: error instanceof Error ? error.message : String(error),
-        },
-      });
-    });
+    // Scope it to the turn we actually observed. Read at CALL time, not
+    // capture time, so a cancel fired after the turn boundary carries the id.
+    const turnId = observedTurnId;
+    void cancelRemoteTurn(turnId === null ? undefined : { turnId }).catch(
+      (error: unknown) => {
+        log?.warn("run.remote_cancel_failed", {
+          fields: {
+            why,
+            turnId,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        });
+      },
+    );
   };
 
   const wallClockTimer = setTimeout(() => {
@@ -545,6 +573,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               pendingInput = false;
               canceledTurn = false;
               catchUpBound = null;
+              // Remember which turn we are following so a late remote cancel
+              // cannot land on a later one (see CancelRemoteTurn).
+              observedTurnId = event.data.turnId;
             }
             pendingInput = nextPendingInputRequest(pendingInput, event);
             if (sawOwnTurn && event.type === "turn.cancelled") {

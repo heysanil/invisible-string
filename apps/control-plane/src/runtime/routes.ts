@@ -350,12 +350,17 @@ export function startTail(
     // Real remote cancellation (eve 0.31): the tailer calls this before it
     // stops reading so the agent's turn actually ends instead of burning
     // tokens against a stream nobody is consuming.
-    cancelRemoteTurn: async () => {
+    cancelRemoteTurn: async (options) => {
       await deps.workerClient.cancelEveTurn(
         workerAddress,
         contentHash,
         await mintPlatformJwt(secret, { audience, claims: { runId } }),
         eveSessionId,
+        // Forward the tail's observed turn id as eve's stale-request guard.
+        // Without it a late cancel can stop a follow-up turn instead of the
+        // one the user stopped — the run is finalized without awaiting this
+        // request, which frees the session's run slot immediately.
+        options?.turnId === undefined ? undefined : { turnId: options.turnId },
       );
     },
   });

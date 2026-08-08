@@ -804,6 +804,61 @@ describe("tailRun — eve 0.31 plumbing", () => {
     expect(store.runStatus).toBe("canceled");
   });
 
+  test("the remote cancel is scoped to the OBSERVED turn id (stale-request guard)", async () => {
+    // Regression: the cancel is fire-and-forget and the run is finalized
+    // without awaiting it, which frees the session's one run slot — so a
+    // follow-up message can start a NEW turn while the request is still in
+    // flight. Unguarded, that late cancel would stop the user's new turn.
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-guard",
+      agentSessionId: "sess-guard",
+      openStream: async (_i, signal) =>
+        ndjsonResponse(
+          [`{"type":"turn.started","data":{"sequence":0,"turnId":"turn_7"}}`],
+          { stayOpen: true, signal },
+        ),
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    // Cancel only once the turn boundary has actually been consumed.
+    while (!store.events.some((e) => e.event.type === "turn.started")) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    handle.cancel("canceled by user", { status: "canceled" });
+    await handle.done;
+
+    expect(seen).toEqual([{ turnId: "turn_7" }]);
+    expect(store.runStatus).toBe("canceled");
+  });
+
+  test("a remote cancel BEFORE any turn.started carries no turn id", async () => {
+    // Nothing to be confused with yet, so the guard must be omitted rather
+    // than sent as a bogus value — eve rejects bodies by key presence.
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-noturn",
+      agentSessionId: "sess-noturn",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    handle.cancel("canceled by user", { status: "canceled" });
+    await handle.done;
+
+    expect(seen).toEqual([undefined]);
+  });
+
   test("the wall-clock cap cancels eve's turn too, and a failing remote cancel never fails the run harder", async () => {
     let attempted = 0;
     const store = memoryStore();

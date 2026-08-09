@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @import "@invisible-string/design-tokens/tokens.css";
 
+/* Tailwind must scan streamdown's dist or none of its utilities are emitted —
+   including the caret's arbitrary variant. Failure is silent. */
+@source "../node_modules/streamdown/dist/*.js";
+
 @theme {
   --font-sans:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
@@ -25,4 +29,26 @@
   --radius-card: var(--radius-card);
   --radius-card-lg: var(--radius-card-lg);
   --radius-capsule: var(--radius-capsule);
+
+  /* Streamdown's markup is written against shadcn semantic tokens. Alias them
+     onto the E1 ink scale so it inherits the design system instead of
+     resolving to undefined custom properties. Nothing in this repo references
+     these by name — do NOT delete them as "unused". */
+  --color-foreground: var(--ink);
+  --color-muted-foreground: var(--ink-3);
+  --color-background: var(--surface-solid);
+  --color-muted: var(--chip);
+  --color-border: var(--hairline);
+  --color-primary: var(--ink);
+  --color-primary-foreground: #ffffff;
+}
+
+/* Streamdown's caret is a static `content:` glyph. E1 signals streaming with
+   a blinking ink caret (see .stream-caret in the design tokens, still used by
+   apps/site) — take streamdown's inline placement, restore our motion.
+   `caret-blink` is defined in @invisible-string/design-tokens/tokens.css. */
+@media (prefers-reduced-motion: no-preference) {
+  [style*="--streamdown-caret"] > *:last-child::after {
+    animation: caret-blink 1s steps(1) infinite;
+  }
 }

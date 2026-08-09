@@ -5,12 +5,15 @@
  * grammar; the output is a prompt read by a model, so anything markdown can
  * express is fair game.
  *
- * `chat` — the chat and copilot composers. Deliberately CAPPED to what the
- * in-house renderer (lib/chat/markdown.ts) can display: paragraphs, h1–h4,
- * fenced code, flat lists, blockquote, hr, and inline code/strong/em/link.
- * Anything the composer can emit but the renderer cannot parse would echo
- * back to the author as literal syntax, so the two must not drift —
- * __tests__/editor-markdown.test.ts asserts exactly that.
+ * `chat` — the chat and copilot composers. Same grammar, no `@reference`
+ * chips: a chat message is addressed to the agent, not compiled against a
+ * draft's trigger fields and attached context.
+ *
+ * The composer used to be capped to a subset because the in-house renderer
+ * could only display paragraphs, flat lists, fenced code and a few inline
+ * marks — anything beyond that echoed back to the author as literal syntax.
+ * Streamdown (see components/chat/Markdown.tsx) parses full GFM, so the cap
+ * is gone and the two tiers differ only in references.
  */
 import StarterKit from "@tiptap/starter-kit";
 import type { Extensions } from "@tiptap/core";
@@ -32,15 +35,7 @@ export function documentExtensions(): Extensions {
 }
 
 export function chatExtensions(): Extensions {
-  return [
-    StarterKit.configure({
-      link: LINK,
-      // Not renderable by lib/chat/markdown.ts — see the file header.
-      strike: false,
-    }),
-    promptMarkdown,
-    faithfulMarkdown,
-  ] as Extensions;
+  return [StarterKit.configure({ link: LINK }), promptMarkdown, faithfulMarkdown] as Extensions;
 }
 
 /**

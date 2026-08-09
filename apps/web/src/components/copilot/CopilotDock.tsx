@@ -410,11 +410,12 @@ export function CopilotDock(props: CopilotDockProps) {
                     />
                   </div>
                 ) : (
-                  <div
-                    key={item.id}
-                    className={cn("mr-2", item.streaming && "stream-caret")}
-                  >
-                    <Markdown text={item.text} className="text-[13px]" />
+                  <div key={item.id} className="mr-2">
+                    <Markdown
+                      text={item.text}
+                      className="text-[13px]"
+                      streaming={item.streaming}
+                    />
                   </div>
                 );
               })}

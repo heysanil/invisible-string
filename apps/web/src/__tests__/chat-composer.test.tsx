@@ -15,7 +15,7 @@ import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
 import { act } from "react";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { Composer } from "../components/chat/Composer";
 import { RunMessage } from "../components/chat/RunMessage";
@@ -28,10 +28,10 @@ afterEach(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 });
 
-test("Enter sends what is in the box right now, not the debounced value", () => {
+test("Enter sends what is in the box right now, not the debounced value", async () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message");
+  const box = await view.findByLabelText("Message");
 
   paste(box, "ship the release notes");
   fireEvent.keyDown(box, { key: "Enter" });
@@ -41,10 +41,10 @@ test("Enter sends what is in the box right now, not the debounced value", () => 
   expect(box.textContent).toBe("");
 });
 
-test("the composer speaks markdown — the message is sent as typed", () => {
+test("the composer speaks markdown — the message is sent as typed", async () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message");
+  const box = await view.findByLabelText("Message");
 
   paste(box, "make it **bold** and `terse`");
   fireEvent.keyDown(box, { key: "Enter" });
@@ -52,10 +52,10 @@ test("the composer speaks markdown — the message is sent as typed", () => {
   expect(onSend.mock.calls[0]).toEqual(["make it **bold** and `terse`"]);
 });
 
-test("Shift+Enter is a newline, not a send", () => {
+test("Shift+Enter is a newline, not a send", async () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message");
+  const box = await view.findByLabelText("Message");
 
   paste(box, "first line");
   fireEvent.keyDown(box, { key: "Enter", shiftKey: true });
@@ -68,10 +68,10 @@ test("Shift+Enter is a newline, not a send", () => {
   expect(onSend.mock.calls[0]?.[0]).toBe("first line  \nsecond line");
 });
 
-test("Enter mid-IME-composition commits the candidate instead of sending", () => {
+test("Enter mid-IME-composition commits the candidate instead of sending", async () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message");
+  const box = await view.findByLabelText("Message");
 
   paste(box, "こんにち");
   fireEvent.keyDown(box, { key: "Enter", isComposing: true });
@@ -116,10 +116,10 @@ test("a disabled composer states the reason and refuses input", () => {
   expect(onSend).not.toHaveBeenCalled();
 });
 
-test("a failed send hands the draft back through initialValue", () => {
+test("a failed send hands the draft back through initialValue", async () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message");
+  const box = await view.findByLabelText("Message");
 
   paste(box, "retry me");
   fireEvent.keyDown(box, { key: "Enter" });
@@ -150,7 +150,7 @@ function chatRun(userMessage: string): RunView {
   };
 }
 
-test("the user's own bubble renders markdown rather than echoing syntax", () => {
+test("the user's own bubble renders markdown rather than echoing syntax", async () => {
   const view = render(
     <RunMessage
       run={chatRun("make it **bold** and `terse`")}
@@ -158,10 +158,16 @@ test("the user's own bubble renders markdown rather than echoing syntax", () => 
       onRespond={() => {}}
     />,
   );
-  expect(view.container.querySelector("strong")?.textContent).toBe("bold");
-  expect(view.container.querySelector("code")?.textContent).toBe("terse");
+  // Assert the OUTCOME, not the tag: Streamdown renders emphasis as a styled
+  // span rather than <strong>, and pinning the markup to one renderer is what
+  // made this test break when the renderer was swapped underneath it.
+  // Streamdown also suspends while Shiki loads, so nothing is in the DOM yet.
+  await waitFor(() =>
+    expect(view.container.textContent).toContain("make it bold and terse"),
+  );
   // No literal asterisks or backticks left over for the author to read.
   expect(view.container.textContent).not.toContain("**");
+  expect(view.container.textContent).not.toContain("`");
   // The ink bubble flips the renderer's tokens rather than forking its styles.
   expect(view.container.querySelector(".md-on-ink")).not.toBeNull();
 });

@@ -107,6 +107,8 @@ Editor chrome lives in `packages/design-tokens/tokens.css` as a `.tt-*` block re
 
 ## 8. Testing
 
-Tiptap runs headlessly under happy-dom in `bun test` — unlike CodeMirror, which the repo excludes from DOM tests as flaky — so the corpus constructs real `Editor` instances. Pure logic (markdown bridge, reference hydration and serialization, profile caps) is tested directly; the composer↔renderer contract is asserted by a test proving the chat profile cannot emit markdown that `lib/chat/markdown.ts` fails to parse.
+Tiptap runs headlessly under happy-dom in `bun test` — unlike CodeMirror, which the repo excludes from DOM tests as flaky — so the corpus constructs real `Editor` instances. Pure logic (markdown bridge, reference hydration and serialization) is tested directly.
+
+**Merged with the Streamdown renderer (#10).** That change deleted the in-house `lib/chat/markdown.ts` parser, which this design had originally capped the chat profile against — Streamdown parses full GFM, so the cap is gone and the two profiles now differ only in `@reference` chips. Two consequences for tests: Streamdown suspends while Shiki loads, so anything asserting on rendered markdown must `await`; and it renders emphasis as a styled `span` rather than `<strong>`, so assertions state the outcome (the author never sees raw `**`) instead of pinning a tag. The author's own bubble still renders through the same component, inverted for the ink surface by `.md-on-ink` redefining the ink scale for the subtree — which works unchanged against Streamdown because it colors with the same token-backed utilities.
 
 E2E drives the editors by `getByRole("textbox", { name })`, so `editorProps.attributes` sets `aria-label`, `aria-multiline` and `role` explicitly on the ProseMirror element; the accessible names `"Persona"`, `"Instructions editor"` and `"Skill instructions (markdown)"` are preserved exactly.

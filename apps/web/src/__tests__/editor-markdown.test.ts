@@ -16,7 +16,6 @@ import { expect, test } from "bun:test";
 import { Editor } from "@tiptap/core";
 
 import { chatExtensions, documentExtensions } from "../lib/editor/profiles";
-import { parseMarkdown } from "../lib/chat/markdown";
 
 ensureDomForThisFile();
 
@@ -105,13 +104,15 @@ test("an empty document serializes to an empty string", () => {
   expect(roundTrip(documentEditor(), "")).toBe("");
 });
 
-test("the chat profile cannot emit markdown the chat renderer fails to parse", () => {
-  // Guards the composer↔renderer contract: every block the chat editor can
-  // produce must come back out of lib/chat/markdown.ts as something other
-  // than a bare paragraph of literal syntax.
+test("the chat profile round-trips everything it can emit", () => {
+  // This used to assert parity against the in-house chat parser, which only
+  // understood a subset of markdown. Streamdown parses full GFM, so the
+  // remaining contract is the one that still matters everywhere: what the
+  // composer serializes is byte-identical to what the author wrote.
   const editor = new Editor({ extensions: chatExtensions(), content: "" });
   const samples = [
     "**bold** and *italic*",
+    "~~struck~~",
     "- one\n- two",
     "1. one\n2. two",
     "> quote",
@@ -119,11 +120,9 @@ test("the chat profile cannot emit markdown the chat renderer fails to parse", (
     "## Heading",
     "`inline code`",
     "[docs](https://example.com)",
+    "Mail support@acme.com about {{ticket_id}}.",
   ];
   for (const sample of samples) {
-    const out = roundTrip(editor, sample);
-    expect(out).toBe(sample);
-    // The renderer must produce at least one non-paragraph-of-literal-text block.
-    expect(parseMarkdown(out).length).toBeGreaterThan(0);
+    expect(roundTrip(editor, sample)).toBe(sample);
   }
 });

@@ -776,24 +776,14 @@
     content: none;
   }
 
-  /* --- Rendered markdown (agent replies + the author's own bubble) --------- */
-  /* components/chat/Markdown.tsx draws every color from a token: the ink
-     scale for text, these two locals for rules and code surfaces. Keeping the
-     tints in tokens (rather than literal black/x utilities in the component)
-     is what lets the SAME renderer sit on white and on ink. */
-  .md-prose {
-    --md-rule: rgba(0, 0, 0, 0.08);
-    --md-surface: rgba(0, 0, 0, 0.035);
-    /* Heavier than --md-rule on purpose: a quote bar is the block's only
-       marker, where the others are dividers under their own content. */
-    --md-quote: rgba(0, 0, 0, 0.15);
-  }
-
-  /* The author's own message sits on --ink. Redefining the scale for the
-     subtree inverts the whole tree at once — headings, quotes, list markers,
-     inline-code chips, the code-block frame and its copy button all follow,
-     with no second copy of the prose styles anywhere. It rides on the SAME
-     element as .md-prose, so it must stay declared after it. */
+  /* --- Rendered markdown on an ink surface --------------------------------- */
+  /* The author's own message bubble sits on --ink, and the Streamdown
+     renderer (components/chat/Markdown.tsx) colors everything with the
+     token-backed utilities — text-ink, text-ink-2, .mono-chip, border-hairline.
+     Redefining the scale for the subtree therefore inverts the whole tree at
+     once — headings, quotes, list markers, inline-code chips, the code-block
+     frame and its copy button all follow — with no second copy of the prose
+     styles and no per-element overrides in the component. */
   .md-on-ink {
     --ink: #ffffff;
     --ink-2: rgba(255, 255, 255, 0.82);
@@ -801,9 +791,6 @@
     --ink-4: rgba(255, 255, 255, 0.5);
     --chip: rgba(255, 255, 255, 0.16);
     --hairline: rgba(255, 255, 255, 0.2);
-    --md-rule: rgba(255, 255, 255, 0.22);
-    --md-surface: rgba(255, 255, 255, 0.1);
-    --md-quote: rgba(255, 255, 255, 0.38);
   }
 
   /* The lazy-boundary placeholder line. Matches the editor's own first-line

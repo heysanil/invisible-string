@@ -484,17 +484,21 @@ export function reduceRunView(
       // last-write-wins per callId, never terminal for the step.
       case "action.partial": {
         const { result } = event.data;
-        const step = toolItemFor(result.callId);
+        const existing = toolItemFor(result.callId);
         // Never walk a settled step backwards. eve emits partials before the
         // result, but a durable step RETRY re-emits the whole sequence, so a
         // partial can legitimately arrive after this call already resolved.
-        if (step !== undefined && step.state !== "pending" && step.state !== "awaiting") {
+        if (
+          existing !== undefined &&
+          existing.state !== "pending" &&
+          existing.state !== "awaiting"
+        ) {
           break;
         }
         upsertTool(
           result.callId,
           result.toolName,
-          step?.state ?? "pending",
+          existing?.state ?? "pending",
           previewValue(result.output),
           frame.at,
         );

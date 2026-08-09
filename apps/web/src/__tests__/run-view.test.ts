@@ -209,6 +209,95 @@ test("a bare message.completed with no prior append still creates a speech segme
   expect((view.segments[0] as SpeechSegment).text).toBe("All at once");
 });
 
+// ── Ordinals, global upsert, and the partial guard ──────────────────────────
+
+test("interleaved reasoning at ONE stepIndex yields two thoughts, not an overwrite", () => {
+  // spike/REPORT.md finding 30: a text-delta seals the reasoning block and
+  // RESETS eve's accumulator, so the second block restarts from empty at the
+  // SAME (turnId, stepIndex). A plain upsert would lose the first.
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    think(0, "t0", 0, "First thought"),
+    thoughtDone(1, "t0", 0, "First thought"),
+    say(2, "t0", 0, "Hi"),
+    said(3, "t0", 0, "Hi", "tool-calls"),
+    think(4, "t0", 0, "Second thought"),
+    thoughtDone(5, "t0", 0, "Second thought"),
+  ]));
+  expect(kinds(view)).toEqual(["work", "speech", "work"]);
+  expect(workItems(view).map((i) => (i as ThoughtItem).text))
+    .toEqual(["First thought", "Second thought"]);
+  // Both work segments must have DISTINCT keys or React recycles the box.
+  expect(view.segments[0]!.key).not.toBe(view.segments[2]!.key);
+});
+
+test("two message.completed at one stepIndex yield two speech segments", () => {
+  // finding 31: flushCurrentMessage resets eve's message accumulator and fires
+  // on every tool request while it is non-empty.
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    say(0, "t0", 0, "First half"),
+    said(1, "t0", 0, "First half", "tool-calls"),
+    toolCall(2, "t0", 0, "c1", "get_log"),
+    toolDone(3, "t0", 0, "c1", "get_log", "ok"),
+    say(4, "t0", 0, "Second half"),
+    said(5, "t0", 0, "Second half", "stop"),
+  ]));
+  expect(kinds(view)).toEqual(["speech", "work", "speech"]);
+  expect((view.segments[0] as SpeechSegment).text).toBe("First half");
+  expect((view.segments[2] as SpeechSegment).text).toBe("Second half");
+  expect(view.segments[0]!.key).not.toBe(view.segments[2]!.key);
+});
+
+test("reason -> tool -> reason at one step is ONE thought sealed after the tool", () => {
+  // finding 33: only TEXT splits a reasoning block. The trailing
+  // reasoning.completed legitimately arrives after the step's tool events.
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    think(0, "t0", 0, "Part one"),
+    toolCall(1, "t0", 0, "c1", "get_log"),
+    toolDone(2, "t0", 0, "c1", "get_log", "ok"),
+    think(3, "t0", 0, "Part one and part two"),
+    thoughtDone(4, "t0", 0, "Part one and part two", 6),
+  ]));
+  expect(kinds(view)).toEqual(["work"]);
+  const items = workItems(view);
+  expect(items).toHaveLength(2);
+  expect((items[0] as ThoughtItem).text).toBe("Part one and part two");
+  expect((items[0] as ThoughtItem).streaming).toBe(false);
+  expect((items[0] as ThoughtItem).seconds).toBe(6);
+});
+
+test("a late action.result updates its item in a closed segment, in place", () => {
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    toolCall(0, "t0", 0, "c1", "slow_tool"),
+    say(1, "t0", 0, "Working on it"),
+    said(2, "t0", 0, "Working on it", "tool-calls"),
+    toolDone(3, "t0", 0, "c1", "slow_tool", "finally"),
+  ]));
+  // No duplicate item, no second work segment, and the result landed upstream.
+  expect(kinds(view)).toEqual(["work", "speech"]);
+  const items = workItems(view);
+  expect(items).toHaveLength(1);
+  expect((items[0] as ToolItem).state).toBe("ok");
+  expect((items[0] as ToolItem).resultPreview).toBe("finally");
+});
+
+test("action.partial after action.result does not walk the step backwards", () => {
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    toolCall(0, "t0", 0, "c1", "retried"),
+    toolDone(1, "t0", 0, "c1", "retried", "final output"),
+    frame(2, {
+      type: "action.partial",
+      data: {
+        result: { callId: "c1", toolName: "retried", output: "stale partial" },
+        sequence: 0, stepIndex: 0, turnId: "t0",
+      },
+    } as EveStreamEvent),
+  ]));
+  const items = workItems(view);
+  expect(items).toHaveLength(1);
+  expect((items[0] as ToolItem).state).toBe("ok");
+  expect((items[0] as ToolItem).resultPreview).toBe("final output");
+});
+
 test("completed turn reduces to a timeline ending in the final reply", async () => {
   const frames = await loadFrames("mocked-turn-events.ndjson");
   const store = addFrames(EMPTY_FRAME_STORE, frames);

@@ -7,8 +7,9 @@
  * streams (the server replays persisted events on connect). seq is
  * authoritative, so a re-delivered frame after a resume is a no-op.
  */
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useBlocker } from "@tanstack/react-router";
 import { MessageSquare } from "lucide-react";
 
 import type {
@@ -44,6 +45,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Spinner } from "../ui/Spinner";
 import { useToast } from "../ui/Toast";
 import type { ContextMarkerKind } from "./ContextDivider";
+import { DiscardQueueDialog } from "./DiscardQueueDialog";
 import { ThreadView } from "./ThreadView";
 import type { SessionContextAction, ThreadHeaderProps } from "./ThreadHeader";
 
@@ -61,6 +63,8 @@ export interface ThreadContainerProps {
    * send 409s `session_not_active` forever.
    */
   onSessionReplaced?: (newSessionId: string) => void;
+  /** Lets the owner of session selection guard a switch away from a live queue. */
+  onQueuedCountChange?: (count: number) => void;
 }
 
 interface PendingInput {
@@ -88,6 +92,7 @@ export function ThreadContainer({
   agentName,
   workflowName,
   onSessionReplaced,
+  onQueuedCountChange,
 }: ThreadContainerProps) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -203,6 +208,24 @@ export function ThreadContainer({
     send: sendForQueue,
     onGiveUp: setRestoreDraft,
     onRetired: () => setSessionRetired(true),
+  });
+
+  // A ref, not a render closure: `shouldBlockFn` is registered once, and a
+  // flush that empties the queue mid-navigation must be visible to it.
+  const queuedCountRef = useRef(0);
+  queuedCountRef.current = queue.queued.length;
+
+  useEffect(() => {
+    onQueuedCountChange?.(queue.queued.length);
+  }, [onQueuedCountChange, queue.queued.length]);
+
+  // `enableBeforeUnload` DEFAULTS TO TRUE. Leaving it out installs a
+  // reload/tab-close prompt on every thread with a queue — deliberately out
+  // of scope for a client-side draft.
+  const blocker = useBlocker({
+    shouldBlockFn: () => queuedCountRef.current > 0,
+    enableBeforeUnload: false,
+    withResolver: true,
   });
 
   // The two 409s have OPPOSITE recoveries and must never share copy:
@@ -511,11 +534,34 @@ export function ThreadContainer({
           message — and starts a fresh one in its place. The messages above stay
           readable here.
         </p>
+        {/* Reset bypasses both discard guards — `onSessionReplaced` remounts
+            the keyed container — so the queue's fate belongs in THIS copy. */}
+        {queue.queued.length > 0 ? (
+          <p className="mt-2 text-[13px] leading-relaxed text-ink-3">
+            The{" "}
+            {queue.queued.length === 1
+              ? "message"
+              : `${queue.queued.length} messages`}{" "}
+            waiting to send {queue.queued.length === 1 ? "is" : "are"} discarded
+            too.
+          </p>
+        ) : null}
         <p className="mt-2 text-[13px] leading-relaxed text-ink-3">
           To keep the conversation and only drop the agent’s memory of it, use{" "}
           <span className="font-medium text-ink-2">Clear context</span> instead.
         </p>
       </ConfirmDialog>
+      {/* Route navigation away from a live queue: the container unmounts and
+          the queue goes with it, so ask before letting the router proceed. */}
+      <DiscardQueueDialog
+        open={blocker.status === "blocked"}
+        count={queue.queued.length}
+        onClose={() => blocker.reset?.()}
+        onConfirm={() => {
+          queue.clear();
+          blocker.proceed?.();
+        }}
+      />
     </>
   );
 }

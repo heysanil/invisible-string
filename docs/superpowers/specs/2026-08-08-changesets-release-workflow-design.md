@@ -441,8 +441,8 @@ lane's weight; this job does an install and two short scripts).
      `.changeset/*.md` and may **create** `CHANGELOG.md`, and the commit is
      `git add -A`.
   5. With changes: `git add -A`, commit `chore(release): version packages`,
-     `git push -f origin "$BRANCH"`, then open the PR **only if one is not
-     already open**. The open-check is
+     `git push -f origin "$BRANCH"`, then **create or update** the PR. The
+     open-check is
      `gh pr list --head "$BRANCH" --state open --json number --jq '.[].number'`,
      deliberately not `gh pr view "$BRANCH"`: `pr view` also matches **merged**
      PRs, and one stale match would mean no version PR is ever opened again.
@@ -454,6 +454,13 @@ lane's weight; this job does an install and two short scripts).
      the GitHub Release will carry, so the PR previews exactly what it publishes.
      Written to `$RUNNER_TEMP`, never the repo (an untracked, un-ignored file in
      the tree would land in the next `git add -A`).
+
+     It is rendered **before** the create/update branch and applied on **both**
+     arms — `gh pr create --body-file` on one, `gh pr edit "$open" --body-file`
+     on the other. Generating it only on the create path would freeze the body
+     at whatever the first push computed, so a later changeset that moves the
+     bump would leave "Merging this PR releases vX.Y.Z." contradicting the
+     manifests in the very diff it describes.
   7. **`git checkout --force "$GITHUB_SHA"`, on every path** — including the
      nothing-to-version one. This is the finding-8 branch-state fix and the whole
      reason the step is ordered this way: §6.3 must observe `main`'s state, never
@@ -628,6 +635,17 @@ docker, no network) so the default `bun test` lane catches drift, in the style o
   `infra/docker/control-plane.Dockerfile:17-28`) rebuilds on every release image
   build. Cost only, no correctness issue; Namespace's builder-side cache simply
   stops helping that one layer per release.
+- **Hand-edits made inside the open version PR are discarded.** `changeset-release/main`
+  is a derived artifact: §6.4 resets it to `$GITHUB_SHA` and force-pushes on every
+  push to `main` that leaves changesets pending. A maintainer who polishes
+  `CHANGELOG.md` wording (or anything else) directly on the PR branch loses it at the
+  next push, silently and with no conflict to notice. **Fix changelog wording by
+  editing the changeset on `main` and letting the branch recompute — never by editing
+  the PR branch.** Inherent to the branch-as-derived-artifact model and identical to
+  `changesets/action`'s own behavior, so not a regression; recorded because nothing
+  else warned about it. (The PR *body* does track the branch — §6.4 re-renders it
+  through `gh pr edit` on every update, so it cannot drift from the version being
+  proposed.)
 - **`changeset version` reformats the manifests it touches.** It rewrites each
   `package.json` through its own JSON writer rather than patching the version
   string in place, so compact one-line blocks get expanded onto several lines —

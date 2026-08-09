@@ -1,8 +1,18 @@
 /**
- * The `version` command for changesets/action.
+ * The version command, invoked as `bun run release:version` by the shell step
+ * in .github/workflows/release.yml that maintains the
+ * `chore(release): version packages` PR.
+ *
+ * That step is deliberately NOT changesets/action, which cannot run against
+ * this repo's `changelog: false` — see AGENTS.md → Releases and finding 8 of
+ * the design spec before wiring this into the action.
  *
  * Validates pending changesets, runs `changeset version`, then writes the
  * single root CHANGELOG.md that `changelog: false` suppresses.
+ *
+ * Exits 0 having changed nothing when nothing is pending; the caller decides
+ * whether there was work by inspecting `git status --porcelain`, not by
+ * reading an exit code from here.
  *
  * Ordering matters: changesets DELETES the .changeset/*.md files, so they are
  * read and parsed before the bump, not after.

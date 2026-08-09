@@ -1,6 +1,8 @@
 /**
  * Tag the release, create its GitHub Release, and tell the workflow whether to
- * build images. Runs on main pushes only, after changesets/action.
+ * build images. Runs on main pushes only, after release.yml's version step —
+ * which ends by restoring the checkout to $GITHUB_SHA, so everything below
+ * reads main's state and never the version branch's unmerged bump.
  *
  * All decision logic lives in scripts/release/decide.ts; this file only gathers
  * git state and performs effects.

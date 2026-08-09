@@ -89,16 +89,23 @@ jobs:
             git commit -m "chore(release): version packages"
             git push -f origin "$BRANCH"
 
+            # Rendered once and applied on BOTH arms below. The force-push just
+            # changed what the PR proposes, so a body left at its original text
+            # would keep naming the old version the moment a later changeset
+            # moves the bump.
+            body="$RUNNER_TEMP/version-pr-body.md"
+            bun run scripts/release-pr-body.ts "$body"
+
             # --state open, not `gh pr view`: that matches merged PRs too, and
             # a stale match would mean the next release never opens a PR.
             open=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')
             if [ -n "$open" ]; then
-              echo "PR #$open already open for $BRANCH — force-push updated it."
+              gh pr edit "$open" --body-file "$body"
+              echo "Updated PR #$open for $BRANCH."
             else
-              bun run scripts/release-pr-body.ts "$RUNNER_TEMP/version-pr-body.md"
               gh pr create --base main --head "$BRANCH" \
                 --title "chore(release): version packages" \
-                --body-file "$RUNNER_TEMP/version-pr-body.md"
+                --body-file "$body"
             fi
           fi
 

@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, within } from "@testing-library/react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
-import type { RunView } from "../lib/chat/run-view";
+import type { RunView, WorkSegment } from "../lib/chat/run-view";
 import { ThreadView } from "../components/chat/ThreadView";
 import { RunMessage } from "../components/chat/RunMessage";
 import { WorkingBlock } from "../components/chat/WorkingBlock";
@@ -91,46 +91,62 @@ test("a trigger-origin header adds the workflow provenance chip", async () => {
   expect(await view.findByText("Nightly metrics digest")).toBeTruthy();
 });
 
-test("a completed working block renders collapsed and expands on click", () => {
-  const block = {
-    steps: [
-      { key: "c1", toolName: "linear_list", state: "ok" as const, resultPreview: "5 issues" },
+function workSegment(over: Partial<WorkSegment> = {}): WorkSegment {
+  return {
+    kind: "work",
+    key: "work:t0:0",
+    items: [
+      { kind: "thought", key: "t0:0", text: "Weighing the options", seconds: 4, streaming: false },
+      { kind: "tool", key: "c1", toolName: "list_runs", state: "ok", resultPreview: "14 runs" },
     ],
-    narration: [],
-    reasoning: null,
-    elapsedSeconds: 4,
+    elapsedSeconds: 24,
+    startedAt: "2026-01-01T00:00:00.000Z",
     active: false,
+    waiting: false,
+    sealed: true,
+    ...over,
   };
-  const view = render(<WorkingBlock block={block} />);
-  // Collapsed summary present; the body stays mounted (it animates the fold via
-  // grid-rows) but is hidden from view + assistive tech until expanded.
-  expect(view.getByText("Worked for 4s · 1 step")).toBeTruthy();
-  expect(
-    view.getByText("linear_list").closest("[aria-hidden='true']"),
-  ).not.toBeNull();
+}
 
-  fireEvent.click(view.getByRole("button", { expanded: false }));
-  // Expanded: aria-hidden clears and the step detail is revealed.
-  expect(view.getByRole("button", { expanded: true })).toBeTruthy();
-  expect(
-    view.getByText("linear_list").closest("[aria-hidden='true']"),
-  ).toBeNull();
-  expect(view.getByText("5 issues")).toBeTruthy();
+test("a settled work segment folds to a summary counting thoughts as steps", () => {
+  const view = render(<WorkingBlock segment={workSegment()} />);
+  const toggle = view.getByRole("button", { name: /Worked/ });
+  // 1 thought + 1 tool = 2 steps.
+  expect(toggle.textContent).toContain("Worked for 24s · 2 steps");
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
 });
 
-test("a live working block renders expanded with a running summary", () => {
-  const block = {
-    steps: [{ key: "c1", toolName: "search", state: "pending" as const, resultPreview: null }],
-    narration: [],
-    reasoning: "Thinking about the plan",
-    elapsedSeconds: null,
-    active: true,
-  };
-  const view = render(<WorkingBlock block={block} />);
-  expect(view.getByText("Working…")).toBeTruthy();
-  // Expanded: the step + reasoning line are visible.
-  expect(view.getByText("search")).toBeTruthy();
-  expect(view.getByText("Thinking about the plan")).toBeTruthy();
+test("expanding a settled segment reveals thoughts and tools in rail order", () => {
+  const view = render(<WorkingBlock segment={workSegment()} />);
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.getByText("Weighing the options")).toBeTruthy();
+  expect(view.getByText("Thought for 4s")).toBeTruthy();
+  expect(view.getByText("list_runs")).toBeTruthy();
+  const items = view.container.querySelectorAll("li");
+  expect(items[0]!.textContent).toContain("Weighing the options");
+  expect(items[1]!.textContent).toContain("list_runs");
+});
+
+test("an active segment defaults open and announces Working", () => {
+  const view = render(<WorkingBlock segment={workSegment({ active: true, sealed: false })} />);
+  const toggle = view.getByRole("button", { name: /Working/ });
+  expect(toggle.getAttribute("aria-expanded")).toBe("true");
+});
+
+test("a segment blocked on the user reads Waiting on you, with no counter", () => {
+  const view = render(
+    <WorkingBlock segment={workSegment({ active: false, waiting: true, sealed: false })} />,
+  );
+  expect(view.getByRole("button", { name: /Waiting on you/ })).toBeTruthy();
+  expect(view.queryByText(/Worked for/)).toBeNull();
+});
+
+test("a thought with no measured duration falls back to a bare label", () => {
+  const view = render(<WorkingBlock segment={workSegment({
+    items: [{ kind: "thought", key: "t0:0", text: "Brief", seconds: null, streaming: false }],
+  })} />);
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.getByText("Thought")).toBeTruthy();
 });
 
 // Run content is asserted against RunMessage directly: the virtualizer's

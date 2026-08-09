@@ -21,6 +21,7 @@ export * from "./copilot";
 export * from "./crypto";
 export * from "./eve-events";
 export * from "./eve-session-api";
+export * from "./id";
 export * from "./observability";
 export * from "./render";
 export * from "./trigger-adapters";

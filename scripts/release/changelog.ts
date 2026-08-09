@@ -5,8 +5,8 @@
  * `changelog: false` disables that and these functions produce a single root
  * file instead.
  *
- * STRUCTURAL RULE, depended on by scripts/release-tag.ts too: the preamble may
- * use `# ` and prose, but the FIRST `## ` in the file is always the newest
+ * STRUCTURAL RULE, depended on by scripts/release/decide.ts too: the preamble
+ * may use `# ` and prose, but the FIRST `## ` in the file is always the newest
  * release. That is how the release-notes body is extracted.
  */
 import type { ChangesetEntry } from "./changesets";

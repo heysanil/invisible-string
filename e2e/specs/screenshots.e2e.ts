@@ -312,7 +312,7 @@ test("capture the eight product screenshots", async ({ page, browser }) => {
   await expect(editor).toContainText("@trigger.email");
   await expect(editor).toContainText("@notes");
   // The autocomplete tooltip must be gone (the pick closes it).
-  await expect(page.locator(".cm-tooltip-autocomplete")).toHaveCount(0);
+  await expect(page.locator(".tt-suggest")).toHaveCount(0);
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
   await publishWorkflow(page);
   await expect(page.getByText("Published", { exact: true }).first()).toBeVisible();

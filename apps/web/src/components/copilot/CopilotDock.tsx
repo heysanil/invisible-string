@@ -34,6 +34,8 @@ import type { WebSocketFactory } from "../../lib/copilot/socket";
 import { useCopilot, type CopilotThreadItem } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
 import { Markdown } from "../chat/Markdown";
+import { LazyComposerEditor } from "../editor/LazyComposerEditor";
+import type { RichTextEditorHandle } from "../editor/RichTextEditor";
 import { SuggestionCard } from "./SuggestionCard";
 
 const OPEN_STORAGE_PREFIX = "is.copilot.open";
@@ -83,7 +85,7 @@ export function CopilotDock(props: CopilotDockProps) {
   const [stuckToLatest, setStuckToLatest] = useState(true);
   const [announcement, setAnnouncement] = useState("");
   const threadRef = useRef<HTMLDivElement | null>(null);
-  const composerRef = useRef<HTMLInputElement | null>(null);
+  const composerRef = useRef<RichTextEditorHandle | null>(null);
   const pillRef = useRef<HTMLButtonElement | null>(null);
   const cardRefs = useRef(new Map<string, HTMLDivElement>());
   const stickRef = useRef(true);
@@ -191,10 +193,26 @@ export function CopilotDock(props: CopilotDockProps) {
     el.scrollTop = el.scrollHeight;
   }
 
-  function submit(text: string) {
+  function submit() {
+    // `composer` trails the editor by one serialize debounce, so the last
+    // keystrokes before Enter are not in it yet — read the document directly.
+    const text = composerRef.current?.flush() ?? composer;
     // Only clear the composer when the frame was actually delivered — a
     // still-connecting socket or an in-flight turn keeps the text in place.
-    if (copilot.send(text)) setComposer("");
+    if (!copilot.send(text)) return;
+    // The imperative write is the one that empties the document: clearing
+    // takes `composer` from "" back to "" in a single React batch, so the
+    // prop never changes and the reconcile effect would never fire.
+    composerRef.current?.setValue("");
+    setComposer("");
+  }
+
+  /** Enter sends; Shift+Enter is a newline (the composer grows to fit). */
+  function onComposerKeyDown(event: KeyboardEvent): boolean {
+    if (event.key !== "Enter" || event.shiftKey) return false;
+    if (event.isComposing || event.keyCode === 229) return false;
+    submit();
+    return true;
   }
 
   /** Apply/Dismiss a card, then move focus to the next pending card (or composer). */
@@ -379,11 +397,17 @@ export function CopilotDock(props: CopilotDockProps) {
                   );
                 }
                 return item.role === "user" ? (
+                  // Markdown, for the same reason as the chat bubble: the
+                  // composer above emits it, so plain text would echo the
+                  // author's own syntax back at them.
                   <div
                     key={item.id}
-                    className="ml-6 self-end rounded-card-lg bg-ink px-3 py-2 text-[13px] leading-relaxed text-white"
+                    className="ml-6 self-end rounded-card-lg bg-ink px-3 py-2 text-white"
                   >
-                    {item.text}
+                    <Markdown
+                      text={item.text}
+                      className="md-on-ink text-[13px] leading-relaxed [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+                    />
                   </div>
                 ) : (
                   <div key={item.id} className="mr-2">
@@ -421,7 +445,11 @@ export function CopilotDock(props: CopilotDockProps) {
         ) : null}
       </div>
 
-      {connecting && !isEmpty ? (
+      {/* Connecting used to ride the composer's placeholder. It cannot any
+          more: the placeholder is an editor construction option, so changing
+          it re-creates the editor — and a draft typed while the socket was
+          still opening would vanish the moment it opened. */}
+      {connecting ? (
         <p className="px-4 pb-1 text-[11.5px] text-ink-3" role="status">
           Connecting…
         </p>
@@ -429,26 +457,26 @@ export function CopilotDock(props: CopilotDockProps) {
 
       {/* Composer */}
       <form
-        className="flex items-center gap-2 border-t border-black/[0.06] p-3"
+        className="flex items-end gap-2 border-t border-black/[0.06] p-3"
         onSubmit={(event) => {
           event.preventDefault();
-          submit(composer);
+          submit();
         }}
       >
-        <input
-          ref={composerRef}
-          value={composer}
-          // Delivered via onInput (React's onChange does not fire under
-          // happy-dom); the noop onChange keeps React's controlled-input
-          // warning quiet.
-          onChange={() => {}}
-          onInput={(event) =>
-            setComposer((event.target as HTMLInputElement).value)
-          }
-          aria-label="Ask copilot"
-          placeholder={connecting ? "Connecting…" : "Ask copilot…"}
-          className="h-9 min-w-0 flex-1 rounded-capsule border border-black/10 bg-white/60 px-3.5 text-[13px] text-ink outline-none placeholder:text-ink-4 focus-visible:border-ink/40"
-        />
+        {/* The capsule owns the surface and the focus ring; the editor inside
+            it is chrome-free and grows with the draft up to ~5 lines. A long
+            paste is a scroll region, never a dock that swallows the thread. */}
+        <div className="flex min-w-0 flex-1 items-center rounded-card-lg border border-black/10 bg-white/60 px-3 py-1.5 transition-colors duration-150 focus-within:border-ink/40">
+          <LazyComposerEditor
+            ref={composerRef}
+            value={composer}
+            onChange={setComposer}
+            ariaLabel="Ask copilot"
+            placeholder="Ask copilot…"
+            onKeyDown={onComposerKeyDown}
+            className="thin-scroll tt-host-composer max-h-28 w-full overflow-y-auto text-[13px] leading-relaxed"
+          />
+        </div>
         {copilot.generating ? (
           <button
             type="button"

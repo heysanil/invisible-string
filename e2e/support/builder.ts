@@ -8,7 +8,7 @@
  * + snapshot, no build). Chat targets agents: `startChatAndSend` drives the
  * "New chat" agent picker.
  */
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 import { gotoSection } from "./authoring.ts";
 
@@ -43,12 +43,55 @@ export async function openNewAgent(page: Page, name: string): Promise<void> {
   await nameInput.press("Enter");
 }
 
-/** Type the agent's persona document into the CodeMirror markdown editor. */
+/**
+ * Put the caret at the very END of a rich-text editor's document.
+ *
+ * The old CodeMirror idiom (select-all, then ArrowRight to collapse to the
+ * right edge) does NOT survive the move to ProseMirror: the select-all stays
+ * uncollapsed, so the next keystroke REPLACES the whole document instead of
+ * appending to it. That silently destroyed the first paragraph — including its
+ * `@trigger.email` ref — and only surfaced as a missing substitution at
+ * dispatch, several hundred lines later in the run.
+ *
+ * Clicking past the end of the last line is the supported affordance instead:
+ * `.tt-host .tiptap` is `flex: 1 0 auto` precisely so the blank space under the
+ * document still lands the caret inside it (see tokens.css).
+ */
+async function caretToEnd(page: Page, editor: Locator): Promise<void> {
+  const box = await editor.boundingBox();
+  if (box === null) throw new Error("editor is not laid out");
+  await editor.click({
+    position: { x: Math.max(1, box.width - 8), y: Math.max(1, box.height - 8) },
+  });
+  // Nothing open to swallow the keystrokes we are about to send.
+  await expect(page.locator(".tt-suggest")).toHaveCount(0);
+}
+
+/**
+ * Type prose into a rich-text editor, mapping markdown line breaks onto the
+ * keystrokes a person would actually use. In a textarea `\n` was a literal
+ * character; in ProseMirror a blank line between paragraphs is ONE Enter (a
+ * new paragraph) and a single line break is Shift+Enter (a hard break).
+ * Typing the raw string would otherwise leave stray empty paragraphs.
+ */
+async function typeProse(page: Page, text: string): Promise<void> {
+  const paragraphs = text.split(/\n{2,}/);
+  for (const [index, paragraph] of paragraphs.entries()) {
+    if (index > 0) await page.keyboard.press("Enter");
+    const lines = paragraph.split("\n");
+    for (const [lineIndex, line] of lines.entries()) {
+      if (lineIndex > 0) await page.keyboard.press("Shift+Enter");
+      if (line.length > 0) await page.keyboard.type(line);
+    }
+  }
+}
+
+/** Type the agent's persona document into the rich markdown editor. */
 export async function writePersona(page: Page, text: string): Promise<void> {
   const editor = page.getByRole("textbox", { name: "Persona" });
   await expect(editor).toBeVisible();
   await editor.click();
-  await page.keyboard.type(text);
+  await typeProse(page, text);
   await expect(editor).toContainText(text.slice(0, 12));
 }
 
@@ -59,10 +102,8 @@ export async function writePersona(page: Page, text: string): Promise<void> {
 export async function appendPersona(page: Page, text: string): Promise<void> {
   const editor = page.getByRole("textbox", { name: "Persona" });
   await expect(editor).toBeVisible();
-  await editor.click();
-  await page.keyboard.press("ControlOrMeta+a");
-  await page.keyboard.press("ArrowRight");
-  await page.keyboard.type(text);
+  await caretToEnd(page, editor);
+  await typeProse(page, text);
 }
 
 /** Pick a model preset in the agent editor's MODEL section. */
@@ -268,8 +309,9 @@ export async function revealWebhookToken(page: Page): Promise<string> {
 }
 
 /**
- * Write instructions in the CodeMirror editor and exercise the real `@`
- * autocomplete: type `@trigger.` → assert the popup → pick a field.
+ * Write instructions in the rich editor and exercise the real `@` suggestion
+ * dropdown: type `@trigger.` → assert the popup → pick a field. Picking an
+ * option inserts an atomic reference chip, not loose characters.
  */
 export async function writeInstructionsWithTriggerRef(
   page: Page,
@@ -278,10 +320,10 @@ export async function writeInstructionsWithTriggerRef(
   const editor = page.getByRole("textbox", { name: "Instructions editor" });
   await expect(editor).toBeVisible();
   await editor.click();
-  await page.keyboard.type(opts.lead);
+  await typeProse(page, opts.lead);
   await page.keyboard.type("@trigger.");
 
-  // The CodeMirror autocomplete popup must appear with the field option.
+  // The suggestion dropdown must appear with the field option.
   const option = page.getByRole("option", {
     name: new RegExp(`@trigger\\.${opts.triggerField}`),
   });
@@ -301,12 +343,8 @@ export async function writeInstructionsWithTriggerRef(
 export async function appendInstructions(page: Page, text: string): Promise<void> {
   const editor = page.getByRole("textbox", { name: "Instructions editor" });
   await expect(editor).toBeVisible();
-  await editor.click();
-  await page.keyboard.press("ControlOrMeta+a");
-  await page.keyboard.press("ArrowRight");
-  // Nothing open to eat the newlines we are about to type.
-  await expect(page.locator(".cm-tooltip-autocomplete")).toHaveCount(0);
-  await page.keyboard.type(text);
+  await caretToEnd(page, editor);
+  await typeProse(page, text);
 }
 
 /** Write plain instructions (no references) — enough to satisfy publish. */
@@ -314,7 +352,7 @@ export async function writePlainInstructions(page: Page, text: string): Promise<
   const editor = page.getByRole("textbox", { name: "Instructions editor" });
   await expect(editor).toBeVisible();
   await editor.click();
-  await page.keyboard.type(text);
+  await typeProse(page, text);
   await expect(editor).toContainText(text.slice(0, 12));
 }
 

@@ -18,6 +18,7 @@ import { CopilotDock } from "../components/copilot/CopilotDock";
 import { workflowCopilotAdapter } from "../lib/copilot/mutations";
 import type { WebSocketLike } from "../lib/copilot/socket";
 import { FIXTURE_AGENTS, FIXTURE_AGENT_IDS } from "../lib/agents/fixtures";
+import { pasteInto, pressEnter } from "../test/editor";
 
 ensureDomForThisFile();
 
@@ -145,13 +146,15 @@ function lastSocket(): FakeWebSocket {
   return socket;
 }
 
+/** The composer is a Tiptap editor — see test/editor.ts for the input path. */
+function composer(): HTMLElement {
+  return q().getByLabelText("Ask copilot");
+}
+
 function sendUserMessage(socket: FakeWebSocket, text = "Help me") {
-  fireEvent.input(q().getByLabelText("Ask copilot"), {
-    target: { value: text },
-  });
-  // happy-dom does not synthesize form submission from a button click.
-  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
-  fireEvent.submit(input.closest("form")!);
+  const box = composer();
+  pasteInto(box, text);
+  pressEnter(box);
   return JSON.parse(socket.sent.at(-1)!);
 }
 
@@ -170,7 +173,7 @@ afterEach(() => {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-test("collapsed pill when closed; opening persists to the per-workspace key and focuses the composer", () => {
+test("collapsed pill when closed; opening persists to the per-workspace key and focuses the composer", async () => {
   window.localStorage.setItem(OPEN_KEY, "0");
   renderDock();
   expect(FakeWebSocket.instances.length).toBe(0);
@@ -179,8 +182,12 @@ test("collapsed pill when closed; opening persists to the per-workspace key and 
   fireEvent.click(pill);
   expect(window.localStorage.getItem(OPEN_KEY)).toBe("1");
   expect(FakeWebSocket.instances.length).toBe(1);
-  // Focus lands on the composer, not <body>.
-  expect(document.activeElement).toBe(q().getByLabelText("Ask copilot"));
+  // Focus lands on the composer, not <body>. Tiptap defers it a frame (the
+  // editor view has to be mounted before it can place a caret).
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+  expect(document.activeElement).toBe(composer());
 });
 
 test("collapsing returns focus to the pill", () => {
@@ -450,16 +457,16 @@ test("composer keeps its text until the socket accepts the frame", () => {
   const socket = lastSocket();
   // Socket not open yet: submit must neither clear the composer nor lose the
   // message silently.
-  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
-  fireEvent.input(input, { target: { value: "early bird" } });
-  fireEvent.submit(input.closest("form")!);
+  const box = composer();
+  pasteInto(box, "early bird");
+  pressEnter(box);
   expect(socket.sent).toEqual([]);
-  expect(input.value).toBe("early bird");
-  // Once open, the same submit goes through and clears the composer.
+  expect(box.textContent).toBe("early bird");
+  // Once open, the same gesture goes through and clears the composer.
   act(() => socket.open());
-  fireEvent.submit(input.closest("form")!);
+  pressEnter(box);
   expect(JSON.parse(socket.sent.at(-1)!).message).toBe("early bird");
-  expect(input.value).toBe("");
+  expect(box.textContent).toBe("");
 });
 
 test("submits are blocked while a turn is generating (no orphaned bubbles)", () => {
@@ -467,15 +474,15 @@ test("submits are blocked while a turn is generating (no orphaned bubbles)", () 
   const socket = lastSocket();
   act(() => socket.open());
   sendUserMessage(socket, "first");
-  const input = q().getByLabelText("Ask copilot") as HTMLInputElement;
-  fireEvent.input(input, { target: { value: "second while busy" } });
-  fireEvent.submit(input.closest("form")!);
+  const box = composer();
+  pasteInto(box, "second while busy");
+  pressEnter(box);
   const userFrames = socket
     .frames()
     .filter((frame) => frame.type === "user_message");
   expect(userFrames).toHaveLength(1);
   // The text stays in the composer for after the turn.
-  expect(input.value).toBe("second while busy");
+  expect(box.textContent).toBe("second while busy");
 });
 
 test("a mid-turn connection drop leaves a visible notice in the thread", async () => {

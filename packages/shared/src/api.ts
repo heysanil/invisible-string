@@ -965,6 +965,180 @@ export type GetMcpConnectionResponse = z.infer<
   typeof getMcpConnectionResponseSchema
 >;
 
+// ── Connections (connectors redesign) ───────────────────────────────────────
+//
+// The rebuilt connection domain (connectors redesign spec §3), replacing the
+// mcp-connections surface above. BOTH scopes:
+//   workspace: /workspaces/:workspaceId/connections[...]
+//   user:      /me/connections[...]
+//
+//   GET    <base>       → ListConnectionsResponse
+//   POST   <base>       → GetConnectionResponse (201; catalog|registry|custom)
+//   GET    <base>/:id   → GetConnectionResponse
+//   PATCH  <base>/:id   → GetConnectionResponse
+//   DELETE <base>/:id   → DeleteResourceResponse
+
+/**
+ * Connection row id: historical uuid rows (immutable published
+ * `agent_versions.definition` snapshots reference them) OR
+ * connectors-redesign `cn_<nanoid16>` rows (`newId("cn")`).
+ */
+export const connectionIdSchema = z.union([
+  z.uuid(),
+  z.string().regex(/^cn_[0-9a-z]{16}$/),
+]);
+
+/** Mirrors pgEnum `connection_source` (spec §2). */
+export const connectionSourceSchema = z.enum(["catalog", "registry", "custom"]);
+export type ConnectionSource = z.infer<typeof connectionSourceSchema>;
+
+/** Mirrors pgEnum `mcp_transport`, persisted at install (spec §3). */
+export const mcpTransportSchema = z.enum(["streamable-http", "sse"]);
+export type McpTransport = z.infer<typeof mcpTransportSchema>;
+
+/** Mirrors pgEnum `connection_auth_type`. `oauth` rows pair with `connection_oauth`. */
+export const connectionAuthTypeSchema = z.enum([
+  "none",
+  "bearer",
+  "headers",
+  "oauth",
+]);
+export type ConnectionAuthType = z.infer<typeof connectionAuthTypeSchema>;
+
+/** Mirrors pgEnum `connection_health` (spec §7). `unknown` until first probe. */
+export const connectionHealthSchema = z.enum([
+  "unknown",
+  "ok",
+  "unreachable",
+  "auth_required",
+  "auth_error",
+]);
+export type ConnectionHealth = z.infer<typeof connectionHealthSchema>;
+
+/** Mirrors pgEnum `connection_oauth_status` (spec §3). */
+export const connectionOauthStatusSchema = z.enum([
+  "pending",
+  "connected",
+  "expired",
+  "revoked",
+  "error",
+]);
+export type ConnectionOauthStatus = z.infer<typeof connectionOauthStatusSchema>;
+
+/** One cached tool, exactly as persisted on `connections.tools_cache`. */
+export const connectionToolSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  params: z.array(z.string()),
+});
+export type ConnectionTool = z.infer<typeof connectionToolSchema>;
+
+export const connectionDtoSchema = z.object({
+  id: connectionIdSchema,
+  scope: resourceScopeSchema,
+  name: z.string().min(1),
+  /** Model-facing summary — eve's connection_search routes on it. */
+  description: z.string().nullable(),
+  source: connectionSourceSchema,
+  /** Curated catalog entry slug (source = catalog). */
+  catalogSlug: z.string().nullable(),
+  /** registry.modelcontextprotocol.io server name (source = registry). */
+  registryName: z.string().nullable(),
+  url: z.string().min(1),
+  transport: mcpTransportSchema,
+  authType: connectionAuthTypeSchema,
+  /** True when encrypted credentials (or an OAuth grant) are stored. Secrets are never echoed. */
+  hasCredentials: z.boolean(),
+  /** Grant lifecycle when authType = "oauth"; null otherwise. */
+  oauthStatus: connectionOauthStatusSchema.nullable(),
+  toolAllow: z.array(z.string()).nullable(),
+  toolBlock: z.array(z.string()).nullable(),
+  approvalPolicy: mcpApprovalPolicySchema.nullable(),
+  enabled: z.boolean(),
+  health: connectionHealthSchema,
+  lastCheckedAt: isoTimestamp.nullable(),
+  lastError: z.string().nullable(),
+  tools: z.array(connectionToolSchema).nullable(),
+  toolsCachedAt: isoTimestamp.nullable(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+export type ConnectionDto = z.infer<typeof connectionDtoSchema>;
+
+/**
+ * Create a connection — one route, discriminated on `source`:
+ * - catalog:  install a curated entry (the recipe supplies name/url/transport;
+ *             `auth` must satisfy the entry's recipe — 422 server-side otherwise)
+ * - registry: install a community server (`remoteUrl` must be one the registry
+ *             advertises — the live provenance check stays server-side)
+ * - custom:   bring-your-own URL
+ */
+export const createConnectionRequestSchema = z.discriminatedUnion("source", [
+  z.object({
+    source: z.literal("catalog"),
+    slug: z.string().min(1),
+    auth: mcpAuthWriteSchema.optional(),
+  }),
+  z.object({
+    source: z.literal("registry"),
+    registryName: z.string().min(1),
+    remoteUrl: httpUrlSchema,
+    version: z.string().min(1).optional(),
+    name: mcpConnectionNameSchema.optional(),
+    description: z.string().max(2000).optional(),
+    auth: mcpAuthWriteSchema.optional(),
+  }),
+  z.object({
+    source: z.literal("custom"),
+    name: mcpConnectionNameSchema,
+    url: httpUrlSchema,
+    transport: mcpTransportSchema.optional(),
+    description: z.string().max(2000).optional(),
+    auth: mcpAuthWriteSchema.optional(),
+  }),
+]);
+export type CreateConnectionRequest = z.infer<
+  typeof createConnectionRequestSchema
+>;
+
+/**
+ * Partial update. `auth` semantics: omitted = keep stored credentials;
+ * `{type:"none"}` = clear; bearer/headers = replace. Explicit nulls clear the
+ * nullable fields. `url`/`transport` parse here but are rejected server-side
+ * (422) when `source !== "custom"`.
+ */
+export const updateConnectionRequestSchema = z
+  .object({
+    name: mcpConnectionNameSchema.optional(),
+    description: z.string().max(2000).nullable().optional(),
+    url: httpUrlSchema.optional(),
+    transport: mcpTransportSchema.optional(),
+    toolAllow: toolNameListSchema.nullable().optional(),
+    toolBlock: toolNameListSchema.nullable().optional(),
+    approvalPolicy: mcpApprovalPolicySchema.nullable().optional(),
+    enabled: z.boolean().optional(),
+    auth: mcpAuthWriteSchema.optional(),
+  })
+  .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
+    message: "update at least one field",
+  })
+  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
+export type UpdateConnectionRequest = z.infer<
+  typeof updateConnectionRequestSchema
+>;
+
+export const listConnectionsResponseSchema = z.object({
+  connections: z.array(connectionDtoSchema),
+});
+export type ListConnectionsResponse = z.infer<
+  typeof listConnectionsResponseSchema
+>;
+
+export const getConnectionResponseSchema = z.object({
+  connection: connectionDtoSchema,
+});
+export type GetConnectionResponse = z.infer<typeof getConnectionResponseSchema>;
+
 // ── MCP registry proxy ──────────────────────────────────────────────────────
 //
 //   GET /mcp-registry/search?q= → RegistrySearchResponse

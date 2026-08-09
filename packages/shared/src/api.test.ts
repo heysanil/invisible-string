@@ -6,7 +6,9 @@ import {
   agentSessionSummaryDtoSchema,
   agentSummaryDtoSchema,
   agentVersionDtoSchema,
+  connectionDtoSchema,
   createAgentRequestSchema,
+  createConnectionRequestSchema,
   createMcpConnectionRequestSchema,
   createSessionRequestSchema,
   createSkillRequestSchema,
@@ -43,6 +45,7 @@ import {
   updateWorkflowRequestSchema,
   workflowDiagnosticsSchema,
   workflowDtoSchema,
+  type ConnectionDto,
   type RunEventFrame,
   type RunStatus,
 } from "./api";
@@ -830,5 +833,59 @@ describe("stream helpers + dto parsing", () => {
       }).success,
     ).toBe(true);
     expect(dryRunCompileResponseSchema.safeParse({ ok: false }).success).toBe(false);
+  });
+});
+
+describe("connection contracts", () => {
+  test("connectionDtoSchema round-trips a full row DTO", () => {
+    const dto = {
+      id: "cn_a1b2c3d4e5f6g7h8",
+      scope: "workspace",
+      name: "Linear",
+      description: null,
+      source: "catalog",
+      catalogSlug: "linear",
+      registryName: null,
+      url: "https://mcp.linear.app/mcp",
+      transport: "streamable-http",
+      authType: "none",
+      hasCredentials: false,
+      oauthStatus: null,
+      toolAllow: null,
+      toolBlock: null,
+      approvalPolicy: null,
+      enabled: true,
+      health: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+      tools: null,
+      toolsCachedAt: null,
+      createdAt: "2026-08-09T00:00:00.000Z",
+      updatedAt: "2026-08-09T00:00:00.000Z",
+    } satisfies ConnectionDto;
+    expect(connectionDtoSchema.parse(dto)).toEqual(dto);
+  });
+
+  test("createConnectionRequestSchema discriminates on source", () => {
+    expect(
+      createConnectionRequestSchema.safeParse({
+        source: "catalog",
+        slug: "deepwiki",
+      }).success,
+    ).toBe(true);
+    expect(
+      createConnectionRequestSchema.safeParse({
+        source: "custom",
+        name: "CMS",
+        url: "https://cms.example.com/mcp",
+      }).success,
+    ).toBe(true);
+    // registry create without remoteUrl is invalid
+    expect(
+      createConnectionRequestSchema.safeParse({
+        source: "registry",
+        registryName: "app.linear/linear",
+      }).success,
+    ).toBe(false);
   });
 });

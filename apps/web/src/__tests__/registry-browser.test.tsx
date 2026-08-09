@@ -7,7 +7,7 @@ import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
-import type { RegistryServerSummary } from "@invisible-string/shared";
+import type { RegistrySearchResult } from "@invisible-string/shared";
 
 import {
   installFetchMock,
@@ -19,14 +19,19 @@ import { RegistryBrowserModal } from "../components/context/RegistryBrowserModal
 
 ensureDomForThisFile();
 
-const SERVER: RegistryServerSummary = {
+// Community-search wire shape ({results, total} from the Meilisearch mirror):
+// secret prompts ride the chosen remote's header declarations.
+const RESULT: RegistrySearchResult = {
   name: "io.github.acme/vault",
   title: "Acme Vault",
   description: "Secrets and config for Acme services.",
-  version: "1.2.0",
-  remotes: [{ type: "streamable-http", url: "https://mcp.acme.dev/mcp" }],
-  envVarDeclarations: [
-    { name: "API_KEY", isRequired: true, isSecret: true },
+  verified: false,
+  remotes: [
+    {
+      type: "streamable-http",
+      url: "https://mcp.acme.dev/mcp",
+      headers: [{ name: "API_KEY", isRequired: true, isSecret: true }],
+    },
   ],
 };
 
@@ -62,7 +67,7 @@ afterEach(() => {
 
 test("search → pick → install sends the typed secret exactly once", async () => {
   fetchMock
-    .on("GET", "/mcp-registry/search", () => jsonResponse({ servers: [SERVER] }))
+    .on("GET", "/mcp-registry/search", () => jsonResponse({ results: [RESULT], total: 1 }))
     .on("POST", "/mcp-connections/install", () =>
       jsonResponse({ connection: CONNECTION }, 201),
     );
@@ -122,7 +127,7 @@ test("search → pick → install sends the typed secret exactly once", async ()
 
 test("required secret is validated before any request is sent", async () => {
   fetchMock
-    .on("GET", "/mcp-registry/search", () => jsonResponse({ servers: [SERVER] }))
+    .on("GET", "/mcp-registry/search", () => jsonResponse({ results: [RESULT], total: 1 }))
     .on("POST", "/mcp-connections/install", () =>
       jsonResponse({ connection: CONNECTION }, 201),
     );

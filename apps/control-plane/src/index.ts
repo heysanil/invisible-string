@@ -466,6 +466,9 @@ export function createAppStack(
     registry:
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
+    // Community search rides the Meilisearch mirror; null keeps the route on
+    // its typed 503 degradation (connectors spec §5).
+    meili,
     // Advisory allowlist-add validation + reasoning/context capabilities from
     // OpenRouter's public model catalog (fail-open when unreachable — see
     // resources/openrouter-catalog.ts).

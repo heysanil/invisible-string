@@ -158,6 +158,17 @@ export const errors = {
       "registry_unavailable",
       `the MCP registry is unavailable: ${detail}`,
     ),
+  /**
+   * Community search degradation (connectors spec §5): Meilisearch is
+   * unconfigured or unreachable. The catalog and custom-URL lanes are
+   * unaffected — the SPA keys off this code to show its degraded state.
+   */
+  searchUnavailable: () =>
+    new RuntimeApiError(
+      503,
+      "search_unavailable",
+      "community search is unavailable — the search index is not configured or not reachable",
+    ),
   registryServerNotFound: (name: string) =>
     new RuntimeApiError(404, "registry_server_not_found", `registry server "${name}" not found`),
   registryServerNotInstallable: (name: string) =>

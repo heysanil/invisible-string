@@ -34,7 +34,6 @@ import {
   type ListWorkflowsResponse,
   type ListWorkspaceMembersResponse,
   type PublishAgentResponse,
-  type RegistrySearchResponse,
   type RegistryServerSummary,
   type RunInputResponse,
   type UpdateAgentResponse,
@@ -129,9 +128,6 @@ const REGISTRY_SERVER: RegistryServerSummary = {
 };
 
 const stubRegistry: RegistryClient = {
-  async search(query) {
-    return query.toLowerCase().includes("linear") ? [REGISTRY_SERVER] : [];
-  },
   async getServer(name) {
     return name === REGISTRY_SERVER.name ? REGISTRY_SERVER : null;
   },
@@ -638,11 +634,14 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
   });
 
   test("connections: registry create keeps the live remote-provenance check", async () => {
-    // Discovery still rides the registry proxy (Meilisearch swap is later).
+    // Community search rides the Meilisearch mirror now; this stack has no
+    // meili client configured, so the route degrades to a typed 503 while
+    // install provenance (getServer, below) still works.
     const search = await api("GET", `/mcp-registry/search?q=linear`, { cookie: ownerCookie });
-    expect(search.status).toBe(200);
-    const servers = ((await search.json()) as RegistrySearchResponse).servers;
-    expect(servers[0]!.name).toBe("io.example/linear");
+    expect(search.status).toBe(503);
+    expect(((await search.json()) as { error: { code: string } }).error.code).toBe(
+      "search_unavailable",
+    );
 
     // A remote the registry does NOT advertise is rejected (a caller must not
     // claim registry provenance while pointing credentials at another host).

@@ -39,7 +39,7 @@ import {
   updateModelAllowlistEntry,
   updateModelPreset,
 } from "./presets";
-import { toRegistrySearchResponse } from "./registry";
+import { searchRegistry } from "../search/registry-search";
 import { listSessions } from "./sessions";
 import {
   createSkill,
@@ -76,6 +76,14 @@ function assertUploadWithinLimit(request: Request): void {
   if (Number.isFinite(length) && length > SKILL_UPLOAD_MAX_BODY_BYTES) {
     throw errors.skillFileTooLarge(SKILL_FILE_MAX_BYTES);
   }
+}
+
+/** Optional numeric query param → number | undefined (clamping is the
+ * search module's job; junk simply falls back to its defaults). */
+function numberParam(value: unknown): number | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 /** Pull an uploaded file out of a parsed multipart body. */
@@ -244,13 +252,17 @@ export function resourcesPlugin(deps: ResourceDeps) {
         { requireAuth: true },
       )
 
-      // ── MCP registry proxy (SSRF-contained: fixed host only) ──────────────
+      // ── Community registry search (Meilisearch mirror; no client ⇒ typed
+      // 503 degradation — the catalog lane never depends on it) ─────────────
       .get(
         "/mcp-registry/search",
         async ({ query }) => {
           const q = typeof query.q === "string" ? query.q.trim() : "";
-          if (q.length === 0) return toRegistrySearchResponse([]);
-          return toRegistrySearchResponse(await deps.registry.search(q));
+          if (q.length === 0) return { results: [], total: 0 };
+          return searchRegistry(deps.meili, q, {
+            limit: numberParam(query.limit),
+            offset: numberParam(query.offset),
+          });
         },
         { requireAuth: true },
       )

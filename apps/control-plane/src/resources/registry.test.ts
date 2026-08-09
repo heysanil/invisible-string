@@ -93,47 +93,14 @@ describe("createRegistryClient", () => {
       handler(String(input))) as unknown as typeof fetch;
   }
 
-  const searchBody = {
-    servers: [
-      {
-        server: {
-          name: "io.example/one",
-          version: "1.0.0",
-          description: "one",
-          remotes: [{ type: "streamable-http", url: "https://one.example/mcp" }],
-        },
-        _meta: {
-          "io.modelcontextprotocol.registry/official": { status: "active", isLatest: true },
-        },
-      },
-    ],
-  };
-
-  test("hits the FIXED host only and caches within the TTL", async () => {
-    const urls: string[] = [];
-    const client = createRegistryClient({
-      fetchImpl: stubFetch((url) => {
-        urls.push(url);
-        return Response.json(searchBody);
-      }),
-      ttlMs: 10_000,
-      now: () => 1000,
-    });
-    const a = await client.search("one");
-    const b = await client.search("one");
-    expect(a).toHaveLength(1);
-    expect(b).toEqual(a);
-    // Second call served from cache — only ONE upstream request.
-    expect(urls).toHaveLength(1);
-    expect(urls[0]!.startsWith(`${REGISTRY_HOST}/v0.1/servers?`)).toBeTrue();
-    expect(urls[0]!).toContain("version=latest");
-  });
+  // Community search rides the Meilisearch mirror (search/registry-search.ts);
+  // this client is install-provenance only, so getServer is the whole surface.
 
   test("upstream failure surfaces as a typed 502", async () => {
     const client = createRegistryClient({
       fetchImpl: stubFetch(() => new Response("nope", { status: 503 })),
     });
-    await expect(client.search("boom")).rejects.toMatchObject({
+    await expect(client.getServer("io.example/boom")).rejects.toMatchObject({
       status: 502,
       code: "registry_unavailable",
     });
@@ -145,7 +112,7 @@ describe("createRegistryClient", () => {
         throw new Error("ECONNREFUSED");
       }) as unknown as typeof fetch,
     });
-    const err = await client.search("x").catch((e) => e);
+    const err = await client.getServer("io.example/x").catch((e) => e);
     expect(err).toBeInstanceOf(RuntimeApiError);
     expect((err as RuntimeApiError).status).toBe(502);
   });

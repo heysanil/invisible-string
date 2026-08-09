@@ -1,20 +1,23 @@
 /**
- * MCP registry proxy client (registry.modelcontextprotocol.io).
+ * MCP registry detail client (registry.modelcontextprotocol.io) — the
+ * install-provenance path. Community SEARCH no longer lives here: it is
+ * served from the Meilisearch mirror (search/registry-search.ts) fed by the
+ * sync ETL; this client keeps only the live `getServer` detail fetch that
+ * `POST /connections {source:"registry"}` uses to verify a claimed remote.
  *
  * SSRF STANCE: this client fetches ONE fixed, hardcoded host and nothing else.
- * The only caller-controlled inputs are a search string (URL-query-encoded)
- * and a registry server NAME (path-segment-encoded) — never a URL. The control
- * plane never fetches a user-supplied URL server-side; custom-URL connections
- * are created from data the client sends, not fetched here. This keeps the
- * registry proxy from being turned into a server-side request forgery gadget.
+ * The only caller-controlled input is a registry server NAME (path-segment-
+ * encoded) — never a URL. The control plane never fetches a user-supplied URL
+ * server-side; custom-URL connections are created from data the client sends,
+ * not fetched here. This keeps the registry proxy from being turned into a
+ * server-side request forgery gadget.
  *
- * The upstream list/detail JSON is trimmed to {@link RegistryServerSummary}
- * (api.ts) — the UI never sees fields we don't render. Results are cached in
- * memory for 60s; upstream failures surface as a typed 502.
+ * The upstream detail JSON is trimmed to {@link RegistryServerSummary}
+ * (api.ts) — the UI never sees fields we don't render; upstream failures
+ * surface as a typed 502.
  */
 import {
   registryServerSummarySchema,
-  type RegistrySearchResponse,
   type RegistryServerSummary,
 } from "@invisible-string/shared";
 
@@ -22,13 +25,10 @@ import { errors } from "../runtime/errors";
 
 /** The ONLY host this module ever contacts (SSRF containment). */
 export const REGISTRY_HOST = "https://registry.modelcontextprotocol.io";
-const SEARCH_PATH = "/v0.1/servers";
-const CACHE_TTL_MS = 60_000;
+const SERVERS_PATH = "/v0.1/servers";
 const REQUEST_TIMEOUT_MS = 10_000;
 
 export interface RegistryClient {
-  /** Active + latest servers matching the free-text query (trimmed DTOs). */
-  search(query: string): Promise<RegistryServerSummary[]>;
   /** One server's latest (or pinned) detail, or null when not found. */
   getServer(name: string, version?: string): Promise<RegistryServerSummary | null>;
 }
@@ -164,15 +164,8 @@ export function mapRegistryEntry(entry: Json): RegistryServerSummary | null {
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
-interface CacheEntry {
-  expires: number;
-  servers: RegistryServerSummary[];
-}
-
 export interface CreateRegistryClientOptions {
   fetchImpl?: typeof fetch;
-  ttlMs?: number;
-  now?: () => number;
   /**
    * Override the registry host (MCP_REGISTRY_BASE_URL). LOCAL DEV/CI ONLY — an
    * operator-controlled test seam that points the proxy at a local stub (same
@@ -186,10 +179,7 @@ export function createRegistryClient(
   options: CreateRegistryClientOptions = {},
 ): RegistryClient {
   const doFetch = options.fetchImpl ?? fetch;
-  const ttlMs = options.ttlMs ?? CACHE_TTL_MS;
-  const now = options.now ?? Date.now;
   const host = (options.baseUrl?.trim() || REGISTRY_HOST).replace(/\/+$/, "");
-  const cache = new Map<string, CacheEntry>();
 
   async function getJson(url: string): Promise<Json> {
     let res: Response;
@@ -213,27 +203,10 @@ export function createRegistryClient(
   }
 
   return {
-    async search(query) {
-      const key = query.trim().toLowerCase();
-      const cached = cache.get(key);
-      if (cached && cached.expires > now()) return cached.servers;
-
-      const url = `${host}${SEARCH_PATH}?search=${encodeURIComponent(query)}&version=latest`;
-      const body = await getJson(url);
-      const servers = asArray(body.servers)
-        .map((entry) => {
-          const obj = asObject(entry);
-          return obj ? mapRegistryEntry(obj) : null;
-        })
-        .filter((s): s is RegistryServerSummary => s !== null);
-      cache.set(key, { expires: now() + ttlMs, servers });
-      return servers;
-    },
-
     async getServer(name, version = "latest") {
       // Path-segment-encode BOTH the reverse-DNS name and version; still the
       // fixed host, never a user URL.
-      const url = `${host}${SEARCH_PATH}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
+      const url = `${host}${SERVERS_PATH}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
       let body: Json;
       try {
         body = await getJson(url);
@@ -251,10 +224,4 @@ export function createRegistryClient(
       return mapRegistryEntry(body);
     },
   };
-}
-
-export function toRegistrySearchResponse(
-  servers: RegistryServerSummary[],
-): RegistrySearchResponse {
-  return { servers };
 }

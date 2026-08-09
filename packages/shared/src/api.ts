@@ -1139,14 +1139,19 @@ export const getConnectionResponseSchema = z.object({
 });
 export type GetConnectionResponse = z.infer<typeof getConnectionResponseSchema>;
 
-// ── MCP registry proxy ──────────────────────────────────────────────────────
+// ── MCP registry search + install provenance ────────────────────────────────
 //
-//   GET /mcp-registry/search?q= → RegistrySearchResponse
+//   GET /mcp-registry/search?q=&limit=&offset= → RegistrySearchResponse
 //
-// The control plane proxies registry.modelcontextprotocol.io
-// (`GET /v0.1/servers?search=&version=latest`, active/latest filtered) and
-// TRIMS each server to this DTO — the UI never talks to the registry
-// directly and never sees fields we don't render.
+// Community search is served from the control plane's Meilisearch mirror of
+// registry.modelcontextprotocol.io (sync ETL, connectors spec §5) — the
+// browser never talks to the registry or Meilisearch directly. Only
+// installable servers (active + latest + ≥1 valid remote) enter the index,
+// so every result can be installed as-is; when Meilisearch is unconfigured
+// or unreachable the route answers a typed 503 `search_unavailable` and the
+// UI degrades to catalog-only. Install provenance still live-fetches the
+// registry detail endpoint — {@link registryServerSummarySchema} remains
+// that path's trimmed DTO.
 
 /**
  * One env-var/header the server declares it needs. Secret-flagged
@@ -1205,8 +1210,26 @@ export const registrySearchQuerySchema = z.object({
 });
 export type RegistrySearchQuery = z.infer<typeof registrySearchQuerySchema>;
 
+/**
+ * One community-search hit (the Meilisearch mirror's trimmed document).
+ * `verified` = domain-verified publisher namespace (NOT io.github.*); the
+ * install flow prompts from the chosen remote's header declarations.
+ */
+export const registrySearchResultSchema = z.object({
+  /** Registry id, reverse-DNS style (e.g. "app.linear/linear"). */
+  name: z.string().min(1),
+  title: z.string().optional(),
+  description: z.string().default(""),
+  verified: z.boolean(),
+  /** Never empty on the wire: only installable servers enter the index. */
+  remotes: z.array(registryRemoteSchema).default([]),
+});
+export type RegistrySearchResult = z.infer<typeof registrySearchResultSchema>;
+
 export const registrySearchResponseSchema = z.object({
-  servers: z.array(registryServerSummarySchema),
+  results: z.array(registrySearchResultSchema),
+  /** Estimated total matches (Meilisearch estimate), for pagination. */
+  total: z.number().int().nonnegative(),
 });
 export type RegistrySearchResponse = z.infer<
   typeof registrySearchResponseSchema

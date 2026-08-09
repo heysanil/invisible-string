@@ -23,6 +23,7 @@ import type { Auth } from "../auth";
 import type { CompileAgentFn } from "../build/compiler-contract";
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
+import type { MeiliClient } from "../search/meili";
 import type { WorkspaceDeps } from "../workspace";
 import type { OpenRouterCatalog } from "./openrouter-catalog";
 import type { RegistryClient } from "./registry";
@@ -37,6 +38,12 @@ export interface ResourceDeps {
   /** Object store for skill attachments (undefined when S3 is unconfigured). */
   artifacts: ArtifactStore | undefined;
   registry: RegistryClient;
+  /**
+   * Meilisearch client backing `GET /mcp-registry/search` (the registry
+   * mirror). Null = community search degraded to a typed 503 — the catalog
+   * and custom-URL lanes never depend on it (connectors spec §5).
+   */
+  meili: MeiliClient | null;
   /**
    * OpenRouter model-catalog lookup: allowlist-add validation AND the model
    * capabilities (supported reasoning efforts, context window) the effort

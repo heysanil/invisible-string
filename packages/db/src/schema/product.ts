@@ -5,7 +5,9 @@
  * Conventions:
  * - Workspace = Better Auth organization; workspace scoping is
  *   `organization_id` FK → organization.id (text, Better Auth ids).
- * - Product rows use uuid PKs (gen_random_uuid()).
+ * - Product rows use uuid PKs (gen_random_uuid()); connectors-redesign tables
+ *   (connections, connection_oauth) use prefixed nanoids (cn_/co_,
+ *   packages/shared newId).
  * - Encrypted-at-rest values (AES-256-GCM envelope, packages/… crypto module)
  *   are stored as opaque `text` columns suffixed `_encrypted`; plaintext must
  *   never be logged or put in model context.
@@ -142,6 +144,42 @@ export const workerStatus = pgEnum("worker_status", [
   "live",
   "draining",
   "dead",
+]);
+
+/** Where a connection came from (connectors redesign spec §2). */
+export const connectionSource = pgEnum("connection_source", [
+  "catalog",
+  "registry",
+  "custom",
+]);
+
+/** MCP remote transport, persisted at install (spec §3). */
+export const mcpTransport = pgEnum("mcp_transport", ["streamable-http", "sse"]);
+
+/** Connection auth mode. `oauth` rows pair with `connection_oauth`. */
+export const connectionAuthType = pgEnum("connection_auth_type", [
+  "none",
+  "bearer",
+  "headers",
+  "oauth",
+]);
+
+/** Probe-derived health (spec §7). `unknown` until first probe. */
+export const connectionHealth = pgEnum("connection_health", [
+  "unknown",
+  "ok",
+  "unreachable",
+  "auth_required",
+  "auth_error",
+]);
+
+/** OAuth grant lifecycle (spec §3). */
+export const connectionOauthStatus = pgEnum("connection_oauth_status", [
+  "pending",
+  "connected",
+  "expired",
+  "revoked",
+  "error",
 ]);
 
 // ── Timestamp helpers ────────────────────────────────────────────────────────
@@ -670,3 +708,107 @@ export const triggers = pgTable(
       .where(sql`${table.type} = 'schedule' AND ${table.enabled} = true`),
   ],
 );
+
+// ── Connections: the rebuilt MCP connection domain (connectors redesign) ────
+
+/**
+ * Connections — the rebuilt MCP connection domain (spec §3). Replaces
+ * `mcp_connections`, which is DEAD (kept only because migrations are
+ * additive; see AGENTS.md known residuals). Ids are `cn_<nanoid16>`,
+ * generated app-side (the auth envelope AAD binds the id pre-insert).
+ */
+export const connections = pgTable(
+  "connections",
+  {
+    id: text("id").primaryKey(),
+    scope: resourceScope("scope").notNull(),
+    organizationId: text("organization_id").references(
+      () => organization.id,
+      { onDelete: "cascade" },
+    ),
+    userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    description: text("description"),
+    source: connectionSource("source").notNull(),
+    catalogSlug: text("catalog_slug"),
+    registryName: text("registry_name"),
+    url: text("url").notNull(),
+    transport: mcpTransport("transport").notNull().default("streamable-http"),
+    authType: connectionAuthType("auth_type").notNull().default("none"),
+    authConfigEncrypted: text("auth_config_encrypted"),
+    toolAllow: jsonb("tool_allow").$type<string[]>(),
+    toolBlock: jsonb("tool_block").$type<string[]>(),
+    approvalPolicy: jsonb("approval_policy"),
+    enabled: boolean("enabled").notNull().default(true),
+    health: connectionHealth("health").notNull().default("unknown"),
+    lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    toolsCache: jsonb("tools_cache").$type<
+      Array<{ name: string; description: string; params: string[] }>
+    >(),
+    toolsCachedAt: timestamp("tools_cached_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("connections_organization_id_idx").on(t.organizationId),
+    index("connections_user_id_idx").on(t.userId),
+    uniqueIndex("connections_org_name_uq")
+      .on(t.organizationId, t.name)
+      .where(sql`${t.organizationId} IS NOT NULL`),
+    uniqueIndex("connections_user_name_uq")
+      .on(t.userId, t.name)
+      .where(sql`${t.userId} IS NOT NULL`),
+    check(
+      "connections_scope_owner_check",
+      sql`(${t.scope} = 'workspace' AND ${t.organizationId} IS NOT NULL AND ${t.userId} IS NULL)
+       OR (${t.scope} = 'user' AND ${t.userId} IS NOT NULL AND ${t.organizationId} IS NULL)`,
+    ),
+  ],
+);
+
+/** 1:1 OAuth grant state for `auth_type = 'oauth'` connections (spec §3/§6). */
+export const connectionOauth = pgTable("connection_oauth", {
+  id: text("id").primaryKey(),
+  connectionId: text("connection_id")
+    .notNull()
+    .unique()
+    .references(() => connections.id, { onDelete: "cascade" }),
+  authorizationServer: text("authorization_server"),
+  authorizationEndpoint: text("authorization_endpoint"),
+  tokenEndpoint: text("token_endpoint"),
+  scopes: jsonb("scopes").$type<string[]>(),
+  clientId: text("client_id"),
+  clientSecretEncrypted: text("client_secret_encrypted"),
+  accessTokenEncrypted: text("access_token_encrypted"),
+  accessTokenExpiresAt: timestamp("access_token_expires_at", {
+    withTimezone: true,
+  }),
+  refreshTokenEncrypted: text("refresh_token_encrypted"),
+  status: connectionOauthStatus("status").notNull().default("pending"),
+  pendingState: text("pending_state"),
+  pendingCodeVerifierEncrypted: text("pending_code_verifier_encrypted"),
+  pendingExpiresAt: timestamp("pending_expires_at", { withTimezone: true }),
+  connectedBy: text("connected_by").references(() => user.id, {
+    onDelete: "set null",
+  }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
+/** Registry→Meilisearch ETL cursor (spec §5). Single row, id = 'official'. */
+export const registrySyncState = pgTable("registry_sync_state", {
+  id: text("id").primaryKey(),
+  lastUpdatedSince: timestamp("last_updated_since", { withTimezone: true }),
+  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+});

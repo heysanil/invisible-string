@@ -2,8 +2,31 @@
  * The chat thread's run state machine — a PURE reduction from a run row +
  * its ordered `run_events` frames to the view model the thread renders:
  *
- *   user message → working block (tool steps ✓/⏸/✗, narration, reasoning)
- *               → pending HITL inputs → final assistant reply → error
+ *   user message → an ORDERED TIMELINE of segments
+ *               → pending HITL inputs → error
+ *
+ * A run is `segments`, in the order the agent produced them: a
+ * {@link WorkSegment} is a contiguous stretch of interior work (thoughts and
+ * tool calls, one rail in one collapsible box) and a {@link SpeechSegment} is
+ * one assistant utterance. Assistant text CLOSES the open work segment, so
+ * later work opens a new one below — mid-run narration therefore renders where
+ * it happened instead of being hoisted to the end.
+ *
+ * Two eve emitter facts drive the keys (spike/REPORT.md findings 30–33):
+ * `(turnId, stepIndex)` is NOT unique for reasoning OR for messages — the
+ * emitter resets its accumulator on every text delta / tool flush — so a key
+ * that has already SEALED (a `reasoning.completed` / `message.completed`
+ * landed) sends the next block to `${key}#2`, `#3`, … Sealing happens AFTER the
+ * key is resolved, so a completion always lands on its own open block. A tool
+ * call does NOT split a reasoning block; only text does, and a step's
+ * `reasoning.completed` legitimately arrives after that step's tool events —
+ * never seal a thought on the next tool call.
+ *
+ * Items are addressed GLOBALLY (`itemOwner`), not within the open segment:
+ * an `action.result`/`action.partial` for a call issued before the agent spoke,
+ * and durable step RETRIES that re-emit an entire sequence, both update the
+ * item in place wherever it already lives rather than duplicating it into a
+ * fresh box.
  *
  * Everything here is deterministic and side-effect free so the same code
  * path serves the live SSE stream, replayed history, tests and the fixture
@@ -76,15 +99,6 @@ export type StepState =
   /** The turn was stopped before this call settled — no result will arrive. */
   | "canceled";
 
-export interface StepRowView {
-  /** Tool call id — stable row identity. */
-  key: string;
-  toolName: string;
-  state: StepState;
-  /** One-line result preview (truncated at render). Null until resolved. */
-  resultPreview: string | null;
-}
-
 export interface PendingInputView {
   requestId: string;
   prompt: string;
@@ -110,27 +124,61 @@ export interface PendingInputView {
   display: "confirmation" | "select" | "text";
 }
 
-export interface WorkingBlockView {
-  steps: readonly StepRowView[];
-  /** Interim assistant narration (non-terminal message completions). */
-  narration: readonly string[];
-  /** Latest reasoning text (rendered as one subtle truncated line). */
-  reasoning: string | null;
-  /** Wall-clock seconds from first to last frame (null with <2 frames). */
-  elapsedSeconds: number | null;
-  /** True while the run may still append to this block. */
-  active: boolean;
+export interface ThoughtItem {
+  kind: "thought";
+  /** `${turnId}:${stepIndex}`, plus `#2`, `#3`… once that key has sealed. */
+  key: string;
+  text: string;
+  /** Wall-clock seconds for this pass; null while streaming or unmeasurable. */
+  seconds: number | null;
+  streaming: boolean;
 }
+
+export interface ToolItem {
+  kind: "tool";
+  /** Tool call id. */
+  key: string;
+  toolName: string;
+  state: StepState;
+  resultPreview: string | null;
+}
+
+export type TimelineItem = ThoughtItem | ToolItem;
+
+export interface SpeechSegment {
+  kind: "speech";
+  /** `say:${turnId}:${stepIndex}`, plus `#2`, `#3`… once that key has sealed. */
+  key: string;
+  text: string;
+  streaming: boolean;
+}
+
+export interface WorkSegment {
+  kind: "work";
+  /** `work:${first item's key}`. */
+  key: string;
+  items: readonly TimelineItem[];
+  /** Span of THIS segment's own frames, floored at 1s; null under two frames. */
+  elapsedSeconds: number | null;
+  /** First frame's `at` — the component ticks its live counter from this. */
+  startedAt: string | null;
+  /** Accepting items right now. Drives the spinner + counter. */
+  active: boolean;
+  /** Blocked on the user. */
+  waiting: boolean;
+  /** A later segment exists — the auto-fold cue. */
+  sealed: boolean;
+}
+
+export type RunSegment = SpeechSegment | WorkSegment;
 
 export interface RunView {
   runId: string;
   status: RunStatus;
   /** The inbound user/trigger message that started this run. */
   userMessage: string;
-  /** Working block; null when the run produced no tool/interim activity. */
-  block: WorkingBlockView | null;
-  /** Assistant prose (streaming while `streaming`). */
-  reply: { text: string; streaming: boolean } | null;
+  /** The run's top-level chronology. Empty when nothing has streamed yet. */
+  segments: readonly RunSegment[];
   /** Unanswered `input.requested` entries (approval cards / questions). */
   pendingInputs: readonly PendingInputView[];
   error: string | null;
@@ -249,21 +297,133 @@ export function reduceRunView(
   const status = isRunSettledStatus(run.status)
     ? run.status
     : (statusOverride ?? run.status);
-  const stepsByCall = new Map<string, StepRowView>();
-  const narration: string[] = [];
+
+  type WorkBuilder = {
+    kind: "work";
+    key: string;
+    items: TimelineItem[];
+    firstAt: string;
+    lastAt: string;
+  };
+  type SpeechBuilder = {
+    kind: "speech";
+    key: string;
+    text: string;
+    completed: boolean;
+  };
+  type SegBuilder = WorkBuilder | SpeechBuilder;
+
+  const segments: SegBuilder[] = [];
+  /** EVERY item ever seen, wherever it lives — the global-upsert index. */
+  const itemOwner = new Map<string, { seg: WorkBuilder; item: TimelineItem }>();
+  const speechByKey = new Map<string, SpeechBuilder>();
+  const thoughtSpan = new Map<string, { first: string; last: string }>();
+  const sealedThoughts = new Set<string>();
+  const sealedSpeech = new Set<string>();
+  let current: WorkBuilder | null = null;
+
   const pendingByRequest = new Map<
     string,
     { view: PendingInputView; callId: string | null }
   >();
 
   let userMessage = run.triggerEvent.message;
-  let reasoning: string | null = null;
-  let streamText: string | null = null;
-  let reply: { text: string; streaming: boolean } | null = null;
   let error: string | null = run.error;
   let modelId: string | null = null;
   let canceled = false;
   let contextCleared = false;
+
+  /**
+   * Keyless append-type frames extend the currently open item of that kind.
+   * 0.19-era `run_events` rows carry no `stepIndex` and are replayed forever;
+   * a per-frame key would render one item per delta.
+   */
+  let openThoughtKey: string | null = null;
+  let openSpeechBase: string | null = null;
+
+  /** The live key for a base: skip forward past any sealed ordinal. */
+  const liveKey = (base: string, sealed: ReadonlySet<string>) => {
+    let key = base;
+    let n = 1;
+    while (sealed.has(key)) {
+      n += 1;
+      key = `${base}#${n}`;
+    }
+    return key;
+  };
+
+  const pushItem = (item: TimelineItem, at: string) => {
+    let seg = current;
+    if (seg === null) {
+      seg = {
+        kind: "work",
+        key: `work:${item.key}`,
+        items: [],
+        firstAt: at,
+        lastAt: at,
+      };
+      segments.push(seg);
+      current = seg;
+    }
+    seg.items.push(item);
+    seg.lastAt = at;
+    itemOwner.set(item.key, { seg, item });
+  };
+
+  /** In-place update wherever the item lives — even a segment closed long ago. */
+  const updateItem = (key: string, next: TimelineItem, at: string): boolean => {
+    const owner = itemOwner.get(key);
+    if (owner === undefined) return false;
+    const index = owner.seg.items.indexOf(owner.item);
+    owner.seg.items[index] = next;
+    owner.seg.lastAt = at;
+    itemOwner.set(key, { seg: owner.seg, item: next });
+    return true;
+  };
+
+  const upsertTool = (
+    callId: string,
+    toolName: string,
+    state: StepState,
+    resultPreview: string | null,
+    at: string,
+  ) => {
+    const next: ToolItem = {
+      kind: "tool",
+      key: callId,
+      toolName,
+      state,
+      resultPreview,
+    };
+    if (!updateItem(callId, next, at)) pushItem(next, at);
+  };
+
+  const toolItemFor = (callId: string): ToolItem | undefined => {
+    const owner = itemOwner.get(callId);
+    if (owner === undefined || owner.item.kind !== "tool") return undefined;
+    return owner.item;
+  };
+
+  /** Assistant text. Opens a speech segment, which CLOSES the current work one. */
+  const upsertSpeech = (base: string, text: string, complete: boolean) => {
+    const key = liveKey(`say:${base}`, sealedSpeech);
+    const existing = speechByKey.get(key);
+    if (existing === undefined) {
+      const seg: SpeechBuilder = {
+        kind: "speech",
+        key,
+        text,
+        completed: complete,
+      };
+      segments.push(seg);
+      speechByKey.set(key, seg);
+      current = null;
+    } else {
+      existing.text = text;
+      existing.completed = existing.completed || complete;
+    }
+    if (complete) sealedSpeech.add(key);
+  };
 
   const resolveInputsForCall = (callId: string) => {
     for (const [requestId, entry] of pendingByRequest) {
@@ -291,12 +451,18 @@ export function reduceRunView(
         break;
       case "actions.requested":
         for (const action of event.data.actions) {
-          stepsByCall.set(action.callId, {
-            key: action.callId,
-            toolName: action.toolName,
-            state: "pending",
-            resultPreview: null,
-          });
+          if (!itemOwner.has(action.callId)) {
+            pushItem(
+              {
+                kind: "tool",
+                key: action.callId,
+                toolName: action.toolName,
+                state: "pending",
+                resultPreview: null,
+              },
+              frame.at,
+            );
+          }
         }
         break;
       case "input.requested":
@@ -307,9 +473,9 @@ export function reduceRunView(
             callId,
           });
           if (callId !== null) {
-            const step = stepsByCall.get(callId);
+            const step = toolItemFor(callId);
             if (step !== undefined && step.state === "pending") {
-              stepsByCall.set(callId, { ...step, state: "awaiting" });
+              updateItem(callId, { ...step, state: "awaiting" }, frame.at);
             }
           }
         }
@@ -318,19 +484,20 @@ export function reduceRunView(
       // last-write-wins per callId, never terminal for the step.
       case "action.partial": {
         const { result } = event.data;
-        const step = stepsByCall.get(result.callId);
+        const step = toolItemFor(result.callId);
         // Never walk a settled step backwards. eve emits partials before the
         // result, but a durable step RETRY re-emits the whole sequence, so a
         // partial can legitimately arrive after this call already resolved.
         if (step !== undefined && step.state !== "pending" && step.state !== "awaiting") {
           break;
         }
-        stepsByCall.set(result.callId, {
-          key: result.callId,
-          toolName: result.toolName,
-          state: step?.state ?? "pending",
-          resultPreview: previewValue(result.output),
-        });
+        upsertTool(
+          result.callId,
+          result.toolName,
+          step?.state ?? "pending",
+          previewValue(result.output),
+          frame.at,
+        );
         break;
       }
       case "action.result": {
@@ -345,34 +512,84 @@ export function reduceRunView(
           state === "ok"
             ? previewValue(result.output)
             : (resultError?.message ?? previewValue(result.output) ?? "Failed");
-        stepsByCall.set(result.callId, {
-          key: result.callId,
-          toolName: result.toolName,
-          state,
-          resultPreview: preview,
-        });
+        upsertTool(result.callId, result.toolName, state, preview, frame.at);
         resolveInputsForCall(result.callId);
         break;
       }
-      case "reasoning.appended":
-        reasoning = event.data.reasoningSoFar;
+      case "reasoning.appended": {
+        const { turnId, reasoningSoFar } = event.data;
+        const stepIndex: number | undefined = event.data.stepIndex;
+        // Annotated: the assignment back into `openThoughtKey` below would
+        // otherwise make this initializer circular for inference.
+        const key: string =
+          stepIndex === undefined
+            ? (openThoughtKey ?? `legacy:${frame.seq}`)
+            : liveKey(`${turnId}:${stepIndex}`, sealedThoughts);
+        if (stepIndex === undefined) openThoughtKey = key;
+        const span = thoughtSpan.get(key);
+        thoughtSpan.set(key, { first: span?.first ?? frame.at, last: frame.at });
+        const next: ThoughtItem = {
+          kind: "thought",
+          key,
+          text: reasoningSoFar,
+          seconds: null,
+          streaming: true,
+        };
+        if (!updateItem(key, next, frame.at)) pushItem(next, frame.at);
         break;
-      case "reasoning.completed":
-        reasoning = event.data.reasoning;
+      }
+      case "reasoning.completed": {
+        const { turnId, reasoning } = event.data;
+        const stepIndex: number | undefined = event.data.stepIndex;
+        const key =
+          stepIndex === undefined
+            ? (openThoughtKey ?? `legacy:${frame.seq}`)
+            : liveKey(`${turnId}:${stepIndex}`, sealedThoughts);
+        if (stepIndex === undefined) openThoughtKey = null;
+        const span = thoughtSpan.get(key);
+        const first = span?.first ?? frame.at;
+        const ms = Date.parse(frame.at) - Date.parse(first);
+        const seconds =
+          Number.isFinite(ms) && ms > 0 ? Math.max(1, Math.round(ms / 1000)) : null;
+        const next: ThoughtItem = {
+          kind: "thought",
+          key,
+          text: reasoning,
+          seconds,
+          streaming: false,
+        };
+        if (!updateItem(key, next, frame.at)) pushItem(next, frame.at);
+        // Seal AFTER resolving the key, so this completion lands on the open
+        // block rather than skipping ahead to a fresh ordinal.
+        sealedThoughts.add(key);
         break;
-      case "message.appended":
-        streamText = event.data.messageSoFar;
-        break;
-      case "message.completed": {
-        const text = event.data.message;
-        if (event.data.finishReason === "stop") {
-          if (text !== null && text.length > 0) {
-            reply = { text, streaming: false };
-          }
-        } else if (text !== null && text.trim().length > 0) {
-          narration.push(text);
+      }
+      case "message.appended": {
+        const { turnId, messageSoFar } = event.data;
+        const stepIndex: number | undefined = event.data.stepIndex;
+        if (messageSoFar.trim().length > 0) {
+          const base: string =
+            stepIndex === undefined
+              ? (openSpeechBase ?? `legacy:${frame.seq}`)
+              : `${turnId}:${stepIndex}`;
+          if (stepIndex === undefined) openSpeechBase = base;
+          upsertSpeech(base, messageSoFar, false);
         }
-        streamText = null;
+        break;
+      }
+      case "message.completed": {
+        const { turnId, message } = event.data;
+        const stepIndex: number | undefined = event.data.stepIndex;
+        // A null/blank completion is eve's empty-delivery sentinel: it creates
+        // no segment and therefore does not close the current work segment.
+        if (message !== null && message.trim().length > 0) {
+          const base =
+            stepIndex === undefined
+              ? (openSpeechBase ?? `legacy:${frame.seq}`)
+              : `${turnId}:${stepIndex}`;
+          upsertSpeech(base, message, true);
+        }
+        if (stepIndex === undefined) openSpeechBase = null;
         break;
       }
       // A USER DECISION, NEVER AN ERROR — deliberately its own arm, far from
@@ -383,9 +600,13 @@ export function reduceRunView(
       case "turn.cancelled": {
         canceled = true;
         retirePendingInputs();
-        for (const [callId, step] of stepsByCall) {
-          if (step.state === "pending" || step.state === "awaiting") {
-            stepsByCall.set(callId, { ...step, state: "canceled" });
+        for (const [key, owner] of [...itemOwner]) {
+          const { item } = owner;
+          if (
+            item.kind === "tool" &&
+            (item.state === "pending" || item.state === "awaiting")
+          ) {
+            updateItem(key, { ...item, state: "canceled" }, frame.at);
           }
         }
         break;
@@ -406,47 +627,58 @@ export function reduceRunView(
     }
   }
 
-  // A stream still in flight at the end of the frames IS the reply so far.
-  // A cancelled turn's partial text is FINAL — freeze it (no blinking caret)
-  // the moment `turn.cancelled` lands, without waiting for the status frame.
-  if (streamText !== null && reply === null) {
-    reply = {
-      text: streamText,
-      streaming: !canceled && (status === "running" || status === "queued"),
-    };
-  }
-
-  const active = !canceled && (status === "queued" || status === "running");
-  const steps = [...stepsByCall.values()];
-  const hasBlock =
-    steps.length > 0 || narration.length > 0 || reasoning !== null;
-
-  let elapsedSeconds: number | null = null;
-  const first = store.frames[0];
-  const last = store.frames[store.frames.length - 1];
-  if (first !== undefined && last !== undefined && first !== last) {
-    const ms = Date.parse(last.at) - Date.parse(first.at);
-    if (Number.isFinite(ms) && ms >= 0) {
-      elapsedSeconds = Math.max(1, Math.round(ms / 1000));
-    }
-  }
+  // A stream still in flight at the end of the frames IS the text so far, and
+  // a cancelled turn's partial text is FINAL — the moment `turn.cancelled`
+  // lands, `runLive` is false, so every caret freezes without waiting for the
+  // status frame.
+  const runLive = !canceled && (status === "queued" || status === "running");
 
   // Pending inputs only matter while the run is parked or still active —
   // a terminal run has nothing left to answer. `turn.cancelled` already
   // retired them above; this also covers a run whose status settled first.
   const pendingInputs =
-    !canceled && (status === "waiting" || active)
+    !canceled && (status === "waiting" || runLive)
       ? [...pendingByRequest.values()].map((entry) => entry.view)
       : [];
+
+  const lastIndex = segments.length - 1;
+  const outSegments: RunSegment[] = segments.map((seg, index) => {
+    if (seg.kind === "speech") {
+      return {
+        kind: "speech",
+        key: seg.key,
+        text: seg.text,
+        streaming: !seg.completed && runLive,
+      };
+    }
+    const ms = Date.parse(seg.lastAt) - Date.parse(seg.firstAt);
+    const elapsedSeconds =
+      Number.isFinite(ms) && ms > 0 ? Math.max(1, Math.round(ms / 1000)) : null;
+    return {
+      kind: "work",
+      key: seg.key,
+      items: seg.items.map((item) =>
+        item.kind === "thought" && item.streaming && !runLive
+          ? { ...item, streaming: false }
+          : item,
+      ),
+      elapsedSeconds,
+      startedAt: seg.firstAt,
+      active: runLive && index === lastIndex,
+      waiting:
+        !canceled &&
+        status === "waiting" &&
+        index === lastIndex &&
+        pendingInputs.length > 0,
+      sealed: index < lastIndex,
+    };
+  });
 
   return {
     runId: run.id,
     status,
     userMessage,
-    block: hasBlock
-      ? { steps, narration, reasoning, elapsedSeconds, active }
-      : null,
-    reply,
+    segments: outSegments,
     pendingInputs,
     // Error surfaces only when the run actually failed — a step that failed
     // mid-run but recovered must not leave a stale banner, and a CANCELLED

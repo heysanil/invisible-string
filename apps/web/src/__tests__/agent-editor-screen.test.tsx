@@ -14,6 +14,7 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
+import type { ModelCapabilityDto } from "@invisible-string/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
@@ -48,8 +49,20 @@ const MODEL_PRESETS = [
     slug: "balanced" as const,
     provider: "openrouter" as const,
     modelId: "deepseek/deepseek-v4-pro",
+    reasoning: "max" as const,
     createdAt: NOW,
     updatedAt: NOW,
+  },
+];
+
+// Efforts arrive DESCENDING from the live catalog — the selector must sort
+// them back through REASONING_ORDER before rendering.
+const CAPABILITIES: ModelCapabilityDto[] = [
+  {
+    provider: "openrouter",
+    modelId: "deepseek/deepseek-v4-pro",
+    supportedEfforts: ["max", "high", "low"],
+    defaultEffort: "high",
   },
 ];
 
@@ -297,10 +310,11 @@ test("model section dispatches preset changes and flags off-allowlist overrides"
   const dispatch = mock(() => {});
   const view = render(
     <ModelSection
-      model={{ preset: "balanced", reasoning: "medium" }}
+      model={{ preset: "balanced" }}
       dispatch={dispatch}
       modelPresets={MODEL_PRESETS}
       allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
     />,
   );
   expect(view.getByText(/balanced maps to/)).toBeTruthy();
@@ -322,6 +336,7 @@ test("model section dispatches preset changes and flags off-allowlist overrides"
       dispatch={() => {}}
       modelPresets={MODEL_PRESETS}
       allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
     />,
   );
   expect(flagged.getByText(/not on the workspace allowlist/)).toBeTruthy();
@@ -338,6 +353,7 @@ test("model section does NOT flag an override while the allowlist is still loadi
       dispatch={() => {}}
       modelPresets={MODEL_PRESETS}
       allowlist={null}
+      capabilities={CAPABILITIES}
     />,
   );
   // Loading is not "empty allowlist": no false publish-blocking error…
@@ -345,6 +361,162 @@ test("model section does NOT flag an override while the allowlist is still loadi
   // …and the stored override stays visible in the Select (an option exists).
   const select = view.getByLabelText("Model override (optional)") as HTMLSelectElement;
   expect(select.value).toBe("internal/warehouse-1");
+});
+
+test("reasoning effort: inherits by default, offers the model's efforts weakest-first", () => {
+  const dispatch = mock(() => {});
+  const view = render(
+    <ModelSection
+      model={{ preset: "balanced" }}
+      dispatch={dispatch}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
+    />,
+  );
+
+  const select = view.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  // No stored effort → the inherit sentinel, naming the preset's own effort.
+  expect(select.value).toBe("__inherit__");
+  const options = [...select.options].map((option) => option.textContent);
+  // `Model default` (= provider-default) is offered on EVERY model — no
+  // catalog advertises it, but it is valid everywhere and is the only usable
+  // option on a model with an empty supported set.
+  expect(options).toEqual([
+    "Inherit from preset (Max)",
+    "Model default",
+    "Low",
+    "High",
+    "Max",
+  ]);
+  // …and the resolved line says where that effort came from.
+  expect(view.getByText(/Reasoning: Max \(inherited\)\./)).toBeTruthy();
+
+  fireEvent.change(select, { target: { value: "low" } });
+  expect(dispatch).toHaveBeenCalledWith({ type: "setReasoning", reasoning: "low" });
+});
+
+test("reasoning effort: the sentinel CLEARS an explicit effort (back to inherit)", () => {
+  const dispatch = mock(() => {});
+  const view = render(
+    <ModelSection
+      model={{ preset: "balanced", reasoning: "low" }}
+      dispatch={dispatch}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
+    />,
+  );
+
+  const select = view.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  expect(select.value).toBe("low");
+  fireEvent.change(select, { target: { value: "__inherit__" } });
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "setReasoning",
+    reasoning: undefined,
+  });
+});
+
+test("reasoning effort: unknown capabilities offer the whole vocabulary; an unsupported stored effort is advisory only", () => {
+  const view = render(
+    <ModelSection
+      model={{ preset: "balanced" }}
+      dispatch={() => {}}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={null}
+    />,
+  );
+  const fallback = view.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  // Sentinel + all eight values — never an empty selector.
+  expect(fallback.options.length).toBe(9);
+
+  cleanup();
+  const stale = render(
+    <ModelSection
+      model={{ preset: "balanced", reasoning: "medium" }}
+      dispatch={() => {}}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
+    />,
+  );
+  const select = stale.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  // The stored value stays selected and selectable…
+  expect(select.value).toBe("medium");
+  // …with a WARNING, not a publish-blocking error.
+  expect(stale.getByText(/does not advertise medium reasoning/)).toBeTruthy();
+  expect(stale.queryByText(/rejected at publish/)).toBeNull();
+});
+
+test("reasoning effort: a model with an EMPTY supported set still offers Model default", () => {
+  const dispatch = mock(() => {});
+  // The ~131/400 catalog models that are listed but advertise no reasoning
+  // support. `[]` is NOT `null`: it is a definite "no efforts", and offering
+  // only the supported set here would leave a selector with nothing in it.
+  const view = render(
+    <ModelSection
+      model={{ preset: "balanced" }}
+      dispatch={dispatch}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={[
+        {
+          provider: "openrouter",
+          modelId: "deepseek/deepseek-v4-pro",
+          supportedEfforts: [],
+        },
+      ]}
+    />,
+  );
+  const select = view.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  expect([...select.options].map((option) => option.textContent)).toEqual([
+    "Inherit from preset (Max)",
+    "Model default",
+  ]);
+  // …and the INHERITED `max` is flagged, since inheritance would otherwise
+  // bake a reasoning block onto a model with no use for it.
+  expect(view.getByText(/advertises no reasoning support/)).toBeTruthy();
+  fireEvent.change(select, { target: { value: "provider-default" } });
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "setReasoning",
+    reasoning: "provider-default",
+  });
+
+  // Choosing it clears the advisory (nothing is sent, so nothing is ignored).
+  cleanup();
+  const safe = render(
+    <ModelSection
+      model={{ preset: "balanced", reasoning: "provider-default" }}
+      dispatch={() => {}}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={[
+        {
+          provider: "openrouter",
+          modelId: "deepseek/deepseek-v4-pro",
+          supportedEfforts: [],
+        },
+      ]}
+    />,
+  );
+  expect(safe.queryByText(/advertises no reasoning support/)).toBeNull();
+  expect(safe.queryByText(/does not advertise/)).toBeNull();
+});
+
+test("an override inherits the MODEL's default, not the preset's effort", () => {
+  const view = render(
+    <ModelSection
+      model={{ preset: "balanced", modelId: "deepseek/deepseek-v4-pro" }}
+      dispatch={() => {}}
+      modelPresets={MODEL_PRESETS}
+      allowlist={ALLOWLIST}
+      capabilities={CAPABILITIES}
+    />,
+  );
+  const select = view.getByLabelText("Reasoning effort") as HTMLSelectElement;
+  expect(select.options[0]?.textContent).toBe("Inherit (model default)");
+  expect(view.getByText(/Reasoning: Model default \(inherited\)\./)).toBeTruthy();
 });
 
 test("access section swaps the run-as member", () => {

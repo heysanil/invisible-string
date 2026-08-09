@@ -117,6 +117,34 @@ test("model actions: preset/reasoning set, clearing the override omits the key",
   expect(state.definition.model.modelId).toBe("z-ai/glm-5.2");
 });
 
+test("setReasoning(undefined) actually CLEARS the effort (back to inherit)", () => {
+  // The regression this guards: merging with `patch.reasoning ?? current`
+  // makes the clear a silent no-op whenever a value is already set — and it
+  // typechecks, so only this assertion catches it.
+  let state = agentEditorReducer(initialState(), {
+    type: "setReasoning",
+    reasoning: "max",
+  });
+  expect(state.definition.model.reasoning).toBe("max");
+
+  state = agentEditorReducer(state, {
+    type: "setReasoning",
+    reasoning: undefined,
+  });
+  expect("reasoning" in state.definition.model).toBe(false);
+
+  // Unrelated model edits must not resurrect it.
+  state = agentEditorReducer(state, {
+    type: "setModelPreset",
+    preset: "powerful",
+  });
+  expect("reasoning" in state.definition.model).toBe(false);
+});
+
+test("a brand-new agent draft INHERITS its effort (no reasoning key at all)", () => {
+  expect("reasoning" in emptyAgentDefinition().model).toBe(false);
+});
+
 test("context actions dedupe adds and filter removes", () => {
   const start = initialState();
   const dup = agentEditorReducer(start, { type: "addConnection", id: CONN_ID });

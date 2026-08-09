@@ -8,13 +8,25 @@
  * (not their mutable draft): workflow instructions render at dispatch against
  * the agent's PUBLISHED context, so that is what workflow-surface @reference
  * validation must check (validate.ts).
+ *
+ * The model rows additionally carry REASONING data — each preset's inherited
+ * effort and each allowlisted model's catalog-advertised efforts. The copilot
+ * proposes efforts through setModel, so the prompt has to state which ones the
+ * model actually accepts; the catalog reaches the copilot only through here.
  */
 import { and, eq, inArray, or } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import { agentDefinitionSchema } from "@invisible-string/shared";
+import {
+  agentDefinitionSchema,
+  type ReasoningEffort,
+} from "@invisible-string/shared";
 
 import type { Db } from "../db";
 import { slugifyName } from "../build/compiler-adapter";
+import {
+  catalogModelInfo,
+  type OpenRouterCatalog,
+} from "../resources/openrouter-catalog";
 
 export interface InventoryConnection {
   id: string;
@@ -53,12 +65,21 @@ export interface InventoryModelPreset {
   slug: string;
   provider: string;
   modelId: string;
+  /** The preset's effort — what an agent inherits when it sets none. */
+  reasoning: ReasoningEffort;
 }
 
 export interface InventoryAllowlistEntry {
   provider: string;
   modelId: string;
   enabled: boolean;
+  /**
+   * Efforts the OpenRouter catalog says this model accepts; `null` = UNKNOWN
+   * (no catalog entry, unreachable catalog, or a non-OpenRouter provider) —
+   * never "supports nothing". Validation only rejects an effort against a
+   * non-null set (validate.ts).
+   */
+  supportedEfforts: readonly ReasoningEffort[] | null;
 }
 
 export interface WorkspaceInventory {
@@ -67,6 +88,13 @@ export interface WorkspaceInventory {
   agents: InventoryAgent[];
   modelPresets: InventoryModelPreset[];
   allowlist: InventoryAllowlistEntry[];
+  /**
+   * False when the OpenRouter catalog could not be consulted this turn (every
+   * `supportedEfforts` is then null). The effort check FAILS OPEN on it,
+   * matching the allowlist-add precedent: an openrouter.ai outage must not
+   * make the copilot reject legitimate proposals.
+   */
+  catalogAvailable: boolean;
 }
 
 export type LoadInventoryFn = (
@@ -74,8 +102,17 @@ export type LoadInventoryFn = (
   userId: string,
 ) => Promise<WorkspaceInventory>;
 
-/** Workspace-scoped rows plus the caller's user-scoped rows (spec §11). */
-export function createInventoryLoader(db: Db): LoadInventoryFn {
+/**
+ * Workspace-scoped rows plus the caller's user-scoped rows (spec §11).
+ *
+ * `openRouterCatalog` is optional and advisory — omitted (tests, offline
+ * deployments) every model's supported efforts read as unknown and the
+ * inventory reports `catalogAvailable: false`.
+ */
+export function createInventoryLoader(
+  db: Db,
+  openRouterCatalog?: OpenRouterCatalog,
+): LoadInventoryFn {
   return async (organizationId, userId) => {
     const scopeFilter = <
       T extends {
@@ -94,7 +131,7 @@ export function createInventoryLoader(db: Db): LoadInventoryFn {
         and(eq(table.scope as never, "user"), eq(table.userId as never, userId)),
       );
 
-    const [connections, skills, agents, presets, allowlist] = await Promise.all([
+    const [connections, skills, agents, presets, allowlist, catalog] = await Promise.all([
       db
         .select()
         .from(schema.mcpConnections)
@@ -122,6 +159,8 @@ export function createInventoryLoader(db: Db): LoadInventoryFn {
         .select()
         .from(schema.modelAllowlist)
         .where(eq(schema.modelAllowlist.organizationId, organizationId)),
+      // Cached + fail-open (null when unreachable) — never blocks a turn.
+      openRouterCatalog ? openRouterCatalog() : Promise.resolve(null),
     ]);
 
     // Published-context ids → slugs. Published definitions may reference rows
@@ -216,12 +255,21 @@ export function createInventoryLoader(db: Db): LoadInventoryFn {
         slug: row.slug,
         provider: row.provider,
         modelId: row.modelId,
+        reasoning: row.reasoning,
       })),
-      allowlist: allowlist.map((row) => ({
-        provider: row.provider,
-        modelId: row.modelId,
-        enabled: row.enabled,
-      })),
+      allowlist: allowlist.map((row) => {
+        const info =
+          catalog !== null && row.provider === "openrouter"
+            ? catalogModelInfo(catalog, row.modelId)
+            : undefined;
+        return {
+          provider: row.provider,
+          modelId: row.modelId,
+          enabled: row.enabled,
+          supportedEfforts: info ? [...info.supportedEfforts] : null,
+        };
+      }),
+      catalogAvailable: catalog !== null,
     };
   };
 }

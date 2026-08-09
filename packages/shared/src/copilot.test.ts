@@ -86,8 +86,35 @@ describe("agent-surface mutation param schemas", () => {
       agentCopilotMutationParamSchemas.setModel.safeParse({ preset: "turbo" }).success,
     ).toBe(false);
     expect(
-      agentCopilotMutationParamSchemas.setModel.safeParse({ reasoning: "max" }).success,
+      agentCopilotMutationParamSchemas.setModel.safeParse({ reasoning: "ultra" }).success,
     ).toBe(false);
+  });
+
+  test("setModel accepts the widened effort vocabulary", () => {
+    for (const reasoning of [
+      "provider-default",
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]) {
+      expect(
+        agentCopilotMutationParamSchemas.setModel.safeParse({ reasoning }).success,
+      ).toBe(true);
+    }
+  });
+
+  test("setModel treats reasoning: null as the explicit inherit edit", () => {
+    // null !== undefined, so clearing the override still satisfies the
+    // at-least-one-field refine — an empty {} does not.
+    const parsed = agentCopilotMutationParamSchemas.setModel.parse({
+      reasoning: null,
+    });
+    expect(parsed.reasoning).toBeNull();
+    expect(agentCopilotMutationParamSchemas.setModel.safeParse({}).success).toBe(false);
   });
 
   test("addContext/removeContext require a kind and uuid", () => {

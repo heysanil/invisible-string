@@ -24,34 +24,53 @@ describe("model enums", () => {
   });
 
   test("reasoning efforts mirror the reasoning_effort pgEnum", () => {
-    expect(reasoningEffortSchema.options).toEqual(["low", "medium", "high"]);
+    expect(reasoningEffortSchema.options).toEqual([
+      "provider-default",
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("keeps \"medium\" for pre-existing drafts and published snapshots", () => {
+    // No seeded model supports it any more, but immutable
+    // `agent_versions.definition` rows carry it — dropping it would make
+    // published agents unparseable.
+    expect(reasoningEffortSchema.safeParse("medium").success).toBe(true);
   });
 });
 
 // ── MODEL ───────────────────────────────────────────────────────────────────
 
 describe("agentModelSchema", () => {
-  test("applies balanced/medium defaults; modelId stays optional", () => {
-    expect(agentModelSchema.parse({})).toEqual({
-      preset: "balanced",
-      reasoning: "medium",
-    });
+  test("defaults the preset; modelId and reasoning stay optional", () => {
+    expect(agentModelSchema.parse({})).toEqual({ preset: "balanced" });
+  });
+
+  test("an absent reasoning stays absent — no default erases the inherit signal", () => {
+    const parsed = agentModelSchema.parse({ preset: "quick" });
+    expect("reasoning" in parsed).toBe(false);
+    expect(parsed.reasoning).toBeUndefined();
   });
 
   test("accepts a full model block", () => {
     const parsed = agentModelSchema.parse({
       preset: "quick",
-      modelId: "deepseek/deepseek-v4-flash",
-      reasoning: "high",
+      modelId: "~deepseek/deepseek-v4-flash-latest",
+      reasoning: "max",
     });
     expect(parsed.preset).toBe("quick");
-    expect(parsed.modelId).toBe("deepseek/deepseek-v4-flash");
-    expect(parsed.reasoning).toBe("high");
+    expect(parsed.modelId).toBe("~deepseek/deepseek-v4-flash-latest");
+    expect(parsed.reasoning).toBe("max");
   });
 
   test("rejects unknown preset slugs, reasoning efforts, empty modelId", () => {
     expect(agentModelSchema.safeParse({ preset: "turbo" }).success).toBe(false);
-    expect(agentModelSchema.safeParse({ reasoning: "max" }).success).toBe(false);
+    expect(agentModelSchema.safeParse({ reasoning: "ultra" }).success).toBe(false);
     expect(agentModelSchema.safeParse({ modelId: "" }).success).toBe(false);
   });
 });
@@ -97,7 +116,7 @@ describe("agentDefinitionSchema", () => {
     } satisfies AgentDefinitionInput;
 
     const parsed = agentDefinitionSchema.parse(input);
-    expect(parsed.model.reasoning).toBe("medium");
+    expect(parsed.model.reasoning).toBeUndefined();
     expect(parsed.context.skillIds).toEqual([]);
   });
 
@@ -105,7 +124,7 @@ describe("agentDefinitionSchema", () => {
     const parsed = agentDefinitionSchema.parse({ model: {}, context: {} });
     expect(parsed).toEqual({
       persona: "",
-      model: { preset: "balanced", reasoning: "medium" },
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [], skillIds: [] },
     });
   });

@@ -1,7 +1,7 @@
 /**
  * Pure unit tests for the seed builders — no database required.
- * Locked model defaults per INITIAL-SPEC.md §2/§7; default agents per the
- * agents-first redesign spec.
+ * Model defaults per the 2026-08-08 reasoning-effort + model-defaults spec;
+ * default agents per the agents-first redesign spec.
  */
 import { describe, expect, test } from "bun:test";
 
@@ -16,34 +16,52 @@ import {
 const ORG = "org_test";
 const OWNER = "user_owner";
 
-describe("model preset seeds (locked, spec §2)", () => {
-  test("exactly the three locked presets, all via OpenRouter", () => {
+describe("model preset seeds", () => {
+  test("exactly the three presets, all via OpenRouter, each with an effort", () => {
     expect(DEFAULT_MODEL_PRESETS).toHaveLength(3);
     const bySlug = new Map(DEFAULT_MODEL_PRESETS.map((p) => [p.slug, p]));
     expect(bySlug.get("powerful")).toEqual({
       slug: "powerful",
       provider: "openrouter",
-      modelId: "z-ai/glm-5.2",
+      modelId: "moonshotai/kimi-k3",
+      reasoning: "max",
     });
     expect(bySlug.get("balanced")).toEqual({
       slug: "balanced",
       provider: "openrouter",
-      modelId: "deepseek/deepseek-v4-pro",
+      modelId: "~deepseek/deepseek-v4-flash-latest",
+      reasoning: "max",
     });
     expect(bySlug.get("quick")).toEqual({
       slug: "quick",
       provider: "openrouter",
-      modelId: "deepseek/deepseek-v4-flash",
+      modelId: "~deepseek/deepseek-v4-flash-latest",
+      reasoning: "low",
     });
   });
 
-  test("buildModelPresetRows stamps the organization id on every row", () => {
+  test("balanced and quick are the same model at different efforts", () => {
+    const bySlug = new Map(DEFAULT_MODEL_PRESETS.map((p) => [p.slug, p]));
+    const balanced = bySlug.get("balanced")!;
+    const quick = bySlug.get("quick")!;
+    expect(quick.modelId).toBe(balanced.modelId);
+    expect(quick.reasoning).not.toBe(balanced.reasoning);
+  });
+
+  test("no seeded preset uses `medium` — none of the models supports it", () => {
+    for (const preset of DEFAULT_MODEL_PRESETS) {
+      expect(preset.reasoning).not.toBe("medium");
+    }
+  });
+
+  test("buildModelPresetRows stamps the organization id and carries the effort", () => {
     const rows = buildModelPresetRows(ORG);
     expect(rows).toHaveLength(3);
     for (const row of rows) {
       expect(row.organizationId).toBe(ORG);
     }
     expect(rows.map((r) => r.slug)).toEqual(["powerful", "balanced", "quick"]);
+    expect(rows.map((r) => r.reasoning)).toEqual(["max", "max", "low"]);
   });
 
   test("builders are deterministic", () => {
@@ -54,16 +72,26 @@ describe("model preset seeds (locked, spec §2)", () => {
 });
 
 describe("allowlist seeds", () => {
-  test("one enabled allowlist row per seeded preset model", () => {
+  test("one enabled allowlist row per DISTINCT seeded preset model", () => {
     const rows = buildAllowlistRows(ORG);
-    expect(rows).toHaveLength(3);
+    const distinct = [
+      ...new Set(DEFAULT_MODEL_PRESETS.map((p) => `${p.provider}:${p.modelId}`)),
+    ];
+    // Two presets, one model: the insert would otherwise carry a row that
+    // conflicts with its own sibling inside a single statement.
+    expect(rows).toHaveLength(distinct.length);
     expect(rows.map((r) => `${r.provider}:${r.modelId}`).sort()).toEqual(
-      DEFAULT_MODEL_PRESETS.map((p) => `${p.provider}:${p.modelId}`).sort(),
+      distinct.sort(),
     );
     for (const row of rows) {
       expect(row.enabled).toBe(true);
       expect(row.organizationId).toBe(ORG);
     }
+  });
+
+  test("rows are unique by (provider, modelId)", () => {
+    const keys = buildAllowlistRows(ORG).map((r) => `${r.provider}:${r.modelId}`);
+    expect(new Set(keys).size).toBe(keys.length);
   });
 });
 
@@ -76,13 +104,13 @@ describe("default agent seeds", () => {
     ]);
   });
 
-  test("all drafts are full AgentDefinitions on the balanced preset", () => {
+  test("all drafts are full AgentDefinitions on the balanced preset, inheriting its effort", () => {
     for (const agent of DEFAULT_AGENTS) {
       expect(agent.draft.persona.length).toBeGreaterThan(80);
-      expect(agent.draft.model).toEqual({
-        preset: "balanced",
-        reasoning: "medium",
-      });
+      // No `reasoning` key at all — an explicit effort here would pin an
+      // override on every workspace's starter agents.
+      expect(agent.draft.model).toEqual({ preset: "balanced" });
+      expect("reasoning" in agent.draft.model).toBe(false);
       expect(agent.draft.context).toEqual({
         mcpConnectionIds: [],
         skillIds: [],

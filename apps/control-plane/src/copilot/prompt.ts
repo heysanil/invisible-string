@@ -31,7 +31,7 @@ const TOOL_DESCRIPTIONS: Record<CopilotMutationTool, string> = {
   setPersona:
     "Propose replacing the agent's PERSONA markdown wholesale. @reference only context attached to this agent; @trigger paths are not allowed in personas.",
   setModel:
-    "Propose updating the agent's MODEL: preset (powerful | balanced | quick), reasoning effort, and/or an allowlisted specific model id — at least one field.",
+    "Propose updating the agent's MODEL: preset (powerful | balanced | quick), reasoning effort, and/or an allowlisted specific model id — at least one field. Reasoning is INHERITED by default: pass null to clear an override and go back to inheriting (the preset's effort, or the model's own default behind a specific-model override); omit the field to leave the current setting alone; pass a level only when the user wants an explicit one, and only a level that model supports.",
   addContext:
     "Propose attaching an existing workspace MCP connection or skill (by its exact id from the inventory) to the agent's CONTEXT.",
   removeContext:
@@ -152,11 +152,23 @@ function buildAgentSystemPrompt(
     )
     .join("\n");
   const presets = inventory.modelPresets
-    .map((p) => `- ${p.slug} → ${p.provider}/${p.modelId}`)
+    .map(
+      (p) =>
+        `- ${p.slug} → ${p.provider}/${p.modelId}, reasoning ${p.reasoning} (inherited by agents on this preset)`,
+    )
     .join("\n");
+  // `supportedEfforts: null` is UNKNOWN, not "none" — say so, so the model
+  // does not read a missing list as "this model takes no effort at all".
   const allowlist = inventory.allowlist
     .filter((entry) => entry.enabled)
-    .map((entry) => `- ${entry.modelId} (${entry.provider})`)
+    .map(
+      (entry) =>
+        `- ${entry.modelId} (${entry.provider}) efforts: ${
+          entry.supportedEfforts === null
+            ? "unknown"
+            : entry.supportedEfforts.join(", ") || "none advertised"
+        }`,
+    )
     .join("\n");
 
   return `You are the agent copilot for invisible-string, docked in the agent editor. \
@@ -190,5 +202,6 @@ References must start with a letter; segments are letters/digits/_/-.
 3. Use only ids/slugs from the inventory above. Never invent connections, skills, or model ids.
 4. Keep the persona consistent with attached context: do not @reference a connection or skill that is not attached to the CONTEXT — propose addContext for it first, then setPersona.
 5. Only models on the allowlist may be set via setModel.modelId; prefer a preset (powerful/balanced/quick) unless a specific model is required.
-6. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
+6. Reasoning effort is inherited unless the draft sets one. Leave it inherited unless the user asks for a specific level; propose only an effort the effective model lists above ("unknown" means any level is acceptable), and use "provider-default" for "send no reasoning setting at all".
+7. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
 }

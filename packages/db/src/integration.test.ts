@@ -7,7 +7,9 @@
  * do not clash; migrations are idempotent.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { and, asc, count, eq } from "drizzle-orm";
+import { join } from "node:path";
+
+import { and, asc, count, eq, sql } from "drizzle-orm";
 
 import { createDb, type Db } from "./client";
 import { runMigrations } from "./migrate";
@@ -35,10 +37,13 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
   const orgId = `org-it-${suffix}`;
   const userId = `user-it-${suffix}`;
 
-  /** Minimal valid AgentDefinition literal (schema in packages/shared). */
+  /**
+   * Minimal valid AgentDefinition literal (schema in packages/shared). No
+   * `reasoning` key: the effort is inherited from the preset unless overridden.
+   */
   const definition = {
     persona: "You are an integration-test agent.",
-    model: { preset: "balanced", reasoning: "medium" },
+    model: { preset: "balanced" },
     context: { mcpConnectionIds: [], skillIds: [] },
   };
 
@@ -62,7 +67,9 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
         compilerVersion: "0.0.1",
         eveVersion: "0.0.0-test",
         modelProvider: "openrouter",
-        modelId: "deepseek/deepseek-v4-pro",
+        // Tilde round-trip: OpenRouter's `-latest` alias ids start with `~`
+        // and are stored verbatim in text columns.
+        modelId: "~deepseek/deepseek-v4-flash-latest",
         buildStatus: "succeeded",
       })
       .returning();
@@ -131,18 +138,20 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       .where(eq(schema.modelPresets.organizationId, orgId));
     expect(presets).toHaveLength(3);
     expect(
-      presets.map((p) => [p.slug, p.provider, p.modelId]).sort(),
+      presets.map((p) => [p.slug, p.provider, p.modelId, p.reasoning]).sort(),
     ).toEqual([
-      ["balanced", "openrouter", "deepseek/deepseek-v4-pro"],
-      ["powerful", "openrouter", "z-ai/glm-5.2"],
-      ["quick", "openrouter", "deepseek/deepseek-v4-flash"],
+      ["balanced", "openrouter", "~deepseek/deepseek-v4-flash-latest", "max"],
+      ["powerful", "openrouter", "moonshotai/kimi-k3", "max"],
+      ["quick", "openrouter", "~deepseek/deepseek-v4-flash-latest", "low"],
     ]);
 
+    // Two rows, not three: balanced and quick share a model and the seed
+    // dedupes before inserting.
     const [allowRows] = await db
       .select({ n: count() })
       .from(schema.modelAllowlist)
       .where(eq(schema.modelAllowlist.organizationId, orgId));
-    expect(allowRows?.n).toBe(3);
+    expect(allowRows?.n).toBe(2);
 
     const agentRows = await db
       .select()
@@ -473,6 +482,71 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       }
       expect(errorText(checkError)).toMatch(/scope_owner_check|check constraint/);
     }
+  });
+
+  /**
+   * Migration 0007's allowlist step, replayed against the pre-state that
+   * would otherwise brick a workspace: a row for one of the new preset models
+   * that an admin had DISABLED.
+   *
+   * The step must UPSERT `enabled = true`, not `DO NOTHING`. Step 2 of the
+   * same migration re-points every preset at these ids unconditionally, and
+   * model resolution requires an ENABLED allowlist row — so a surviving
+   * `enabled = false` answers 422 `model_not_allowlisted` on every publish
+   * through that preset. The shipped SQL is READ rather than restated, so
+   * relaxing the conflict clause fails here.
+   *
+   * Ordered after the seed tests deliberately: it inserts allowlist rows for
+   * every organization in the database (that is what the migration does), and
+   * their row-count assertions would otherwise see them.
+   */
+  test("migration 0007's allowlist step RE-ENABLES a disabled preset model", async () => {
+    await seedWorkspace(db, orgId);
+    await db
+      .update(schema.modelAllowlist)
+      .set({ enabled: false })
+      .where(
+        and(
+          eq(schema.modelAllowlist.organizationId, orgId),
+          eq(schema.modelAllowlist.modelId, "moonshotai/kimi-k3"),
+        ),
+      );
+
+    const migrationSql = await Bun.file(
+      join(import.meta.dir, "..", "migrations", "0007_tough_famine.sql"),
+    ).text();
+    const statements = migrationSql
+      .split("--> statement-breakpoint")
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.includes('INSERT INTO "model_allowlist"'));
+    expect(statements).toHaveLength(1);
+    await db.execute(sql.raw(statements[0]!));
+
+    const [row] = await db
+      .select()
+      .from(schema.modelAllowlist)
+      .where(
+        and(
+          eq(schema.modelAllowlist.organizationId, orgId),
+          eq(schema.modelAllowlist.modelId, "moonshotai/kimi-k3"),
+        ),
+      );
+    expect(row?.enabled).toBe(true);
+    // …and the tilde alias is present too (it could never pre-exist: the
+    // id-shape check rejected a leading `~` before this change).
+    const [alias] = await db
+      .select()
+      .from(schema.modelAllowlist)
+      .where(
+        and(
+          eq(schema.modelAllowlist.organizationId, orgId),
+          eq(
+            schema.modelAllowlist.modelId,
+            "~deepseek/deepseek-v4-flash-latest",
+          ),
+        ),
+      );
+    expect(alias?.enabled).toBe(true);
   });
 
   test("better-auth login session accepts activeOrganizationId", async () => {

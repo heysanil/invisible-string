@@ -11,6 +11,12 @@
  * - mcp-skill — connection + packaged skill (SKILL.md + references/ file),
  *   the control-plane skill-attachment path in fixture form.
  *
+ * And two run the WIRE PROBE (`wire-probe.mjs`): the emitted agent module is
+ * imported for real, its model is pointed at a stub gateway through the
+ * generated OPENROUTER_BASE_URL branch, and the captured request BODY is
+ * asserted — the only check that proves the reasoning effort actually reaches
+ * OpenRouter rather than being read out of the provider's source.
+ *
  *   SPIKE_EVE_BUILD=1 bun test packages/compiler/src/eve-build.test.ts
  *
  * Requires: `mise install` (or SPIKE_NODE24_BIN) + network for npm.
@@ -18,7 +24,14 @@
  * (spike/REPORT.md friction 4).
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -26,6 +39,7 @@ import { compile } from "./compile";
 import {
   ALL_FIXTURES,
   basicFixture,
+  customApprovalFixture,
   mcpSkillFixture,
   type CompilerFixture,
 } from "./test-fixtures";
@@ -170,6 +184,79 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
       expect(
         existsSync(join(projectDir, ".eve", "compile", "compiled-agent-manifest.json")),
       ).toBe(false);
+    },
+    1_200_000,
+  );
+
+  /**
+   * Run `wire-probe.mjs` inside a rendered project and return the request
+   * bodies its stub gateway captured. No `eve build` needed: the probe
+   * imports the emitted `agent/agent.ts` directly (Node 24 strips the types)
+   * and calls the model that `defineAgent` was handed, which is precisely the
+   * object the built artifact carries.
+   */
+  async function captureWireBodies(
+    fixture: CompilerFixture,
+  ): Promise<Record<string, unknown>[]> {
+    const projectDir = await ensureInstalled(fixture);
+    copyFileSync(
+      join(import.meta.dir, "wire-probe.mjs"),
+      join(projectDir, "wire-probe.mjs"),
+    );
+    const probe = await run([node24Bin(), "wire-probe.mjs"], projectDir, env, 120_000);
+    expect(
+      probe.exitCode,
+      `wire probe failed for ${fixture.name}:\n${probe.output.slice(-4000)}`,
+    ).toBe(0);
+    const marker = probe.output
+      .split("\n")
+      .find((line) => line.startsWith("__WIRE_PROBE__"));
+    expect(marker, `no probe output:\n${probe.output.slice(-4000)}`).toBeDefined();
+    const captured = JSON.parse(marker!.slice("__WIRE_PROBE__".length)) as {
+      path: string;
+      body: string;
+    }[];
+    expect(captured.length).toBe(2);
+    for (const request of captured) expect(request.path).toBe("/api/v1/chat/completions");
+    return captured.map((request) => JSON.parse(request.body) as Record<string, unknown>);
+  }
+
+  // THE proof the whole reasoning change rests on: an effort emitted as
+  // `extraBody` lands in the request body verbatim. Everything else about the
+  // effort (schema, resolution, hashing, UI) is worthless if this line is
+  // wrong, and it cannot be proven by reading the generated source — that is
+  // exactly how the pre-4.0.0 no-op survived review.
+  test(
+    "basic fixture: the resolved effort reaches the OpenRouter request body",
+    async () => {
+      const [plain, withCallOption] = await captureWireBodies(basicFixture);
+      expect(plain).toMatchObject({
+        model: "deepseek/deepseek-v4-pro",
+        reasoning: { effort: "max" },
+      });
+      // Nothing but `effort` inside it — a stray key would be sent to the
+      // provider on every turn of every agent.
+      expect(Object.keys(plain!.reasoning as object)).toEqual(["effort"]);
+      // Passing `reasoning` the way eve's tool loop does changes NOTHING:
+      // @openrouter/ai-sdk-provider@3.0.0's getArgs() never destructures the
+      // call option (spike finding 29). This is the empirical half of that
+      // finding, and it is why the effort has to ride extraBody.
+      expect(withCallOption).toEqual(plain!);
+    },
+    1_200_000,
+  );
+
+  // The suppression branch: `provider-default` must send NO reasoning key at
+  // all — distinct from `"none"`, and the escape hatch for models with no
+  // reasoning support.
+  test(
+    "custom-approval fixture: provider-default sends no reasoning key",
+    async () => {
+      const bodies = await captureWireBodies(customApprovalFixture);
+      for (const body of bodies) {
+        expect(body).toMatchObject({ model: "deepseek/deepseek-v4-pro" });
+        expect("reasoning" in body).toBe(false);
+      }
     },
     1_200_000,
   );

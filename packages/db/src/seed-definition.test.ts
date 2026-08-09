@@ -14,7 +14,9 @@ describe("DEFAULT_AGENTS drafts vs shared agentDefinitionSchema", () => {
       const parsed = agentDefinitionSchema.parse(agent.draft);
       expect(parsed.persona).toBe(agent.draft.persona);
       expect(parsed.model.preset).toBe(agent.draft.model.preset);
-      expect(parsed.model.reasoning).toBe(agent.draft.model.reasoning);
+      // The inherit signal must survive parsing: `reasoning` has no schema
+      // default precisely so an absent effort stays absent.
+      expect(parsed.model.reasoning).toBeUndefined();
       expect(parsed.context.mcpConnectionIds).toEqual([]);
       expect(parsed.context.skillIds).toEqual([]);
     });

@@ -57,14 +57,30 @@ export const modelPresetSlug = pgEnum("model_preset_slug", [
 ]);
 
 /**
- * eve reasoning effort for an agent's model config. The value itself lives in
- * the AgentDefinition jsonb (agents.draft / agent_versions.definition); the
- * enum stays defined for the db↔shared lockstep (`reasoningEffortSchema`).
+ * Reasoning effort. Two homes, both real:
+ * - `model_presets.reasoning` — the workspace default a preset carries (an
+ *   effort is part of a preset's identity: `balanced` and `quick` may be the
+ *   same model at different efforts).
+ * - the AgentDefinition jsonb (agents.draft / agent_versions.definition), where
+ *   it is the OPTIONAL per-agent override (absent = inherit the preset's).
+ *
+ * The vocabulary is OpenRouter's per-model `reasoning.supported_efforts` set —
+ * no model supports all of it, the UI filters against the live catalog — plus
+ * `provider-default`, which means "omit the reasoning field from the request
+ * entirely" (distinct from `none` = explicitly disabled). `medium` is retained
+ * despite no seeded model supporting it: immutable published definitions carry
+ * it and must keep parsing. Keep in lockstep with packages/shared's
+ * `reasoningEffortSchema`.
  */
 export const reasoningEffort = pgEnum("reasoning_effort", [
+  "provider-default",
+  "none",
+  "minimal",
   "low",
   "medium",
   "high",
+  "xhigh",
+  "max",
 ]);
 
 /** Build lifecycle for agent versions and the build cache. */
@@ -240,6 +256,14 @@ export const modelPresets = pgTable(
     slug: modelPresetSlug("slug").notNull(),
     provider: modelProvider("provider").notNull(),
     modelId: text("model_id").notNull(),
+    /**
+     * The preset's default reasoning effort — part of the preset's identity,
+     * not decoration: `balanced` and `quick` seed to the same model and differ
+     * only here. Agents inherit it unless their definition sets an override.
+     * NOT NULL DEFAULT 'high' so pre-existing rows land on a value every
+     * catalog model with reasoning support accepts.
+     */
+    reasoning: reasoningEffort("reasoning").notNull().default("high"),
     createdAt,
     updatedAt,
   },

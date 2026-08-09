@@ -112,7 +112,7 @@ const streamingRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_live", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "deepseek/deepseek-v4-pro" } }, meta: { at: iso(-1) } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-1) } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "message.received", data: { message: "Draft a launch announcement.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
@@ -135,7 +135,7 @@ const parkedRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_parked", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "z-ai/glm-5.2" } }, meta: { at: iso(-1) } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "moonshotai/kimi-k3" } }, meta: { at: iso(-1) } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "message.received", data: { message: "Send the weekly report email to the team.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
@@ -160,7 +160,7 @@ const completedRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_done", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "deepseek/deepseek-v4-pro" } }, meta: { at: iso(-1) } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-1) } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "message.received", data: { message: "Summarize the latest issues in the tracker.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
@@ -202,7 +202,7 @@ const failedRun: FixtureRun = {
     error: "Model provider returned 401 — credentials rejected.",
   },
   frames: framesFor("run_failed", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "deepseek/deepseek-v4-flash" } }, meta: { at: iso(-1) } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-1) } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "message.received", data: { message: webhookTaskMessage, sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
@@ -234,7 +234,7 @@ const canceledRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_stopped", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "deepseek/deepseek-v4-pro" } }, meta: { at: iso(-30), id: "evt_01KZFM7A0000000000000001" } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-30), id: "evt_01KZFM7A0000000000000001" } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000002" } },
     { type: "message.received", data: { message: "Crawl every open issue and write a full triage report.", sequence: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000003" } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000004" } },
@@ -266,7 +266,7 @@ const clearedRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_cleared", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "deepseek/deepseek-v4-flash" } }, meta: { at: iso(-60), id: "evt_01KZFM7B0000000000000001" } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-60), id: "evt_01KZFM7B0000000000000001" } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-59), id: "evt_01KZFM7B0000000000000002" } },
     { type: "message.received", data: { message: "What were last quarter's top three revenue drivers?", sequence: 0, turnId: "t0" }, meta: { at: iso(-59), id: "evt_01KZFM7B0000000000000003" } },
     { type: "message.completed", data: { finishReason: "stop", message: "Last quarter's top three drivers were **self-serve upgrades**, **seat expansion** in existing accounts, and **annual prepay**.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-55), id: "evt_01KZFM7B0000000000000004" } },
@@ -297,7 +297,7 @@ const sessionLimitRun: FixtureRun = {
     error: null,
   },
   frames: framesFor("run_limit", [
-    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "z-ai/glm-5.2" } }, meta: { at: iso(-120), id: "evt_01KZFM7C0000000000000001" } },
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "moonshotai/kimi-k3" } }, meta: { at: iso(-120), id: "evt_01KZFM7C0000000000000001" } },
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-119), id: "evt_01KZFM7C0000000000000002" } },
     { type: "message.received", data: { message: "Keep going through the rest of the inbox.", sequence: 0, turnId: "t0" }, meta: { at: iso(-119), id: "evt_01KZFM7C0000000000000003" } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-119), id: "evt_01KZFM7C0000000000000004" } },

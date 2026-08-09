@@ -23,7 +23,10 @@
  *   `@trigger.*` is rejected (compile error TRIGGER_REF_NOT_ALLOWED);
  * - `addContext` must point at an ENABLED connection (publish resolution
  *   drops disabled rows with context_resource_not_found);
- * - `setModel.modelId` must be on the enabled workspace allowlist.
+ * - `setModel.modelId` must be on the enabled workspace allowlist, and an
+ *   explicit `setModel.reasoning` must be an effort the EFFECTIVE model
+ *   advertises — but only when the catalog answered (fail-open, same rule as
+ *   the allowlist-add catalog check).
  */
 import {
   agentCopilotMutationParamSchemas,
@@ -66,6 +69,14 @@ export interface AgentDraftState {
   surface: "agent";
   connectionIds: Set<string>;
   skillIds: Set<string>;
+  /**
+   * The draft's MODEL selection, needed to know which model an effort-only
+   * `setModel` would actually apply to. Loose strings: mid-edit drafts are
+   * lenient, and an unrecognized preset simply finds no mapping (no check).
+   */
+  preset: string | null;
+  /** Specific-model override; wins over `preset`, exactly as at publish. */
+  modelId: string | null;
 }
 
 export type CopilotDraftState = WorkflowDraftState | AgentDraftState;
@@ -84,6 +95,7 @@ export function draftStateFor(
     };
   }
   const context = (draft.context ?? {}) as Record<string, unknown>;
+  const model = (draft.model ?? {}) as Record<string, unknown>;
   const ids = (value: unknown): Set<string> =>
     new Set(
       Array.isArray(value)
@@ -94,6 +106,8 @@ export function draftStateFor(
     surface,
     connectionIds: ids(context.mcpConnectionIds),
     skillIds: ids(context.skillIds),
+    preset: typeof model.preset === "string" ? model.preset : null,
+    modelId: typeof model.modelId === "string" ? model.modelId : null,
   };
 }
 
@@ -125,6 +139,14 @@ export function applyAcceptedMutation(
     case "removeContext": {
       const { kind, id } = params as CopilotMutationParams["removeContext"];
       (kind === "connection" ? state.connectionIds : state.skillIds).delete(id);
+      break;
+    }
+    case "setModel": {
+      // Keeps a follow-up effort-only proposal in the same turn validating
+      // against the model the user just accepted, not the stale one.
+      const model = params as CopilotMutationParams["setModel"];
+      if (model.preset !== undefined) state.preset = model.preset;
+      if (model.modelId !== undefined) state.modelId = model.modelId;
       break;
     }
     default:
@@ -319,6 +341,24 @@ function workflowSemanticProblem(
 
 // ── agent-surface semantics ──────────────────────────────────────────────────
 
+/**
+ * Which model a `setModel` proposal would actually run on, mirroring publish
+ * resolution (runtime/model-resolution.ts): a specific-model override wins
+ * outright — the proposal's own, else one already on the draft — and only
+ * without one does the preset mapping apply. Undefined when nothing resolves
+ * (unknown preset, presets not loaded); callers then skip the effort check.
+ */
+function effectiveModelId(
+  params: CopilotMutationParams["setModel"],
+  draftState: AgentDraftState,
+  inventory: WorkspaceInventory,
+): string | undefined {
+  const override = params.modelId ?? draftState.modelId;
+  if (override != null) return override;
+  const slug = params.preset ?? draftState.preset;
+  return inventory.modelPresets.find((preset) => preset.slug === slug)?.modelId;
+}
+
 function agentSemanticProblem(
   tool: CopilotMutationTool,
   params: CopilotMutationParams[CopilotMutationTool],
@@ -367,6 +407,30 @@ function agentSemanticProblem(
           .map((entry) => entry.modelId)
           .join(", ");
         return `model "${model.modelId}" is not on this workspace's allowlist — allowed: ${allowed || "(none)"}`;
+      }
+      // `null` = clear the override (inherit) and `provider-default` = send no
+      // reasoning setting at all; both are legal for every model. Only an
+      // explicit LEVEL is checked, and only when the catalog answered — an
+      // openrouter.ai outage must not start rejecting proposals (fail-open,
+      // matching the allowlist-add catalog check).
+      if (
+        model.reasoning != null &&
+        model.reasoning !== "provider-default" &&
+        inventory.catalogAvailable
+      ) {
+        const target = effectiveModelId(model, draftState, inventory);
+        const supported = inventory.allowlist.find(
+          (entry) => entry.enabled && entry.modelId === target,
+        )?.supportedEfforts;
+        if (
+          supported !== undefined &&
+          supported !== null &&
+          !supported.includes(model.reasoning)
+        ) {
+          return `reasoning effort "${model.reasoning}" is not supported by "${target}" — supported: ${
+            supported.join(", ") || "(none — use provider-default)"
+          }`;
+        }
       }
       return null;
     }

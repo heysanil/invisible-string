@@ -5,7 +5,9 @@ Date: 2026-07-02 · eve **0.19.0** · Node **24.18.0** (mise) · Bun **1.3.5** (
 > This header and findings 1–20 are the original 0.19.0 record and are kept
 > verbatim (later docs cite the numbers). The suite now runs against eve
 > **0.31.3** — see **[appended findings 21–28](#appended-findings--eve-0313-upgrade-2026-08-07)**,
-> which supersede the version matrix below plus findings 3 and 4.
+> which supersede the version matrix below plus findings 3 and 4, and
+> **[finding 29](#appended-finding--reasoning-effort-on-openrouter-2026-08-08)**
+> on reasoning-effort passthrough.
 
 ## Verdict
 
@@ -233,10 +235,12 @@ eve 0.31.3 install (28 pass / 8 skip — the keyed suite skipped, no key).
     a cold keyless build's manifest records
     `"routing":{"kind":"gateway","target":"deepseek"}` — the fallback branch —
     and that artifact then booted, served, streamed, parked, resumed after
-    SIGKILL, cancelled a turn and ran the docker sandbox. Unproven and
-    deliberately left open: the KEYED round-trip against real OpenRouter under
-    3.0.0 (the keyed lane costs money and was not run); because the throw is
-    lazy, a keyed-path break would surface only at the first turn.
+    SIGKILL, cancelled a turn and ran the docker sandbox. The KEYED round-trip
+    against real OpenRouter under 3.0.0 was left open here (the lane costs
+    money); because the throw is lazy, a keyed-path break would surface only at
+    the first turn. **Closed 2026-08-08** — `keyed-acceptance` 5/5 and the
+    copilot keyed smoke 1/1 against a real key, so the lazy-key path is proven,
+    not merely typechecked (see finding 29's live-API results).
 
 22. **The compiled-agent manifest MOVED.** eve 0.31 emits it at
     `.output/.eve/compile/compiled-agent-manifest.json`; the 0.19 path
@@ -355,6 +359,78 @@ eve 0.31.3 install (28 pass / 8 skip — the keyed suite skipped, no key).
     added so a turn can be held open long enough to cancel one in flight —
     every other mocked flow settles in ~200 ms, and an approval park emits
     `turn.completed`, so a parked session has no active turn to cancel).
+
+---
+
+## Appended finding — reasoning effort on OpenRouter (2026-08-08)
+
+Source-read against the pinned `@openrouter/ai-sdk-provider@3.0.0` dist (the
+version compiled agents install, per `packages/compiler/versions.json` — not the
+control plane's `6.0.0-alpha.1`). Design:
+`docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md`.
+
+29. **CRITICAL — eve's `defineAgent({ reasoning })` is SILENTLY DROPPED on
+    OpenRouter; the effort must ride `settings.extraBody`.** eve hands the
+    config straight to ai@7 as a call option — `dist/src/harness/tool-loop.js`
+    constructs `new ToolLoopAgent({ model, …, reasoning: <agent>.reasoning, … })`,
+    which lands on `LanguageModelV4CallOptions.reasoning` — and
+    `OpenRouterChatLanguageModel.getArgs()` destructures its call options at
+    `dist/index.js:3589-3602` — `prompt, maxOutputTokens, temperature, topP,
+    frequencyPenalty, presencePenalty, seed, stopSequences, responseFormat,
+    topK, tools, toolChoice` — with **no `reasoning` among them**. The field
+    never reaches the request body. Only three routes do: the provider's own
+    `this.settings.reasoning` (`dist/index.js:3637`), `providerOptions.openrouter.*`,
+    and `settings.extraBody`, which is spread **LAST** over the assembled body
+    (`dist/index.js:3648`, after `this.config.extraBody`) and therefore wins over
+    anything the provider derived. Consequence: every compiled OpenRouter agent
+    before `COMPILER_VERSION` 4.0.0 ran at the provider's default effort no
+    matter what its definition said — the platform's reasoning control was a
+    no-op on every seeded preset.
+    The provider's typed `reasoning` SETTING would reach the wire but is not
+    usable either: its effort union is
+    `'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'`
+    (`dist/index.d.ts:394`) and has **no `max`** — which is exactly the top
+    effort OpenRouter's own `/api/v1/models` advertises in
+    `reasoning.supported_efforts` for the seeded models (all three:
+    `[max, high, low]`, and none of them supports `medium`). The codegen
+    therefore emits
+    `openrouter(MODEL_ID, { extraBody: { reasoning: { effort: "<effort>" } } })`,
+    and a bare `openrouter(MODEL_ID)` when the resolved effort is
+    `provider-default`. Two accepted losses: the keyless/gateway branch carries
+    no effort (there is no model object to hang settings on), and eve's
+    agent-info introspection route (`build-agent-info-response.js`) reports
+    `config.reasoning`, which is now unset for OpenRouter agents.
+    **`@ai-sdk/anthropic@4.0.36` is unaffected** — it is spec-v4 and eve maps the
+    effort onto a thinking budget, so that branch keeps `reasoning:` in
+    `defineAgent` (clamping `max` → `xhigh`, the AI SDK union's ceiling).
+
+    **Confirmed on the wire, not only in the dist** (2026-08-08). The compiled
+    fixtures were rendered, npm-installed, and their emitted `agent/agent.ts`
+    imported for real with `OPENROUTER_BASE_URL` pointed at a capturing stub
+    (`packages/compiler/src/wire-probe.mjs`, run by the gated
+    `eve-build.test.ts`). Captured bodies:
+    - `max` fixture → `{"model":"deepseek/deepseek-v4-pro","messages":[…],"reasoning":{"effort":"max"}}`;
+    - the SAME call with `reasoning` passed as a call option (eve's route) →
+      byte-identical body: the call option is dropped, exactly as the source
+      read predicted;
+    - `provider-default` fixture → `{"model":"deepseek/deepseek-v4-pro","messages":[…]}`,
+      no `reasoning` key.
+    **Answered against the live API** (2026-08-08, real key; both keyed lanes
+    also run green — `keyed-acceptance` 5/5, copilot `keyed.test.ts` 1/1, which
+    retires finding 21's deliberately-open keyed round-trip on 3.0.0):
+    - `effort: "max"` on `moonshotai/kimi-k3` → **200, and honoured**: 116
+      reasoning tokens (442 chars) vs 20 tokens (80 chars) at `effort: "low"`
+      on the identical prompt. The catalog's `supported_efforts` is not
+      decorative — the value changes how much the model thinks.
+    - A `reasoning` block sent to a model advertising NO reasoning support is
+      **ignored, not rejected**: `inclusionai/ling-2.6-flash` and
+      `mistralai/mistral-nemo` (both `reasoning: null` in the catalog) each
+      answered 200 with `reasoning_tokens: 0`, matching the same request sent
+      without a `reasoning` key. Sending an effort to an effort-less model is
+      inert, so `provider-default` stays an OFFERED value rather than the
+      forced resolution for such models. (A 404 on
+      `meta-llama/llama-3.2-1b-instruct` during the same sweep was an account
+      data-policy/guardrail restriction — unrelated to reasoning.)
 
 ## How to run
 

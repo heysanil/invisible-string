@@ -15,10 +15,13 @@ import {
   dryRunCompileResponseSchema,
   installMcpConnectionRequestSchema,
   isRunStreamTerminalStatus,
+  listModelCapabilitiesResponseSchema,
   listSessionsQuerySchema,
   mcpAuthWriteSchema,
   mcpConnectionDtoSchema,
+  modelCapabilityDtoSchema,
   modelIdShapeProblem,
+  modelPresetDtoSchema,
   parseAgentDefinition,
   parseWorkflowConfig,
   postMessageRequestSchema,
@@ -465,6 +468,44 @@ describe("model preset + allowlist schemas", () => {
     ).toBe(false);
   });
 
+  test("the preset DTO carries the effort; the update body may omit it", () => {
+    const preset = {
+      id: UUID,
+      slug: "quick",
+      provider: "openrouter",
+      modelId: "~deepseek/deepseek-v4-flash-latest",
+      reasoning: "low",
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    expect(modelPresetDtoSchema.safeParse(preset).success).toBe(true);
+    // Required on reads — a preset without an effort is not resolvable.
+    const { reasoning: _dropped, ...withoutEffort } = preset;
+    expect(modelPresetDtoSchema.safeParse(withoutEffort).success).toBe(false);
+
+    // Optional on writes: a web bundle from before efforts existed must keep
+    // working mid-deploy (absent = keep the stored effort).
+    const parsed = updateModelPresetRequestSchema.parse({
+      provider: "openrouter",
+      modelId: "~deepseek/deepseek-v4-flash-latest",
+    });
+    expect(parsed.reasoning).toBeUndefined();
+    expect(
+      updateModelPresetRequestSchema.safeParse({
+        provider: "openrouter",
+        modelId: "moonshotai/kimi-k3",
+        reasoning: "max",
+      }).success,
+    ).toBe(true);
+    expect(
+      updateModelPresetRequestSchema.safeParse({
+        provider: "openrouter",
+        modelId: "moonshotai/kimi-k3",
+        reasoning: "ultra",
+      }).success,
+    ).toBe(false);
+  });
+
   test("allowlist add defaults enabled to true", () => {
     const parsed = addModelAllowlistEntryRequestSchema.parse({
       provider: "anthropic",
@@ -474,11 +515,15 @@ describe("model preset + allowlist schemas", () => {
   });
 
   test("allowlist add enforces provider-aware id shape (keyed-run papercut: malformed ids used to fail only at run time)", () => {
-    // openrouter ids are vendor/slug (optionally :variant).
+    // openrouter ids are vendor/slug (optionally :variant), and a leading `~`
+    // marks OpenRouter's floating `-latest` aliases — part of the id, not a
+    // typo (a seeded preset points at one).
     for (const good of [
       "deepseek/deepseek-v4-flash",
       "z-ai/glm-5.2",
       "openai/gpt-5.2:extended",
+      "~deepseek/deepseek-v4-flash-latest",
+      "moonshotai/kimi-k3",
     ]) {
       expect(
         addModelAllowlistEntryRequestSchema.safeParse({
@@ -487,7 +532,15 @@ describe("model preset + allowlist schemas", () => {
         }).success,
       ).toBe(true);
     }
-    for (const bad of ["claude-sonnet-5", "deepseek/", "/model", "a b/c"]) {
+    for (const bad of [
+      "claude-sonnet-5",
+      "deepseek/",
+      "/model",
+      "a b/c",
+      // the tilde is a PREFIX, not a free-floating character
+      "~/model",
+      "deep~seek/model",
+    ]) {
       expect(
         addModelAllowlistEntryRequestSchema.safeParse({
           provider: "openrouter",
@@ -506,6 +559,62 @@ describe("model preset + allowlist schemas", () => {
       modelIdShapeProblem("openrouter", "no-vendor-prefix"),
     ).toContain("vendor/model");
     expect(modelIdShapeProblem("anthropic", "claude-opus-4-8")).toBeNull();
+    expect(
+      modelIdShapeProblem("openrouter", "~deepseek/deepseek-v4-flash-latest"),
+    ).toBeNull();
+  });
+
+  test("capability DTOs: unknown efforts are null, never an empty list", () => {
+    expect(
+      modelCapabilityDtoSchema.safeParse({
+        provider: "openrouter",
+        modelId: "moonshotai/kimi-k3",
+        supportedEfforts: ["max", "high", "low"],
+        defaultEffort: "high",
+        contextWindowTokens: 1_048_576,
+      }).success,
+    ).toBe(true);
+    // Anthropic / no catalog entry / catalog unreachable — unknown, and the
+    // UI must offer the full vocabulary rather than an empty selector.
+    const unknown = modelCapabilityDtoSchema.parse({
+      provider: "anthropic",
+      modelId: "claude-opus-4-8",
+      supportedEfforts: null,
+    });
+    expect(unknown.supportedEfforts).toBeNull();
+    expect(unknown.defaultEffort).toBeUndefined();
+    // Nullable, not optional: an absent key is a server bug, not "unknown".
+    expect(
+      modelCapabilityDtoSchema.safeParse({
+        provider: "anthropic",
+        modelId: "claude-opus-4-8",
+      }).success,
+    ).toBe(false);
+    expect(
+      modelCapabilityDtoSchema.safeParse({
+        provider: "openrouter",
+        modelId: "moonshotai/kimi-k3",
+        supportedEfforts: ["ultra"],
+      }).success,
+    ).toBe(false);
+    expect(
+      modelCapabilityDtoSchema.safeParse({
+        provider: "openrouter",
+        modelId: "moonshotai/kimi-k3",
+        supportedEfforts: null,
+        contextWindowTokens: 0,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      listModelCapabilitiesResponseSchema.safeParse({
+        models: [],
+        catalogAvailable: false,
+      }).success,
+    ).toBe(true);
+    expect(
+      listModelCapabilitiesResponseSchema.safeParse({ models: [] }).success,
+    ).toBe(false);
   });
 });
 

@@ -24,6 +24,7 @@ import { z } from "zod";
 import {
   agentDefinitionSchema,
   modelPresetSlugSchema,
+  reasoningEffortSchema,
   type AgentDefinition,
 } from "./agent-definition";
 import type { EveStreamEvent } from "./eve-events";
@@ -112,7 +113,11 @@ export type ModelProvider = z.infer<typeof modelProviderSchema>;
  * additionally consults OpenRouter's public catalog when reachable — but it
  * catches the whole wrong-provider-grammar class up front:
  * - openrouter ids are `vendor/slug` (optionally `:variant`), e.g.
- *   `deepseek/deepseek-v4-flash`, `openai/gpt-5.2:extended`
+ *   `deepseek/deepseek-v4-flash`, `openai/gpt-5.2:extended`, optionally with
+ *   a LEADING TILDE — `~` is OpenRouter's convention for its `-latest`
+ *   floating aliases (`~deepseek/deepseek-v4-flash-latest`) and is part of
+ *   the id, so the shape check must allow it or a seeded preset's model
+ *   cannot even be allowlisted
  * - anthropic (native API) ids are hyphenated, NO vendor prefix, e.g.
  *   `claude-opus-4-8` — a slash means someone pasted a gateway/OpenRouter id
  */
@@ -121,9 +126,9 @@ export function modelIdShapeProblem(
   modelId: string,
 ): string | null {
   if (provider === "openrouter") {
-    return /^[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*(?::[\w.-]+)?$/i.test(modelId)
+    return /^~?[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*(?::[\w.-]+)?$/i.test(modelId)
       ? null
-      : `"${modelId}" is not an OpenRouter model id — expected "vendor/model" (e.g. "deepseek/deepseek-v4-flash")`;
+      : `"${modelId}" is not an OpenRouter model id — expected "vendor/model" (e.g. "deepseek/deepseek-v4-flash", "~deepseek/deepseek-v4-flash-latest")`;
   }
   return modelId.includes("/")
     ? `"${modelId}" is not an Anthropic model id — native ids have no "/" (e.g. "claude-opus-4-8"); for OpenRouter-routed models pick the openrouter provider`
@@ -1145,12 +1150,19 @@ export type GetSkillResponse = z.infer<typeof getSkillResponseSchema>;
 //
 // The three slugs are seeded per workspace and fixed — presets are re-pointed
 // (PUT), never created or deleted.
+//
+// A preset is `(provider, modelId, reasoning)`: the EFFORT is part of the
+// preset, not just of the agent. Two tiers may point at the same model and
+// differ only in effort (the seeded `balanced`/`quick` pair does exactly
+// that), which is impossible if effort lives only on the agent.
 
 export const modelPresetDtoSchema = z.object({
   id: productId,
   slug: modelPresetSlugSchema,
   provider: modelProviderSchema,
   modelId: z.string().min(1),
+  /** The preset's effort — agents inherit it unless they override. */
+  reasoning: reasoningEffortSchema,
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
 });
@@ -1160,6 +1172,11 @@ export const updateModelPresetRequestSchema = z.object({
   provider: modelProviderSchema,
   /** Must be on the workspace allowlist (422 `model_not_allowlisted`). */
   modelId: z.string().min(1),
+  /**
+   * OPTIONAL on purpose — absent means "keep the stored effort". A web bundle
+   * from before efforts existed must not start 400ing mid-deploy.
+   */
+  reasoning: reasoningEffortSchema.optional(),
 });
 export type UpdateModelPresetRequest = z.infer<
   typeof updateModelPresetRequestSchema
@@ -1233,6 +1250,42 @@ export const getModelAllowlistEntryResponseSchema = z.object({
 });
 export type GetModelAllowlistEntryResponse = z.infer<
   typeof getModelAllowlistEntryResponseSchema
+>;
+
+// ── Model capabilities ──────────────────────────────────────────────────────
+//
+//   GET /workspaces/:workspaceId/model-capabilities → ListModelCapabilitiesResponse
+//
+// Every ENABLED allowlist entry, joined with what the OpenRouter catalog says
+// about it — the source for the reasoning-effort selectors in the agent editor
+// and the Models settings panel. FAIL-OPEN, like the catalog check on
+// allowlist adds: an unreachable catalog answers every entry with unknown
+// capabilities rather than an error, and the UI falls back to offering the
+// whole effort vocabulary.
+
+export const modelCapabilityDtoSchema = z.object({
+  provider: modelProviderSchema,
+  modelId: z.string().min(1),
+  /**
+   * null = UNKNOWN, which is NOT the same as "supports nothing": no catalog
+   * entry, an unreachable catalog, or a non-OpenRouter provider (Anthropic
+   * publishes no such list). Clients must offer the full vocabulary on null,
+   * never an empty selector.
+   */
+  supportedEfforts: z.array(reasoningEffortSchema).nullable(),
+  /** The catalog's own default, when it names one inside supportedEfforts. */
+  defaultEffort: reasoningEffortSchema.optional(),
+  contextWindowTokens: z.number().int().positive().optional(),
+});
+export type ModelCapabilityDto = z.infer<typeof modelCapabilityDtoSchema>;
+
+export const listModelCapabilitiesResponseSchema = z.object({
+  models: z.array(modelCapabilityDtoSchema),
+  /** False when the catalog could not be consulted — all efforts are null. */
+  catalogAvailable: z.boolean(),
+});
+export type ListModelCapabilitiesResponse = z.infer<
+  typeof listModelCapabilitiesResponseSchema
 >;
 
 // ── Agents CRUD ─────────────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ import {
   modelPresetSlugSchema,
   reasoningEffortSchema,
 } from "./agent-definition";
+import { connectionIdSchema } from "./api";
 import { triggerConfigSchema } from "./workflow-config";
 
 // ── surfaces ─────────────────────────────────────────────────────────────────
@@ -112,8 +113,12 @@ export type CopilotContextKind = z.infer<typeof copilotContextKindSchema>;
 /** `addContext` equips the agent with an existing workspace/user resource. */
 export const addContextParamsSchema = z.object({
   kind: copilotContextKindSchema,
-  /** `mcp_connections.id` or `skills.id` — must exist in the workspace inventory. */
-  id: z.uuid(),
+  /**
+   * `connections.id` or `skills.id` — must exist in the workspace inventory.
+   * `connectionIdSchema` (uuid OR `cn_` nanoid) covers both: skill ids are
+   * always uuids, which the union's first branch accepts.
+   */
+  id: connectionIdSchema,
 });
 export type AddContextParams = z.infer<typeof addContextParamsSchema>;
 

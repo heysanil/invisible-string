@@ -33,8 +33,8 @@ import { eq } from "drizzle-orm";
 import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
-  encryptSecret,
   generateMasterKeyBase64,
+  newId,
   parseMasterKey,
   type AgentDefinitionInput,
   type ApiErrorBody,
@@ -56,7 +56,7 @@ import {
 } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
-import { mcpAuthAadContext } from "./agent-env";
+import { encryptConnectionAuthConfig } from "../resources/mcp-crypto";
 import {
   derivePlatformJwtSecret,
   PLATFORM_JWT_ISSUER,
@@ -617,27 +617,23 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     orgId = owner.orgId;
     await seedWorkspace(db, orgId, owner.userId);
 
-    // MCP connection with an envelope-encrypted token (workspace scope).
-    const mcpRows = await db
-      .insert(schema.mcpConnections)
-      .values({
-        scope: "workspace",
-        organizationId: orgId,
-        name: "linear",
-        source: "custom",
-        url: "https://mcp.example.com/mcp",
-      })
-      .returning({ id: schema.mcpConnections.id });
-    mcpConnectionId = mcpRows[0]!.id;
-    const envelope = encryptSecret(
-      JSON.stringify({ token: "lin-secret-token" }),
-      parseMasterKey(MASTER_KEY_B64),
-      mcpAuthAadContext(mcpConnectionId),
-    );
-    await db
-      .update(schema.mcpConnections)
-      .set({ authConfigEncrypted: JSON.stringify(envelope) })
-      .where(eq(schema.mcpConnections.id, mcpConnectionId));
+    // Connection with an envelope-encrypted token (workspace scope). The AAD
+    // binds the row id, so the id exists before the insert (newId, spec §3).
+    mcpConnectionId = newId("cn");
+    await db.insert(schema.connections).values({
+      id: mcpConnectionId,
+      scope: "workspace",
+      organizationId: orgId,
+      name: "linear",
+      source: "custom",
+      url: "https://mcp.example.com/mcp",
+      authType: "bearer",
+      authConfigEncrypted: encryptConnectionAuthConfig(
+        { type: "bearer", values: { token: "lin-secret-token" } },
+        parseMasterKey(MASTER_KEY_B64),
+        mcpConnectionId,
+      ),
+    });
 
     draft = {
       persona: "Be helpful. Use @linear when asked.",

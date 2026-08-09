@@ -18,7 +18,7 @@
  *                                per version (never the platform master)
  * - exactly ONE provider key   → matching the version's RESOLVED provider
  * - OPENROUTER_BASE_URL        → passthrough when set (test harnesses)
- * - MCP_<CONN>_TOKEN           → decrypted from mcp_connections auth envelopes
+ * - MCP_<CONN>_TOKEN           → decrypted from `connections` auth envelopes
  */
 import { inArray } from "drizzle-orm";
 import { connectionTokenEnvVar } from "@invisible-string/compiler";
@@ -31,6 +31,7 @@ import {
 
 import { slugifyName } from "../build/compiler-adapter";
 import type { Db } from "../db";
+import { connectionAuthAad } from "../resources/mcp-crypto";
 import { errors } from "./errors";
 import { derivePlatformJwtSecret } from "./jwt";
 import type { ModelProvider } from "./model-resolution";
@@ -70,15 +71,8 @@ export function mcpHeaderEnvName(connectionName: string, header: string): string
 }
 
 /**
- * AAD context binding an mcp_connections auth envelope to its row — writers
- * (Phase-2 CRUD/install flow) must use the same context.
- */
-export function mcpAuthAadContext(connectionId: string): string {
-  return `mcp_connections:auth_config:${connectionId}`;
-}
-
-/**
- * Decrypted auth-config shape stored (encrypted) on mcp_connections.
+ * Decrypted auth-config shape stored (encrypted) on `connections` — AAD-bound
+ * to the row via `connectionAuthAad` (resources/mcp-crypto.ts, the write side).
  * - bearer: `{ token }` (legacy) or `{ type: "bearer", token }`
  * - headers: `{ type: "headers", headers: { <name>: <value> } }`
  */
@@ -96,7 +90,7 @@ export function decryptMcpAuthConfig(
   if (!masterKey) throw errors.encryptionKeyMissing();
   try {
     const envelope = JSON.parse(authConfigEncrypted) as EncryptedEnvelope;
-    const plaintext = decryptSecret(envelope, masterKey, mcpAuthAadContext(connectionId));
+    const plaintext = decryptSecret(envelope, masterKey, connectionAuthAad(connectionId));
     return JSON.parse(plaintext) as McpAuthConfig;
   } catch {
     throw errors.mcpSecretUnavailable(connectionId);
@@ -141,15 +135,18 @@ export async function decryptMcpEnv(
   if (connectionIds.length === 0) return {};
   const rows = await db
     .select({
-      id: schema.mcpConnections.id,
-      name: schema.mcpConnections.name,
-      authConfigEncrypted: schema.mcpConnections.authConfigEncrypted,
+      id: schema.connections.id,
+      name: schema.connections.name,
+      authType: schema.connections.authType,
+      authConfigEncrypted: schema.connections.authConfigEncrypted,
     })
-    .from(schema.mcpConnections)
-    .where(inArray(schema.mcpConnections.id, connectionIds));
+    .from(schema.connections)
+    .where(inArray(schema.connections.id, connectionIds));
 
   const env: Record<string, string> = {};
   for (const row of rows) {
+    // Plan 3: broker-delivered, never env-injected (spec §6).
+    if (row.authType === "oauth") continue;
     const config = decryptMcpAuthConfig(row.authConfigEncrypted, masterKey, row.id);
     if (!config) continue;
     if (config.type === "headers") {

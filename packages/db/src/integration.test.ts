@@ -431,12 +431,14 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(scheduled?.nextFireAt?.getTime()).toBe(nextFireAt.getTime());
   });
 
-  test("scope/owner CHECK constraints reject inconsistent mcp_connections and skills rows", async () => {
-    // Valid rows on both sides of the enum pass.
-    await db.insert(schema.mcpConnections).values({
+  test("scope/owner CHECK constraints reject inconsistent connections and skills rows", async () => {
+    // Valid rows on both sides of the enum pass. Connections ids are
+    // app-generated (`cn_` nanoids in production; any text satisfies the PK).
+    await db.insert(schema.connections).values({
+      id: `cn_valid${suffix}`,
       scope: "workspace",
       organizationId: orgId,
-      name: `mcp-ws-${suffix}`,
+      name: `conn-ws-${suffix}`,
       source: "custom",
       url: "https://mcp.example.com/mcp",
     });
@@ -448,28 +450,34 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     });
 
     const invalid: {
-      table: "mcp" | "skill";
+      table: "connection" | "skill";
       row: Record<string, unknown>;
     }[] = [
       // workspace scope without organization_id (orphan)
-      { table: "mcp", row: { scope: "workspace", userId } },
+      { table: "connection", row: { scope: "workspace", userId } },
       // user scope without user_id (orphan)
-      { table: "mcp", row: { scope: "user", organizationId: orgId } },
+      { table: "connection", row: { scope: "user", organizationId: orgId } },
       // both owners set (cross-scope ambiguity)
-      { table: "mcp", row: { scope: "workspace", organizationId: orgId, userId } },
+      {
+        table: "connection",
+        row: { scope: "workspace", organizationId: orgId, userId },
+      },
       // neither owner set
       { table: "skill", row: { scope: "user" } },
       { table: "skill", row: { scope: "workspace", userId } },
     ];
+    let badCount = 0;
     for (const { table, row } of invalid) {
       let checkError: unknown;
       try {
-        if (table === "mcp") {
-          await db.insert(schema.mcpConnections).values({
-            name: `mcp-bad-${suffix}`,
+        if (table === "connection") {
+          await db.insert(schema.connections).values({
+            id: `cn_bad${badCount++}${suffix}`,
+            name: `conn-bad-${suffix}`,
             source: "custom",
+            url: "https://mcp.example.com/mcp",
             ...row,
-          } as typeof schema.mcpConnections.$inferInsert);
+          } as typeof schema.connections.$inferInsert);
         } else {
           await db.insert(schema.skills).values({
             name: `skill-bad-${suffix}`,

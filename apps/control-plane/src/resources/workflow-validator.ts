@@ -19,7 +19,7 @@
  *
  * The pure validators take a resolved {@link AgentValidationSnapshot};
  * {@link loadAgentValidationSnapshot} resolves one from `agents` /
- * `agent_versions` / `mcp_connections` / `skills` rows (slug grammar =
+ * `agent_versions` / `connections` / `skills` rows (slug grammar =
  * `slugifyName`, the same mapping the compiler applies to persona `@refs`).
  */
 import { and, eq, inArray } from "drizzle-orm";
@@ -53,7 +53,7 @@ export interface AgentValidationSnapshot {
 /**
  * Resolve the agent named by a workflow config into a validation snapshot.
  * Context slugs come from the agent's PUBLISHED version definition (that is
- * what dispatch runs), resolved via `mcp_connections`/`skills` rows — a row
+ * what dispatch runs), resolved via `connections`/`skills` rows — a row
  * deleted after the agent published simply drops out of the set, so refs to
  * it are flagged. Returns null when the agent does not exist in this
  * workspace (workspace scoping: the id must be owned by `organizationId`).
@@ -94,9 +94,9 @@ export async function loadAgentValidationSnapshot(
       const { mcpConnectionIds, skillIds } = parsed.data.context;
       if (mcpConnectionIds.length > 0) {
         const rows = await db
-          .select({ name: schema.mcpConnections.name })
-          .from(schema.mcpConnections)
-          .where(inArray(schema.mcpConnections.id, mcpConnectionIds));
+          .select({ name: schema.connections.name })
+          .from(schema.connections)
+          .where(inArray(schema.connections.id, mcpConnectionIds));
         for (const row of rows) {
           const slug = slugifyName(row.name);
           if (slug !== "") connectionSlugs.add(slug);

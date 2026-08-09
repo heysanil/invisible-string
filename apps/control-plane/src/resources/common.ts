@@ -13,7 +13,6 @@ import type {
   ConnectionDto,
   ConnectionOauthStatus,
   MasterKey,
-  McpConnectionDto,
   ModelAllowlistEntryDto,
   ModelPresetDto,
   SkillDto,
@@ -53,12 +52,9 @@ export type Scope =
   | { kind: "workspace"; organizationId: string }
   | { kind: "user"; userId: string };
 
-/** drizzle WHERE for a scoped table (connections / mcp_connections / skills share columns). */
+/** drizzle WHERE for a scoped table (connections / skills share columns). */
 export function scopeWhere(
-  table:
-    | typeof schema.connections
-    | typeof schema.mcpConnections
-    | typeof schema.skills,
+  table: typeof schema.connections | typeof schema.skills,
   scope: Scope,
 ): SQL {
   return scope.kind === "workspace"
@@ -101,7 +97,6 @@ export function parseBody<T>(
 // ── DTO mappers ──────────────────────────────────────────────────────────────
 
 type ConnectionRow = typeof schema.connections.$inferSelect;
-type McpConnectionRow = typeof schema.mcpConnections.$inferSelect;
 type SkillRow = typeof schema.skills.$inferSelect;
 type ModelPresetRow = typeof schema.modelPresets.$inferSelect;
 type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
@@ -137,27 +132,6 @@ export function connectionDto(
     lastError: row.lastError,
     tools: row.toolsCache ?? null,
     toolsCachedAt: row.toolsCachedAt?.toISOString() ?? null,
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
-  };
-}
-
-/** Secrets are NEVER echoed — only `hasCredentials`. */
-export function mcpConnectionDto(row: McpConnectionRow): McpConnectionDto {
-  return {
-    id: row.id,
-    scope: row.scope,
-    name: row.name,
-    description: row.description,
-    source: row.source,
-    registryId: row.registryId,
-    url: row.url,
-    toolAllow: row.toolAllow ?? null,
-    toolBlock: row.toolBlock ?? null,
-    approvalPolicy:
-      (row.approvalPolicy as McpConnectionDto["approvalPolicy"]) ?? null,
-    enabled: row.enabled,
-    hasCredentials: row.authConfigEncrypted != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

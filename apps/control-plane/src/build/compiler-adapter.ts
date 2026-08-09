@@ -92,7 +92,7 @@ function uniqueSlugs<T extends { name: string }>(
 const DB_DECISIONS = new Set(["never", "once", "always"]);
 
 /**
- * db `mcp_connections.approval_policy` → compiler ApprovalSpec.
+ * db `connections.approval_policy` → compiler ApprovalSpec.
  * Stored shape: `{ default: "never"|"once"|"always", tools?: { <tool>: same } }`
  * ("always" = always ask; "never" = auto-allow). null → never (no gating).
  */

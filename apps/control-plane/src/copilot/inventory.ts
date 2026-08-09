@@ -134,8 +134,8 @@ export function createInventoryLoader(
     const [connections, skills, agents, presets, allowlist, catalog] = await Promise.all([
       db
         .select()
-        .from(schema.mcpConnections)
-        .where(scopeFilter(schema.mcpConnections)),
+        .from(schema.connections)
+        .where(scopeFilter(schema.connections)),
       db.select().from(schema.skills).where(scopeFilter(schema.skills)),
       db
         .select({
@@ -198,9 +198,9 @@ export function createInventoryLoader(
     const [extraConnections, extraSkills] = await Promise.all([
       missingConnectionIds.size > 0
         ? db
-            .select({ id: schema.mcpConnections.id, name: schema.mcpConnections.name })
-            .from(schema.mcpConnections)
-            .where(inArray(schema.mcpConnections.id, [...missingConnectionIds]))
+            .select({ id: schema.connections.id, name: schema.connections.name })
+            .from(schema.connections)
+            .where(inArray(schema.connections.id, [...missingConnectionIds]))
         : Promise.resolve([]),
       missingSkillIds.size > 0
         ? db

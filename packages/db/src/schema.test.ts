@@ -238,10 +238,8 @@ describe("indexes and uniques", () => {
 });
 
 describe("encrypted-at-rest columns are opaque text", () => {
-  test("mcp_connections.auth_config_encrypted", () => {
-    expect(schema.mcpConnections.authConfigEncrypted.getSQLType()).toBe(
-      "text",
-    );
+  test("connections.auth_config_encrypted", () => {
+    expect(schema.connections.authConfigEncrypted.getSQLType()).toBe("text");
   });
 
   test("integrations.credentials_encrypted", () => {

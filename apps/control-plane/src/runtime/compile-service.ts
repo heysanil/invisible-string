@@ -95,8 +95,8 @@ export async function resolveCompileInputs(
   for (const id of definition.context.mcpConnectionIds) {
     const rows = await db
       .select()
-      .from(schema.mcpConnections)
-      .where(eq(schema.mcpConnections.id, id))
+      .from(schema.connections)
+      .where(eq(schema.connections.id, id))
       .limit(1);
     const row = rows[0];
     const owned =
@@ -124,7 +124,8 @@ export async function resolveCompileInputs(
           : null,
       toolAllow: row.toolAllow ?? null,
       toolBlock: row.toolBlock ?? null,
-      approvalPolicy: row.approvalPolicy ?? null,
+      approvalPolicy:
+        (row.approvalPolicy as CompileConnection["approvalPolicy"]) ?? null,
     });
   }
 

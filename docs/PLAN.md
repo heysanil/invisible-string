@@ -18,7 +18,7 @@ This plan is the outcome of a brainstorming pass: live eve/Better Auth/OpenRoute
 |---|---|
 | Plan scope | Master plan, Phases 0–4 fully detailed (this file) |
 | Environments | Local-first: docker-compose (Postgres, Garage, Dex IdP, control plane, 2 workers) is the acceptance target; CI on GitHub Actions; production compose provisioned (docker-compose.prod.yml; docs/DEPLOY.md) |
-| Stack (open items) | Drizzle ORM + drizzle-kit · Tailwind v4 + shadcn/ui · TanStack Router + Query · CodeMirror 6 (instructions editor) · Elysia TypeBox validation · bun:test + Playwright · monorepo `apps/{control-plane,worker,web}` + `packages/{compiler,db,shared}` |
+| Stack (open items) | Drizzle ORM + drizzle-kit · Tailwind v4 + shadcn/ui · TanStack Router + Query · Tiptap 3 (prompt editors — superseded CodeMirror 6, see the 2026-08-08 spec) · Elysia TypeBox validation · bun:test + Playwright · monorepo `apps/{control-plane,worker,web}` + `packages/{compiler,db,shared}` |
 | App shell | **B — workspace rail**: floating glass dock with 💬 Chat · ⚡ Workflows · 🧩 Context · ⚙ Settings, each = list panel + main pane |
 | Builder layout | **A+B hybrid**: left pillar-summary rail (live config cards with ✓/warning states; active card "solidifies"), center focused per-pillar editor, right docked copilot; Run draft/Publish in rail |
 | Run rendering in chat | **C — collapsible working block**: steps stream live (tool name + one-line result), folds to "Worked for Ns · N steps" on completion; full detail one click away |
@@ -124,8 +124,8 @@ Per spec §10 verbatim (Better Auth mount, workspace/user MCP + skills CRUD, reg
 
 ## Phase 2 — Four-pillar data + builder UI
 
-1. CRUD APIs + UI for all pillars; MCP registry proxy (`GET /v0.1/servers?search=&version=latest`, filter active/latest) + install flow (map `remotes[].url`, env-var declarations → secret prompts, encrypted) + custom-URL path; skill authoring (CodeMirror markdown + file attachments); model presets + allowlist UI; agent presets UI.
-2. Builder (hybrid layout, E1): pillar rail with live cards + ✓/warning validation (client mirror of compiler checks); focused editors — Trigger (manual/form/webhook/Slack config UI; Slack adapter itself lands Phase 3), Context (registry browser, per-connection tool allow/block + approval policy editor), Agent (preset picker + preset/model override within allowlist), Instructions (CodeMirror 6 with `@` autocomplete sourced from trigger schema + connections + skills); Run draft (snapshots version) + Publish.
+1. CRUD APIs + UI for all pillars; MCP registry proxy (`GET /v0.1/servers?search=&version=latest`, filter active/latest) + install flow (map `remotes[].url`, env-var declarations → secret prompts, encrypted) + custom-URL path; skill authoring (markdown editor + file attachments; Tiptap since the 2026-08-08 spec); model presets + allowlist UI; agent presets UI.
+2. Builder (hybrid layout, E1): pillar rail with live cards + ✓/warning validation (client mirror of compiler checks); focused editors — Trigger (manual/form/webhook/Slack config UI; Slack adapter itself lands Phase 3), Context (registry browser, per-connection tool allow/block + approval policy editor), Agent (preset picker + preset/model override within allowlist), Instructions (`@` autocomplete sourced from trigger schema + connections + skills; Tiptap reference chips since the 2026-08-08 spec); Run draft (snapshots version) + Publish.
 3. Chat surface: session list w/ status; thread with collapsible working blocks (C) fed by SSE; approval cards → `POST /runs/:id/input`; composer; version/model chips; "Edit workflow ↗".
 4. Settings: members/roles, integrations placeholder, workspace/user context tabs.
 5. Playwright E2E begins here (compose stack): the §Acceptance flow below.

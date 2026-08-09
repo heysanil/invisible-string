@@ -209,8 +209,9 @@ agent" drops you straight into `/chat`.
 Standing delegations: **trigger → Agent → instructions**. One focused column
 with three sections — Trigger ("When this runs": webhook, form, Slack, or
 schedule), Agent ("Who does the work": a published Agent), Instructions
-("What they should do": CodeMirror with `@trigger.*` and the bound Agent's
-`@skill.*` autocomplete). Publishing is **instant** — validate + snapshot, no
+("What they should do": a rich markdown editor where `@trigger.*` and the
+bound Agent's `@skill.*` become atomic reference chips, with a Markdown
+source toggle). Publishing is **instant** — validate + snapshot, no
 build (blocking diagnostics answer 422 and route onto the section cards) —
 and the header's Run popover fires the published snapshot through the real
 trigger-dispatch path.

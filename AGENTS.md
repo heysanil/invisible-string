@@ -97,11 +97,11 @@ Replace the markdown renderer with Streamdown.
 - **All eight shipped workspaces share one version** (`fixed` globs), because `docs/DEPLOY.md` pins all three images with a single `IMAGE_TAG`.
 - **Never `git clean -fd .changeset`.** A changeset you just wrote is untracked until you stage it, so the sweep that clears build junk deletes precisely the file the PR exists to carry — and it does so in the exact state you are in right after writing one.
 
-Releasing is merging: pushes to `main` keep a **"Version Packages"** PR up to date; merging it bumps the manifests, writes `CHANGELOG.md`, tags `vX.Y.Z`, cuts the GitHub Release, and builds the GHCR images — in one workflow run, so no PAT is needed. Pushing a `v*` tag by hand still builds images, but then the manifests must be aligned to that version or the number is burned (`docs/DEPLOY.md` §10).
+Releasing is merging: pushes to `main` keep a **"Version Packages"** PR up to date; merging it bumps the manifests, writes `CHANGELOG.md`, tags `vX.Y.Z`, cuts the GitHub Release, and builds the GHCR images — in one workflow run, so no PAT is needed. Pushing a `v*` tag by hand still builds images, but the manifests must already be aligned to that version **in the tagged commit** or the number is burned — `release:tag` reads the comparison version out of the tag's own commit, so an alignment commit landed afterwards cannot repair it (recovery: `docs/DEPLOY.md` §10).
 
 Two repository facts the flow depends on — check both before blaming the workflow:
 
-1. **"Allow GitHub Actions to create and approve pull requests" must be ON** (Settings → Actions → General). This is merge-blocking, not a nicety: with it off, `changesets/action` fails at PR creation with an error that never names the setting, so the `version` job fails on *every* push to `main` and releases go permanently red.
+1. **"Allow GitHub Actions to create and approve pull requests" must be ON** (Settings → Actions → General). This is merge-blocking, not a nicety: with it off, `changesets/action` fails at PR creation with an error that never names the setting, so the `version` job fails on every push that leaves changesets pending — i.e. effectively every push between releases — and releases go permanently red.
 2. **The Version PR runs no CI checks** — a `GITHUB_TOKEN`-opened PR does not trigger `pull_request` workflows. Benign while `main` has no branch protection; add a required status check and the Version PR becomes unmergeable until the action is given a PAT or GitHub App token.
 
 ## Architecture (one screen)

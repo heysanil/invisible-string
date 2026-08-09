@@ -274,11 +274,15 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 3. **Rollback** = set `IMAGE_TAG` back to the previous tag and redeploy.
    Migrations are additive (AGENTS.md golden rule), so rolling an image back to
    a prior tag against an already-migrated database is safe.
-4. **Fallback:** pushing a `v*` tag by hand still builds and pushes images. If
-   you do, immediately set the eight shipped `package.json` versions to that
-   same number and commit — otherwise the next Version PR computes a version
-   whose tag already exists, and the release stops with an error naming both
-   commits.
+4. **Fallback:** pushing a `v*` tag by hand still builds and pushes images, but
+   it burns the number unless the tagged commit's manifests already claim it.
+   `release:tag` reads the version out of the **tag's own commit**, so bump the
+   eight shipped `package.json` versions, commit, and tag *that* commit — an
+   alignment commit landed after the tag cannot repair it. If the tag is
+   already out ahead of the manifests, either move it onto the aligned commit
+   (`git tag -f` + force-push) or skip the number entirely (land a `minor` so
+   the next Version PR computes past it); otherwise the `version` job exits 1
+   on every push to `main`.
 
 ---
 

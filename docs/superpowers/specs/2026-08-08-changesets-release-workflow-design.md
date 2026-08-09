@@ -335,7 +335,7 @@ Which yields:
 | Version PR merges | `0.3.0` (new) | absent | — | **tag + release + images** |
 | Re-run after a mid-release failure | `0.3.0` | at `HEAD` | `0.3.0` | release and/or images completed; no duplicate tag |
 | Ordinary commit, or a changeset-bearing PR merging | `0.3.0` (unchanged) | at an older commit | `0.3.0` | `released=false`, clean exit |
-| Hand-pushed tag burned the number | `0.3.1` | at an unrelated commit | `0.3.0` | **exit 1**, naming both commits |
+| Hand-pushed tag burned the number | `0.3.1` | at an unrelated commit | `0.3.0` | **exit 1**, naming the version the tag actually marks |
 
 The `Vt` comparison is what separates "this release is already done" (benign, the
 common case on every ordinary push to `main`) from "this tag marks something else
@@ -477,10 +477,11 @@ document in the same commit"):
     it, so that test passes; only the prose goes stale.
 - **`docs/DEPLOY.md` §10** — the upgrade path becomes "merge the Version Packages
   PR; the release workflow tags, releases, and builds images." Document the manual
-  `git tag v*` push as the fallback **and its obligation**: a manual tag must be
-  followed by aligning the manifests to that version, or the number is burned
-  (§9). The `IMAGE_TAG` description (line ~71) stays accurate — image tags are
-  still `vX.Y.Z`.
+  `git tag v*` push as the fallback **and its obligation**: the manifests must
+  already claim that version **in the commit being tagged**, or the number is
+  burned (§9) — §6.3 reads `Vt` from the tag's own commit, so aligning
+  afterwards cannot repair it. The `IMAGE_TAG` description (line ~71) stays
+  accurate — image tags are still `vX.Y.Z`.
 - **`README.md`** — a line on how releases are cut, if it describes CI at all.
 - **No docs-sentinel interaction.** Its denylist already excludes
   `(^|/)CHANGELOG\.md$`, so the new root changelog will not trip the audit. Worth
@@ -527,8 +528,12 @@ docker, no network) so the default `bun test` lane catches drift, in the style o
 - **A manual tag burns the version number.** Pushing `v0.3.1` by hand leaves the
   manifests at `0.3.0`, so the next Version PR computes `0.3.1` — whose tag already
   exists, pointing at an unrelated commit. §6.3's tag-points-elsewhere hard-fail
-  makes this loud instead of silent, but the operator must still align the
-  manifests to any hand-pushed tag. Documented in `docs/DEPLOY.md` §10.
+  makes this loud instead of silent, and it is **not** repairable after the fact:
+  `Vt` comes from the tag's own commit, so a later alignment commit moves `V`
+  and leaves `Vt` untouched — both branches still land on the same exit 1. The
+  recoveries are to move the tag onto a commit whose manifests claim the version
+  (`git tag -f` + force-push) or to skip the number outright. Documented in
+  `docs/DEPLOY.md` §10.
 - **Concurrency pending-cancellation race.** `concurrency: release-${{ github.ref }}`
   keeps only the newest *pending* run. Sequence: the Version PR merge (commit A)
   queues behind an in-progress run; ordinary commit B lands; A's run is cancelled;

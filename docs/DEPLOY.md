@@ -53,7 +53,7 @@ Images are pulled from GHCR, pinned by `IMAGE_TAG`:
 - A public domain pointed at the host (or at the hoster's proxy).
 - `/var/run/docker.sock` available to the `worker` container — eve session
   sandboxes launch as sibling containers on the host daemon.
-- The GHCR images published by the `release` workflow (push a `v*` tag), or use
+- The GHCR images published by the `release` workflow (see §10), or use
   the build override (§6) to build locally.
 
 ---
@@ -266,12 +266,24 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 
 ## 10. Upgrades & rollback
 
-1. Push a `v*` git tag → the `release` workflow builds and pushes the three
-   GHCR images tagged with the git tag and the commit sha.
+1. Merge the PR titled **`chore(release): version packages`** (branch
+   `changeset-release/main`) that the `release` workflow keeps open on
+   `main`. That bumps the version, writes `CHANGELOG.md`, pushes the `vX.Y.Z`
+   tag, cuts the GitHub Release, and builds and pushes the three GHCR images
+   tagged with the version and the commit sha. See AGENTS.md → Releases.
 2. Change `IMAGE_TAG` to the new tag and redeploy (`up -d` re-pulls).
 3. **Rollback** = set `IMAGE_TAG` back to the previous tag and redeploy.
    Migrations are additive (AGENTS.md golden rule), so rolling an image back to
    a prior tag against an already-migrated database is safe.
+4. **Fallback:** pushing a `v*` tag by hand still builds and pushes images, but
+   it burns the number unless the tagged commit's manifests already claim it.
+   `release:tag` reads the version out of the **tag's own commit**, so bump the
+   eight shipped `package.json` versions, commit, and tag *that* commit — an
+   alignment commit landed after the tag cannot repair it. If the tag is
+   already out ahead of the manifests, either move it onto the aligned commit
+   (`git tag -f` + force-push) or skip the number entirely (land a `minor` so
+   the next version PR computes past it); otherwise the `version` job exits 1
+   on every push to `main`.
 
 ---
 

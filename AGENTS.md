@@ -32,6 +32,8 @@ The living documents and what each owns:
 | `.env.example` | **Canonical inventory of every environment variable** — add new vars here with comments |
 | `e2e/README.md` | Playwright harness operation |
 | `docs/DEPLOY.md` | Production deployment: prod compose operation, Dokploy, external data services, backups, upgrades |
+| `docs/superpowers/specs/2026-08-08-changesets-release-workflow-design.md` | Release flow: version model, changelog generation, tag/release/image pipeline |
+| `.changeset/` + `CHANGELOG.md` | Pending release notes and the shipped changelog |
 | `docs/SLACK.md` | Platform Slack app: manifest (`infra/slack/manifest.template.json` + drift test), credential wiring, workspace connect, trigger binding |
 | `apps/site/README.md` | Marketing/docs site: commands, Cloudflare Workers deploy, MDX authoring, token-extension rules |
 
@@ -76,6 +78,34 @@ If you add a subsystem, add its doc and list it here. If a doc contradicts the c
 
 E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never collects them. The eve spike (`spike/`) is standalone (not a workspace) — its suites run in the gated lane and are the upgrade gate for eve version bumps. One exception: `spike/tests/pins.test.ts` is deliberately UNGATED (no DB, no docker, no network) so the default lane catches spike-vs-`versions.json` drift; `spike/agent-project/package.json` is GENERATED from `versions.json` (`bun run spike/tests/sync-pins.ts`, then regenerate the lockfile with `npm install --package-lock-only` under Node 24 — never hand-edit either file).
 
+## Releases (changesets)
+
+Every behavior-affecting PR adds a changeset — same commit as the change, the same way docs move with code. Write the file directly rather than running `bun changeset`; the prompt walks all ten workspaces:
+
+```md
+<!-- .changeset/any-name.md -->
+---
+"@invisible-string/web": minor
+---
+
+Replace the markdown renderer with Streamdown.
+```
+
+- **Bump types while on 0.x**: breaking → `minor` (semver §4 — anything may change below 1.0), feature → `minor`, fix/chore → `patch`. **`major` is reserved for the deliberate 1.0.0 cut** and is not used before then.
+- **Mark breaking changes** by starting the summary with `**Breaking:**`. That marker, not the bump type, is what routes an entry to the changelog's "Breaking changes" section — necessary precisely because a 0.x breaking change ships as a `minor`.
+- **The summary is ONE line.** `parseChangeset` collapses the whole body into a single space-joined line, so bullets, sub-lists, and fenced code inside a summary come back out as a run-on sentence. Write one sentence (a few clauses at most) on one logical line.
+- **The bold scope label in `CHANGELOG.md` is DERIVED, not authored** — it is the changeset's package names with `@invisible-string/` stripped, **sorted alphabetically**, comma-joined. Naming `web` and `shared` renders `**shared, web**`, never `**web**`; which packages you name is the only lever you have over it.
+- **Name only shipped workspaces.** `@invisible-string/e2e` and `@invisible-string/integration-tests` have no `version` and are excluded. Naming one alone makes changesets exit 0 and silently never consume the file — a zombie that blocks nothing and fixes nothing; naming one alongside a shipped package fails with "Mixed changesets that contain both ignored and not ignored packages are not allowed". `bun run release:version` rejects both up front with a file-and-package message, and `tests/integration/changesets-config.test.ts` guards the config that makes the exclusion work.
+- **All eight shipped workspaces share one version** (`fixed` globs), because `docs/DEPLOY.md` pins all three images with a single `IMAGE_TAG`.
+- **Never `git clean -fd .changeset`.** A changeset you just wrote is untracked until you stage it, so the sweep that clears build junk deletes precisely the file the PR exists to carry — and it does so in the exact state you are in right after writing one.
+
+Releasing is merging: pushes to `main` keep a PR titled **`chore(release): version packages`** (branch `changeset-release/main`) up to date; merging it bumps the manifests, writes `CHANGELOG.md`, tags `vX.Y.Z`, cuts the GitHub Release, and builds the GHCR images — in one workflow run, so no PAT is needed. Search for that exact title; the PR is opened by a shell step in `release.yml`, **not** by `changesets/action`, which is unusable here for the two reasons that step documents (an unguarded per-package `CHANGELOG.md` read that `changelog: false` makes fatal, and a checkout it leaves on the version branch) — do not "simplify" the step back into the action. Pushing a `v*` tag by hand still builds images, but the manifests must already be aligned to that version **in the tagged commit** or the number is burned — `release:tag` reads the comparison version out of the tag's own commit, so an alignment commit landed afterwards cannot repair it (recovery: `docs/DEPLOY.md` §10).
+
+Two repository facts the flow depends on — check both before blaming the workflow:
+
+1. **"Allow GitHub Actions to create and approve pull requests" must be ON** (Settings → Actions → General). This is merge-blocking, not a nicety: with it off, `gh pr create` fails with a permissions error that never names the setting, so the `version` job fails on every push that leaves changesets pending — i.e. effectively every push between releases — and releases go permanently red.
+2. **The version PR runs no CI checks** — a `GITHUB_TOKEN`-opened PR does not trigger `pull_request` workflows. Benign while `main` has no branch protection; add a required status check and the version PR becomes unmergeable until the step is given a PAT or GitHub App token.
+
 ## Architecture (one screen)
 
 `apps/control-plane` (Bun+Elysia): Better Auth (email/pw + OIDC SSO + orgs; workspace creation seeds starter Agents and fire-and-forget-publishes "General Purpose") · agent + workflow CRUD · compiler invocation + `eve build` + tarball → object store (Garage) (cache keyed by content hash = agent definition + the resolved model **and reasoning effort** + compiler version + eve version + build-env epoch) · scheduler (session affinity → artifact-warm → any live worker; dead-worker sweep + fencing) · trigger ingress (`/t/:token`, Slack events with signature + replay window) + schedule ticker (advisory-locked cron claims, `SCHEDULE_TICK_MS`) → dispatcher (renders workflow instructions + trigger event into the task message → eve session create/continue, ID-addressed, with a version-bound JWT; the `TriggerEvent` envelope is stored on the run as provenance only) · outbound reply delivery (`DeliveryService`: Slack `chat.postMessage` off the run's terminal event, at-least-once with boot recovery) · NDJSON tailer → `run_events` → resumable SSE · copilot WS tool loop (agent + workflow editors).
@@ -111,7 +141,7 @@ E2E specs are `*.e2e.ts` under `e2e/specs/` precisely so root `bun test` never c
 
 **Every job installs its host toolchain the same way: `- uses: jdx/mise-action@v2`, with no `with:` block** — the action reads the repo-root `mise.toml`, sets `MISE_TRUSTED_CONFIG_PATHS` + `MISE_YES`, and puts mise's shims on `PATH`, so the bare `bun`/`node`/`npm`/`wrangler` calls in later steps are the pinned versions. Do NOT add `oven-sh/setup-bun`, `actions/setup-node`, or `install_args:`/`tool_versions:` — a second toolchain or a fuzzy version defeats the pin, and `tests/integration/toolchain-pins.test.ts` fails the unit lane if one reappears. mise-action hashes `mise.toml` into its own cache key, so a version bump self-invalidates.
 
-All jobs run on Namespace runners (`nscloud-ubuntu-24.04-amd64-*` labels). The eve npm cache (`~/.npm`) and Playwright browsers persist on a shared Namespace cache volume (tag `eve-npm`, mounted via `nscloud-cache-action` — no `actions/cache` tarball round-trips), and `release.yml` image builds use Namespace's pre-configured remote builders (no `setup-buildx-action`, no gha layer cache — cache lives builder-side). `release.yml` and `docs-sentinel.yml` need no mise step: neither runs a host toolchain binary.
+All jobs run on Namespace runners (`nscloud-ubuntu-24.04-amd64-*` labels). The eve npm cache (`~/.npm`) and Playwright browsers persist on a shared Namespace cache volume (tag `eve-npm`, mounted via `nscloud-cache-action` — no `actions/cache` tarball round-trips), and `release.yml` image builds use Namespace's pre-configured remote builders (no `setup-buildx-action`, no gha layer cache — cache lives builder-side). `release.yml`'s `version` job DOES need mise (it runs `bun`); its `images` job and all of `docs-sentinel.yml` do not, since neither runs a host toolchain binary.
 
 `.github/workflows/site.yml` is a separate, deliberately non-Namespace workflow (`ubuntu-latest`): pushes to `main` touching `apps/site/**` or `packages/design-tokens/**` build the static site (`VITE_SITE_URL=https://invisiblestring.io`) and deploy it to Cloudflare Workers (assets-only Worker `invisible-string-site`, config in `apps/site/wrangler.jsonc`, SPA fallback with real 200s) via the wrangler mise pins (`npm:wrangler` in `mise.toml`, installed under mise's own data dir — not `cloudflare/wrangler-action`, whose npm fallback installs in-project and can't parse Bun's `workspace:*` protocol); pull requests touching the same paths upload a preview version (`wrangler versions upload --preview-alias <branch>`) and comment the preview URLs on the PR (fork PRs skip — no secrets). Secrets: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`. A static marketing/docs build needs no Namespace cache, and this keeps public-site deploys decoupled from the platform's CI runners.
 

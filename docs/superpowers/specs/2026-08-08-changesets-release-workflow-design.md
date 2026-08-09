@@ -2,8 +2,10 @@
 
 **Date:** 2026-08-08
 **Status:** Approved, ready for implementation
-**Revision:** 2 — incorporates an independent review that re-ran every empirical
-finding against this repo (not a replica) and corrected two of them.
+**Revision:** 3 — two rounds of independent review, each re-running the empirical
+findings against this repo (not a replica). Round 1 corrected two findings; round 2
+caught a reachable state in §6.3's algorithm (the transition window) and an
+overstated coverage claim in §8's guard test.
 **Owns:** How a version number is chosen, how the changelog and GitHub Release are
 produced, and how `release.yml` gets from a merged PR to published GHCR images.
 
@@ -215,12 +217,19 @@ Invoked as the action's `version:` command. Lands in `scripts/`, which the root
 1. Read and parse every `.changeset/*.md` (excluding `config.json` and
    `README.md`) **before** they are consumed: frontmatter gives the bump type and
    the named packages; the body gives the summary.
-2. **Validate.** If any changeset names a workspace that has no `version` field
-   (today: `@invisible-string/e2e`, `@invisible-string/integration-tests`), **exit
-   1**, naming the offending file and the offending package. This converts finding
-   7's two bad outcomes — the silent zombie and the mixed-changeset error — into
-   one clear failure at the earliest possible point. Do not hard-code the excluded
-   names; derive them by reading which workspaces lack a `version`.
+2. **Validate.** **Exit 1**, naming the offending file and package, if any
+   changeset names either:
+   - **a workspace with no `version` field** (today: `@invisible-string/e2e`,
+     `@invisible-string/integration-tests`) — converting finding 7's two bad
+     outcomes, the silent zombie and the mixed-changeset error, into one clear
+     failure at the earliest possible point; or
+   - **a package that is not a workspace at all** — a typo such as
+     `@invisible-string/webb` names no versionless workspace, so it would otherwise
+     pass this check and fail later inside `changeset version` with Changesets' own
+     less-located error.
+
+   Do not hard-code either set; derive both by enumerating the workspaces and
+   reading which ones lack a `version`.
 3. If there are no changesets at all, exit 0 having changed nothing.
 4. Record the current version, then run `changeset version`, which bumps the eight
    manifests and deletes the changeset files.
@@ -268,7 +277,8 @@ Two values drive every decision:
   what this commit *is*).
 - `Vt` — the version recorded **at the tag's own commit**, read via
   `git show vV:packages/shared/package.json` (the tag's claim about what it
-  *marked*). Only defined when tag `vV` exists.
+  *marked*). Defined only when tag `vV` exists **and** that commit's manifest
+  actually carries a `version` key — see the pre-version-fields branch below.
 
 The algorithm:
 
@@ -281,8 +291,12 @@ if tag vV does not exist:
 
 else:
     Vt := version at `git show vV:packages/shared/package.json`
+          (undefined if the command fails OR the JSON has no `version` key)
 
-    if Vt != V:
+    if Vt is undefined:
+        emit released=false                 # tag predates version fields — see below
+
+    else if Vt != V:
         exit 1   # inconsistent: vV marks a commit that never claimed to be V
                  # (classically, a hand-pushed tag that burned the number — §9)
 
@@ -293,19 +307,34 @@ else:
         emit released=false                                 # ordinary commit
 ```
 
+**The `Vt is undefined` branch is mandatory, not defensive.** All seven existing
+tags predate this design, so none of their commits carries a `version` field.
+Verified: `git show v0.2.0:packages/shared/package.json` exits **0** — the path
+exists — but the JSON has no `version` key, at every tag from `v0.1.3` to `v0.2.0`.
+Without this branch, the **transition window** breaks: §5.1 seeds the manifests at
+`0.2.0`, the tag `v0.2.0` already exists, so `V = 0.2.0` with `Vt` undefined would
+take the `Vt != V` path and **exit 1 on every push to `main`** between the
+implementation PR merging and the first Version PR merging. Long-term the branch is
+reachable only by reverting a Version PR, where a quiet no-op is also correct.
+
+Tag object type does not matter: `v0.1.3`–`v0.1.6` are lightweight and `v0.1.7`+
+are annotated, and `git show <tag>:<path>` resolves both identically (verified).
+
 `ensure_release(V)`: if `gh release view vV` fails, extract the release body — the
 span from the **first** `## ` heading to the next `## ` heading or EOF, per §6.2
-step 7 — and run `gh release create vV --title vV --notes-file …`. If the release
-already exists, leave it alone.
+step 7 — and run `gh release create vV --title vV --notes-file …`. **Assert the
+extracted heading is `vV` before creating the release**, so a hand-edited or
+malformed `CHANGELOG.md` cannot attach the wrong notes. If the release already
+exists, leave it alone.
 
 Which yields:
 
 | Situation | `V` | Tag `vV` | `Vt` | Result |
 |---|---|---|---|---|
-| PR with changesets merges | `0.2.0` (unchanged) | at the older release commit | `0.2.0` | `released=false`; action opens/updates the Version PR |
+| **Transition window** — any push to `main` after this ships, before the first Version PR merges | `0.2.0` (seeded) | exists, at `7967ce2` | **undefined** | `released=false`, clean exit; the action still opens/updates the Version PR |
 | Version PR merges | `0.3.0` (new) | absent | — | **tag + release + images** |
 | Re-run after a mid-release failure | `0.3.0` | at `HEAD` | `0.3.0` | release and/or images completed; no duplicate tag |
-| Ordinary commit, nothing pending | `0.3.0` | at an older commit | `0.3.0` | `released=false`, clean exit |
+| Ordinary commit, or a changeset-bearing PR merging | `0.3.0` (unchanged) | at an older commit | `0.3.0` | `released=false`, clean exit |
 | Hand-pushed tag burned the number | `0.3.1` | at an unrelated commit | `0.3.0` | **exit 1**, naming both commits |
 
 The `Vt` comparison is what separates "this release is already done" (benign, the
@@ -463,14 +492,24 @@ docker, no network) so the default `bun test` lane catches drift, in the style o
 
 1. Every workspace under `apps/*` and `packages/*` has a `version`, and all eight
    are equal.
-2. `tests/integration` and `e2e` have **no** `version` — the exclusion mechanism.
+2. **Enumerate every workspace** from the root `package.json` `workspaces` globs,
+   and assert that the set of workspaces **lacking** a `version` equals **exactly**
+   the set named in the `fixed` negations — comparing each versionless package name
+   against the literal `"!" + name`. Plain string set comparison; no glob matching.
+
+   This is the check that matters, and a narrower "`tests/integration` and `e2e`
+   have no version" would not do the job. A future versionless workspace whose name
+   still matches the positive glob — say `tests/load` → `@invisible-string/load-tests`
+   — falls **inside** `@invisible-string/*` with no negation covering it. That is
+   finding 3's config-level `TypeError`, and it would detonate at the next release
+   attempt, on `main`, in the `version` job, long after the offending workspace
+   merged. Checks 1 and 3 both pass in that scenario; only this one catches it.
 3. The `fixed` array **deep-equals** the expected literal from §6.1. Assert the
    literal rather than evaluating the globs: correct evaluation needs micromatch
    semantics (`Bun.Glob` does not do `!`-negation across a pattern list), and
    hand-rolling that is exactly the kind of subtle error a guard test should not
-   contain. Combined with checks 1 and 2 the coverage is equivalent — a new
-   workspace under `apps/` is caught by check 1, and any edit to the globs
-   deliberately trips this check.
+   contain. Check 2 supplies the coverage that glob evaluation would have given;
+   this check makes any edit to the globs a deliberate, visible act.
 4. `privatePackages` is `{ version: true, tag: false }` and `changelog` is `false`.
 5. The root `@changesets/cli` dependency is an exact version (no `^` or `~`).
 
@@ -559,16 +598,22 @@ than inventing a scope.
 3. `bun install --frozen-lockfile` succeeds on a clean tree after a simulated
    `changeset version`.
 4. A changeset naming `@invisible-string/e2e` fails `bun run release:version` with
-   exit 1 and a message naming the file — it does not silently persist.
-5. Adding a changeset and pushing to a branch produces no release activity.
-6. On merge to `main` with changesets pending: a "Version Packages" PR appears; no
+   exit 1 and a message naming the file — it does not silently persist. A changeset
+   naming a non-existent package (`@invisible-string/webb`) fails the same way.
+5. **Transition window:** with the manifests seeded at `0.2.0` and tag `v0.2.0`
+   already present, `bun run release:tag` exits 0 with `released=false` — it does
+   **not** error on the missing `version` key at that tag's commit. Verify before
+   merging the implementation PR, since every push to `main` hits this state until
+   the first Version PR lands.
+6. Adding a changeset and pushing to a branch produces no release activity.
+7. On merge to `main` with changesets pending: a "Version Packages" PR appears; no
    tag, no release, no images.
-7. On merging that PR: `CHANGELOG.md` gains a `v0.3.0` section, tag `v0.3.0` is
+8. On merging that PR: `CHANGELOG.md` gains a `v0.3.0` section, tag `v0.3.0` is
    pushed, a GitHub Release is created with that section as its body, and all three
    GHCR images publish as `v0.3.0` and `<sha>`.
-8. Re-running the release workflow on the release commit re-checks the release and
+9. Re-running the release workflow on the release commit re-checks the release and
    images without creating a duplicate tag, and does **not** short-circuit to a
    no-op if the release or images were missing.
-9. An ordinary commit to `main` with nothing pending is a clean no-op —
-   `released=false`, no error.
-10. `git tag v0.3.1 && git push --tags` still builds and publishes images.
+10. An ordinary commit to `main` with nothing pending is a clean no-op —
+    `released=false`, no error.
+11. `git tag v0.3.1 && git push --tags` still builds and publishes images.

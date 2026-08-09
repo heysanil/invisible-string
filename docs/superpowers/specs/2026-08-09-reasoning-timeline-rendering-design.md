@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Status:** Approved, ready for implementation
-**Supersedes:** the 2026-07-02 design spec's decision C (the collapsible working block), in `apps/web` only. Nothing about the event stream, the control plane, or the compiler changes — this is a presentation-layer redesign of `RunView` and the components that render it.
+**Supersedes:** the 2026-07-02 design spec's decision C and `docs/PLAN.md`'s "Run rendering in chat" row (the collapsible working block), in `apps/web` only. Nothing about the event stream, the control plane, or the compiler changes — this is a presentation-layer redesign of `RunView` and the components that render it.
 
 ---
 
@@ -34,7 +34,7 @@ Symptom 3 has a second, independent cause. `message.appended` carries only `mess
 
 ## 2. The model
 
-`RunView.block: WorkingBlockView | null` is replaced by `RunView.segments: readonly RunSegment[]` — the run's top-level chronology.
+`RunView.block: WorkingBlockView | null` and `RunView.reply` are replaced by `RunView.segments: readonly RunSegment[]` — the run's top-level chronology.
 
 ```ts
 /** One assistant utterance: mid-run narration or the final answer. Identical
@@ -44,7 +44,7 @@ export interface SpeechSegment {
   kind: "speech";
   key: string;              // `say:${turnId}:${stepIndex}`
   text: string;
-  streaming: boolean;
+  streaming: boolean;       // see §2.4
 }
 
 /** A contiguous stretch of interior work: thinking and tool calls. Renders as
@@ -55,8 +55,13 @@ export interface WorkSegment {
   items: readonly TimelineItem[];
   /** Wall-clock span of THIS segment's own frames — not the run's. */
   elapsedSeconds: number | null;
-  /** The run is unsettled AND this is the last segment. */
+  /** First frame's `at`. The component ticks the live counter from this;
+   *  the reducer cannot, because it only re-runs when frames arrive. */
+  startedAt: string | null;
+  /** Accepting items right now — see §2.4. Drives the spinner + counter. */
   active: boolean;
+  /** Blocked on the user (a pending input gates an item here). */
+  waiting: boolean;
   /** A later segment exists, so this one has been superseded — the fold cue. */
   sealed: boolean;
 }
@@ -67,11 +72,11 @@ export type TimelineItem = ThoughtItem | ToolItem;
 
 export interface ThoughtItem {
   kind: "thought";
-  key: string;              // `${turnId}:${stepIndex}`
+  key: string;              // `${turnId}:${stepIndex}` (+ `#n`, see §2.1)
   text: string;
   /** Wall-clock seconds for this pass; null while streaming or unmeasurable. */
   seconds: number | null;
-  streaming: boolean;
+  streaming: boolean;       // see §2.4
 }
 
 export interface ToolItem {
@@ -83,40 +88,64 @@ export interface ToolItem {
 }
 ```
 
-`StepState`, `PendingInputView`, `FrameStore`, and every existing invariant around cancellation, `context.cleared`, and settled-status precedence are **unchanged**.
+`StepState`, `PendingInputView`, `FrameStore`, and the settled-status-precedence rule (`statusOverride` applies only while the row is unsettled) are **unchanged**.
 
-### 2.1 Thought segmentation is exact, not heuristic
+### 2.1 Thought segmentation
 
-Every eve event carries `(turnId, stepIndex, sequence)`. A thought's identity is `${turnId}:${stepIndex}`:
+Events used to build timeline keys — `reasoning.*`, `message.appended`/`completed`, `actions.requested`, `action.*`, `input.requested` — all carry `(turnId, stepIndex, sequence)`. (Turn- and session-level events like `turn.*`, `context.cleared` and `compaction.*` do not, but they are never timeline items.) `stepIndex` is per-turn, so every key embeds `turnId` and multi-turn runs cannot collide.
 
-- `reasoning.appended` → upsert the thought at that key, `text = reasoningSoFar`, `streaming = true`.
-- `reasoning.completed` → same key, `text = reasoning`, `streaming = false`, and `seconds` = the span between that key's first and last frame `at` timestamps, rounded, floored at 1.
+A thought's identity is `${turnId}:${stepIndex}`:
 
-Two passes in different steps are different keys, so they are different items. **Nothing overwrites anything.** This is not a "seal on next tool call" guess — the runtime tells us.
+- `reasoning.appended` → upsert that key, `text = reasoningSoFar`.
+- `reasoning.completed` → same key, `text = reasoning`, and **seal it**; `seconds` = the span between that key's first and last frame `at`, rounded, floored at 1.
+- A `reasoning.appended` arriving for an **already-sealed** key opens a *new* item at `${turnId}:${stepIndex}#2` (then `#3`, …).
 
-`stepIndex` is also why a *durable step retry* is safe: a retried step re-emits its own key and updates in place rather than appending a duplicate.
+That last rule is the difference between "exact" and "assumed". `reasoning.appended`/`reasoning.completed` are **DOCS-DERIVED, never live-observed** (`eve-events.ts:28-32`, `:515-538`) — the spike has never captured one, and the AGENTS.md "wire probe" is request-side, not stream-side. If a model interleaves thinking within one step (reason → text → reason, all at one `stepIndex`), and if `reasoningSoFar` turns out to be per-block rather than per-step-cumulative, a plain upsert would overwrite the first pass — reproducing symptom 1 one level down. The ordinal suffix costs nothing when eve is one-pass-per-step and prevents that entirely.
 
-### 2.2 Segmentation of the run itself
+> **Pre-implementation task:** capture a real reasoning stream through the gated spike lane (`SPIKE_EVE_BUILD=1`) and record the observed shapes in `spike/REPORT.md`. Build to the spec regardless — the ordinal rule is safe either way — but the fixtures in §5 encode assumptions until this exists.
 
-Walk frames in `seq` order and append to the current segment:
+### 2.2 The walk
 
-- A **thought** or **tool** item opens (or extends) a `work` segment.
-- Assistant text opens a `speech` segment, which **closes the current work segment**.
-- Any subsequent work opens a **new** work segment below.
+One pass over `store.frames` in `seq` order, maintaining two **global** lookup maps (`itemsByKey`, `speechByKey`) and a pointer to the current work segment:
 
-`message.appended` streams into a speech segment immediately; `message.completed` settles the same key's text and clears `streaming`. **The text never moves** — `finishReason` decides only whether more segments follow, which is a fact about *what comes after*, never a correction to what already rendered. Symptom 3 is designed out rather than mitigated.
+- **Known key ⇒ update in place, wherever it already lives** — even if that item sits in a segment closed several segments ago.
+- **Unknown key ⇒** a thought/tool item opens or extends the current work segment; assistant text opens a speech segment, which **closes** the current work segment. Subsequent work opens a **new** work segment below.
 
-The reply is simply the last speech segment. `RunView.reply` is removed; `RunMessage` no longer renders it separately.
+The global-lookup rule is load-bearing, not an optimization. Updates legitimately arrive for items in closed segments: `action.result`/`action.partial` for a call issued before the agent spoke, and durable **step retries**, which `eve-events.ts:63-64` documents as re-emitting under new `meta.id`s with the *same* `turnId`/`stepIndex`. A current-segment-only lookup would duplicate the item into a new box *and* mint a second segment keyed `work:t0:0`, colliding as a React key.
+
+**Carry forward the don't-walk-a-settled-step-backwards guard** (`run-view.ts:319-334`): `action.partial` must not demote a tool item that already reached `ok`/`error`/`rejected`. It lives in the exact code being rewritten and has no test today; §5.11 adds one.
+
+**Fallback for frames without `stepIndex`** (0.19-era rows are replayed from `run_events` forever). Point events get a synthetic key from `frame.seq`. Append-type events (`reasoning.appended`, `message.appended`) instead **stick to the currently-open item/segment of that kind** — a per-frame key would render one item per delta, so a 500-delta stream would produce 500 thought items each holding progressively longer cumulative text.
+
+### 2.3 Speech
+
+`message.appended` streams into a speech segment immediately; `message.completed` settles the same key. A `message.completed` with **no prior `message.appended`** still creates the segment (the `clearedRun` fixture at `fixtures.ts:272` is exactly this). A **blank or null** `message` creates nothing and therefore does not close the current work segment.
+
+**The text never moves.** `finishReason` decides only whether more segments follow — a fact about what comes *after*, never a correction to what already rendered. Symptom 3 is designed out rather than mitigated.
+
+The reply is simply the last speech segment; `RunMessage` no longer renders one separately.
 
 > **Consequence, accepted:** a run where the agent speaks mid-work renders as several boxes interleaved with prose. This is honest — it is what happened — and reads as a transcript. A run with no mid-work narration (the common case) renders as exactly one box followed by one reply, unchanged from the approved mockup.
 
-### 2.3 Edge cases the reduction must pin down
+### 2.4 `active`, `waiting`, and `streaming` — the invariants that must not regress
 
-- **Segment keys are kind-prefixed** (`work:` / `say:`) because one step can emit *both* reasoning and text, which would otherwise give a thought and a speech segment the same `${turnId}:${stepIndex}` and collide as React keys in the same list.
-- **Empty `message.completed`.** `message` is `string | null`, and eve emits a null/blank one for a pure tool-call step. A speech segment is created only once non-blank text exists; a blank completion opens nothing and therefore does not close the current work segment.
-- **A run with no segments at all** (`segments: []`) keeps the existing `Thinking…` presence cue in `RunMessage.tsx:151`, which now keys off `segments.length === 0` instead of `block === null && !showReply`.
-- **`elapsedSeconds` is per-segment** — the span between that segment's own first and last frame `at` values, floored at 1s, `null` when the segment holds fewer than two frames. It is no longer the whole run's span.
-- **Frames with no `stepIndex`** (0.19-era rows still replayed from `run_events` forever, per the existing `inputRequestKindOf` precedent) fall back to a synthetic key derived from `frame.seq`, which yields one item per frame rather than mis-merging distinct passes.
+These are derived from **both** status and the frame-derived `canceled` flag, never status alone. `canceled` flips a beat *before* the `run_status` frame (`RunMessage.tsx:48-51`), which is what lets the spinner, caret and Stop button settle together instead of lingering for a round trip.
+
+```
+runLive   = !canceled && (status === "queued" || status === "running")
+active    = runLive && isLastSegment          // WorkSegment
+waiting   = !canceled && status === "waiting" && segment gates a pendingInput
+streaming = no completion seen for this key && runLive   // Speech + Thought
+```
+
+Two traps this closes:
+
+- **`waiting` is NOT settled.** `isRunSettledStatus` (`api.ts:602-604`) is `succeeded|failed|canceled` only. Defining `active` as "the run is unsettled" would give a run parked on a human approval a spinner and a live-ticking counter for as long as the person takes to answer.
+- **Cancellation and crashes produce no completion event.** `run-view.test.ts:205` ("a cancelled turn freezes its partial reply instead of blinking on forever") asserts `reply.streaming === false` after `turn.cancelled` with no `message.completed`. Clearing `streaming` only on completion regresses it — and a crashed run replayed from history would render an eternal caret on a `failed` run.
+
+### 2.5 Segment-key stability
+
+`addFrame` sort-inserts frames arriving below `maxSeq` (`run-view.ts:54-56`). A late gap-fill that inserts a new *first* item into a segment changes that segment's key on the from-scratch re-reduce, remounting the box and losing its manual toggle. This is rare (SSE resume is normally in-order) and low-consequence; **accepted and documented**, not worked around.
 
 ---
 
@@ -127,7 +156,7 @@ One work segment = one collapsible glass box (existing E1 treatment: `rounded-ca
 | Item | Node | Body |
 |---|---|---|
 | Thought (streaming) | filled `--ink-4` dot | header `Thinking`, body `text-ink-3` at 12.5px |
-| Thought (sealed) | filled `--ink-4` dot | header `Thought for Ns` |
+| Thought (sealed) | filled `--ink-4` dot | header `Thought for Ns`, or plain `Thought` when `seconds` is null |
 | Tool `pending` | spinner, `--ink-4` | mono `toolName` |
 | Tool `ok` | check, `--ok` | mono name + one-line `resultPreview` in `--ink-3` |
 | Tool `awaiting` | pause bars, `--warn` | preview in `--warn-ink` (the bright `--warn` fails contrast as small text) |
@@ -136,27 +165,39 @@ One work segment = one collapsible glass box (existing E1 treatment: `rounded-ca
 
 Color stays meaning-only per E1 §5.
 
-### 3.1 Header and fold
+### 3.1 Header, counter, fold
 
-Header: chevron (rotates 90° when open), a spinner while `active`, a label, and a right-aligned tabular-nums elapsed counter while `active`.
+Header: chevron (rotates 90° when open), a spinner while `active`, a label, and a right-aligned tabular-nums counter while `active`.
 
-- **Active:** `Working` + live `M:SS`.
-- **Settled:** `Worked for Ns · M steps`, counter hidden.
+| State | Label | Counter |
+|---|---|---|
+| `active` | `Working` | live `M:SS`, ticked component-side from `startedAt` |
+| `waiting` | `Waiting on you` | none |
+| settled | `Worked for Ns · M steps` | none |
 
 **`M steps` is `items.length` — thoughts included.** The summary is literally the length of the rail, so it cannot drift from its contents, and the two vocabularies (`steps` meaning tool calls, reasoning meaning something else) collapse into one.
 
-**The fold trigger changes.** Today `WorkingBlock.tsx:67-71` folds on `block.active` going false — i.e. run-settled, which is *after* the reply has finished streaming. Instead a work segment auto-folds when it becomes **`sealed`** (a later segment exists), which for the last box is the first token of the final message. The rail closes as the answer opens: one handoff, not two beats.
+The counter ticks in the component because the reducer is pure and only re-runs on frames — a model thinking silently emits none. Derive it as `startedAt` + local elapsed; client-clock skew against the server's `at` is accepted (the value is a progress cue, not a measurement).
 
-Fold uses the existing `grid-template-rows: 0fr ↔ 1fr` transition at 220ms `--ease-out`. The manual toggle wins permanently: once the user has clicked a box, auto-fold never overrides them again.
+**Fold rules** (today's is `active → false`, at `WorkingBlock.tsx:67-71`):
 
-### 3.2 Height
+- Default open iff `active` on mount — so a history-replayed run opens collapsed.
+- Auto-fold when `sealed` **or** on `active → false` (a failed or cancelled run has no following segment to seal it, and must still fold).
+- A manual toggle wins over auto-fold for the life of the mounted component. Note `ThreadView` virtualizes rows (overscan 4), so scrolling a box far off-screen unmounts it and resets the toggle — same as today, and accepted.
 
-- **While `active`:** body capped at `max-height: 210px`, `overflow-y: auto`, scrolled to bottom on each new item. A long reasoning pass streams *within* the box instead of shoving the composer down the page.
+Fold uses the existing `grid-template-rows: 0fr ↔ 1fr` transition at **200ms** `--ease-out`, matching the current `duration-200` and the E1 150–200ms band.
+
+### 3.2 Height and inner scroll
+
+- **While `active`:** body capped at `max-height: 210px`, `overflow-y: auto`. A long reasoning pass streams *within* the box instead of shoving the composer down the page.
+- Auto-scroll to bottom on new content **only while the user is pinned near the bottom of that body** — reuse the stick-to-bottom heuristic at `ThreadView.tsx:80-85`. Unconditional scrolling would yank a reader who scrolled up inside a live box to re-read an earlier thought.
 - **Once settled:** the cap is removed. Reopening a finished box expands full-height in page flow — no nested scrollbar, and no second click per thought. The cap exists to serve streaming, not reading.
+
+A pathological run (say 50 reasoning passes) reopens to a very large DOM subtree inside a dynamically-measured virtual row. Accepted: it requires a deliberate click, and re-reduce cost is unchanged from today.
 
 ### 3.3 What stays outside the boxes
 
-`pendingInputs` (approval cards), the failure banner, the stopped notice, the `ContextDivider`, and the Stop button keep their current position **below** the segments. Approval cards are actionable and always concern the run's present state; burying one inside a scrolling rail would hide the thing the run is blocked on. The gating tool row shows `awaiting` and points at the card.
+`pendingInputs` (approval cards), the failure banner, the stopped notice, the `ContextDivider`, and the Stop button keep their current position **below** the segments. Approval cards are actionable and always concern the run's present state; burying one inside a scrolling rail would hide the thing the run is blocked on. The gating tool row shows `awaiting` and its segment shows `Waiting on you`, pointing at the card.
 
 ---
 
@@ -164,16 +205,20 @@ Fold uses the existing `grid-template-rows: 0fr ↔ 1fr` transition at 220ms `--
 
 | File | Change |
 |---|---|
-| `apps/web/src/lib/chat/run-view.ts` | Replace `WorkingBlockView`/`reply` with `RunSegment[]`; segment-aware reduction; keyed thoughts; drop the optimistic `streamText → reply` promotion at :412 |
-| `apps/web/src/components/chat/WorkingBlock.tsx` | Rewrite as the rail-in-box for **one** `WorkSegment`; new `ThoughtRow`; `StepRow` → `ToolRow`; capped/uncapped body; `sealed`-driven auto-fold |
-| `apps/web/src/components/chat/RunMessage.tsx` | Map `run.segments` in order; speech segments render through `Markdown`; remove the separate reply branch |
-| `apps/web/src/lib/chat/fixtures.ts` | Extend the scripted frames to cover multi-pass reasoning and a mid-run narration so `VITE_FIXTURE_MODE=1` exercises segmentation |
-| `apps/web/src/__tests__/run-view.test.ts` | New cases (§5) |
+| `apps/web/src/lib/chat/run-view.ts` | Replace `WorkingBlockView`/`reply` with `RunSegment[]`; the §2.2 global-upsert walk; §2.4 derivations; drop the optimistic `streamText → reply` promotion at :412. Rewrite the header comment to describe segments, **keeping** the cancellation and settled-precedence prose |
+| `apps/web/src/components/chat/WorkingBlock.tsx` | Rewrite as the rail-in-box for **one** `WorkSegment`; new `ThoughtRow`; `StepRow` → `ToolRow`; capped/uncapped body; component-side counter; `sealed`-driven fold |
+| `apps/web/src/components/chat/RunMessage.tsx` | Map `run.segments` in order; speech segments render through `Markdown`; remove the reply branch; presence cue keys off `segments.length === 0` |
+| `apps/web/src/components/chat/ThreadView.tsx` | **`streamSignature` (:88-93) reads `reply.text.length` + `block.steps.length`.** Not just a typecheck fix — it drives autoscroll, so the replacement must grow with segment count *and* trailing speech length or streaming stops following |
+| `apps/web/src/lib/chat/fixtures.ts` | Extend scripted frames to cover multi-pass reasoning and mid-run narration. **Append new sessions, never splice** — `fixture-chat.test.tsx` addresses them by list index (`fixtures.ts:335`) |
+| `apps/web/src/__tests__/run-view.test.ts` | New cases (§5); carry :205 forward |
 | `apps/web/src/__tests__/chat-thread.test.tsx` | Update for the new DOM |
-| `.changeset/*.md` | `"@invisible-string/web": minor` |
-| `AGENTS.md` | Add this spec to the living-documents table |
+| `apps/web/src/__tests__/integrations-ui.test.tsx` | `:131-132`, `:159` build `RunView` literals with `block:`/`reply:` |
+| `apps/web/src/__tests__/chat-composer.test.tsx` | `:143-144`, same |
+| `.changeset/*.md` | `"@invisible-string/web": minor`, one-line summary |
+| `AGENTS.md` | Add this spec to the living-documents table; amend the 2026-07-02 row (its decision C is now superseded in `apps/web`) |
+| `docs/PLAN.md` | `:24` "Run rendering in chat" documents decision C's fold-on-completion and step semantics — both change |
 
-No control-plane, worker, compiler, shared-package, or database change. No new dependency.
+Nothing outside `apps/web` reads `RunView`. No control-plane, worker, compiler, shared-package, or database change. No new dependency.
 
 ---
 
@@ -182,29 +227,54 @@ No control-plane, worker, compiler, shared-package, or database change. No new d
 Reducer tests (`run-view.test.ts`) are the primary guard, because the bugs are reducer bugs:
 
 1. **Two reasoning passes in different `stepIndex` produce two thought items** with both texts intact — the direct regression test for symptom 1.
-2. **A retried step's re-emitted reasoning updates in place**, not appended twice.
+2. **A re-`appended` sealed key opens `#2`** rather than overwriting (§2.1).
 3. **Interleaving is preserved**: `reason → tool → reason → tool` yields items in exactly that order.
-4. **Mid-run narration segments the run**: text with `finishReason: "tool-calls"` followed by more tools yields `work, speech, work` — the regression test for symptom 2.
+4. **Mid-run narration segments the run**: text with `finishReason: "tool-calls"` followed by more tools yields `work, speech, work` — symptom 2.
 5. **Streaming text never relocates**: a speech segment's key is stable from first `message.appended` through `message.completed`, whichever `finishReason` lands — symptom 3.
 6. **`M steps` equals `items.length`** across a mixed segment.
-7. **Cancellation freezes the rail**: pending/awaiting tools go `canceled`, thoughts keep their text, no failure state.
-8. **`turn.cancelled` mid-thought** leaves that thought rendered and non-streaming.
-9. **A step emitting both reasoning and text** yields two segments with *distinct* keys (`work:t0:0` and `say:t0:0`) — the key-collision guard.
-10. **A blank/null `message.completed`** creates no speech segment and does not split the surrounding work segment.
+7. **A retry / late `action.result` for a call in a closed segment updates it in place** — no duplicate item, no second segment with the same key (§2.2).
+8. **`action.partial` after `action.result` does not demote the item** — the carried-forward :319-334 guard.
+9. **Cancellation freezes the rail**: pending/awaiting tools go `canceled`, thoughts keep their text, no failure state.
+10. **Cancel mid-thought and cancel mid-speech** both leave the text rendered with `streaming === false` — the carried-forward :205 invariant, extended to thoughts.
+11. **A `failed` run replayed with an unterminated append** renders `streaming === false` (no eternal caret in history).
+12. **A run parked on `waiting`** has `active === false` and `waiting === true` on its last segment — no perpetual spinner.
+13. **A step emitting both reasoning and text** yields two segments with distinct keys (`work:t0:0`, `say:t0:0`) — the key-collision guard.
+14. **A blank/null `message.completed`** creates no speech segment and does not split the surrounding work segment; a bare non-blank one (no prior append) does create one.
 
-Component tests: auto-fold on `sealed`; manual toggle survives subsequent frames; `prefers-reduced-motion` zeroes the fold transition.
+Component tests: auto-fold on `sealed` and on `active → false`; default-collapsed on history mount; manual toggle survives subsequent frames; `prefers-reduced-motion` zeroes the fold and item-entry transitions.
 
-Lane: `bun test` (ungated) + `bun run typecheck`. No DB or eve build needed.
+**Lanes:** `bun test` + `bun run typecheck` (no DB or eve build needed) — **and the e2e lane**. `e2e/specs/agent-workflow.e2e.ts:104-117` asserts `getByRole("button", {name: /Work(ing|ed)/})`, `aria-expanded="false"` after completion, and `/Worked for \d+s · \d+ step/`. All three survive the new strings, but the **fold timing changes** (sealed = first reply token, not run-settled). Verify, don't assume. The mock model emits no reasoning events, so the step count there is unchanged.
 
 ---
 
 ## 6. Accessibility
 
-The rail is a `<ul>` of `<li>`; each tool row keeps its `sr-only` state label (`STEP_STATE_LABEL`), and thought rows expose `Thought for Ns` as real text rather than a title attribute. The existing `aria-live="polite"` / `aria-busy` wrapper in `RunMessage` is unchanged. The fold button keeps `aria-expanded`; the collapsed body keeps `aria-hidden`. Every animation added here (`fold`, item entry, caret, spinner) is inside the global `prefers-reduced-motion` guard.
+The rail is a `<ul>` of `<li>`; each tool row keeps its `sr-only` state label (`STEP_STATE_LABEL`), and thought rows expose `Thought for Ns` as real text.
+
+**The streaming rail body must be excluded from the live region.** `RunMessage.tsx:96-100` wraps the run in `aria-live="polite" aria-relevant="additions text"`, which today announces a 2-line truncated stub. With full reasoning in the rail, a screen reader would read the entire chain of thought delta by delta and drown the actual answer. Announce state changes — "Working", "Thought for 4s", tool results, the reply — not thought token streams.
+
+The fold button keeps `aria-expanded`; the collapsed body keeps `aria-hidden`. Every animation added here (fold, item entry, caret, spinner) sits inside the global `prefers-reduced-motion` guard; the counter must not animate its digits.
 
 ---
 
-## 7. Rejected alternatives
+## 7. Implementation order
+
+The reducer is the risk; everything downstream is mechanical.
+
+1. Types + the §2.2 walk, TDD against the full §5 set.
+2. `WorkingBlock` rewrite (one `WorkSegment`).
+3. `RunMessage` segment mapping + presence cue.
+4. `ThreadView.streamSignature`.
+5. Fixtures, then the component/DOM tests.
+6. Changeset, `AGENTS.md`, `docs/PLAN.md`.
+
+Reducer shape: a single seq-ordered pass with `itemsByKey` + `speechByKey` (both global, each pointing at its owning segment) and a current-work-segment pointer. Known key ⇒ mutate in place; unknown ⇒ open or extend. That one rule delivers retry-safety, text-never-moves, and the closed-segment update case simultaneously.
+
+Memoization needs no new work: `ThreadContainer`'s per-run cache (`:143-161`) keys on `(run, store, status)` references and is untouched, and `RunMessage`'s memo semantics are identical. Just never key segment components by array index.
+
+---
+
+## 8. Rejected alternatives
 
 - **Always-open timeline (no box).** Maximum transparency, but every reply sits below a wall of process and threads grow unboundedly tall. Rejected on scrollback cost.
 - **Keep the box, only reorder its contents.** Fixes symptoms 1 and 2 with no layout risk, but leaves thinking a `line-clamp-2` stub and does nothing for symptom 3.

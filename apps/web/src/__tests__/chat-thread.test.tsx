@@ -271,10 +271,18 @@ test("a streaming reply renders markdown with a caret", () => {
       onRespond={() => {}}
     />,
   );
-  const strong = view.container.querySelector("strong");
+  // Streamdown renders `**x**` as a marked span, not a bare <strong>.
+  const strong = view.container.querySelector('[data-streamdown="strong"]');
   expect(strong?.textContent).toBe("live");
-  // Streaming replies carry the blinking caret marker class.
-  expect(view.container.querySelector(".stream-caret")).not.toBeNull();
+  // Streamdown sets the caret glyph as an INLINE custom property on its
+  // wrapper; there is no data attribute to select on. Note the
+  // `content-[var(--streamdown-caret)]` utility sits in the wrapper's class
+  // list in both states, so a substring check on the token name would be
+  // vacuously true — match the inline style, which is what the blink CSS in
+  // index.css keys off too.
+  expect(
+    view.container.querySelector('[style*="--streamdown-caret"]'),
+  ).not.toBeNull();
 });
 
 // ── Stop (eve 0.31 turn cancellation) ───────────────────────────────────────

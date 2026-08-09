@@ -14,7 +14,6 @@ import { AlertCircle, Ban, Square } from "lucide-react";
 import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
-import { cn } from "../../lib/cn";
 import { Button } from "../ui/Button";
 import { ApprovalCard } from "./ApprovalCard";
 import { ContextDivider } from "./ContextDivider";
@@ -94,9 +93,7 @@ function RunMessageImpl({
         {run.block !== null ? <WorkingBlock block={run.block} /> : null}
 
         {showReply ? (
-          <div className={cn(run.reply?.streaming && "stream-caret")}>
-            <Markdown text={run.reply!.text} />
-          </div>
+          <Markdown text={run.reply!.text} streaming={run.reply!.streaming} />
         ) : null}
 
         {run.pendingInputs.map((input) => (

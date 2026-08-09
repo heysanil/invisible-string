@@ -25,6 +25,7 @@ import {
   type RunView,
 } from "../../lib/chat/run-view";
 import { isSessionOver } from "../../lib/chat/session-errors";
+import { useMessageQueue } from "../../lib/chat/use-message-queue";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
 import { titleFromMessage } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
@@ -100,7 +101,11 @@ export function ThreadContainer({
 
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
-  const [failedDraft, setFailedDraft] = useState<string | undefined>(undefined);
+  // Text handed back after a send the queue could not land. Its consumer is
+  // the composer's APPEND path, not the replace path — the box stays live
+  // through all of this, so a give-up landing seconds later must not clobber
+  // whatever the user has started typing since.
+  const [restoreDraft, setRestoreDraft] = useState<string | null>(null);
   const [busyNotice, setBusyNotice] = useState<string | null>(null);
   /** Set once eve reports this session id permanently unusable. */
   const [sessionRetired, setSessionRetired] = useState(false);
@@ -183,10 +188,28 @@ export function ThreadContainer({
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
 
+  // `mutateAsync` so the queue can await the outcome of its own flush. The
+  // direct `send` path below keeps using `mutate` with callbacks.
+  const postMessageAsync = postMessage.mutateAsync;
+  const sendForQueue = useCallback(
+    async (message: string) => {
+      await postMessageAsync({ sessionId, message });
+    },
+    [postMessageAsync, sessionId],
+  );
+
+  const queue = useMessageQueue({
+    canFlush: !slotHeld && !sessionRetired && !postMessage.isPending,
+    send: sendForQueue,
+    onGiveUp: setRestoreDraft,
+    onRetired: () => setSessionRetired(true),
+  });
+
   // The two 409s have OPPOSITE recoveries and must never share copy:
-  // `session_busy` is transient (the draft is worth keeping — retry shortly),
-  // `session_not_active` is permanent for this id (eve retired it; retrying
-  // can never succeed, so the only honest offer is a new chat).
+  // `session_busy` is transient (the message is worth keeping — the queue
+  // retries it shortly), `session_not_active` is permanent for this id (eve
+  // retired it; retrying can never succeed, so the only honest offer is a
+  // new chat).
   const send = useCallback(
     (message: string) => {
       setBusyNotice(null);
@@ -194,12 +217,17 @@ export function ThreadContainer({
         { sessionId, message },
         {
           onError: (mutationError) => {
-            setFailedDraft(message);
             if (isSessionBusy(mutationError)) {
-              setBusyNotice(
-                "This session is still working. Your message will be kept — try again once it finishes.",
-              );
-            } else if (isSessionOver(mutationError)) {
+              // The slot was taken between the keystroke and the POST (a
+              // stale `slotHeld`, or another tab). Hand it to the queue
+              // rather than making the user re-send: with `queued.length > 0`
+              // forcing the queue path afterwards, the queue is the single
+              // owner of busy recovery.
+              queue.enqueue(message);
+              return;
+            }
+            setRestoreDraft(message);
+            if (isSessionOver(mutationError)) {
               setSessionRetired(true);
               setBusyNotice(
                 "This session has been retired and can’t take new messages. Start a new chat to keep going — your text is still here to copy.",
@@ -209,13 +237,28 @@ export function ThreadContainer({
             }
           },
           onSuccess: () => {
-            setFailedDraft(undefined);
+            setRestoreDraft(null);
             setBusyNotice(null);
           },
         },
       );
     },
-    [postMessage, sessionId],
+    [postMessage, queue, sessionId],
+  );
+
+  // Submit means ENQUEUE whenever the slot is (or is about to be) held. The
+  // `queued.length > 0` term keeps order: once anything is waiting, a later
+  // message must join the tail rather than overtake it down the direct path.
+  const queueing = slotHeld || postMessage.isPending || queue.queued.length > 0;
+  const onSubmit = useCallback(
+    (message: string) => {
+      if (queueing) {
+        queue.enqueue(message);
+        return;
+      }
+      send(message);
+    },
+    [queue, queueing, send],
   );
 
   // Depend on the STABLE pieces (react-query's bound mutate + the reopen
@@ -406,11 +449,19 @@ export function ThreadContainer({
           : null,
   };
 
-  const composerDisabledReason = anyActive
-    ? "Working… you can send a follow-up when this run finishes."
-    : awaitingApproval
-      ? "Waiting for your response above."
-      : busyNotice;
+  // A live run no longer freezes the box — that is the whole point of the
+  // queue. The ONLY thing that disables the composer is a session eve has
+  // retired, where there is genuinely nowhere for the text to go. Everything
+  // else is a non-blocking hint.
+  const composerDisabledReason = sessionRetired
+    ? "This session has been retired — start a new chat."
+    : null;
+  const composerHint =
+    queue.notice ??
+    busyNotice ??
+    (awaitingApproval
+      ? "Waiting for your response above — anything you send now is queued."
+      : null);
 
   return (
     <>
@@ -432,10 +483,15 @@ export function ThreadContainer({
         contextMarker={lastRun?.contextCleared === true ? null : contextMarker}
         pendingInput={pendingInput}
         inputError={inputError}
-        onSend={send}
-        composerDisabledReason={composerDisabledReason ?? null}
+        onSend={onSubmit}
+        composerDisabledReason={composerDisabledReason}
+        composerHint={composerHint}
+        queueing={queueing}
+        queued={queue.queued}
+        onRemoveQueued={queue.remove}
+        restoreDraft={restoreDraft}
+        onRestoreConsumed={() => setRestoreDraft(null)}
         sending={postMessage.isPending}
-        failedDraft={failedDraft}
       />
       {/* Reset is the one control that destroys something: the eve session id
           is retired for good, so the dialog names that consequence rather

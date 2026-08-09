@@ -10,8 +10,10 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
+import type { QueuedMessage } from "../../lib/chat/use-message-queue";
 import { Composer } from "./Composer";
 import { ContextDivider, type ContextMarkerKind } from "./ContextDivider";
+import { QueuedMessages } from "./QueuedMessages";
 import { RunMessage } from "./RunMessage";
 import { ThreadHeader, type ThreadHeaderProps } from "./ThreadHeader";
 
@@ -42,7 +44,16 @@ export interface ThreadViewProps {
   onSend: (message: string) => void;
   composerDisabledReason?: string | null;
   sending?: boolean;
-  failedDraft?: string;
+  /** Messages waiting for the session's run slot to free. */
+  queued?: readonly QueuedMessage[];
+  onRemoveQueued?: (id: string) => void;
+  /** Non-blocking composer notice (queue retry state, transient errors). */
+  composerHint?: string | null;
+  /** Submit means enqueue. */
+  queueing?: boolean;
+  /** Text handed back after a failed send — appended, never replacing. */
+  restoreDraft?: string | null;
+  onRestoreConsumed?: () => void;
 }
 
 export function ThreadView({
@@ -58,7 +69,12 @@ export function ThreadView({
   onSend,
   composerDisabledReason,
   sending,
-  failedDraft,
+  queued,
+  onRemoveQueued,
+  composerHint,
+  queueing,
+  restoreDraft,
+  onRestoreConsumed,
 }: ThreadViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -95,11 +111,15 @@ export function ThreadView({
     (lastSegment?.kind === "speech" ? lastSegment.text.length : 0) +
     (lastSegment?.kind === "work" ? lastSegment.items.length * 1000 : 0) +
     (lastRun?.pendingInputs.length ?? 0) * 100;
+  // The queue strip sits BELOW the scroll container, so a new row shrinks the
+  // transcript's viewport with nothing inside it to re-pin — the newest run
+  // slides out of sight unless the queue length is a scroll trigger too.
+  const queuedCount = queued?.length ?? 0;
   useLayoutEffect(() => {
     if (stickToBottom.current && runs.length > 0) {
       virtualizer.scrollToIndex(runs.length - 1, { align: "end" });
     }
-  }, [runs.length, streamSignature, virtualizer]);
+  }, [runs.length, streamSignature, queuedCount, virtualizer]);
 
   // On first mount of a thread, jump to the bottom.
   useEffect(() => {
@@ -167,13 +187,20 @@ export function ThreadView({
             <ContextDivider kind={contextMarker} />
           </div>
         ) : null}
+        <QueuedMessages
+          messages={queued ?? []}
+          onRemove={onRemoveQueued ?? (() => {})}
+        />
         <Composer
           onSend={onSend}
           disabledReason={composerDisabledReason}
+          hint={composerHint}
           onStop={onStop}
           stopping={stopping}
+          queueing={queueing}
+          restoreDraft={restoreDraft}
+          onRestoreConsumed={onRestoreConsumed}
           sending={sending}
-          initialValue={failedDraft}
         />
       </div>
     </div>

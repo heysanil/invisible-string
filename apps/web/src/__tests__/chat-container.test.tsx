@@ -13,7 +13,8 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { useEffect, useReducer } from "react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
@@ -65,6 +66,28 @@ const NOW = "2026-07-03T00:00:00.000Z";
 const liveStores = new Map<string, { store: FrameStore; status: RunStatus | null }>();
 const reopenCalls: string[] = [];
 
+/** Subscribers that turn a mid-test `liveStores` write into a real re-render. */
+const liveStoreListeners = new Set<() => void>();
+
+/**
+ * Move a run's live stream state AFTER the thread has mounted — the gesture
+ * "the run settled" is made of, and the only way to watch the queue flush.
+ *
+ * The mocked hook reads `liveStores` at render time, so a bare `.set()` sits
+ * there unobserved, and RTL's `rerender` cannot force the issue either: it
+ * takes a React element, and nothing in this test owns one (the tree is built
+ * inside `renderWithRouter`). Hence the listener channel.
+ */
+function setLiveStore(
+  runId: string,
+  entry: { store: FrameStore; status: RunStatus | null },
+): void {
+  liveStores.set(runId, entry);
+  act(() => {
+    for (const notify of [...liveStoreListeners]) notify();
+  });
+}
+
 const streamsModulePath = new URL(
   "../lib/chat/use-thread-streams.ts",
   import.meta.url,
@@ -87,6 +110,15 @@ const realUseThreadStreams = realThreadStreams.useThreadStreams;
 
 mock.module(streamsModulePath, () => ({
   useThreadStreams: ((runs, options) => {
+    // The re-render channel `setLiveStore` publishes on. Subscribed ABOVE the
+    // delegation branch so the hook order is identical on both paths.
+    const [, bump] = useReducer((count: number) => count + 1, 0);
+    useEffect(() => {
+      liveStoreListeners.add(bump);
+      return () => {
+        liveStoreListeners.delete(bump);
+      };
+    }, [bump]);
     if (!streamsMockFlag.active) return realUseThreadStreams(runs, options);
     const map = new Map<string, { store: FrameStore; status: RunStatus | null; error: null; streamError: null }>();
     for (const run of runs) {
@@ -214,7 +246,12 @@ function sessionDto(id: string) {
   };
 }
 
-test("409 session_busy keeps the draft and shows a notice", async () => {
+test("409 session_busy hands the message to the queue, not back to the box", async () => {
+  // The queue is the single owner of busy recovery. A direct send only ever
+  // 409s `session_busy` when the slot was taken between the keystroke and the
+  // POST (a stale `slotHeld`, or another tab), and re-typing is not the fix
+  // for a race the client can just wait out — so the text moves into the
+  // strip and retries itself instead of coming back as a draft.
   handler = (method, url) => {
     if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
       return json(sessionResponse("succeeded"));
@@ -237,14 +274,13 @@ test("409 session_busy keeps the draft and shows a notice", async () => {
   pasteInto(box, "second message");
   pressEnter(box);
 
-  await waitFor(() => {
-    expect(
-      view.getByText(/still working|kept/i),
-    ).toBeTruthy();
-  });
-  // Draft retained in the box for retry.
+  // Queued — visible, removable, and retrying on its own.
+  await waitFor(() => expect(view.getByText("second message")).toBeTruthy());
+  expect(
+    view.getByRole("button", { name: /Remove queued message/ }),
+  ).toBeTruthy();
   await waitFor(() =>
-    expect(view.getByLabelText("Message").textContent).toBe("second message"),
+    expect(view.getByText(/send shortly|still busy/i)).toBeTruthy(),
   );
 });
 
@@ -416,4 +452,144 @@ test("Reset asks first, then swaps the thread onto the replacement session", asy
   );
   // The user must land on the REPLACEMENT row, or every later send 409s.
   await waitFor(() => expect(replaced).toEqual([NEW_SESSION_ID]));
+});
+
+// ── message queue ───────────────────────────────────────────────────────────
+
+test("a message typed during a run is queued, then sent as one message", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("running"));
+    }
+    if (method === "POST" && url.includes("/messages")) {
+      return json({ run: { ...sessionResponse("queued").runs[0], id: "run_2" } });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+  const view = renderContainer();
+  const box = await view.findByLabelText("Message");
+
+  // The run is live, so the composer is in queueing mode — and still typeable.
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Stop" })).toBeTruthy(),
+  );
+  pasteInto(box, "also mention the Tiptap swap");
+  pressEnter(box);
+  pasteInto(box, "keep it under 200 words");
+  pressEnter(box);
+
+  // Both sit in the strip; nothing has been POSTed.
+  await waitFor(() =>
+    expect(view.getByText(/also mention the Tiptap swap/)).toBeTruthy(),
+  );
+  expect(view.getByText(/keep it under 200 words/)).toBeTruthy();
+  expect(requests.filter((r) => r.url.includes("/messages"))).toHaveLength(0);
+
+  // The run settles → the slot frees → the queue flushes as ONE message.
+  setLiveStore(RUN_ID, { store: EMPTY_FRAME_STORE, status: "succeeded" });
+
+  await waitFor(() => {
+    const posts = requests.filter((r) => r.url.includes("/messages"));
+    expect(posts).toHaveLength(1);
+    expect((posts[0]?.body as { message: string }).message).toBe(
+      "also mention the Tiptap swap\n\nkeep it under 200 words",
+    );
+  });
+});
+
+test("the composer Stop cancels the run that holds the slot", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("running"));
+    }
+    if (method === "POST" && url.includes(`/runs/${RUN_ID}/cancel`)) {
+      return json({ run: { ...sessionResponse("canceled").runs[0], status: "canceled" } });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+  const view = renderContainer();
+
+  const stop = await view.findByRole("button", { name: "Stop" });
+  fireEvent.click(stop);
+
+  await waitFor(() =>
+    expect(requests.some((r) => r.url.includes(`/runs/${RUN_ID}/cancel`))).toBe(true),
+  );
+});
+
+test("a queued message survives a stop and flushes afterwards", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("running"));
+    }
+    if (method === "POST" && url.includes("/cancel")) {
+      return json({ run: { ...sessionResponse("canceled").runs[0], status: "canceled" } });
+    }
+    if (method === "POST" && url.includes("/messages")) {
+      return json({ run: { ...sessionResponse("queued").runs[0], id: "run_2" } });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+  const view = renderContainer();
+  const box = await view.findByLabelText("Message");
+
+  pasteInto(box, "actually use zod");
+  pressEnter(box);
+  await waitFor(() => expect(view.getByText(/actually use zod/)).toBeTruthy());
+
+  fireEvent.click(view.getByRole("button", { name: "Stop" }));
+  // Stop cancels the turn only — the follow-up explaining WHY is exactly what
+  // the user still wants delivered.
+  setLiveStore(RUN_ID, { store: EMPTY_FRAME_STORE, status: "canceled" });
+
+  await waitFor(() => {
+    const posts = requests.filter((r) => r.url.includes("/messages"));
+    expect((posts[0]?.body as { message: string }).message).toBe("actually use zod");
+  });
+});
+
+test("a FAILED run flushes the queue too", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("running"));
+    }
+    if (method === "POST" && url.includes("/messages")) {
+      return json({ run: { ...sessionResponse("queued").runs[0], id: "run_2" } });
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+  const view = renderContainer();
+  const box = await view.findByLabelText("Message");
+
+  pasteInto(box, "try again with the other model");
+  pressEnter(box);
+
+  setLiveStore(RUN_ID, { store: EMPTY_FRAME_STORE, status: "failed" });
+
+  await waitFor(() =>
+    expect(requests.filter((r) => r.url.includes("/messages"))).toHaveLength(1),
+  );
+});
+
+test("removing a queued row drops it before it is ever sent", async () => {
+  handler = (method, url) => {
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("running"));
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+  const view = renderContainer();
+  const box = await view.findByLabelText("Message");
+
+  pasteInto(box, "scrap this one");
+  pressEnter(box);
+  await waitFor(() => expect(view.getByText(/scrap this one/)).toBeTruthy());
+
+  fireEvent.click(view.getByRole("button", { name: /Remove queued message/ }));
+  await waitFor(() => expect(view.queryByText(/scrap this one/)).toBeNull());
 });

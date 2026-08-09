@@ -266,12 +266,19 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 
 ## 10. Upgrades & rollback
 
-1. Push a `v*` git tag → the `release` workflow builds and pushes the three
-   GHCR images tagged with the git tag and the commit sha.
+1. Merge the **"Version Packages"** PR that the `release` workflow keeps open on
+   `main`. That bumps the version, writes `CHANGELOG.md`, pushes the `vX.Y.Z`
+   tag, cuts the GitHub Release, and builds and pushes the three GHCR images
+   tagged with the version and the commit sha. See AGENTS.md → Releases.
 2. Change `IMAGE_TAG` to the new tag and redeploy (`up -d` re-pulls).
 3. **Rollback** = set `IMAGE_TAG` back to the previous tag and redeploy.
    Migrations are additive (AGENTS.md golden rule), so rolling an image back to
    a prior tag against an already-migrated database is safe.
+4. **Fallback:** pushing a `v*` tag by hand still builds and pushes images. If
+   you do, immediately set the eight shipped `package.json` versions to that
+   same number and commit — otherwise the next Version PR computes a version
+   whose tag already exists, and the release stops with an error naming both
+   commits.
 
 ---
 

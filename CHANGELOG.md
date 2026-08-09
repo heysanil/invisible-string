@@ -37,7 +37,8 @@ release notes.
 ### Fixes & maintenance
 - **design-tokens** — Extract the E1 tokens out of `apps/web` into `packages/design-tokens`.
 - **build** — Resolve Node 24 directly; build steps no longer spawn the mise binary.
-- **ci** — Move workflows to Namespace runners; copy the `apps/site` manifest into image builds, which a frozen install had broken.
+- **ci** — Move workflows to Namespace runners.
+- **infra** — Copy the `apps/site` manifest into image builds, which a frozen install had broken.
 - **site** — Eliminate layout shift from looping vignettes.
 
 ## v0.1.5 — 2026-07-08

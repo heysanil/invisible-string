@@ -19,6 +19,10 @@ describe("decide", () => {
       pointsAtHead: false,
     });
     expect(decision.action).toBe("noop");
+    // Pins WHICH no-op: without this the predates branch would satisfy the test.
+    expect(decision).toMatchObject({
+      reason: expect.stringContaining("already released"),
+    });
   });
 
   // The transition window: every existing tag (v0.1.3..v0.2.0) predates the
@@ -42,7 +46,15 @@ describe("decide", () => {
       pointsAtHead: false,
     });
     expect(decision.action).toBe("fail");
-    expect(decision).toMatchObject({ message: expect.stringContaining("0.3.1") });
+    // Both numbers belong in the message: the one being released, and the one
+    // the tag actually marks — the more diagnostic half. Asserted against the
+    // string rather than with a second `toMatchObject`, because bun (1.3.14)
+    // OVERWRITES the received property with the asymmetric matcher: after one
+    // `toMatchObject({message: expect.stringContaining(…)})` the object reads
+    // back as `{message: {}}`, so a follow-up call can never pass.
+    const message = decision.action === "fail" ? decision.message : "";
+    expect(message).toContain("0.3.1");
+    expect(message).toContain("0.3.0");
   });
 });
 
@@ -84,5 +96,13 @@ Older.
     const section = extractLatestSection("## v0.3.0 — 2026-08-08\n\nOnly.\n");
     expect(section?.heading).toBe("v0.3.0 — 2026-08-08");
     expect(section?.body).toBe("Only.");
+  });
+
+  // A heading with no trailing newline: `rest.slice(-1 + 1)` is `rest.slice(0)`,
+  // which echoed the heading back as the body.
+  test("returns an empty body when the file ends on the heading line", () => {
+    const section = extractLatestSection("## v0.3.0 — 2026-08-08");
+    expect(section?.heading).toBe("v0.3.0 — 2026-08-08");
+    expect(section?.body).toBe("");
   });
 });

@@ -66,7 +66,9 @@ export function extractLatestSection(
   const newlineIndex = rest.indexOf("\n");
   const heading = rest.slice(3, newlineIndex === -1 ? undefined : newlineIndex).trim();
 
-  const after = rest.slice(newlineIndex + 1);
+  // Same -1 case as the heading above: `rest.slice(-1 + 1)` would echo the whole
+  // heading back as the body when the file ends on the heading line.
+  const after = newlineIndex === -1 ? "" : rest.slice(newlineIndex + 1);
   const nextIndex = after.indexOf("\n## ");
   const body = (nextIndex === -1 ? after : after.slice(0, nextIndex)).trim();
 

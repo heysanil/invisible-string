@@ -19,6 +19,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { RunEventFrame, RunStatus } from "@invisible-string/shared";
 import { EMPTY_FRAME_STORE, addFrames, type FrameStore } from "../lib/chat/run-view";
 import { renderWithRouter } from "../test/router";
+import { pasteInto, pressEnter } from "../test/editor";
 import { ToastProvider } from "../components/ui/Toast";
 // The real implementation, bound at THIS file's evaluation, so the module
 // mock below can delegate to it when use-thread-streams.test.tsx flips the
@@ -233,8 +234,8 @@ test("409 session_busy keeps the draft and shows a notice", async () => {
   const view = renderContainer();
   // Wait for the thread to hydrate (composer present).
   const box = await view.findByLabelText("Message");
-  fireEvent.input(box, { target: { value: "second message" } });
-  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  pasteInto(box, "second message");
+  pressEnter(box);
 
   await waitFor(() => {
     expect(
@@ -243,9 +244,7 @@ test("409 session_busy keeps the draft and shows a notice", async () => {
   });
   // Draft retained in the box for retry.
   await waitFor(() =>
-    expect((view.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(
-      "second message",
-    ),
+    expect(view.getByLabelText("Message").textContent).toBe("second message"),
   );
 });
 
@@ -339,16 +338,14 @@ test("409 session_not_active offers a NEW chat, never a retry", async () => {
 
   const view = renderContainer();
   const box = await view.findByLabelText("Message");
-  fireEvent.input(box, { target: { value: "still there?" } });
-  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  pasteInto(box, "still there?");
+  pressEnter(box);
 
   await waitFor(() => expect(view.getByText(/retired/i)).toBeTruthy());
   // Crucially NOT the transient copy.
   expect(view.queryByText(/try again once it finishes/i)).toBeNull();
   // The text is still recoverable by the user even though retrying is futile.
-  expect((view.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(
-    "still there?",
-  );
+  expect(view.getByLabelText("Message").textContent).toBe("still there?");
 });
 
 // ── context controls ────────────────────────────────────────────────────────

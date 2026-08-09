@@ -1,8 +1,8 @@
 /**
- * INSTRUCTIONS section editor: the CodeMirror surface plus a reference
+ * INSTRUCTIONS section editor: the rich markdown surface plus a reference
  * legend. Reference sources arrive from the builder controller — trigger
  * fields from the live draft, connections/skills from the SELECTED AGENT's
- * attached context — so `@` autocomplete and the amber unresolved-underlines
+ * attached context — so the `@` menu and the amber unresolved-underlines
  * reflect exactly what dispatch will resolve.
  */
 import { AtSign } from "lucide-react";
@@ -12,7 +12,7 @@ import type { WorkflowConfig } from "@invisible-string/shared";
 import type { ReferenceSources } from "../../lib/builder/references";
 import { Spinner } from "../ui/Spinner";
 
-// CodeMirror is heavy — only pull it in when the editor actually renders.
+// The editor is heavy — only pull it in when the section actually renders.
 const InstructionsEditor = lazy(() =>
   import("./InstructionsEditor").then((module) => ({
     default: module.InstructionsEditor,

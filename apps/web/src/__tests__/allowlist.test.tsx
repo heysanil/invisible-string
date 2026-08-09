@@ -50,6 +50,7 @@ const PRESETS = {
       slug: "balanced",
       provider: "openrouter",
       modelId: "z-ai/glm-5.2",
+      reasoning: "high",
       createdAt: NOW,
       updatedAt: NOW,
     },
@@ -89,8 +90,12 @@ test("in-use entry is guarded; unreferenced entry can be removed (owner)", async
   }) as HTMLButtonElement;
   expect(removable.disabled).toBe(false);
 
-  // The add-model affordance is present for a manager.
+  // The add-model affordance is present for a manager, with the seeded
+  // suggestions — including the tilde-prefixed `-latest` alias id.
   expect(view.getByText("Add a model")).toBeTruthy();
+  expect(
+    view.getByRole("button", { name: "~deepseek/deepseek-v4-flash-latest" }),
+  ).toBeTruthy();
 });
 
 test("a member sees a read-only allowlist — no toggles, remove, or add", async () => {

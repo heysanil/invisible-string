@@ -85,6 +85,19 @@ describe("product enums", () => {
     ]);
   });
 
+  test("reasoning efforts are the 8-value vocabulary (shared lockstep)", () => {
+    expect(schema.reasoningEffort.enumValues).toEqual([
+      "provider-default",
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
   test("worker status is live/draining/dead", () => {
     expect(schema.workerStatus.enumValues).toEqual([
       "live",
@@ -173,6 +186,13 @@ describe("indexes and uniques", () => {
       (i) => i.config.name,
     );
     expect(names).toContain("agent_sessions_agent_id_idx");
+  });
+
+  test("model_presets carry a NOT NULL reasoning effort (part of the preset)", () => {
+    expect(columnNames(schema.modelPresets)).toContain("reasoning");
+    expect(schema.modelPresets.reasoning.notNull).toBe(true);
+    // Backfill value for rows that predate the column.
+    expect(schema.modelPresets.reasoning.default).toBe("high");
   });
 
   test("model_presets unique per (organization_id, slug)", () => {

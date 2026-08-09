@@ -84,7 +84,17 @@ export const setModelParamsSchema = z
     preset: modelPresetSlugSchema.optional(),
     /** Specific-model override; must pass the workspace allowlist. */
     modelId: z.string().min(1).optional(),
-    reasoning: reasoningEffortSchema.optional(),
+    /**
+     * Reasoning effort. Three-valued on the wire, because the model must be
+     * able to say "go back to inheriting" as an ACTION:
+     * - absent  → leave the agent's current effort alone
+     * - `null`  → clear the override (inherit the preset's effort); applied as
+     *   `setReasoning(undefined)` on the draft
+     * - a value → set that explicit override
+     * `null !== undefined`, so the at-least-one-field refine below still
+     * counts an inherit-me proposal as a real edit.
+     */
+    reasoning: reasoningEffortSchema.nullable().optional(),
   })
   .refine(
     (params) =>

@@ -41,11 +41,18 @@ export interface AgentEditorState {
   runAsUserId: string;
 }
 
-/** A shape-valid empty definition for a brand-new agent draft. */
+/**
+ * A shape-valid empty definition for a brand-new agent draft.
+ *
+ * `model.reasoning` is deliberately ABSENT: undefined means "inherit the
+ * preset's effort". Materializing one here would give every new agent an
+ * explicit override it never asked for — and pin it to a value the seeded
+ * models may not even support.
+ */
 export function emptyAgentDefinition(): AgentDefinition {
   return {
     persona: "",
-    model: { preset: "balanced", reasoning: "medium" },
+    model: { preset: "balanced" },
     context: { mcpConnectionIds: [], skillIds: [] },
   };
 }
@@ -79,7 +86,8 @@ export type AgentEditorAction =
   | { type: "setDescription"; description: string }
   | { type: "setModelPreset"; preset: ModelPresetSlug }
   | { type: "setModelId"; modelId: string | undefined }
-  | { type: "setReasoning"; reasoning: ReasoningEffort }
+  /** `undefined` clears the override → inherit (preset effort, or the model's default under an override). */
+  | { type: "setReasoning"; reasoning: ReasoningEffort | undefined }
   | { type: "addConnection"; id: string }
   | { type: "removeConnection"; id: string }
   | { type: "addSkill"; id: string }
@@ -95,18 +103,28 @@ function withDefinition(
   return { ...state, definition };
 }
 
-/** Model rebuild — omits a cleared override instead of writing undefined. */
+/**
+ * Model rebuild — omits cleared overrides instead of writing undefined.
+ *
+ * BOTH optional fields are keyed on `"x" in patch`, never on `??`: undefined
+ * is a MEANINGFUL value for each of them (no model override / inherit the
+ * preset's effort), so `patch.reasoning ?? current.reasoning` would make
+ * "clear the effort" a silent no-op whenever one is already set — and it
+ * typechecks, so nothing would catch it.
+ */
 function withModel(
   state: AgentEditorState,
-  patch: Partial<Pick<AgentDefinition["model"], "preset" | "reasoning">> & {
+  patch: Partial<Pick<AgentDefinition["model"], "preset">> & {
+    reasoning?: ReasoningEffort | undefined;
     modelId?: string | undefined | null;
   },
 ): AgentEditorState {
   const current = state.definition.model;
   const next: AgentDefinition["model"] = {
     preset: patch.preset ?? current.preset,
-    reasoning: patch.reasoning ?? current.reasoning,
   };
+  const reasoning = "reasoning" in patch ? patch.reasoning : current.reasoning;
+  if (reasoning !== undefined) next.reasoning = reasoning;
   const modelId = "modelId" in patch ? patch.modelId : current.modelId;
   if (modelId != null) next.modelId = modelId;
   return withDefinition(state, { ...state.definition, model: next });

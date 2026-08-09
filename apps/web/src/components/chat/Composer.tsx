@@ -3,16 +3,19 @@
  * While a run is active the composer is disabled with a contextual reason
  * (session busy / awaiting your approval); a failed send keeps the text in
  * the box for retry.
+ *
+ * THE FLUSH IS LOAD-BEARING. `RichTextEditor` serializes on an idle debounce,
+ * so at the instant Enter fires, `value` is still the markdown from ~180 ms
+ * ago — sending it would drop the tail of the message (or send nothing at all
+ * for a fast one-word reply). Every send path therefore reads the editor
+ * synchronously through `flush()`.
  */
-import {
-  useEffect,
-  useRef,
-  useState,
-  type KeyboardEvent,
-} from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowUp } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { LazyComposerEditor } from "../editor/LazyComposerEditor";
+import type { RichTextEditorHandle } from "../editor/RichTextEditor";
 
 export interface ComposerProps {
   onSend: (message: string) => void;
@@ -35,7 +38,7 @@ export function Composer({
   autoFocus,
 }: ComposerProps) {
   const [value, setValue] = useState(initialValue ?? "");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<RichTextEditorHandle>(null);
   const disabled = disabledReason != null;
 
   // Re-seed the box when the parent hands back a failed draft.
@@ -43,27 +46,37 @@ export function Composer({
     if (initialValue !== undefined) setValue(initialValue);
   }, [initialValue]);
 
-  // Autosize up to ~6 lines.
+  // The editor exists by the time a passive effect runs (its imperative
+  // handle is attached in a layout effect), so one shot is enough.
   useEffect(() => {
-    const el = textareaRef.current;
-    if (el === null) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 148)}px`;
-  }, [value]);
+    if (autoFocus) editorRef.current?.focus();
+  }, [autoFocus]);
 
   function submit() {
-    const message = value.trim();
+    const message = (editorRef.current?.flush() ?? value).trim();
     if (message.length === 0 || disabled || sending) return;
     onSend(message);
+    // Both halves are needed. The imperative write is what actually empties
+    // the document: send-and-clear takes `value` from "" back to "" inside a
+    // single React batch, so the prop never changes and the reconcile effect
+    // would never run. The state update keeps the two in step afterwards.
+    editorRef.current?.setValue("");
     setValue("");
   }
 
-  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      submit();
-    }
+  function onKeyDown(event: KeyboardEvent): boolean {
+    if (event.key !== "Enter" || event.shiftKey) return false;
+    // Mid-composition Enter commits an IME candidate; it is not a send.
+    if (event.isComposing || event.keyCode === 229) return false;
+    submit();
+    // Handled — ProseMirror must not also split the paragraph underneath.
+    return true;
   }
+
+  // Emptiness rides the debounced value, so the send button can trail the
+  // last keystroke by one debounce. That only ever gates the MOUSE path
+  // (Enter flushes), and reaching for the button costs more than 180 ms.
+  const empty = value.trim().length === 0;
 
   return (
     <div className="px-4 pb-4 pt-2">
@@ -82,26 +95,25 @@ export function Composer({
           disabled && "opacity-60",
         )}
       >
-        <textarea
-          ref={textareaRef}
-          rows={1}
+        {/* The contenteditable grows with its content — no autosize math —
+            and the clamp turns into a scroll region past ~6 lines. The
+            placeholder is constant: it is suppressed for a read-only host in
+            CSS, because changing the prop re-creates the editor and would
+            drop the draft the moment a run starts. */}
+        <LazyComposerEditor
+          ref={editorRef}
           value={value}
-          disabled={disabled}
-          autoFocus={autoFocus}
-          // Delivered via onInput (React's onChange does not fire under
-          // happy-dom; both ride the same native `input` event in browsers —
-          // see components/ui/Input.tsx for the full rationale).
-          onChange={() => {}}
-          onInput={(event) => setValue((event.target as HTMLTextAreaElement).value)}
+          onChange={setValue}
+          ariaLabel="Message"
+          placeholder={placeholder}
+          readOnly={disabled}
           onKeyDown={onKeyDown}
-          placeholder={disabled ? "" : placeholder}
-          aria-label="Message"
-          className="max-h-40 min-h-6 flex-1 resize-none bg-transparent py-1 text-sm leading-relaxed text-ink outline-none placeholder:text-ink-4 disabled:cursor-not-allowed"
+          className="thin-scroll tt-host-composer max-h-40 min-w-0 flex-1 overflow-y-auto text-sm leading-relaxed"
         />
         <button
           type="button"
           onClick={submit}
-          disabled={disabled || sending || value.trim().length === 0}
+          disabled={disabled || sending || empty}
           aria-label="Send message"
           aria-busy={sending || undefined}
           className="lift flex size-8 shrink-0 items-center justify-center rounded-full bg-ink text-white disabled:pointer-events-none disabled:opacity-40"

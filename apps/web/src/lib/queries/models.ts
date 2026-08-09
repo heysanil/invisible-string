@@ -17,6 +17,7 @@ import {
   getModelAllowlistEntryResponseSchema,
   getModelPresetResponseSchema,
   listModelAllowlistResponseSchema,
+  listModelCapabilitiesResponseSchema,
   listModelPresetsResponseSchema,
   type AddModelAllowlistEntryRequest,
   type ListModelAllowlistResponse,
@@ -31,6 +32,8 @@ const presetsPath = (workspaceId: string) =>
   `/workspaces/${workspaceId}/model-presets`;
 const allowlistPath = (workspaceId: string) =>
   `/workspaces/${workspaceId}/model-allowlist`;
+const capabilitiesPath = (workspaceId: string) =>
+  `/workspaces/${workspaceId}/model-capabilities`;
 
 // ── model presets ───────────────────────────────────────────────────────────
 
@@ -72,6 +75,36 @@ export function useUpdateModelPreset(workspaceId: string) {
   });
 }
 
+// ── model capabilities ──────────────────────────────────────────────────────
+
+export function fetchModelCapabilities(
+  workspaceId: string,
+  signal?: AbortSignal,
+) {
+  return api.get(
+    capabilitiesPath(workspaceId),
+    listModelCapabilitiesResponseSchema,
+    { signal },
+  );
+}
+
+/**
+ * What the OpenRouter catalog says about each enabled allowlist entry —
+ * the source for the reasoning-effort selectors. FAIL-OPEN by contract: an
+ * unreachable catalog answers `supportedEfforts: null` for every entry (never
+ * an error), and callers must then offer the full vocabulary rather than an
+ * empty selector. A query ERROR is treated the same way by consumers, which
+ * read `data ?? null`.
+ */
+export function useModelCapabilities(workspaceId: string) {
+  return useQuery({
+    queryKey: queryKeys.modelCapabilities.list(workspaceId),
+    queryFn: ({ signal }) => fetchModelCapabilities(workspaceId, signal),
+    select: (data) => data.models,
+    staleTime: 60_000,
+  });
+}
+
 // ── model allowlist ─────────────────────────────────────────────────────────
 
 export function fetchModelAllowlist(workspaceId: string, signal?: AbortSignal) {
@@ -80,13 +113,24 @@ export function fetchModelAllowlist(workspaceId: string, signal?: AbortSignal) {
   });
 }
 
+/**
+ * Capabilities are computed FROM the enabled allowlist entries, so every
+ * allowlist write invalidates both — otherwise a freshly added model would
+ * have no capability row for a full staleTime and its effort selector would
+ * silently fall back to the whole vocabulary.
+ */
 export function invalidateModelAllowlist(
   queryClient: QueryClient,
   workspaceId: string,
 ): Promise<void> {
-  return queryClient.invalidateQueries({
-    queryKey: queryKeys.modelAllowlist.list(workspaceId),
-  });
+  return Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.modelAllowlist.list(workspaceId),
+    }),
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.modelCapabilities.list(workspaceId),
+    }),
+  ]).then(() => undefined);
 }
 
 export function useModelAllowlist(workspaceId: string) {

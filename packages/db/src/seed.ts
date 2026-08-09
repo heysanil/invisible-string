@@ -1,6 +1,9 @@
 /**
- * Workspace seeds — INITIAL-SPEC.md §2/§7 locked model defaults + the three
- * default agents (agents-first redesign).
+ * Workspace seeds — the default model presets + the three default agents
+ * (agents-first redesign). The preset triple originally came from
+ * INITIAL-SPEC.md §2/§7; it is now owned by
+ * docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md,
+ * which supersedes those sections (new models, and an effort per preset).
  *
  * `seedWorkspace(db, organizationId, ownerUserId?)` is idempotent and safe to
  * call at workspace-creation time and on every deploy: rows are upserted with
@@ -19,26 +22,52 @@ import { createDb, type Db } from "./client";
 import { member, organization, user } from "./schema/auth";
 import { agents, modelAllowlist, modelPresets } from "./schema/product";
 
-// ── Locked seed data (spec §2: do not relitigate) ───────────────────────────
+// ── Seed data (2026-08-08 reasoning-effort + model-defaults spec) ───────────
 
 export type ModelPresetSeed = {
   slug: "powerful" | "balanced" | "quick";
   provider: "anthropic" | "openrouter";
   modelId: string;
+  /** Mirrors pgEnum `reasoning_effort` / shared `reasoningEffortSchema`. */
+  reasoning:
+    | "provider-default"
+    | "none"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
 };
 
-/** powerful/balanced/quick → OpenRouter models (spec §2, verified live). */
+/**
+ * powerful/balanced/quick → OpenRouter models, each with the effort agents
+ * inherit from it. `balanced` and `quick` are THE SAME MODEL at different
+ * efforts — the reason a preset is `(provider, modelId, reasoning)` and not
+ * just `(provider, modelId)`. All three models advertise exactly
+ * `[max, high, low]` in OpenRouter's `reasoning.supported_efforts`; none
+ * supports `medium`.
+ */
 export const DEFAULT_MODEL_PRESETS: readonly ModelPresetSeed[] = [
-  { slug: "powerful", provider: "openrouter", modelId: "z-ai/glm-5.2" },
+  {
+    slug: "powerful",
+    provider: "openrouter",
+    modelId: "moonshotai/kimi-k3",
+    reasoning: "max",
+  },
   {
     slug: "balanced",
     provider: "openrouter",
-    modelId: "deepseek/deepseek-v4-pro",
+    // The leading `~` is part of the id: OpenRouter's convention for its
+    // `-latest` aliases. Kept verbatim everywhere (allowlist, hashes, codegen).
+    modelId: "~deepseek/deepseek-v4-flash-latest",
+    reasoning: "max",
   },
   {
     slug: "quick",
     provider: "openrouter",
-    modelId: "deepseek/deepseek-v4-flash",
+    modelId: "~deepseek/deepseek-v4-flash-latest",
+    reasoning: "low",
   },
 ] as const;
 
@@ -51,10 +80,12 @@ export type AgentSeed = {
    */
   draft: {
     persona: string;
-    model: {
-      preset: "powerful" | "balanced" | "quick";
-      reasoning: "low" | "medium" | "high";
-    };
+    /**
+     * No `reasoning` key: seeded agents INHERIT their preset's effort. Setting
+     * one here would pin an explicit override on every workspace's starter
+     * agents and defeat the inheritance the presets exist to provide.
+     */
+    model: { preset: "powerful" | "balanced" | "quick" };
     context: { mcpConnectionIds: string[]; skillIds: string[] };
   };
 };
@@ -71,7 +102,7 @@ export const DEFAULT_AGENTS: readonly AgentSeed[] = [
         "Use the tools and context available to you rather than guessing, and say so plainly when you cannot verify something.",
         "Be concise and concrete: lead with the answer or result, then any essential caveats.",
       ].join("\n"),
-      model: { preset: "balanced", reasoning: "medium" },
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [], skillIds: [] },
     },
   },
@@ -87,7 +118,7 @@ export const DEFAULT_AGENTS: readonly AgentSeed[] = [
         "Verify your work whenever possible (run tests, type checks, or the code itself) and report exactly what you verified.",
         "When you make a claim about behavior, back it with evidence from code you read or commands you ran.",
       ].join("\n"),
-      model: { preset: "balanced", reasoning: "medium" },
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [], skillIds: [] },
     },
   },
@@ -103,7 +134,7 @@ export const DEFAULT_AGENTS: readonly AgentSeed[] = [
         "Favor clarity and accessibility over decoration; call out trade-offs between options explicitly.",
         "When critiquing existing work, be specific about what to change and why it improves the user's outcome.",
       ].join("\n"),
-      model: { preset: "balanced", reasoning: "medium" },
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [], skillIds: [] },
     },
   },
@@ -117,17 +148,38 @@ export function buildModelPresetRows(organizationId: string) {
     slug: preset.slug,
     provider: preset.provider,
     modelId: preset.modelId,
+    reasoning: preset.reasoning,
   }));
 }
 
-/** Allowlist rows for the three seeded preset models (spec §7). */
+/**
+ * Allowlist rows for the seeded preset models — DEDUPED by
+ * (provider, modelId): `balanced` and `quick` are the same model, and the
+ * insert's ON CONFLICT DO NOTHING cannot save us from two conflicting rows
+ * inside ONE statement ("ON CONFLICT DO UPDATE command cannot affect row a
+ * second time" is the DO UPDATE flavor; the DO NOTHING flavor simply is not a
+ * guard against self-conflicts, so dedupe here).
+ */
 export function buildAllowlistRows(organizationId: string) {
-  return DEFAULT_MODEL_PRESETS.map((preset) => ({
-    organizationId,
-    provider: preset.provider,
-    modelId: preset.modelId,
-    enabled: true,
-  }));
+  const seen = new Set<string>();
+  const rows: {
+    organizationId: string;
+    provider: ModelPresetSeed["provider"];
+    modelId: string;
+    enabled: boolean;
+  }[] = [];
+  for (const preset of DEFAULT_MODEL_PRESETS) {
+    const key = `${preset.provider}:${preset.modelId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      organizationId,
+      provider: preset.provider,
+      modelId: preset.modelId,
+      enabled: true,
+    });
+  }
+  return rows;
 }
 
 export function buildAgentRows(organizationId: string, runAsUserId: string) {

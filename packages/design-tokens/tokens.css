@@ -334,54 +334,146 @@
   }
 
   /* Tool names / @refs — ink on 8% black chips, ui-monospace */
-  /* --- CodeMirror (markdown skill editor) --------------------------------- */
-  .cm-host .cm-editor {
-    height: 100%;
-    background: transparent;
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 13px;
-  }
+  /* --- Tiptap (rich prompt editors) ---------------------------------------- */
+  /* The DOM is
+       .tt-host > [.tt-toolbar] + (.tt-content > .tiptap | textarea.tt-source)
+     and the host carries no Tailwind sizing utilities — the
+     components pass height in from their parent — so the frame, the scrollport
+     and the column layout all live here. */
 
-  .cm-host .cm-editor.cm-focused {
-    outline: none;
-  }
-
-  .cm-host .cm-scroller {
-    padding: 12px 14px;
-    line-height: 1.6;
-  }
-
-  .cm-host .cm-content {
-    caret-color: var(--ink);
-  }
-
-  .cm-host .cm-cursor {
-    border-left-color: var(--ink);
-  }
-
-  .cm-host .cm-selectionBackground,
-  .cm-host .cm-focused .cm-selectionBackground {
-    background: rgba(17, 17, 17, 0.12) !important;
-  }
-
-  .cm-host .cm-placeholder {
-    color: var(--ink-4);
-  }
-
-  .cm-host .cm-gutters {
-    background: transparent;
-    border: none;
-    color: var(--ink-4);
+  /* The host IS the scrollport: that is what lets .tt-toolbar stick, and it
+     clips the content to the card radius. Callers give it a bounded height by
+     making it a flex child of a sized column. */
+  .tt-host {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+    overflow: auto;
+    background: var(--glass-bg);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-card);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
   }
 
   /* Focus ring on the wrapper, not the inner content */
-  .cm-host:focus-within {
+  .tt-host:focus-within {
     outline: 2px solid var(--ink);
     outline-offset: 1px;
     border-color: transparent;
   }
 
-  .mono-chip {
+  /* Grows past .tt-content when the document is long (which is what makes the
+     host scroll) and fills it when short, so clicking the blank space under
+     the last line still lands the caret in the document. */
+  .tt-host .tiptap {
+    flex: 1 0 auto;
+    font-family: var(--font-sans);
+    font-size: 13.5px;
+    line-height: 1.65;
+    color: var(--ink);
+    caret-color: var(--ink);
+    padding: 12px 14px;
+    outline: none;
+    /* Prompts are whitespace-significant and full of long placeholders and
+       URLs — keep the author's spacing, break rather than overflow. */
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  .tt-host .tiptap ::selection {
+    background: rgba(17, 17, 17, 0.12);
+  }
+
+  /* Document grammar. Tailwind's preflight strips heading sizes, list markers
+     and block margins, so they are rebuilt here; weight and tracking still
+     come from the base layer's h1–h4 rule. */
+  .tt-host .tiptap p {
+    margin: 0 0 0.7em;
+  }
+
+  .tt-host .tiptap h1,
+  .tt-host .tiptap h2,
+  .tt-host .tiptap h3,
+  .tt-host .tiptap h4 {
+    margin: 1.2em 0 0.45em;
+    line-height: 1.3;
+  }
+
+  .tt-host .tiptap h1 {
+    font-size: 1.4em;
+  }
+
+  .tt-host .tiptap h2 {
+    font-size: 1.2em;
+  }
+
+  .tt-host .tiptap h3 {
+    font-size: 1.05em;
+  }
+
+  .tt-host .tiptap h4 {
+    font-size: 1em;
+  }
+
+  .tt-host .tiptap ul,
+  .tt-host .tiptap ol {
+    margin: 0 0 0.7em;
+    padding-left: 1.35em;
+  }
+
+  .tt-host .tiptap ul {
+    list-style: disc outside;
+  }
+
+  .tt-host .tiptap ol {
+    list-style: decimal outside;
+  }
+
+  .tt-host .tiptap li {
+    margin: 0.15em 0;
+  }
+
+  /* A list item wraps its text in a paragraph node — that paragraph's bottom
+     margin would double-space every bullet. */
+  .tt-host .tiptap li > p {
+    margin: 0;
+  }
+
+  .tt-host .tiptap li > ul,
+  .tt-host .tiptap li > ol {
+    margin: 0.2em 0 0;
+  }
+
+  .tt-host .tiptap blockquote {
+    margin: 0 0 0.7em;
+    padding-left: 0.85em;
+    border-left: 2px solid var(--chip);
+    color: var(--ink-2);
+  }
+
+  .tt-host .tiptap hr {
+    height: 0;
+    margin: 1.1em 0;
+    border: none;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .tt-host .tiptap pre {
+    margin: 0 0 0.7em;
+    padding: 10px 12px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.85em;
+    line-height: 1.55;
+    background: rgba(0, 0, 0, 0.04);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-card);
+    overflow-x: auto;
+  }
+
+  /* Inline code wears the .mono-chip look */
+  .tt-host .tiptap code {
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 0.85em;
     background: var(--chip);
@@ -390,67 +482,69 @@
     padding: 0.1em 0.45em;
   }
 
-  /* --- Instructions editor (CodeMirror 6, E1-styled) ---------------------- */
-  .cm-editor {
-    background: transparent;
-    font-size: 13.5px;
-    line-height: 1.65;
+  /* …but a fenced block must not stack a second chip on its own surface. */
+  .tt-host .tiptap pre code {
+    font-size: inherit;
+    background: none;
+    color: inherit;
+    border-radius: 0;
+    padding: 0;
   }
 
-  .cm-editor .cm-scroller {
-    font-family: var(--font-sans);
-    padding: 4px 2px;
-  }
-
-  .cm-editor.cm-focused {
-    outline: none;
-  }
-
-  .cm-editor .cm-content {
-    caret-color: var(--ink);
+  .tt-host .tiptap a {
     color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--ink-4);
+    text-underline-offset: 2px;
   }
 
-  .cm-editor .cm-cursor {
-    border-left-color: var(--ink);
+  .tt-host .tiptap a:hover {
+    text-decoration-color: var(--ink);
   }
 
-  .cm-editor .cm-selectionBackground,
-  .cm-editor.cm-focused .cm-selectionBackground,
-  .cm-editor ::selection {
-    background: rgba(17, 17, 17, 0.12);
+  .tt-host .tiptap strong {
+    font-weight: 650;
   }
 
-  .cm-editor .cm-gutters {
-    background: transparent;
-    border: none;
+  .tt-host .tiptap em {
+    font-style: italic;
+  }
+
+  .tt-host .tiptap > :first-child {
+    margin-top: 0;
+  }
+
+  .tt-host .tiptap > :last-child {
+    margin-bottom: 0;
+  }
+
+  /* Placeholder extension: the empty first paragraph carries the text in
+     data-placeholder. float + zero height keeps it out of the layout so the
+     caret still sits at the start of the line. */
+  .tt-host .tiptap p.is-editor-empty:first-child::before {
+    content: attr(data-placeholder);
     color: var(--ink-4);
-  }
-
-  .cm-editor .cm-activeLine,
-  .cm-editor .cm-activeLineGutter {
-    background: rgba(0, 0, 0, 0.02);
-  }
-
-  .cm-editor .cm-placeholder {
-    color: var(--ink-4);
+    float: left;
+    height: 0;
+    pointer-events: none;
   }
 
   /* @refs — resolved render as ink-on-8%-black mono pills */
-  .cm-ref {
+  .tt-ref {
     font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 0.92em;
-    border-radius: 5px;
-    padding: 0.05em 0.28em;
+    font-size: 0.85em;
+    border-radius: 6px;
+    padding: 0.1em 0.45em;
+    white-space: nowrap;
   }
 
-  .cm-ref-resolved {
+  .tt-ref-resolved {
     background: var(--chip);
     color: var(--ink);
   }
 
   /* unresolved refs — amber underline, hover explains (dry-run diagnostics) */
-  .cm-ref-unresolved {
+  .tt-ref-unresolved {
     background: rgba(245, 158, 11, 0.1);
     color: var(--warn-ink);
     text-decoration: underline wavy var(--warn);
@@ -458,75 +552,251 @@
     text-decoration-thickness: 1.5px;
   }
 
-  .cm-ref-tooltip {
+  /* A ref is an atom node: without this, keyboard-selecting one shows nothing. */
+  .tt-host .tiptap .tt-ref.ProseMirror-selectednode {
+    outline: 2px solid var(--ink);
+    outline-offset: 1px;
+  }
+
+  /* The ref tooltip carries its own surface — there is no wrapper to
+     inherit one from. */
+  .tt-ref-tooltip {
+    z-index: 90;
     max-width: 260px;
     padding: 6px 10px;
+    font-family: var(--font-sans);
     font-size: 12px;
     line-height: 1.4;
     color: var(--ink);
-  }
-
-  /* CodeMirror tooltip/autocomplete surfaces adopt the glass panel look */
-  .cm-tooltip {
     background: var(--surface-solid);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-card);
     box-shadow: var(--glass-shadow);
-    overflow: hidden;
+  }
+
+  /* The `@` suggestion dropdown. z-index clears the panels (40–50) and the
+     overlay scrim (80) so it works inside a drawer, and stays under toasts. */
+  .tt-suggest {
+    z-index: 90;
+    min-width: 190px;
+    max-width: 320px;
+    max-height: 15rem;
+    overflow-y: auto;
+    padding: 4px;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    background: var(--surface-solid);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-card);
+    box-shadow: var(--glass-shadow);
   }
 
   @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-    .cm-tooltip {
+    .tt-suggest,
+    .tt-ref-tooltip {
       background: rgba(255, 255, 255, 0.85);
       -webkit-backdrop-filter: blur(20px) saturate(140%);
       backdrop-filter: blur(20px) saturate(140%);
     }
   }
 
-  .cm-tooltip.cm-tooltip-autocomplete > ul {
-    font-family: var(--font-sans);
-    font-size: 13px;
-    max-height: 15rem;
-  }
-
-  .cm-tooltip.cm-tooltip-autocomplete > ul > li {
-    padding: 4px 10px;
+  .tt-suggest-item {
     display: flex;
+    width: 100%;
     align-items: center;
     gap: 8px;
+    padding: 5px 8px;
+    border-radius: 8px;
     color: var(--ink-2);
+    text-align: left;
+    cursor: pointer;
+    transition:
+      background-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
   }
 
-  .cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected] {
-    background: var(--ink);
-    color: #ffffff;
+  .tt-suggest-item[aria-selected="true"] {
+    background: rgba(0, 0, 0, 0.06);
+    color: var(--ink);
   }
 
-  .cm-tooltip.cm-tooltip-autocomplete .cm-completionLabel {
+  .tt-suggest-label {
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .cm-tooltip.cm-tooltip-autocomplete .cm-completionDetail {
+  .tt-suggest-detail {
     margin-left: auto;
-    font-style: normal;
+    padding-left: 4px;
     font-size: 11px;
+    color: var(--ink-3);
+    white-space: nowrap;
+  }
+
+  /* Designed empty state — a dropdown that renders nothing on no matches
+     reads as a broken menu. */
+  .tt-suggest-empty {
+    padding: 7px 8px;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  /* Sticky glass toolbar — the document scrolls *under* it inside .tt-host,
+     which is the whole reason it is translucent. The top corners take the
+     host's inner radius so it still reads right if a caller ever unclips the
+     host, and `flex: none` keeps a wrapped two-row toolbar from being crushed
+     in a short editor. */
+  .tt-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px;
+    padding: 5px 6px;
+    background: rgba(255, 255, 255, 0.72);
+    border-bottom: 1px solid var(--hairline);
+    border-radius: calc(var(--radius-card) - 1px) calc(var(--radius-card) - 1px)
+      0 0;
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+    backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  }
+
+  /* Hairline dividers between action groups rather than separator elements —
+     one less thing in the accessibility tree of a role="toolbar". */
+  .tt-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .tt-toolbar-group + .tt-toolbar-group {
+    margin-left: 5px;
+    padding-left: 6px;
+    border-left: 1px solid var(--hairline);
+  }
+
+  /* Mirrors ui/Button's `quiet` variant at `sm`, in CSS because the toolbar
+     needs a square icon target rather than the button's pill geometry. */
+  .tt-toolbar-button {
+    display: inline-flex;
+    width: 26px;
+    height: 26px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    color: var(--ink-2);
+    transition:
+      background-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
+  }
+
+  .tt-toolbar-button:hover {
+    background: rgba(0, 0, 0, 0.04);
+    color: var(--ink);
+  }
+
+  /* Ink fill for an engaged mark — the same "active means ink" language the
+     primary button and the segmented control use. */
+  .tt-toolbar-button.is-active {
+    background: var(--ink);
+    color: #fff;
+  }
+
+  .tt-toolbar-trailing {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+  }
+
+  /* `.tt-host` is the scrollport (see above), so this only needs to grow —
+     giving it its own overflow would create a second scroll container and
+     unstick the toolbar. */
+  .tt-content {
+    display: flex;
+    min-height: 0;
+    flex: 1;
+    flex-direction: column;
+  }
+
+  /* Markdown source view. Deliberately plain and monospace: its entire job is
+     to show the literal bytes that get compiled into the agent. */
+  .tt-source {
+    width: 100%;
+    min-height: 0;
+    flex: 1;
+    padding: 10px 12px;
+    background: transparent;
+    border: 0;
+    outline: none;
+    resize: none;
+    color: var(--ink);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12.5px;
+    line-height: 1.6;
+    tab-size: 2;
+  }
+
+  .tt-source::placeholder {
     color: var(--ink-4);
   }
 
-  .cm-tooltip.cm-tooltip-autocomplete
-    > ul
-    > li[aria-selected]
-    .cm-completionDetail {
-    color: rgba(255, 255, 255, 0.75);
+  /* Composer tier — the chat and copilot message boxes. Same editor, no
+     chrome: the capsule they sit inside owns the surface, the border and the
+     focus ring, so the host has to contribute nothing but the text box. Size
+     (the max-height clamp that turns a long draft into a scroll region) stays
+     a Tailwind utility on the call site, as everywhere else.
+     Doubled class = higher specificity than the plain .tt-host rules above,
+     so this holds whichever order the two blocks end up in. */
+  .tt-host.tt-host-composer,
+  .tt-host.tt-host-composer:focus-within {
+    background: none;
+    border-color: transparent;
+    border-radius: 0;
+    outline: none;
   }
 
-  .cm-tooltip.cm-completionInfo {
-    padding: 8px 10px;
-    font-size: 12px;
-    line-height: 1.45;
-    color: var(--ink-2);
-    max-width: 220px;
+  /* Type size and rhythm come from the call site (the composer matches the
+     bubbles it produces, and the dock runs a step smaller than chat). */
+  .tt-host.tt-host-composer .tiptap {
+    padding: 2px 0;
+    font-size: inherit;
+    line-height: inherit;
+  }
+
+  /* A disabled composer keeps its placeholder node — but the reason it is
+     disabled is already spelled out above the box, and an invitation to type
+     under it would contradict that. */
+  .tt-host-readonly .tiptap p.is-editor-empty:first-child::before {
+    content: none;
+  }
+
+  /* --- Rendered markdown on an ink surface --------------------------------- */
+  /* The author's own message bubble sits on --ink, and the Streamdown
+     renderer (components/chat/Markdown.tsx) colors everything with the
+     token-backed utilities — text-ink, text-ink-2, .mono-chip, border-hairline.
+     Redefining the scale for the subtree therefore inverts the whole tree at
+     once — headings, quotes, list markers, inline-code chips, the code-block
+     frame and its copy button all follow — with no second copy of the prose
+     styles and no per-element overrides in the component. */
+  .md-on-ink {
+    --ink: #ffffff;
+    --ink-2: rgba(255, 255, 255, 0.82);
+    --ink-3: rgba(255, 255, 255, 0.66);
+    --ink-4: rgba(255, 255, 255, 0.5);
+    --chip: rgba(255, 255, 255, 0.16);
+    --hairline: rgba(255, 255, 255, 0.2);
+  }
+
+  /* The lazy-boundary placeholder line. Matches the editor's own first-line
+     metrics so the composer does not reflow when the chunk lands. */
+  .tt-fallback-line {
+    color: var(--ink-4);
   }
 
   /* --- Builder scroll regions --------------------------------------------- */
@@ -550,14 +820,19 @@
 
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .glass-panel,
-  .glass-dock {
+  .glass-dock,
+  .tt-toolbar {
     background: var(--surface-solid);
   }
 }
 
 @media (prefers-reduced-transparency: reduce) {
   .glass-panel,
-  .glass-dock {
+  .glass-dock,
+  .tt-host,
+  .tt-toolbar,
+  .tt-suggest,
+  .tt-ref-tooltip {
     background: var(--surface-solid);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;

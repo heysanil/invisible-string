@@ -14,7 +14,10 @@ function slug(name: string): string {
 function baseRequest(connection: CompileConnection): CompileRequest {
   const definition: AgentDefinition = agentDefinitionSchema.parse({
     persona: `Use @${slug(connection.name)} to look things up.`,
-    model: { preset: "balanced", reasoning: "medium" },
+    // No explicit effort — the agent INHERITS what the control plane resolved
+    // (an explicit one that disagreed with `model.reasoning` below would trip
+    // the compiler's MODEL_MISMATCH guard).
+    model: { preset: "balanced" },
     context: { mcpConnectionIds: [connection.id], skillIds: [] },
   });
   return {
@@ -22,6 +25,7 @@ function baseRequest(connection: CompileConnection): CompileRequest {
     model: {
       provider: "openrouter",
       modelId: "deepseek/deepseek-v4-flash",
+      reasoning: "max",
       presetSlug: "balanced",
     },
     connections: [connection],
@@ -93,6 +97,7 @@ describe("compileAgent — build-env epoch in the content hash", () => {
       resolvedModel: {
         provider: request.model.provider,
         modelId: request.model.modelId,
+        reasoning: request.model.reasoning,
       },
       workspaceSlug: request.workspaceSlug,
       agentSlug: request.agentSlug,
@@ -135,5 +140,44 @@ describe("compileAgent — build-env epoch in the content hash", () => {
     const authLib = adapted.files.get("agent/lib/platform-auth.ts");
     expect(authLib).toBeDefined();
     expect(authLib!).toContain(adapted.hash);
+  });
+});
+
+describe("compileAgent — resolved reasoning effort", () => {
+  const connection: CompileConnection = {
+    id: "7d3f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6",
+    name: "Linear",
+    description: "Issues",
+    url: "https://mcp.linear.app/mcp",
+    envTokenVar: "MCP_LINEAR_TOKEN",
+    authHeaders: null,
+    toolAllow: null,
+    toolBlock: null,
+    approvalPolicy: null,
+  };
+
+  test("the RESOLVED effort (not the definition's, which may be inherited) reaches the generated model", () => {
+    const request = baseRequest(connection);
+    // The definition sets no effort at all; only the resolved model carries it.
+    expect(request.definition.model.reasoning).toBeUndefined();
+    const agentTs = compileAgent(request).files.get("agent/agent.ts");
+    expect(agentTs).toBeDefined();
+    expect(agentTs!).toContain('extraBody: { reasoning: { effort: "max" } }');
+  });
+
+  test("`provider-default` emits no reasoning field at all", () => {
+    const base = baseRequest(connection);
+    const agentTs = compileAgent({
+      ...base,
+      model: { ...base.model, reasoning: "provider-default" },
+    }).files.get("agent/agent.ts");
+    expect(agentTs!).not.toContain("reasoning:");
+  });
+
+  test("the effort re-keys the content hash — inheritance from two presets with different efforts must not share an artifact", () => {
+    const base = baseRequest(connection);
+    const max = compileAgent(base);
+    const low = compileAgent({ ...base, model: { ...base.model, reasoning: "low" } });
+    expect(low.hash).not.toBe(max.hash);
   });
 });

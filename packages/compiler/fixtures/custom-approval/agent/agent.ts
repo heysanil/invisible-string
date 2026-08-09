@@ -18,6 +18,11 @@ const MODEL_ID = "deepseek/deepseek-v4-pro";
  * would therefore NOT fail loudly at build: it would emit a provider model
  * with EXTERNAL routing baked in, build clean, boot clean, and die on the
  * agent's first turn.
+ *
+ * The platform resolved the reasoning effort to "provider-default", so NO
+ * reasoning field is sent at all and OpenRouter applies the model's own
+ * behavior. (That is distinct from an explicit "none", which would disable
+ * reasoning on a model that supports it.)
  */
 function resolveModel(): LanguageModel {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -43,7 +48,6 @@ export default defineAgent({
   // way "does not have known AI Gateway context window metadata" fails the
   // build (spike/agent-project documented this escape hatch).
   modelContextWindowTokens: 1048576,
-  reasoning: "medium",
   limits: {
     // eve's own default (40M). Crossing it does NOT kill the session: a
     // conversation-mode session parks on a deterministic Approve/Stop

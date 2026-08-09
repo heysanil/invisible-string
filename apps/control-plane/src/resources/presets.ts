@@ -1,8 +1,10 @@
 /**
  * Model layer CRUD (workspace-scoped):
  * - model presets: three fixed slugs, re-pointed via PUT (allowlist-checked).
+ *   A preset carries its own reasoning EFFORT — agents inherit it.
  * - model allowlist: add / toggle / remove; a model referenced by a preset (or
  *   an agent draft's specific-model override) cannot be removed.
+ * - model capabilities: the allowlist joined with the OpenRouter catalog.
  */
 import { and, eq, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -14,13 +16,15 @@ import {
   type GetModelAllowlistEntryResponse,
   type GetModelPresetResponse,
   type ListModelAllowlistResponse,
+  type ListModelCapabilitiesResponse,
   type ListModelPresetsResponse,
+  type ModelCapabilityDto,
   type ModelProvider,
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
-import { catalogHasModel } from "./openrouter-catalog";
+import { catalogHasModel, catalogModelInfo } from "./openrouter-catalog";
 import {
   modelAllowlistEntryDto,
   modelPresetDto,
@@ -77,6 +81,10 @@ export async function updateModelPreset(
   if (!(await isAllowlisted(deps.db, organizationId, input.provider, input.modelId))) {
     throw errors.modelNotAllowlisted(input.modelId);
   }
+  // `reasoning` is OPTIONAL on the wire (a pre-effort web bundle mid-deploy
+  // must not 400): absent means KEEP the stored effort, so it is omitted from
+  // both the insert values and the conflict SET rather than written as a
+  // default — the column default only applies to a genuinely new row.
   const rows = await deps.db
     .insert(schema.modelPresets)
     .values({
@@ -84,13 +92,73 @@ export async function updateModelPreset(
       slug: parsedSlug,
       provider: input.provider,
       modelId: input.modelId,
+      ...(input.reasoning !== undefined ? { reasoning: input.reasoning } : {}),
     })
     .onConflictDoUpdate({
       target: [schema.modelPresets.organizationId, schema.modelPresets.slug],
-      set: { provider: input.provider, modelId: input.modelId },
+      set: {
+        provider: input.provider,
+        modelId: input.modelId,
+        ...(input.reasoning !== undefined ? { reasoning: input.reasoning } : {}),
+      },
     })
     .returning();
   return { preset: modelPresetDto(rows[0]!) };
+}
+
+// ── model capabilities ────────────────────────────────────────────────────────
+
+/**
+ * Every ENABLED allowlist entry, joined with what the OpenRouter catalog says
+ * about it — the source for the reasoning-effort selectors.
+ *
+ * The entry list is ALWAYS complete: a model the workspace allowlisted stays
+ * selectable whether or not the catalog can be reached, so an openrouter.ai
+ * outage can never empty the model picker. Only the CAPABILITIES degrade —
+ * `supportedEfforts: null` means UNKNOWN (no catalog entry, an unreachable
+ * catalog, or a non-OpenRouter provider, since Anthropic publishes no such
+ * list), and clients must then offer the full effort vocabulary. Whether the
+ * catalog answered at all is reported separately so the UI can say so.
+ */
+export async function getModelCapabilities(
+  deps: ResourceDeps,
+  organizationId: string,
+): Promise<ListModelCapabilitiesResponse> {
+  const rows = await deps.db
+    .select({
+      provider: schema.modelAllowlist.provider,
+      modelId: schema.modelAllowlist.modelId,
+    })
+    .from(schema.modelAllowlist)
+    .where(
+      and(
+        eq(schema.modelAllowlist.organizationId, organizationId),
+        eq(schema.modelAllowlist.enabled, true),
+      ),
+    )
+    .orderBy(schema.modelAllowlist.provider, schema.modelAllowlist.modelId);
+
+  const catalog = deps.openRouterCatalog ? await deps.openRouterCatalog() : null;
+
+  const models: ModelCapabilityDto[] = rows.map((row) => {
+    const info =
+      catalog !== null && row.provider === "openrouter"
+        ? catalogModelInfo(catalog, row.modelId)
+        : undefined;
+    return {
+      provider: row.provider,
+      modelId: row.modelId,
+      supportedEfforts: info ? [...info.supportedEfforts] : null,
+      ...(info?.defaultEffort !== undefined
+        ? { defaultEffort: info.defaultEffort }
+        : {}),
+      ...(info?.contextWindowTokens !== undefined
+        ? { contextWindowTokens: info.contextWindowTokens }
+        : {}),
+    };
+  });
+
+  return { models, catalogAvailable: catalog !== null };
 }
 
 // ── model allowlist ───────────────────────────────────────────────────────────
@@ -118,9 +186,9 @@ export async function addModelAllowlistEntry(
   // error). Fail-OPEN: `null` means the catalog was unreachable — allowlist
   // the id unchecked rather than couple workspace config to openrouter.ai
   // availability. The id's SHAPE was already schema-validated.
-  if (input.provider === "openrouter" && deps.openRouterModelIds) {
-    const knownIds = await deps.openRouterModelIds();
-    if (knownIds !== null && !catalogHasModel(knownIds, input.modelId)) {
+  if (input.provider === "openrouter" && deps.openRouterCatalog) {
+    const catalog = await deps.openRouterCatalog();
+    if (catalog !== null && !catalogHasModel(catalog, input.modelId)) {
       throw errors.modelUnknownToOpenRouter(input.modelId);
     }
   }

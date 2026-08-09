@@ -3,9 +3,9 @@
  * the full state matrix the grid + editor must render:
  *
  *   1. Executive assistant — published, rich context (3 connections + 2
- *      skills), balanced preset.
- *   2. Support triager     — published, specific-model override + high
- *      reasoning.
+ *      skills), balanced preset, INHERITED reasoning effort (no override).
+ *   2. Support triager     — published, specific-model override + an explicit
+ *      high reasoning effort.
  *   3. Release bot         — draft, never published.
  *   4. Data analyst        — published but the published version's build
  *      FAILED (error chip states).
@@ -202,7 +202,7 @@ export const FIXTURE_EXEC_ASSISTANT: FixtureAgent = fixtureAgent({
       "items using @skill.meeting-notes. Confirm before sending anything",
       "external.",
     ].join("\n"),
-    model: { preset: "balanced", reasoning: "medium" },
+    model: { preset: "balanced" },
     context: {
       mcpConnectionIds: [
         FIXTURE_CONNECTION_IDS.gmail,
@@ -247,7 +247,7 @@ export const FIXTURE_RELEASE_BOT: FixtureAgent = fixtureAgent({
   description: null,
   definition: {
     persona: "",
-    model: { preset: "powerful", reasoning: "medium" },
+    model: { preset: "powerful" },
     context: { mcpConnectionIds: [], skillIds: [] },
   },
   published: false,
@@ -260,7 +260,7 @@ export const FIXTURE_DATA_ANALYST: FixtureAgent = fixtureAgent({
   definition: {
     persona:
       "You are a careful data analyst. Answer with numbers, name your sources, and flag any metric you could not verify.",
-    model: { preset: "powerful", reasoning: "high" },
+    model: { preset: "powerful", reasoning: "max" },
     context: { mcpConnectionIds: [], skillIds: [] },
   },
   published: true,

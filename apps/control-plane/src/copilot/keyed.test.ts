@@ -58,14 +58,40 @@ const inventory: WorkspaceInventory = {
   ],
   agents: [],
   modelPresets: [
-    { slug: "powerful", provider: "openrouter", modelId: "anthropic/claude-opus-4.8" },
-    { slug: "balanced", provider: "openrouter", modelId: "anthropic/claude-sonnet-5" },
-    { slug: "quick", provider: "openrouter", modelId: "anthropic/claude-haiku-4.5" },
+    {
+      slug: "powerful",
+      provider: "openrouter",
+      modelId: "anthropic/claude-opus-4.8",
+      reasoning: "max",
+    },
+    {
+      slug: "balanced",
+      provider: "openrouter",
+      modelId: "anthropic/claude-sonnet-5",
+      reasoning: "high",
+    },
+    {
+      slug: "quick",
+      provider: "openrouter",
+      modelId: "anthropic/claude-haiku-4.5",
+      reasoning: "low",
+    },
   ],
   allowlist: [
-    { provider: "openrouter", modelId: "anthropic/claude-sonnet-5", enabled: true },
-    { provider: "openrouter", modelId: "anthropic/claude-haiku-4.5", enabled: true },
+    {
+      provider: "openrouter",
+      modelId: "anthropic/claude-sonnet-5",
+      enabled: true,
+      supportedEfforts: ["max", "high", "low"],
+    },
+    {
+      provider: "openrouter",
+      modelId: "anthropic/claude-haiku-4.5",
+      enabled: true,
+      supportedEfforts: ["max", "high", "low"],
+    },
   ],
+  catalogAvailable: true,
 };
 
 /** Apply an accepted proposal to the draft — mirrors the agent editor reducer. */
@@ -81,8 +107,11 @@ function applyProposal(draft: AgentDefinition, proposal: CopilotProposal): void 
       if (proposal.params.modelId !== undefined) {
         draft.model.modelId = proposal.params.modelId;
       }
+      // Three-valued on the wire: absent leaves the draft alone, `null`
+      // CLEARS the override (back to inheriting the preset's effort), a value
+      // sets it — the same mapping the agent editor's reducer performs.
       if (proposal.params.reasoning !== undefined) {
-        draft.model.reasoning = proposal.params.reasoning;
+        draft.model.reasoning = proposal.params.reasoning ?? undefined;
       }
       break;
     case "addContext": {
@@ -119,6 +148,14 @@ function compileDepsFor(definition: AgentDefinition): CompileDeps {
   );
   const modelId =
     definition.model.modelId ?? mapped?.modelId ?? "anthropic/claude-sonnet-5";
+  // Mirrors resolveModel: the definition's own effort wins; otherwise a
+  // preset inherits its effort and a specific-model override falls to
+  // `provider-default`.
+  const reasoning =
+    definition.model.reasoning ??
+    (definition.model.modelId !== undefined
+      ? ("provider-default" as const)
+      : (mapped?.reasoning ?? ("provider-default" as const)));
 
   const connections: ResolvedMcpConnection[] =
     definition.context.mcpConnectionIds.map((id) => {
@@ -144,7 +181,7 @@ function compileDepsFor(definition: AgentDefinition): CompileDeps {
 
   return {
     versions: RUNTIME_VERSIONS,
-    resolvedModel: { provider: "openrouter", modelId },
+    resolvedModel: { provider: "openrouter", modelId, reasoning },
     workspaceSlug: "keyed-smoke",
     agentSlug: "support-agent",
     connections,

@@ -10,7 +10,11 @@ import { useContextResources } from "../lib/builder/resources";
 import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import { useAgent } from "../lib/queries/agents";
 import { useWorkspaceMembers } from "../lib/queries/members";
-import { useModelAllowlist, useModelPresets } from "../lib/queries/models";
+import {
+  useModelAllowlist,
+  useModelCapabilities,
+  useModelPresets,
+} from "../lib/queries/models";
 import { useActiveWorkspaceId, useWorkspaceRole } from "../lib/workspace";
 
 export const Route = createFileRoute("/_app/agents/$agentId")({
@@ -50,6 +54,7 @@ function AgentEditorLoader({
   const members = useWorkspaceMembers(workspaceId);
   const modelPresets = useModelPresets(workspaceId);
   const allowlist = useModelAllowlist(workspaceId);
+  const capabilities = useModelCapabilities(workspaceId);
   const { canManage } = useWorkspaceRole(workspaceId);
 
   if (agent.isPending) return <CenteredSpinner />;
@@ -84,6 +89,7 @@ function AgentEditorLoader({
       members={members.data ?? []}
       modelPresets={modelPresets.data ?? []}
       allowlist={allowlist.data ?? null}
+      capabilities={capabilities.data ?? null}
       canManage={canManage}
     />
   );

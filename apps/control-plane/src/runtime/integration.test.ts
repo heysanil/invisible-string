@@ -371,7 +371,14 @@ const stubCompile: CompileAgentFn = (request) => {
     .update(
       JSON.stringify({
         definition: request.definition,
-        model: { provider: request.model.provider, modelId: request.model.modelId },
+        // Mirrors the real compiler, which hashes the whole resolved model —
+        // the EFFORT included, so inheriting a re-pointed preset's effort
+        // re-keys the artifact.
+        model: {
+          provider: request.model.provider,
+          modelId: request.model.modelId,
+          reasoning: request.model.reasoning,
+        },
         connections: request.connections.map((c) => [c.name, c.url, c.envTokenVar]),
         skills: request.skills.map((s) => [s.name, s.content]),
         workspace: request.workspaceSlug,
@@ -634,7 +641,9 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
     draft = {
       persona: "Be helpful. Use @linear when asked.",
-      model: { preset: "balanced", reasoning: "medium" },
+      // No explicit effort: the agent INHERITS the preset's, which is the
+      // default state of every new agent.
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [mcpConnectionId], skillIds: [] },
     };
     agentId = await createAgent(ownerCookie, orgId, "Runtime Test Agent", draft);
@@ -703,14 +712,22 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       compilerVersion: "stub-compiler-1",
       eveVersion: STUB_EVE_VERSION,
       modelProvider: "openrouter",
-      modelId: "deepseek/deepseek-v4-pro",
+      // The seeded `balanced` preset (packages/db seed) — a `~`-prefixed
+      // OpenRouter `-latest` alias; the tilde is part of the id.
+      modelId: "~deepseek/deepseek-v4-flash-latest",
       buildStatus: "succeeded",
     });
-    // The snapshot is the parsed (defaults-applied) AgentDefinition.
+    // The snapshot is the parsed (defaults-applied) AgentDefinition — and an
+    // inherited effort stays ABSENT in it: materializing one would freeze the
+    // preset's current effort into an immutable snapshot.
     expect(versions[0]!.definition).toMatchObject({
       persona: draft.persona,
+      model: { preset: "balanced" },
       context: { mcpConnectionIds: [mcpConnectionId], skillIds: [] },
     });
+    expect(
+      (versions[0]!.definition as { model: Record<string, unknown> }).model,
+    ).not.toHaveProperty("reasoning");
 
     // Draft is now published.
     const agents = await db

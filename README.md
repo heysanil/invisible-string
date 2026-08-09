@@ -196,9 +196,12 @@ workflow-provenance chips; "Edit agent ↗" deep-links into the agent editor.
 ### 🤖 Agents — `/agents`, `/agents/:id`
 Your agents at a glance. A card grid links into the agent editor — the
 flagship surface: the persona document in a markdown editor, the Model
-section (Powerful / Balanced / Quick preset, or a specific allowlisted model
-plus reasoning effort), Context (equip MCP connections & skills, each with an
-approval policy), and Access (which member's credentials it runs as) — with a
+section (Powerful / Balanced / Quick preset, or a specific allowlisted model,
+plus a reasoning effort that **inherits the preset's** unless you override it —
+the options come from what the model actually advertises, always plus "Model
+default", which sends no reasoning field at all), Context (equip MCP
+connections & skills, each with an approval policy), and Access (which member's
+credentials it runs as) — with a
 left rail of live section cards and lifecycle chips. **Publish** compiles the
 Agent (the real `eve build` — Agents are the compile unit), and "Chat with
 agent" drops you straight into `/chat`.
@@ -209,8 +212,9 @@ agent" drops you straight into `/chat`.
 Standing delegations: **trigger → Agent → instructions**. One focused column
 with three sections — Trigger ("When this runs": webhook, form, Slack, or
 schedule), Agent ("Who does the work": a published Agent), Instructions
-("What they should do": CodeMirror with `@trigger.*` and the bound Agent's
-`@skill.*` autocomplete). Publishing is **instant** — validate + snapshot, no
+("What they should do": a rich markdown editor where `@trigger.*` and the
+bound Agent's `@skill.*` become atomic reference chips, with a Markdown
+source toggle). Publishing is **instant** — validate + snapshot, no
 build (blocking diagnostics answer 422 and route onto the section cards) —
 and the header's Run popover fires the published snapshot through the real
 trigger-dispatch path.
@@ -226,7 +230,9 @@ editor and packaged straight into the compiled agent.
 ![Context section](docs/screenshots/context.png)
 
 ### ⚙️ Settings — `/settings`
-Model presets, provider/model allowlist, members (Better Auth organization
+Model presets (each a provider + model + reasoning effort — `balanced` and
+`quick` ship as the same model at different efforts; re-pointing one applies on
+the next publish), provider/model allowlist, members (Better Auth organization
 roles), workspace rename, and **Integrations** (connect the platform Slack
 app, per-team bot tokens — app setup: [`docs/SLACK.md`](docs/SLACK.md)).
 
@@ -353,6 +359,7 @@ docs/              Design specs, master plan, runtime contract (+ screenshots/)
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Operational contract: commands, test lanes, conventions, constraints |
 | [`docs/superpowers/specs/2026-07-10-agents-first-redesign.md`](docs/superpowers/specs/2026-07-10-agents-first-redesign.md) | Agents-first redesign: concept model, IA, technical decisions, supersessions, vocabulary standard |
+| [`docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md`](docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md) | The model layer today: seeded presets, preset-carries-effort + inheritance, the effort vocabulary, the OpenRouter passthrough fix |
 | [`docs/PLAN.md`](docs/PLAN.md) | Master phase plan |
 | [`docs/runtime-worker-contract.md`](docs/runtime-worker-contract.md) | Control-plane ↔ worker protocol |
 | [`packages/compiler/README.md`](packages/compiler/README.md) | Codegen contract & versioning discipline |

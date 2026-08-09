@@ -44,5 +44,26 @@
  * limits equal what eve already enforced) and the env contract is
  * untouched, hence minor rather than major. Every version hash changes
  * regardless — versions.json moved in the same commit.
+ *
+ * 4.0.0 — MAJOR: changed generated-code semantics for the reasoning effort.
+ * The effort is no longer read from `definition.model.reasoning` (which is
+ * now an OPTIONAL override — `undefined` means inherit) but from the
+ * control-plane-resolved `deps.resolvedModel.reasoning`, so two identical
+ * definitions inheriting different preset efforts now hash — and build —
+ * differently. On the OPENROUTER branch the effort moved OFF eve's
+ * `reasoning:` config and onto the model's `extraBody`
+ * (`openrouter(MODEL_ID, { extraBody: { reasoning: { effort } } })`): eve
+ * forwards its config to ai@7 as a top-level call option that
+ * @openrouter/ai-sdk-provider@3.0.0's getArgs() never destructures, so every
+ * OpenRouter agent built before this version ran at the provider's default
+ * effort no matter what its definition said. `provider-default` emits a bare
+ * `openrouter(MODEL_ID)` with no settings at all. The ANTHROPIC branch keeps
+ * `reasoning:` (spec-v4 provider; eve maps the effort to a thinking budget)
+ * but clamps `max` → `xhigh` and omits the field for `provider-default`.
+ * OPENROUTER_CONTEXT_WINDOW_TOKENS also gained the two new seeded models
+ * (moonshotai/kimi-k3, ~deepseek/deepseek-v4-flash-latest); the previous
+ * entries stay so older versions keep recompiling to identical bytes.
+ * BUILD_ENV_EPOCH is deliberately NOT bumped — the byte change is inside
+ * compile(), which this version already re-keys.
  */
-export const COMPILER_VERSION = "3.1.0";
+export const COMPILER_VERSION = "4.0.0";

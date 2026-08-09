@@ -72,8 +72,17 @@ function RunMessageImpl({
       {/* Inbound message */}
       {isChatOrigin ? (
         <div className="flex justify-end">
-          <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-[16px] rounded-br-md bg-ink px-3.5 py-2 text-sm text-white [overflow-wrap:anywhere]">
-            {run.userMessage}
+          {/* The composer is a markdown editor, so the author's own text has
+              to come back as prose — echoing raw `**stars**` at the person who
+              typed bold would be the migration's most visible regression.
+              `.md-on-ink` inverts the renderer's tokens for the dark bubble;
+              the margin trims collapse the prose's outer block spacing into
+              the bubble's own padding. */}
+          <div className="max-w-[80%] break-words rounded-[16px] rounded-br-md bg-ink px-3.5 py-2 text-white [overflow-wrap:anywhere]">
+            <Markdown
+              text={run.userMessage}
+              className="md-on-ink [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+            />
           </div>
         </div>
       ) : (

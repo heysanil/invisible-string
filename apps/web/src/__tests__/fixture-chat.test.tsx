@@ -160,5 +160,12 @@ test("New chat opens the agent picker and picking shows the composer", async () 
 
   fireEvent.click(picker.getByText("Support triager"));
   expect(view.getByText("New chat with Support triager")).toBeTruthy();
-  expect(view.getByPlaceholderText("Message Support triager…")).toBeTruthy();
+  // Tiptap hangs the placeholder off the empty paragraph, not a `placeholder`
+  // attribute, so `getByPlaceholderText` cannot see it.
+  expect(
+    view
+      .getByLabelText("Message")
+      .querySelector("[data-placeholder]")
+      ?.getAttribute("data-placeholder"),
+  ).toBe("Message Support triager…");
 });

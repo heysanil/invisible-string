@@ -1,7 +1,14 @@
 /**
- * Streaming-friendly markdown renderer for agent replies. Parses via
- * lib/chat/markdown (typed AST, no HTML passthrough) and renders ink-styled
- * prose; code blocks get ui-monospace + a copy button.
+ * Streaming-friendly markdown renderer for agent replies AND the author's own
+ * chat bubble. Parses via lib/chat/markdown (typed AST, no HTML passthrough)
+ * and renders ink-styled prose; code blocks get ui-monospace + a copy button.
+ *
+ * Every color here is a token — the ink scale, plus `--md-rule`, `--md-surface`
+ * and `--md-quote` for the rules, code surfaces and quote bar (all defined on
+ * `.md-prose` in tokens.css). That is what lets the same renderer sit on an ink
+ * bubble: `.md-on-ink` redefines those tokens for the subtree and the whole
+ * tree inverts. Do not reintroduce literal `black/x` tints — a literal cannot
+ * follow the surface it is drawn on.
  */
 import { useMemo, useState, type ReactNode } from "react";
 import { Check, Copy } from "lucide-react";
@@ -19,6 +26,8 @@ function renderInline(nodes: MdInline[], keyPrefix: string): ReactNode[] {
     switch (node.kind) {
       case "text":
         return <span key={key}>{node.text}</span>;
+      case "br":
+        return <br key={key} />;
       case "code":
         return (
           <code key={key} className="mono-chip">
@@ -40,7 +49,7 @@ function renderInline(nodes: MdInline[], keyPrefix: string): ReactNode[] {
             href={node.href}
             target="_blank"
             rel="noreferrer noopener"
-            className="rounded-sm font-medium text-ink underline decoration-black/25 underline-offset-2 transition-colors duration-150 hover:decoration-black/60"
+            className="rounded-sm font-medium text-ink underline decoration-ink-4 underline-offset-2 transition-colors duration-150 hover:decoration-ink-2"
           >
             {renderInline(node.children, key)}
           </a>
@@ -63,14 +72,14 @@ function CodeBlock({ lang, text }: { lang: string | null; text: string }) {
   }
 
   return (
-    <div className="group relative my-2 overflow-hidden rounded-card border border-black/[0.07] bg-black/[0.035]">
-      <div className="flex h-8 items-center justify-between border-b border-black/[0.05] pl-3 pr-1.5">
+    <div className="group relative my-2 overflow-hidden rounded-card border border-[var(--md-rule)] bg-[var(--md-surface)]">
+      <div className="flex h-8 items-center justify-between border-b border-[var(--md-rule)] pl-3 pr-1.5">
         <span className="font-mono text-[11px] text-ink-4">{lang ?? "code"}</span>
         <button
           type="button"
           onClick={copy}
           aria-label={copied ? "Copied" : "Copy code"}
-          className="lift flex h-6 items-center gap-1 rounded-capsule px-2 text-[11px] font-medium text-ink-3 hover:bg-black/[0.05] hover:text-ink"
+          className="lift flex h-6 items-center gap-1 rounded-capsule px-2 text-[11px] font-medium text-ink-3 hover:bg-[var(--md-surface)] hover:text-ink"
         >
           {copied ? (
             <>
@@ -138,13 +147,13 @@ function renderBlock(block: MdBlock, index: number): ReactNode {
       return (
         <blockquote
           key={key}
-          className="my-2 border-l-2 border-black/15 pl-3 text-ink-2"
+          className="my-2 border-l-2 border-[var(--md-quote)] pl-3 text-ink-2"
         >
           {renderInline(block.inline, key)}
         </blockquote>
       );
     case "hr":
-      return <hr key={key} className="my-3 border-black/[0.08]" aria-hidden="true" />;
+      return <hr key={key} className="my-3 border-[var(--md-rule)]" aria-hidden="true" />;
   }
 }
 
@@ -156,7 +165,7 @@ export interface MarkdownProps {
 export function Markdown({ text, className }: MarkdownProps) {
   const blocks = useMemo(() => parseMarkdown(text), [text]);
   return (
-    <div className={cn("text-sm text-ink [overflow-wrap:anywhere]", className)}>
+    <div className={cn("md-prose text-sm text-ink [overflow-wrap:anywhere]", className)}>
       {blocks.map(renderBlock)}
     </div>
   );

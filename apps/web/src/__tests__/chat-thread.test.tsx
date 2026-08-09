@@ -18,6 +18,7 @@ import { WorkingBlock } from "../components/chat/WorkingBlock";
 import { Composer } from "../components/chat/Composer";
 import type { ThreadHeaderProps } from "../components/chat/ThreadHeader";
 import { renderWithRouter } from "../test/router";
+import { pasteInto, pressEnter } from "../test/editor";
 
 ensureDomForThisFile();
 // Drain a macrotask after unmount so React's scheduler flushes its pending
@@ -389,12 +390,16 @@ test("a landed clear renders the neutral context marker", async () => {
   expect(await view.findByText("Context cleared")).toBeTruthy();
 });
 
-test("composer sends on click and clears; disabled reason blocks input", () => {
+// The composer's own behavior (Enter/Shift+Enter, flush-on-send, clearing)
+// lives in __tests__/chat-composer.test.tsx; these two keep the thread's
+// contract with it — the label it is found by, and the disabled reason.
+
+test("composer sends on Enter; a disabled reason blocks input", () => {
   const onSend = mock((_message: string) => {});
   const view = render(<Composer onSend={onSend} />);
-  const box = view.getByLabelText("Message") as HTMLTextAreaElement;
-  fireEvent.input(box, { target: { value: "hello there" } });
-  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  const box = view.getByLabelText("Message");
+  pasteInto(box, "hello there");
+  pressEnter(box);
   expect(onSend).toHaveBeenCalledWith("hello there");
 
   cleanup();
@@ -402,10 +407,13 @@ test("composer sends on click and clears; disabled reason blocks input", () => {
     <Composer onSend={() => {}} disabledReason="Working… try again soon." />,
   );
   expect(disabled.getByText("Working… try again soon.")).toBeTruthy();
-  expect((disabled.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(true);
+  // A contenteditable has no `disabled` — read-only is how ProseMirror says it.
+  expect(disabled.getByLabelText("Message").getAttribute("contenteditable")).toBe(
+    "false",
+  );
 });
 
 test("composer keeps a failed draft handed back via initialValue", () => {
   const view = render(<Composer onSend={() => {}} initialValue="retry me" />);
-  expect((view.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("retry me");
+  expect(view.getByLabelText("Message").textContent).toBe("retry me");
 });

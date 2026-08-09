@@ -11,6 +11,7 @@
 
 export type MdInline =
   | { kind: "text"; text: string }
+  | { kind: "br" }
   | { kind: "code"; text: string }
   | { kind: "strong"; children: MdInline[] }
   | { kind: "em"; children: MdInline[] }
@@ -25,6 +26,14 @@ export type MdBlock =
   | { kind: "hr" };
 
 const SAFE_LINK = /^(https?:|mailto:)/i;
+
+/**
+ * A markdown hard break — two or more trailing spaces. This is how a
+ * Shift+Enter in the chat composer reaches the bubble (Tiptap serializes a
+ * hardBreak node that way); every other line ending inside a paragraph is a
+ * soft wrap and folds into a single space, per markdown.
+ */
+const HARD_BREAK = /\s\s+$/;
 
 export function parseInline(text: string): MdInline[] {
   const out: MdInline[] = [];
@@ -43,8 +52,12 @@ export function parseInline(text: string): MdInline[] {
     const strong = rest.match(/\*\*([^*\n]+)\*\*/);
     const em = rest.match(/(?<![*\w])[*_]([^*_\n]+)[*_](?![*\w])/);
     const link = rest.match(/\[([^\]\n]+)\]\(([^)\s]+)\)/);
+    // A hard break survives block assembly as a literal newline (see
+    // parseMarkdown); every other line ending was already folded into a space.
+    const br = rest.indexOf("\n");
 
     const candidates = [
+      br >= 0 ? { index: br, len: 1, apply: () => out.push({ kind: "br" as const }) } : null,
       code ? { index: code.index ?? 0, len: code[0].length, apply: () => out.push({ kind: "code" as const, text: code[1] ?? "" }) } : null,
       strong ? { index: strong.index ?? 0, len: strong[0].length, apply: () => out.push({ kind: "strong" as const, children: parseInline(strong[1] ?? "") }) } : null,
       em ? { index: em.index ?? 0, len: em[0].length, apply: () => out.push({ kind: "em" as const, children: parseInline(em[1] ?? "") }) } : null,
@@ -83,9 +96,17 @@ export function parseMarkdown(source: string): MdBlock[] {
   let paragraph: string[] = [];
   let list: { ordered: boolean; items: string[] } | null = null;
 
+  // Lines arrive untrimmed so the hard-break marker is still readable here.
   const flushParagraph = () => {
     if (paragraph.length === 0) return;
-    blocks.push({ kind: "p", inline: parseInline(paragraph.join(" ")) });
+    const text = paragraph
+      .map((line, index) =>
+        index === paragraph.length - 1
+          ? line.trim()
+          : `${line.trim()}${HARD_BREAK.test(line) ? "\n" : " "}`,
+      )
+      .join("");
+    blocks.push({ kind: "p", inline: parseInline(text) });
     paragraph = [];
   };
   const flushList = () => {
@@ -164,7 +185,7 @@ export function parseMarkdown(source: string): MdBlock[] {
     }
 
     flushList();
-    paragraph.push(line.trim());
+    paragraph.push(line);
   }
   flushAll();
   return blocks;

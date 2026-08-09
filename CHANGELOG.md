@@ -8,6 +8,21 @@ Entries from `v0.3.0` onward are written at merge time as
 reconstruction** from the conventional-commit log between tags, not authored
 release notes.
 
+## v0.3.0 — 2026-08-09
+
+### Breaking changes
+- **compiler, control-plane, shared, web, worker** — Upgrade eve 0.19.0 → 0.31.3. Sessions are now ID-addressed (session API v2), continuation tokens are gone, and stop plus context controls are available. Every published agent must be republished to migrate.
+- **compiler, control-plane, db, shared, web** — Reasoning effort is now set per preset and inherited by agents, and the default model set has changed. Existing agents pick up the new defaults on their next publish.
+
+### Features
+- **control-plane** — Adopt changesets for releases: merging the `chore(release): version packages` PR now computes the version, writes `CHANGELOG.md`, tags `vX.Y.Z`, cuts the GitHub Release, and builds the GHCR images in one workflow run.
+- **web** — Replace the chat markdown renderer with Streamdown, including a streaming caret and E1-themed code blocks.
+- **design-tokens, web** — Replace the CodeMirror prompt editors with Tiptap, including the E1 token work the new editor surface needs.
+
+### Fixes & maintenance
+- **control-plane** — Align the production images' node with `packages/compiler/versions.json` and add a guard so the two cannot drift.
+- **control-plane** — Pin the host toolchain (bun, node, wrangler) in `mise.toml` and install it in every CI job via `mise-action`, so all lanes run the same versions.
+
 ## v0.2.0 — 2026-07-21
 
 ### Breaking changes

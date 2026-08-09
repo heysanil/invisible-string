@@ -2,10 +2,16 @@
 
 **Date:** 2026-08-08
 **Status:** Approved, ready for implementation
-**Revision:** 3 — two rounds of independent review, each re-running the empirical
-findings against this repo (not a replica). Round 1 corrected two findings; round 2
-caught a reachable state in §6.3's algorithm (the transition window) and an
-overstated coverage claim in §8's guard test.
+**Revision:** 4 — whole-branch review of the implementation. **`changesets/action@v1`
+is gone**: reading its source turned up two defects, either one fatal here (new
+finding 8), so §6.4's `version` job is now a shell step and §4 drops the action's
+pin. Also in this revision: per-job `permissions` replacing the workflow-level
+block, an explicit `cancel-in-progress: false`, and a §9 residual for the manifest
+reformatting `changeset version` performs. Revision 3 was two rounds of independent
+review, each re-running the empirical findings against this repo (not a replica):
+round 1 corrected two findings; round 2 caught a reachable state in §6.3's
+algorithm (the transition window) and an overstated coverage claim in §8's guard
+test.
 **Owns:** How a version number is chosen, how the changelog and GitHub Release are
 produced, and how `release.yml` gets from a merged PR to published GHCR images.
 
@@ -97,7 +103,9 @@ depends on; re-verify the corresponding finding before changing any decision.
    2 — an earlier draft claimed `changesets/action@v1` lacks a `hasChangesets`
    output. It does not: `action.yml` at tag `v1` declares `published`,
    `publishedPackages`, `hasChangesets`, and `pullRequestNumber`. The v1 README's
-   Outputs section is simply incomplete; `action.yml` is authoritative.)*
+   Outputs section is simply incomplete; `action.yml` is authoritative. Moot as of
+   revision 4 — finding 8 removed the action — but the reasoning below is what
+   still keeps §6.3 from keying off "were changesets pending".)*
 
    The decision stands on its merits rather than on a missing output: tag existence
    is what makes re-runs safe and makes the manual-tag fallback (§2 goal 4)
@@ -119,13 +127,42 @@ depends on; re-verify the corresponding finding before changing any decision.
    subsequent push to `main` re-enters the version path with nothing to do. §6.2
    therefore rejects such changesets before Changesets ever sees them.
 
+8. **`changesets/action@v1` cannot be used with `changelog: false`, and leaves
+   the checkout on the version branch.** *(New in revision 4 — both read out of
+   the action's source at tag `v1`; this is why §6.4 now runs a shell step.)*
+
+   - **ENOENT crash.** `runVersion` reads
+     `path.join(dir, "CHANGELOG.md")` for **every** changed package with no
+     existence check and no `try` (`src/run.ts:319-334`), to build the PR body.
+     With `changelog: false` those files are never written, so the read throws
+     `ENOENT` and the job dies **before** the PR is ever opened. The tell that
+     this is an oversight rather than a contract: the *identical* read at
+     `src/run.ts:31-41` **is** guarded, with the comment "if we can't find a
+     changelog, the user has probably disabled changelogs". Filed as
+     changesets/action **issue #569**, closed as a duplicate, never fixed.
+   - **The branch is never restored.** `Git.prepareBranch` (`src/git.ts:94-101`)
+     does `git checkout changeset-release/main` + `reset --hard $GITHUB_SHA` and
+     nothing switches back — `grep "checkout\|switch"` across `run.ts` returns
+     nothing. Any later step in the same job therefore runs on the version
+     branch. For us that is §6.3 running against the **unmerged** bump: it would
+     tag that commit, `images` would build pre-bump source, and the real release
+     commit would later decide `noop` — "already released" — for a release that
+     never happened.
+
+   Either defect alone is fatal here, and the second is silent. §6.4's shell
+   step reproduces the action's useful behavior (create/reset the branch, run
+   the version command, commit, force-push, open the PR once) in ~20 lines, and
+   ends by returning the checkout to `$GITHUB_SHA` on every path.
+
 ## 4. Version pinning
 
 | Thing | Pin | Why |
 |---|---|---|
 | `@changesets/cli` | **`2.31.1`** exact | Current `latest`. v3 is still `3.0.0-next.11`. Exact per the repo's "version pins are exact" rule. |
-| `changesets/action` | **`v1`** | Stable line. `v2.0.0-next.4` targets changesets v3; pairing v2 with cli 2.x is unsupported. |
 | `.changeset/config.json` `$schema` | `@changesets/config@3.1.4` | cli 2.31.1 depends on `@changesets/config@^3.1.4`; latest is 3.1.4. |
+
+`changesets/action` is **not** a dependency of this design — see finding 8 for why
+it was dropped and §6.4 for what replaced it.
 
 `@changesets/cli` goes in the **root** `devDependencies`.
 
@@ -331,7 +368,7 @@ Which yields:
 
 | Situation | `V` | Tag `vV` | `Vt` | Result |
 |---|---|---|---|---|
-| **Transition window** — any push to `main` after this ships, before the first Version PR merges | `0.2.0` (seeded) | exists, at `7967ce2` | **undefined** | `released=false`, clean exit; the action still opens/updates the Version PR |
+| **Transition window** — any push to `main` after this ships, before the first Version PR merges | `0.2.0` (seeded) | exists, at `7967ce2` | **undefined** | `released=false`, clean exit; the version step still opens/updates the version PR |
 | Version PR merges | `0.3.0` (new) | absent | — | **tag + release + images** |
 | Re-run after a mid-release failure | `0.3.0` | at `HEAD` | `0.3.0` | release and/or images completed; no duplicate tag |
 | Ordinary commit, or a changeset-bearing PR merging | `0.3.0` (unchanged) | at an older commit | `0.3.0` | `released=false`, clean exit |
@@ -360,13 +397,21 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Least privilege at the workflow level; each job widens only what it needs, so
+# neither job can do the other's damage.
 permissions:
-  contents: write        # was: read — needed to push tags and create releases
-  pull-requests: write   # needed for the Version Packages PR
-  packages: write        # unchanged — GHCR
+  contents: read
 
-concurrency: release-${{ github.ref }}
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # spelled out: a later edit flipping this on would
+                              # silently preempt a release mid-tag
 ```
+
+| Job | `permissions` | Why |
+|---|---|---|
+| `version` | `contents: write`, `pull-requests: write` | push the version branch and the release tag, cut the GitHub Release, open the version PR |
+| `images` | `contents: read`, `packages: write` | GHCR push only |
 
 **Job `version`** — runs only for `push` to `refs/heads/main`. `runs-on` a Namespace
 label per repo convention (`nscloud-ubuntu-24.04-amd64-4x8` matches the `unit`
@@ -377,16 +422,46 @@ lane's weight; this job does an install and two short scripts).
 - `jdx/mise-action@v2` with no `with:` block, exactly as every other job in this
   repo — the pinned toolchain comes from `mise.toml`.
 - `bun install --frozen-lockfile`.
-- `changesets/action@v1` with **only** `version: bun run release:version`. No
-  `publish:` input — nothing is published, so the action's sole job is to
-  create/update the **"Version Packages"** PR. No `NPM_TOKEN`, no `.npmrc`. Its
-  `github-token` input defaults to `${{ github.token }}`, so no explicit wiring.
+- **A shell step that maintains the version PR** — *not* `changesets/action@v1`,
+  which finding 8 rules out on two counts. `env: BRANCH: changeset-release/main`,
+  `GH_TOKEN: ${{ github.token }}`, `set -euo pipefail`, and in order:
+
+  1. `git config user.name/email` to `github-actions[bot]`. Set **here**, not in
+     the tag step: the same repo-local config serves both the version commit and
+     §6.3's annotated tag.
+  2. `git switch -C "$BRANCH"` — the action's `checkout` + `reset --hard
+     $GITHUB_SHA` in one command, since `actions/checkout` already left HEAD
+     detached at `$GITHUB_SHA`. Resetting every run is deliberate: the branch is
+     a derived artifact, always recomputed from the current `main`.
+  3. `bun run release:version`. With nothing pending it exits **0** having
+     changed nothing (§6.2), which is why no `hasChangesets`-style precheck is
+     needed.
+  4. Change detection is `[ -z "$(git status --porcelain)" ]`, **not**
+     `git diff --quiet`: `release:version` **deletes** the consumed
+     `.changeset/*.md` and may **create** `CHANGELOG.md`, and the commit is
+     `git add -A`.
+  5. With changes: `git add -A`, commit `chore(release): version packages`,
+     `git push -f origin "$BRANCH"`, then open the PR **only if one is not
+     already open**. The open-check is
+     `gh pr list --head "$BRANCH" --state open --json number --jq '.[].number'`,
+     deliberately not `gh pr view "$BRANCH"`: `pr view` also matches **merged**
+     PRs, and one stale match would mean no version PR is ever opened again.
+     (`--jq '.[].number'` rather than `.[0].number` — the latter prints the
+     string `null` for an empty array and would read as "already open".)
+  6. The PR body comes from `scripts/release-pr-body.ts`, a thin entrypoint over
+     §6.3's `extractLatestSection`: one framing line ("Merging this PR releases
+     vX.Y.Z.") plus the newest `CHANGELOG.md` section — byte-for-byte the notes
+     the GitHub Release will carry, so the PR previews exactly what it publishes.
+     Written to `$RUNNER_TEMP`, never the repo (an untracked, un-ignored file in
+     the tree would land in the next `git add -A`).
+  7. **`git checkout --force "$GITHUB_SHA"`, on every path** — including the
+     nothing-to-version one. This is the finding-8 branch-state fix and the whole
+     reason the step is ordered this way: §6.3 must observe `main`'s state, never
+     the version branch's.
 - `bun run release:tag`. No further `if:` guard is needed — the whole job is
   already `main`-only. This step **requires**:
   - `env: GH_TOKEN: ${{ github.token }}` — `gh` will not authenticate otherwise.
-  - An explicit git identity for the annotated tag (`git config user.name/email`
-    to `github-actions[bot]`). Do **not** rely on the Changesets action's
-    `setupGitUser` side effect having run earlier in the job.
+  - The git identity from the step above (for the annotated tag).
   - `gh` present on the runner — confirm on the Namespace image; if absent, use
     `actions/github-script` or the REST API instead.
 - Job outputs: `released`, `version`.
@@ -418,11 +493,11 @@ another workflow — never comes into play. **No PAT or GitHub App token is need
 for the tag → images path.** (It *is* the reason the Version PR gets no CI; see
 §9.)
 
-**Repository prerequisite.** `changesets/action` opens a pull request with the
-default `GITHUB_TOKEN`, which requires **Settings → Actions → General → "Allow
-GitHub Actions to create and approve pull requests"** to be enabled. Without it the
-action fails at PR-creation time with a permissions error that does not name the
-setting. Confirm before the first release.
+**Repository prerequisite.** The step opens the pull request with the default
+`GITHUB_TOKEN`, which requires **Settings → Actions → General → "Allow GitHub
+Actions to create and approve pull requests"** to be enabled. Without it
+`gh pr create` fails with a permissions error that does not name the setting.
+Confirm before the first release.
 
 ### 6.5 Root `package.json` scripts
 
@@ -475,8 +550,9 @@ document in the same commit"):
     one. Note that `tests/integration/toolchain-pins.test.ts` *requires*
     mise-action in any job whose `run:` steps invoke bun — the §6.4 yaml includes
     it, so that test passes; only the prose goes stale.
-- **`docs/DEPLOY.md` §10** — the upgrade path becomes "merge the Version Packages
-  PR; the release workflow tags, releases, and builds images." Document the manual
+- **`docs/DEPLOY.md` §10** — the upgrade path becomes "merge the
+  `chore(release): version packages` PR; the release workflow tags, releases, and
+  builds images." Document the manual
   `git tag v*` push as the fallback **and its obligation**: the manifests must
   already claim that version **in the commit being tagged**, or the number is
   burned (§9) — §6.3 reads `Vt` from the tag's own commit, so aligning
@@ -516,15 +592,15 @@ docker, no network) so the default `bun test` lane catches drift, in the style o
 
 ## 9. Residuals
 
-- **The Version PR receives no CI runs.** `changesets/action` opens it with the
+- **The version PR receives no CI runs.** The version step opens it with the
   default `GITHUB_TOKEN`, and events caused by that token do not trigger
   `pull_request` workflows. **Currently benign**: `main` has no branch protection
   and no rulesets (verified), the PR is mergeable, and its diff is only manifests
   plus `CHANGELOG.md` — code being released already passed CI in its own PR.
   **Trigger condition:** the moment required status checks are added to `main`, the
-  Version PR becomes permanently unmergeable, because its checks never report. The
-  fix at that point is a PAT or GitHub App token on the action — not a redesign.
-  Closing and reopening the PR by hand also forces a CI run.
+  version PR becomes permanently unmergeable, because its checks never report. The
+  fix at that point is a PAT or GitHub App token on the `gh` calls — not a
+  redesign. Closing and reopening the PR by hand also forces a CI run.
 - **A manual tag burns the version number.** Pushing `v0.3.1` by hand leaves the
   manifests at `0.3.0`, so the next Version PR computes `0.3.1` — whose tag already
   exists, pointing at an unrelated commit. §6.3's tag-points-elsewhere hard-fail
@@ -552,6 +628,14 @@ docker, no network) so the default `bun test` lane catches drift, in the style o
   `infra/docker/control-plane.Dockerfile:17-28`) rebuilds on every release image
   build. Cost only, no correctness issue; Namespace's builder-side cache simply
   stops helping that one layer per release.
+- **`changeset version` reformats the manifests it touches.** It rewrites each
+  `package.json` through its own JSON writer rather than patching the version
+  string in place, so compact one-line blocks get expanded onto several lines —
+  already visible in `packages/design-tokens/package.json`, whose `exports` and
+  `scripts` came back multi-line. Purely cosmetic, it recurs on **every** release,
+  and it only ever touches the eight shipped manifests. Recorded here so a
+  reviewer of a future version PR reads the extra hunks as expected noise rather
+  than an unexplained diff.
 - **Changelog entries carry no PR links or author attribution.**
   `@changesets/changelog-github` provides these but writes per-package files, which
   §5 rejects. Adding link enrichment to `release-version.ts` later is
@@ -611,8 +695,10 @@ than inventing a scope.
    merging the implementation PR, since every push to `main` hits this state until
    the first Version PR lands.
 6. Adding a changeset and pushing to a branch produces no release activity.
-7. On merge to `main` with changesets pending: a "Version Packages" PR appears; no
-   tag, no release, no images.
+7. On merge to `main` with changesets pending: a `chore(release): version packages`
+   PR appears on branch `changeset-release/main`, its body is the new
+   `CHANGELOG.md` section; no tag, no release, no images. A second push while it
+   is open force-updates the branch and opens **no** duplicate PR.
 8. On merging that PR: `CHANGELOG.md` gains a `v0.3.0` section, tag `v0.3.0` is
    pushed, a GitHub Release is created with that section as its body, and all three
    GHCR images publish as `v0.3.0` and `<sha>`.

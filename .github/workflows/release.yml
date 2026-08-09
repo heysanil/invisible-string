@@ -5,25 +5,32 @@ on:
     branches: [main]
     tags: ["v*"]
 
-# contents: write — push the release tag and create the GitHub Release.
-# pull-requests: write — open/update the "Version Packages" PR.
+# Least privilege at the workflow level; each job widens only what it needs.
 permissions:
-  contents: write
-  packages: write
-  pull-requests: write
+  contents: read
 
-concurrency: release-${{ github.ref }}
+# cancel-in-progress is spelled out rather than left to the default: a release
+# run pushes a tag and cuts a GitHub Release, and a later edit that flips this
+# on would silently preempt one mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # Maintains the "Version Packages" PR; when that PR merges, tags the release
-  # and cuts its GitHub Release. Tag and image build happen in ONE run on
-  # purpose: a tag pushed with GITHUB_TOKEN cannot trigger another workflow, so
-  # splitting them would need a PAT.
+  # Maintains the `chore(release): version packages` PR; when that PR merges,
+  # tags the release and cuts its GitHub Release. Tag and image build happen in
+  # ONE run on purpose: a tag pushed with GITHUB_TOKEN cannot trigger another
+  # workflow, so splitting them would need a PAT.
   version:
     name: Version and tag
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 15
+    # contents: write — push the version branch, the release tag, and the
+    # GitHub Release. pull-requests: write — open the version PR.
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       released: ${{ steps.tag.outputs.released }}
       version: ${{ steps.tag.outputs.version }}
@@ -42,24 +49,67 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # No `publish:` input — nothing here is published to npm, so the action's
-      # only job is the Version PR. Requires "Allow GitHub Actions to create and
-      # approve pull requests" in repo settings.
-      - name: Create or update the Version Packages PR
-        uses: changesets/action@v1
-        with:
-          version: bun run release:version
-          commit: "chore(release): version packages"
-          title: "chore(release): version packages"
+      # Deliberately NOT changesets/action@v1, which is unusable here on two
+      # counts (both read out of its source at tag v1):
+      #
+      #  1. `runVersion` reads a per-package CHANGELOG.md for every changed
+      #     package with no ENOENT guard (src/run.ts:319-334). Our config sets
+      #     `changelog: false`, so those files never exist and the job would
+      #     crash before ever opening the PR. The identical read at
+      #     src/run.ts:31-41 IS guarded ("if we can't find a changelog, the
+      #     user has probably disabled changelogs") — their issue #569, closed
+      #     as a duplicate, never fixed.
+      #  2. `Git.prepareBranch` (src/git.ts:94-101) checks out
+      #     changeset-release/main and never switches back, so `release:tag`
+      #     below would run on the version branch: it would tag the UNMERGED
+      #     bump commit and build images from pre-bump source, and the real
+      #     release commit would later no-op as "already released".
+      #
+      # Hence the final `git checkout --force "$GITHUB_SHA"`, on every path —
+      # release:tag must observe main's state, never the version branch's.
+      - name: Version packages and maintain the version PR
+        run: |
+          set -euo pipefail
+
+          # Also required later for release:tag's annotated tag — do not move
+          # this into the tag step.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch -C "$BRANCH"
+          bun run release:version
+
+          # --porcelain, not `git diff --quiet`: release:version DELETES the
+          # consumed .changeset/*.md files and may create CHANGELOG.md, and the
+          # commit below is `git add -A`.
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Nothing to version — leaving $BRANCH alone."
+          else
+            git add -A
+            git commit -m "chore(release): version packages"
+            git push -f origin "$BRANCH"
+
+            # --state open, not `gh pr view`: that matches merged PRs too, and
+            # a stale match would mean the next release never opens a PR.
+            open=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')
+            if [ -n "$open" ]; then
+              echo "PR #$open already open for $BRANCH — force-push updated it."
+            else
+              bun run scripts/release-pr-body.ts "$RUNNER_TEMP/version-pr-body.md"
+              gh pr create --base main --head "$BRANCH" \
+                --title "chore(release): version packages" \
+                --body-file "$RUNNER_TEMP/version-pr-body.md"
+            fi
+          fi
+
+          git checkout --force "$GITHUB_SHA"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: changeset-release/main
+          GH_TOKEN: ${{ github.token }}
 
       - name: Tag and release
         id: tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          bun run release:tag
+        run: bun run release:tag
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -74,6 +124,9 @@ jobs:
     if: ${{ !cancelled() && (needs.version.outputs.released == 'true' || startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: nscloud-ubuntu-24.04-amd64-8x16
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:

@@ -1,5 +1,7 @@
 # Changesets Release Workflow Implementation Plan
 
+> **EXECUTED — historical record; do not follow, do not edit.** This plan was carried out on the `chore/changesets-release-workflow` branch. Post-implementation review then **removed `changesets/action@v1`** (two defects, either one fatal here — see finding 8 of the design spec), so this plan's `release.yml` yaml, its `changesets/action@v1` pin, and every "Version Packages" PR title below describe a shape that was never shipped. The current truth is `.github/workflows/release.yml` and revision 4 of the design spec; `AGENTS.md` → Releases is the operator-facing summary.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace hand-typed `git tag vX.Y.Z` releases with a Changesets flow that computes the version, writes a root `CHANGELOG.md`, cuts the tag and GitHub Release, and builds the GHCR images — all from merging one PR.

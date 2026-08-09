@@ -266,7 +266,8 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 
 ## 10. Upgrades & rollback
 
-1. Merge the **"Version Packages"** PR that the `release` workflow keeps open on
+1. Merge the PR titled **`chore(release): version packages`** (branch
+   `changeset-release/main`) that the `release` workflow keeps open on
    `main`. That bumps the version, writes `CHANGELOG.md`, pushes the `vX.Y.Z`
    tag, cuts the GitHub Release, and builds and pushes the three GHCR images
    tagged with the version and the commit sha. See AGENTS.md → Releases.
@@ -281,7 +282,7 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
    alignment commit landed after the tag cannot repair it. If the tag is
    already out ahead of the manifests, either move it onto the aligned commit
    (`git tag -f` + force-push) or skip the number entirely (land a `minor` so
-   the next Version PR computes past it); otherwise the `version` job exits 1
+   the next version PR computes past it); otherwise the `version` job exits 1
    on every push to `main`.
 
 ---

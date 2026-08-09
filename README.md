@@ -314,9 +314,9 @@ Workers at [invisiblestring.io](https://invisiblestring.io), via
 on pull requests.
 
 Releases are cut by changesets: add a `.changeset/*.md` to any behavior-affecting
-PR, then merge the "Version Packages" PR that CI keeps open on `main` — it tags
-the release, writes `CHANGELOG.md`, and publishes the GHCR images. Details in
-AGENTS.md → Releases.
+PR, then merge the `chore(release): version packages` PR that CI keeps open on
+`main` — it tags the release, writes `CHANGELOG.md`, and publishes the GHCR
+images. Details in AGENTS.md → Releases.
 
 ## Repo map
 

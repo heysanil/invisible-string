@@ -10,6 +10,8 @@
 import { and, eq, type SQL } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
+  ConnectionDto,
+  ConnectionOauthStatus,
   MasterKey,
   McpConnectionDto,
   ModelAllowlistEntryDto,
@@ -51,9 +53,12 @@ export type Scope =
   | { kind: "workspace"; organizationId: string }
   | { kind: "user"; userId: string };
 
-/** drizzle WHERE for a scoped table (mcp_connections / skills share columns). */
+/** drizzle WHERE for a scoped table (connections / mcp_connections / skills share columns). */
 export function scopeWhere(
-  table: typeof schema.mcpConnections | typeof schema.skills,
+  table:
+    | typeof schema.connections
+    | typeof schema.mcpConnections
+    | typeof schema.skills,
   scope: Scope,
 ): SQL {
   return scope.kind === "workspace"
@@ -95,10 +100,47 @@ export function parseBody<T>(
 
 // ── DTO mappers ──────────────────────────────────────────────────────────────
 
+type ConnectionRow = typeof schema.connections.$inferSelect;
 type McpConnectionRow = typeof schema.mcpConnections.$inferSelect;
 type SkillRow = typeof schema.skills.$inferSelect;
 type ModelPresetRow = typeof schema.modelPresets.$inferSelect;
 type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
+
+/**
+ * Rebuilt `connections` row → wire DTO. Secrets are NEVER echoed — only
+ * `hasCredentials` (an `oauth` row counts as credentialed even before Plan 3
+ * stores its grant). `oauthStatus` stays null until the OAuth broker lands.
+ */
+export function connectionDto(
+  row: ConnectionRow,
+  oauthStatus: ConnectionOauthStatus | null = null,
+): ConnectionDto {
+  return {
+    id: row.id,
+    scope: row.scope,
+    name: row.name,
+    description: row.description,
+    source: row.source,
+    catalogSlug: row.catalogSlug,
+    registryName: row.registryName,
+    url: row.url,
+    transport: row.transport,
+    authType: row.authType,
+    hasCredentials: row.authConfigEncrypted != null || row.authType === "oauth",
+    oauthStatus,
+    toolAllow: row.toolAllow ?? null,
+    toolBlock: row.toolBlock ?? null,
+    approvalPolicy: (row.approvalPolicy as ConnectionDto["approvalPolicy"]) ?? null,
+    enabled: row.enabled,
+    health: row.health,
+    lastCheckedAt: row.lastCheckedAt?.toISOString() ?? null,
+    lastError: row.lastError,
+    tools: row.toolsCache ?? null,
+    toolsCachedAt: row.toolsCachedAt?.toISOString() ?? null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
 
 /** Secrets are NEVER echoed — only `hasCredentials`. */
 export function mcpConnectionDto(row: McpConnectionRow): McpConnectionDto {

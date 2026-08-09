@@ -172,6 +172,31 @@ export const errors = {
       "registry_remote_mismatch",
       `the requested remote URL is not one advertised by registry server "${name}"`,
     ),
+  // ── Connections (connectors redesign, spec §3/§4) ─────────────────────────
+  catalogEntryNotFound: (slug: string) =>
+    new RuntimeApiError(
+      404,
+      "catalog_entry_not_found",
+      `no connector catalog entry with slug "${slug}"`,
+    ),
+  duplicateConnectionName: (name: string) =>
+    new RuntimeApiError(
+      409,
+      "duplicate_connection_name",
+      `a connection named "${name}" already exists in this scope`,
+    ),
+  /**
+   * Two distinct names that slugify to the SAME identifier would collide in
+   * the compiler's per-agent connection namespace (filenames, env vars,
+   * `@ref` slugs) — rejected at create/rename, not at publish.
+   */
+  duplicateConnectionSlug: (name: string, clashingName: string) =>
+    new RuntimeApiError(
+      409,
+      "duplicate_connection_slug",
+      `connection name "${name}" collides with existing connection "${clashingName}" — both produce the same identifier; pick a more distinct name`,
+      { clashingName },
+    ),
   noPendingInput: () =>
     new RuntimeApiError(
       409,

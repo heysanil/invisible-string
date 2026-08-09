@@ -1,6 +1,6 @@
 /**
  * Resource CRUD plugin — wires the HTTP surface for agents, workflows,
- * sessions (list), MCP connections (+ registry proxy/install), skills
+ * sessions (list), connections (rebuilt domain + registry proxy), skills
  * (+ attachments), model presets/allowlist, and members onto the pure
  * service functions in this directory. Mounted unconditionally (product CRUD
  * does not require the runtime env); skill uploads that need the object
@@ -22,15 +22,14 @@ import {
   updateAgent,
 } from "./agents";
 import type { ResourceDeps, Scope } from "./common";
-import { listWorkspaceMembers } from "./members";
 import {
   createConnection,
   deleteConnection,
   getConnection,
-  installConnection,
   listConnections,
   updateConnection,
-} from "./mcp-connections";
+} from "./connections";
+import { listWorkspaceMembers } from "./members";
 import {
   addModelAllowlistEntry,
   deleteModelAllowlistEntry,
@@ -176,57 +175,51 @@ export function resourcesPlugin(deps: ResourceDeps) {
         { requireWorkspace: true },
       )
 
-      // ── MCP connections — workspace scope ─────────────────────────────────
+      // ── Connections — workspace scope (rebuilt domain; one create route
+      // discriminated on source, so no separate /install). Reads are member
+      // ops; mutations are owner/admin-gated (spec §9 authz) ────────────────
       .get(
-        "/workspaces/:workspaceId/mcp-connections",
+        "/workspaces/:workspaceId/connections",
         ({ workspace }) => listConnections(deps, wsScope(workspace.organizationId)),
         { requireWorkspace: true },
       )
       .post(
-        "/workspaces/:workspaceId/mcp-connections",
+        "/workspaces/:workspaceId/connections",
         async ({ workspace, body, set }) => {
           const result = await createConnection(deps, wsScope(workspace.organizationId), body);
           set.status = 201;
           return result;
         },
-        { requireWorkspace: true },
-      )
-      .post(
-        "/workspaces/:workspaceId/mcp-connections/install",
-        async ({ workspace, body, set }) => {
-          const result = await installConnection(deps, wsScope(workspace.organizationId), body);
-          set.status = 201;
-          return result;
-        },
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .get(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params }) =>
           getConnection(deps, wsScope(workspace.organizationId), params.id),
         { requireWorkspace: true },
       )
       .patch(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params, body }) =>
           updateConnection(deps, wsScope(workspace.organizationId), params.id, body),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .delete(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params }) =>
           deleteConnection(deps, wsScope(workspace.organizationId), params.id),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
 
-      // ── MCP connections — user scope (/me) ────────────────────────────────
+      // ── Connections — user scope (/me; the signed-in user owns the rows,
+      // so no role gate applies) ────────────────────────────────────────────
       .get(
-        "/me/mcp-connections",
+        "/me/connections",
         ({ authUser }) => listConnections(deps, userScope(authUser.id)),
         { requireAuth: true },
       )
       .post(
-        "/me/mcp-connections",
+        "/me/connections",
         async ({ authUser, body, set }) => {
           const result = await createConnection(deps, userScope(authUser.id), body);
           set.status = 201;
@@ -234,28 +227,19 @@ export function resourcesPlugin(deps: ResourceDeps) {
         },
         { requireAuth: true },
       )
-      .post(
-        "/me/mcp-connections/install",
-        async ({ authUser, body, set }) => {
-          const result = await installConnection(deps, userScope(authUser.id), body);
-          set.status = 201;
-          return result;
-        },
-        { requireAuth: true },
-      )
       .get(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params }) => getConnection(deps, userScope(authUser.id), params.id),
         { requireAuth: true },
       )
       .patch(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params, body }) =>
           updateConnection(deps, userScope(authUser.id), params.id, body),
         { requireAuth: true },
       )
       .delete(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params }) => deleteConnection(deps, userScope(authUser.id), params.id),
         { requireAuth: true },
       )

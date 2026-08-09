@@ -1,5 +1,5 @@
 /**
- * Full-height skill editor: markdown body (CodeMirror) + name + description
+ * Full-height skill editor: rich markdown body + name + description
  * + attachments sidebar. Save is explicit with dirty tracking; a member
  * (read-only) sees the same layout without mutating affordances.
  */
@@ -10,7 +10,8 @@ import type { SkillDto } from "@invisible-string/shared";
 import { errorMessage } from "../../lib/forms";
 import { useSkill, useUpdateSkill } from "../../lib/queries/skills";
 import type { ScopeRef } from "../../lib/queries/keys";
-import { CodeMirrorMarkdown } from "../CodeMirrorMarkdown";
+import { DOCUMENT_EXTENSIONS } from "../../lib/editor/profiles";
+import { MarkdownDocumentEditor } from "../editor/MarkdownDocumentEditor";
 import { Button } from "../ui/Button";
 import { ErrorState } from "../ui/ErrorState";
 import { Input } from "../ui/Input";
@@ -165,12 +166,14 @@ export function SkillEditor({ scope, skillId, readOnly, onBack }: SkillEditorPro
                 Instructions
               </span>
               <div className="min-h-0 flex-1">
-                <CodeMirrorMarkdown
+                <MarkdownDocumentEditor
                   ariaLabel="Skill instructions (markdown)"
                   value={draft.content}
                   readOnly={readOnly}
-                  placeholder={"# How to…\n\nWrite the skill in Markdown."}
+                  extensions={DOCUMENT_EXTENSIONS}
+                  placeholder={"# How to…  Write the skill in Markdown."}
                   onChange={(content) => setDraft({ ...draft, content })}
+                  className="min-h-0 flex-1"
                 />
               </div>
             </div>

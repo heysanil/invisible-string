@@ -1,5 +1,6 @@
 {
   "name": "@invisible-string/shared",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "exports": {

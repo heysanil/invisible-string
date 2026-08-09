@@ -22,6 +22,7 @@ The living documents and what each owns:
 | `docs/superpowers/specs/2026-08-07-eve-0.31-upgrade-design.md` | eve 0.19.0 → 0.31.3 upgrade: version matrix, the forced session-API-v2 migration, republish-to-migrate, adopted 0.31 features |
 | `docs/superpowers/specs/2026-08-08-tiptap-editors-design.md` | Tiptap prompt editors (supersedes the 2026-07-02 spec's CodeMirror 6 decision): the faithful markdown bridge, debounced serialization, `@reference` chips, per-surface chrome |
 | `docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md` | The MODEL layer as it stands: seeded preset defaults, preset-carries-effort + agent inheritance, the 8-value effort vocabulary, the OpenRouter passthrough fix — **supersedes `INITIAL-SPEC.md` §2/§7** |
+| `docs/superpowers/specs/2026-08-09-reasoning-timeline-rendering-design.md` | How a run RENDERS in the thread: the segmented `RunSegment[]` model, the rail-in-box, `stepIndex`-keyed thoughts, fold-on-seal — **supersedes the 2026-07-02 spec's decision C** (the three-bucket working block) |
 | `docs/PLAN.md` | Master phase plan — update acceptance/status notes if scope shifts |
 | `docs/runtime-worker-contract.md` | Control-plane ↔ worker protocol: identity, ensure/dispatch, proxy, reapers |
 | `packages/compiler/README.md` + `WORLD-ISOLATION.md` | Codegen contract, `COMPILER_VERSION` discipline, world-DB isolation mechanism |

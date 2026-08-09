@@ -170,6 +170,11 @@ export function WorkingBlock({ segment }: { segment: WorkSegment }) {
         <div className="overflow-hidden">
           <div
             ref={bodyRef}
+            // The run wrapper is an `aria-live` region, and this body now holds
+            // FULL chain-of-thought — announcing it would read every thought
+            // delta aloud. The header ("Working", "Worked for 24s · 5 steps")
+            // and the reply still announce; the rail's live tail does not.
+            aria-hidden={segment.active ? true : undefined}
             onScroll={(e) => {
               const el = e.currentTarget;
               stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;

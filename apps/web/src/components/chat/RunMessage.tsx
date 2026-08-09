@@ -1,7 +1,10 @@
 /**
  * One run rendered in the thread: the inbound user/trigger message bubble
- * (ink), the collapsible working block, the streamed assistant reply
- * (markdown), inline HITL cards, a failure banner — and the Stop control.
+ * (ink), then the run's segments IN THE ORDER THE AGENT PRODUCED THEM — a
+ * work segment as a collapsible rail box, a speech segment as markdown prose
+ * — then inline HITL cards, a failure banner, and the Stop control. Mid-run
+ * narration therefore renders where it happened instead of being hoisted
+ * below every tool call.
  *
  * STOP IS NOT A FAILURE. eve 0.31 answers a stop with `turn.cancelled` →
  * `session.waiting`, never a failure event, so a stopped run renders in
@@ -44,7 +47,6 @@ function RunMessageImpl({
   pendingInput,
   inputError,
 }: RunMessageProps) {
-  const showReply = run.reply !== null;
   // `run.canceled` comes off the event stream, so it flips a beat BEFORE the
   // run_status frame — the spinner, caret and Stop button all settle together
   // rather than lingering for a round trip.
@@ -99,11 +101,13 @@ function RunMessageImpl({
         aria-busy={isActive || undefined}
         aria-relevant="additions text"
       >
-        {run.block !== null ? <WorkingBlock block={run.block} /> : null}
-
-        {showReply ? (
-          <Markdown text={run.reply!.text} streaming={run.reply!.streaming} />
-        ) : null}
+        {run.segments.map((segment) =>
+          segment.kind === "work" ? (
+            <WorkingBlock key={segment.key} segment={segment} />
+          ) : (
+            <Markdown key={segment.key} text={segment.text} streaming={segment.streaming} />
+          ),
+        )}
 
         {run.pendingInputs.map((input) => (
           <ApprovalCard
@@ -148,7 +152,7 @@ function RunMessageImpl({
         {run.contextCleared ? <ContextDivider kind="cleared" /> : null}
 
         {/* An active run with no output yet still needs a presence cue. */}
-        {run.block === null && !showReply && run.pendingInputs.length === 0 && run.error === null &&
+        {run.segments.length === 0 && run.pendingInputs.length === 0 && run.error === null &&
         isActive ? (
           <p className="py-1 text-[12.5px] text-ink-4">Thinking…</p>
         ) : null}

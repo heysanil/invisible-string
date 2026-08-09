@@ -86,10 +86,14 @@ export function ThreadView({
 
   // Autoscroll to the newest content while pinned. Runs on every render of the
   // run set (new frames grow the last item) — measurement drives real height.
+  // The signature must GROW monotonically as the tail streams, or the thread
+  // stops following: a new segment outranks anything inside the previous one.
   const lastRun = runs[runs.length - 1];
+  const lastSegment = lastRun?.segments[lastRun.segments.length - 1];
   const streamSignature =
-    (lastRun?.reply?.text.length ?? 0) +
-    (lastRun?.block?.steps.length ?? 0) * 1000 +
+    (lastRun?.segments.length ?? 0) * 100000 +
+    (lastSegment?.kind === "speech" ? lastSegment.text.length : 0) +
+    (lastSegment?.kind === "work" ? lastSegment.items.length * 1000 : 0) +
     (lastRun?.pendingInputs.length ?? 0) * 100;
   useLayoutEffect(() => {
     if (stickToBottom.current && runs.length > 0) {

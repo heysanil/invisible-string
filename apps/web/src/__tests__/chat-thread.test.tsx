@@ -48,8 +48,7 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
     runId: "run1",
     status: "succeeded",
     userMessage: "Summarize the issues",
-    block: null,
-    reply: null,
+    segments: [],
     pendingInputs: [],
     error: null,
     modelId: "deepseek/deepseek-v4-pro",
@@ -63,7 +62,13 @@ test("thread header shows agent, version and model chips", async () => {
   const view = renderWithRouter(
     <ThreadView
       header={HEADER}
-      runs={[baseRun({ reply: { text: "Done.", streaming: false } })]}
+      runs={[
+        baseRun({
+          segments: [
+            { kind: "speech", key: "say:t0:0", text: "Done.", streaming: false },
+          ],
+        }),
+      ]}
       isChatOrigin
       onRespond={() => {}}
       onSend={() => {}}
@@ -283,7 +288,12 @@ test("a failed run renders an error banner", () => {
 test("a streaming reply renders markdown with a caret", () => {
   const view = render(
     <RunMessage
-      run={baseRun({ status: "running", reply: { text: "We're **live**", streaming: true } })}
+      run={baseRun({
+        status: "running",
+        segments: [
+          { kind: "speech", key: "say:t0:0", text: "We're **live**", streaming: true },
+        ],
+      })}
       isChatOrigin
       onRespond={() => {}}
     />,
@@ -310,7 +320,14 @@ test("a stopped run reads as a user decision, never as a failure", () => {
       run={baseRun({
         status: "canceled",
         canceled: true,
-        reply: { text: "I pulled 142 open issues", streaming: false },
+        segments: [
+          {
+            kind: "speech",
+            key: "say:t0:0",
+            text: "I pulled 142 open issues",
+            streaming: false,
+          },
+        ],
       })}
       isChatOrigin
       onRespond={() => {}}

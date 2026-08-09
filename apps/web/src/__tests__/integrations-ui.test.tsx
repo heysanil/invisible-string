@@ -128,8 +128,7 @@ function runningRunView(runId: string): RunView {
     runId,
     status: "running",
     userMessage: "do the thing",
-    block: null,
-    reply: null,
+    segments: [],
     pendingInputs: [],
     error: null,
     modelId: null,
@@ -156,7 +155,11 @@ test("RunMessage renders a Stop button on an active run and fires onCancel", () 
 test("RunMessage shows no Stop button on a settled run", () => {
   const view = renderWithProviders(
     <RunMessage
-      run={{ ...runningRunView("run_2"), status: "succeeded", reply: { text: "done", streaming: false } }}
+      run={{
+        ...runningRunView("run_2"),
+        status: "succeeded",
+        segments: [{ kind: "speech", key: "say:t0:0", text: "done", streaming: false }],
+      }}
       isChatOrigin
       onRespond={() => {}}
       onCancel={() => {}}

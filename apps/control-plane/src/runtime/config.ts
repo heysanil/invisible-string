@@ -127,6 +127,12 @@ export interface RuntimeConfig {
    */
   meilisearchUrl?: string;
   meilisearchMasterKey?: string;
+  /**
+   * Registry→Meilisearch sync cadence (REGISTRY_SYNC_INTERVAL_MS, default
+   * 6 h): how often the ETL mirrors the official MCP registry into the
+   * search index. Only consulted when the Meilisearch client exists.
+   */
+  registrySyncIntervalMs: number;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -216,6 +222,13 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     120_000,
     problems,
   );
+  const registrySyncIntervalMs = parsePositiveInt(
+    env.REGISTRY_SYNC_INTERVAL_MS,
+    "REGISTRY_SYNC_INTERVAL_MS",
+    // Keep in sync with search/registry-sync.ts DEFAULT_REGISTRY_SYNC_INTERVAL_MS.
+    21_600_000,
+    problems,
+  );
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -256,6 +269,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     workerAllowedIds: parseWorkerAllowedIds(env.WORKER_ALLOWED_IDS),
     meilisearchUrl: env.MEILISEARCH_URL?.trim() || undefined,
     meilisearchMasterKey: env.MEILISEARCH_MASTER_KEY?.trim() || undefined,
+    registrySyncIntervalMs,
   };
 }
 

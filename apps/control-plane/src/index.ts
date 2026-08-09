@@ -52,9 +52,18 @@ import {
   createOpenRouterCatalog,
   type OpenRouterCatalog,
 } from "./resources/openrouter-catalog";
-import { createRegistryClient, type RegistryClient } from "./resources/registry";
+import {
+  createRegistryClient,
+  REGISTRY_HOST,
+  type RegistryClient,
+} from "./resources/registry";
 import type { ResourceDeps } from "./resources/common";
-import { createMeiliClient, ensureRegistryIndex } from "./search/meili";
+import {
+  createMeiliClient,
+  ensureRegistryIndex,
+  type MeiliClient,
+} from "./search/meili";
+import { createRegistrySync, type RegistrySync } from "./search/registry-sync";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
@@ -99,6 +108,12 @@ export interface AppStack {
   runtime: RuntimeDeps | null;
   /** Present when the runtime API is configured (triggers/integrations). */
   integrations: IntegrationDeps | null;
+  /**
+   * Meilisearch client for the registry-search mirror — present only when
+   * MEILISEARCH_URL + MEILISEARCH_MASTER_KEY are configured alongside the
+   * runtime. Null = registry search degraded, never fatal (spec §5).
+   */
+  meili: MeiliClient | null;
   close(): Promise<void>;
 }
 
@@ -419,11 +434,12 @@ export function createAppStack(
   // configured, and NEVER fatal — an unreachable Meilisearch degrades registry
   // search, nothing else (connectors redesign spec §5). The index bootstrap is
   // fire-and-forget; consumers find the index ready or degrade.
+  let meili: MeiliClient | null = null;
   if (
     runtimeDeps?.runtime.meilisearchUrl &&
     runtimeDeps.runtime.meilisearchMasterKey
   ) {
-    const meili = createMeiliClient({
+    meili = createMeiliClient({
       url: runtimeDeps.runtime.meilisearchUrl,
       apiKey: runtimeDeps.runtime.meilisearchMasterKey,
     });
@@ -524,6 +540,7 @@ export function createAppStack(
     logger,
     runtime: runtimeDeps,
     integrations: integrationDeps,
+    meili,
     close: async () => {
       await runtimeDeps?.tailers.stopAll();
       await dbHandle.close();
@@ -571,6 +588,7 @@ if (import.meta.main) {
   });
 
   let scheduleTicker: ScheduleTicker | null = null;
+  let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
     // they hold cap slots and hang SSE streams forever otherwise. The
@@ -613,6 +631,23 @@ if (import.meta.main) {
       tickMs: stack.runtime.runtime.scheduleTickMs,
     });
     scheduleTicker.start();
+    // Registry→Meilisearch sync ETL: mirrors the official MCP registry into
+    // the disposable search index (immediate full/incremental run, then
+    // REGISTRY_SYNC_INTERVAL_MS cadence). Only when the meili client exists —
+    // without it registry search is degraded and there is nothing to feed.
+    // Multi-instance safe via a single advisory try-lock.
+    if (stack.meili) {
+      registrySync = createRegistrySync({
+        db: stack.dbHandle.db,
+        meili: stack.meili,
+        // Same dev/CI-only override seam as the registry proxy client.
+        registryBaseUrl:
+          process.env.MCP_REGISTRY_BASE_URL?.trim() || REGISTRY_HOST,
+        logger: logger.child({ fields: { component: "registry-sync" } }),
+        intervalMs: stack.runtime.runtime.registrySyncIntervalMs,
+      });
+      registrySync.start();
+    }
   }
 
   // Graceful shutdown (SIGTERM/SIGINT): stop accepting new connections, drain
@@ -626,7 +661,7 @@ if (import.meta.main) {
       fields: { signal },
     });
     stack.app.server?.stop();
-    void Promise.resolve(scheduleTicker?.stop())
+    void Promise.all([scheduleTicker?.stop(), registrySync?.stop()])
       .then(() => stack.close())
       .catch((error) => {
         logger.error("control-plane.shutdown_failed", { err: error });

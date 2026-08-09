@@ -36,6 +36,7 @@ const RUNTIME: RuntimeConfig = {
   workerRequestTimeoutMs: 120_000,
   allowInsecureWorkerTransport: false,
   workerAuthMode: "shared-secret",
+  registrySyncIntervalMs: 21_600_000,
 };
 
 const HASH = "abcdef0123456789abcdef0123456789";

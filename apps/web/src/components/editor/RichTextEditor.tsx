@@ -68,6 +68,14 @@ export interface RichTextEditorHandle {
    * imperative write is the only reset that always takes.
    */
   setValue: (next: string) => void;
+  /**
+   * Append text to the end of the document, keeping what is already there.
+   *
+   * The non-destructive counterpart to `setValue`: a queued message handed
+   * back after a failed flush must never overwrite a draft the user has since
+   * started typing. Separated by a blank line so both stay their own paragraph.
+   */
+  append: (text: string) => void;
   focus: () => void;
 }
 
@@ -244,6 +252,14 @@ export const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorPro
             timerRef.current = null;
           }
           applyExternalValue(next);
+        },
+        append: (text: string) => {
+          if (timerRef.current) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
+          }
+          const current = isLive(editor) ? editor.getMarkdown() : lastValueRef.current;
+          applyExternalValue(current.trim().length === 0 ? text : `${current}\n\n${text}`);
         },
         focus: () => {
           if (!isLive(editor)) return;

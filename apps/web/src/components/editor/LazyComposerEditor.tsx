@@ -62,6 +62,10 @@ export function LazyComposerEditor({ ref, ...props }: LazyComposerEditorProps) {
   const proxy = useRef<RichTextEditorHandle>({
     flush: () => real.current?.flush() ?? "",
     setValue: (next) => real.current?.setValue(next),
+    // Dropped before the chunk resolves, and that is correct: with no
+    // document to append to, the caller's `value` prop is what seeds the
+    // editor when it finally mounts.
+    append: (text) => real.current?.append(text),
     focus: () => {
       if (real.current) real.current.focus();
       else pendingFocus.current = true;

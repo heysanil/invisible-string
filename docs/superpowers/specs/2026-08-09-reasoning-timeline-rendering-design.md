@@ -42,7 +42,7 @@ Symptom 3 has a second, independent cause. `message.appended` carries only `mess
  *  is not a distinction the reader needs drawn for them. */
 export interface SpeechSegment {
   kind: "speech";
-  key: string;              // `say:${turnId}:${stepIndex}`
+  key: string;              // `say:${turnId}:${stepIndex}` (+ `#n`, see §2.3)
   text: string;
   streaming: boolean;       // see §2.4
 }
@@ -94,15 +94,22 @@ export interface ToolItem {
 
 Events used to build timeline keys — `reasoning.*`, `message.appended`/`completed`, `actions.requested`, `action.*`, `input.requested` — all carry `(turnId, stepIndex, sequence)`. (Turn- and session-level events like `turn.*`, `context.cleared` and `compaction.*` do not, but they are never timeline items.) `stepIndex` is per-turn, so every key embeds `turnId` and multi-turn runs cannot collide.
 
-A thought's identity is `${turnId}:${stepIndex}`:
+**`(turnId, stepIndex)` is NOT unique for either reasoning or messages.** This was read out of eve's emitter — `eve@0.31.3`, `dist/src/harness/emission.js`, `consumeStreamContent` — and recorded as `spike/REPORT.md` findings 30–33. The emitter holds one reasoning accumulator `u`; a `text-delta` seals the current block (`emit reasoning.completed`) and **resets `u` to empty**. So a model that interleaves thinking (reason → speak → reason inside one model call) emits **two `reasoning.completed` events at the same `turnId` *and* `stepIndex`**, the second `reasoningSoFar` restarting from empty. `sequence` does not disambiguate — it is the turn's sequence, constant within the turn.
 
-- `reasoning.appended` → upsert that key, `text = reasoningSoFar`.
-- `reasoning.completed` → same key, `text = reasoning`, and **seal it**; `seconds` = the span between that key's first and last frame `at`, rounded, floored at 1.
-- A `reasoning.appended` arriving for an **already-sealed** key opens a *new* item at `${turnId}:${stepIndex}#2` (then `#3`, …).
+A plain upsert would let the second block overwrite the first, **reproducing symptom 1 one level down**, and in the shorter direction. So the ordinal is required:
 
-That last rule is the difference between "exact" and "assumed". `reasoning.appended`/`reasoning.completed` are **DOCS-DERIVED, never live-observed** (`eve-events.ts:28-32`, `:515-538`) — the spike has never captured one, and the AGENTS.md "wire probe" is request-side, not stream-side. If a model interleaves thinking within one step (reason → text → reason, all at one `stepIndex`), and if `reasoningSoFar` turns out to be per-block rather than per-step-cumulative, a plain upsert would overwrite the first pass — reproducing symptom 1 one level down. The ordinal suffix costs nothing when eve is one-pass-per-step and prevents that entirely.
+- `reasoning.appended` → upsert `${turnId}:${stepIndex}`, `text = reasoningSoFar`.
+- `reasoning.completed` → same key, `text = reasoning`, **seal it**; `seconds` = the span between that key's first and last frame `at`, rounded, floored at 1.
+- `reasoning.appended` for an **already-sealed** key opens a new item at `${turnId}:${stepIndex}#2` (then `#3`, …).
 
-> **Pre-implementation task:** capture a real reasoning stream through the gated spike lane (`SPIKE_EVE_BUILD=1`) and record the observed shapes in `spike/REPORT.md`. Build to the spec regardless — the ordinal rule is safe either way — but the fixtures in §5 encode assumptions until this exists.
+The ordinal also resolves a segment-key collision the walk would otherwise hit: text closes the work segment, so the second reasoning block opens a *new* work segment — which without the suffix would be keyed `work:t0:0` exactly like the first.
+
+Two consequences of finding 33 worth building to:
+
+- **A tool call does not split a reasoning block; only text does.** `reason → tool → reason` at one step is ONE block.
+- Its `reasoning.completed` is emitted at **end of stream**, i.e. *after* that step's `actions.requested` and `action.result`. A thought therefore stays unsealed (`Thinking`, no duration) until the step ends — correct, but later than a "seal on the next tool call" heuristic would guess. Do not add such a heuristic.
+
+> **Residual:** these shapes are read from the shipped emitter, not captured off a live model — no reasoning-capable keyed run has been recorded, and there is no `.openrouter-key` in the tree. The emitter is authoritative for what eve *sends*; what remains unobserved is only which of these branches a given provider actually exercises. The design is correct under all of them.
 
 ### 2.2 The walk
 
@@ -119,7 +126,11 @@ The global-lookup rule is load-bearing, not an optimization. Updates legitimatel
 
 ### 2.3 Speech
 
+**Assistant messages need the same ordinal, for the same reason** (finding 31). `flushCurrentMessage` emits `message.completed({finishReason: "tool-calls"})` and then resets its accumulator `d`, and it fires on *every* tool request while `d` is non-empty — so a step that speaks, calls a tool, speaks again and calls another tool emits **two `message.completed` at one `(turnId, stepIndex)`**, each `messageSoFar` restarting from empty. Speech keys are `say:${turnId}:${stepIndex}`, then `#2`, `#3`, … once the prior key has completed.
+
 `message.appended` streams into a speech segment immediately; `message.completed` settles the same key. A `message.completed` with **no prior `message.appended`** still creates the segment (the `clearedRun` fixture at `fixtures.ts:272` is exactly this). A **blank or null** `message` creates nothing and therefore does not close the current work segment.
+
+**Narration always precedes its tool call in `seq` order** (finding 32): `emitActionRequest` flushes the pending message *before* emitting `actions.requested`. The walk needs no lookahead, and a fixture asserting the opposite order would be wrong.
 
 **The text never moves.** `finishReason` decides only whether more segments follow — a fact about what comes *after*, never a correction to what already rendered. Symptom 3 is designed out rather than mitigated.
 
@@ -227,19 +238,21 @@ Nothing outside `apps/web` reads `RunView`. No control-plane, worker, compiler, 
 Reducer tests (`run-view.test.ts`) are the primary guard, because the bugs are reducer bugs:
 
 1. **Two reasoning passes in different `stepIndex` produce two thought items** with both texts intact — the direct regression test for symptom 1.
-2. **A re-`appended` sealed key opens `#2`** rather than overwriting (§2.1).
-3. **Interleaving is preserved**: `reason → tool → reason → tool` yields items in exactly that order.
-4. **Mid-run narration segments the run**: text with `finishReason: "tool-calls"` followed by more tools yields `work, speech, work` — symptom 2.
-5. **Streaming text never relocates**: a speech segment's key is stable from first `message.appended` through `message.completed`, whichever `finishReason` lands — symptom 3.
-6. **`M steps` equals `items.length`** across a mixed segment.
-7. **A retry / late `action.result` for a call in a closed segment updates it in place** — no duplicate item, no second segment with the same key (§2.2).
-8. **`action.partial` after `action.result` does not demote the item** — the carried-forward :319-334 guard.
-9. **Cancellation freezes the rail**: pending/awaiting tools go `canceled`, thoughts keep their text, no failure state.
-10. **Cancel mid-thought and cancel mid-speech** both leave the text rendered with `streaming === false` — the carried-forward :205 invariant, extended to thoughts.
-11. **A `failed` run replayed with an unterminated append** renders `streaming === false` (no eternal caret in history).
-12. **A run parked on `waiting`** has `active === false` and `waiting === true` on its last segment — no perpetual spinner.
-13. **A step emitting both reasoning and text** yields two segments with distinct keys (`work:t0:0`, `say:t0:0`) — the key-collision guard.
-14. **A blank/null `message.completed`** creates no speech segment and does not split the surrounding work segment; a bare non-blank one (no prior append) does create one.
+2. **A re-`appended` sealed reasoning key opens `#2`** rather than overwriting — finding 30's interleaving case (`reason → text → reason` at ONE `stepIndex`), which must yield two thoughts, two work segments with distinct keys, and no lost text.
+3. **Two `message.completed` at one `(turnId, stepIndex)`** yield two speech segments, not one overwritten — finding 31.
+4. **`reason → tool → reason` at one step is ONE thought**, sealed by the single trailing `reasoning.completed` that arrives *after* the step's tool events — finding 33. Guards against re-adding a seal-on-next-tool heuristic.
+5. **Interleaving is preserved**: `reason → tool → reason → tool` yields items in exactly that order.
+6. **Mid-run narration segments the run**: text with `finishReason: "tool-calls"` followed by more tools yields `work, speech, work` — symptom 2. Frames must be ordered per finding 32: the `message.completed` precedes its `actions.requested`.
+7. **Streaming text never relocates**: a speech segment's key is stable from first `message.appended` through `message.completed`, whichever `finishReason` lands — symptom 3.
+8. **`M steps` equals `items.length`** across a mixed segment.
+9. **A retry / late `action.result` for a call in a closed segment updates it in place** — no duplicate item, no second segment with the same key (§2.2).
+10. **`action.partial` after `action.result` does not demote the item** — the carried-forward :319-334 guard.
+11. **Cancellation freezes the rail**: pending/awaiting tools go `canceled`, thoughts keep their text, no failure state.
+12. **Cancel mid-thought and cancel mid-speech** both leave the text rendered with `streaming === false` — the carried-forward :205 invariant, extended to thoughts.
+13. **A `failed` run replayed with an unterminated append** renders `streaming === false` (no eternal caret in history).
+14. **A run parked on `waiting`** has `active === false` and `waiting === true` on its last segment — no perpetual spinner.
+15. **A step emitting one reasoning block and one message** yields two segments with distinct keys (`work:t0:0`, `say:t0:0`) — the cross-kind collision guard, distinct from case 2's same-kind one.
+16. **A blank/null `message.completed`** creates no speech segment and does not split the surrounding work segment; a bare non-blank one (no prior append) does create one.
 
 Component tests: auto-fold on `sealed` and on `active → false`; default-collapsed on history mount; manual toggle survives subsequent frames; `prefers-reduced-motion` zeroes the fold and item-entry transitions.
 

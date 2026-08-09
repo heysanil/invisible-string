@@ -23,6 +23,7 @@ import {
   type SpeechSegment,
   type ThoughtItem,
   type ToolItem,
+  type WorkSegment,
 } from "../lib/chat/run-view";
 
 const FIXTURE_DIR = new URL(
@@ -498,6 +499,62 @@ test("action.partial previews live tool output without settling the step", () =>
   const step = toolItems(view)[0]!;
   expect(step.state).toBe("pending");
   expect(step.resultPreview).toBe("12 pages so far");
+});
+
+// ── active, waiting, and streaming derivations ──────────────────────────────
+
+test("a run parked on approval is NOT active and shows no live counter", async () => {
+  // `waiting` is UNSETTLED (api.ts isRunSettledStatus = succeeded|failed|canceled),
+  // so deriving `active` from settledness alone would spin for as long as the
+  // human takes to answer.
+  const frames = await loadFrames("mocked-parked-events.ndjson");
+  const view = reduceRunView(runRow("waiting"), addFrames(EMPTY_FRAME_STORE, frames), "waiting");
+  const work = view.segments.filter((s) => s.kind === "work") as WorkSegment[];
+  const last = work[work.length - 1]!;
+  expect(last.active).toBe(false);
+  expect(last.waiting).toBe(true);
+  expect(view.pendingInputs.length).toBeGreaterThan(0);
+});
+
+test("a cancelled turn freezes partial speech AND partial thought", () => {
+  // Cancellation emits NO message.completed / reasoning.completed, so clearing
+  // `streaming` only on completion would blink forever. run-view.test.ts:205
+  // is the original invariant; this extends it to thoughts.
+  const view = reduceRunView(runRow("running"), addFrames(EMPTY_FRAME_STORE, [
+    think(0, "t0", 0, "Mid thou"),
+    say(1, "t0", 1, "Half a sentence"),
+    frame(2, { type: "turn.cancelled", data: {} } as EveStreamEvent),
+  ]), "running");
+  expect(view.canceled).toBe(true);
+  const thought = workItems(view)[0] as ThoughtItem;
+  expect(thought.text).toBe("Mid thou");
+  expect(thought.streaming).toBe(false);
+  const speech = view.segments.find((s) => s.kind === "speech") as SpeechSegment;
+  expect(speech.text).toBe("Half a sentence");
+  expect(speech.streaming).toBe(false);
+});
+
+test("a failed run replayed with an unterminated append shows no caret", () => {
+  const view = reduceRunView(runRow("failed"), addFrames(EMPTY_FRAME_STORE, [
+    say(0, "t0", 0, "Cut off mid-"),
+  ]));
+  expect((view.segments[0] as SpeechSegment).streaming).toBe(false);
+});
+
+test("only the LAST work segment can be active; earlier ones are sealed", () => {
+  const view = reduceRunView(runRow("running"), addFrames(EMPTY_FRAME_STORE, [
+    toolCall(0, "t0", 0, "c1", "first"),
+    toolDone(1, "t0", 0, "c1", "first", "ok"),
+    say(2, "t0", 0, "Interim"),
+    said(3, "t0", 0, "Interim", "tool-calls"),
+    toolCall(4, "t0", 1, "c2", "second"),
+  ]), "running");
+  const work = view.segments.filter((s) => s.kind === "work") as WorkSegment[];
+  expect(work[0]!.sealed).toBe(true);
+  expect(work[0]!.active).toBe(false);
+  expect(work[1]!.sealed).toBe(false);
+  expect(work[1]!.active).toBe(true);
+  expect(work[1]!.startedAt).not.toBeNull();
 });
 
 // ── HITL kind discriminator ─────────────────────────────────────────────────

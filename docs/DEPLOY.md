@@ -53,7 +53,7 @@ Images are pulled from GHCR, pinned by `IMAGE_TAG`:
 - A public domain pointed at the host (or at the hoster's proxy).
 - `/var/run/docker.sock` available to the `worker` container — eve session
   sandboxes launch as sibling containers on the host daemon.
-- The GHCR images published by the `release` workflow (push a `v*` tag), or use
+- The GHCR images published by the `release` workflow (see §10), or use
   the build override (§6) to build locally.
 
 ---

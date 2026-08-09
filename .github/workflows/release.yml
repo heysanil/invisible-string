@@ -2,14 +2,76 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
+# contents: write — push the release tag and create the GitHub Release.
+# pull-requests: write — open/update the "Version Packages" PR.
 permissions:
-  contents: read
+  contents: write
   packages: write
+  pull-requests: write
+
+concurrency: release-${{ github.ref }}
 
 jobs:
+  # Maintains the "Version Packages" PR; when that PR merges, tags the release
+  # and cuts its GitHub Release. Tag and image build happen in ONE run on
+  # purpose: a tag pushed with GITHUB_TOKEN cannot trigger another workflow, so
+  # splitting them would need a PAT.
+  version:
+    name: Version and tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    timeout-minutes: 15
+    outputs:
+      released: ${{ steps.tag.outputs.released }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      # fetch-depth: 0 also fetches tags, which release:tag needs to decide
+      # whether this version was already released.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Installs the pinned host toolchain from mise.toml (bun, node, …) and
+      # puts mise's shims on PATH, so the bare `bun` calls below are those
+      # exact versions — no `mise exec` wrapper needed.
+      - uses: jdx/mise-action@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # No `publish:` input — nothing here is published to npm, so the action's
+      # only job is the Version PR. Requires "Allow GitHub Actions to create and
+      # approve pull requests" in repo settings.
+      - name: Create or update the Version Packages PR
+        uses: changesets/action@v1
+        with:
+          version: bun run release:version
+          commit: "chore(release): version packages"
+          title: "chore(release): version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and release
+        id: tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bun run release:tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   images:
+    name: Build and push images
+    needs: [version]
+    # `!cancelled()` (not `always()`) so the tag-push path still runs when
+    # `version` is SKIPPED, while a cancelled run does not publish images, and a
+    # FAILED version job leaves both disjuncts false so this correctly skips.
+    # The ${{ }} wrapper is mandatory: a bare leading `!` is a YAML tag
+    # indicator and the file would not parse.
+    if: ${{ !cancelled() && (needs.version.outputs.released == 'true' || startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: nscloud-ubuntu-24.04-amd64-8x16
     timeout-minutes: 30
     strategy:
@@ -31,11 +93,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # On the release path the ref is `main`, so github.ref_name would publish
+      # `…-web:main`. A skipped job's outputs are empty strings, and '' is
+      # falsy, so the fallback resolves correctly on the tag-push path.
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ghcr.io/heysanil/invisible-string-${{ matrix.name }}:${{ github.ref_name }}
+            ghcr.io/heysanil/invisible-string-${{ matrix.name }}:${{ needs.version.outputs.version || github.ref_name }}
             ghcr.io/heysanil/invisible-string-${{ matrix.name }}:${{ github.sha }}

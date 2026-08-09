@@ -181,7 +181,7 @@ test("copilot edit: apply one suggestion, dismiss the other — the dismissal ne
     "explicit approval",
   );
   await instructionsCard.getByRole("button", { name: "Apply" }).click();
-  // Applied through the builder controller: the CodeMirror editor shows it.
+  // Applied through the builder controller: the rich editor shows it.
   await expect(
     page.getByRole("textbox", { name: "Instructions editor" }),
   ).toContainText("explicit approval");

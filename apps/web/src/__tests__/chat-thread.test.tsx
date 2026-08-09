@@ -331,7 +331,6 @@ test("a stopped run reads as a user decision, never as a failure", () => {
       })}
       isChatOrigin
       onRespond={() => {}}
-      onCancel={() => {}}
     />,
   );
   // No error banner: eve emits NO failure event for a cancelled turn.
@@ -339,38 +338,31 @@ test("a stopped run reads as a user decision, never as a failure", () => {
   expect(view.getByText(/You stopped this run/)).toBeTruthy();
   // Whatever streamed before the stop stays readable.
   expect(view.getByText(/142 open issues/)).toBeTruthy();
-  // Nothing left to stop.
+});
+
+test("the transcript never offers Stop — it lives on the composer now", () => {
+  // Virtualization can scroll a transcript button out of the DOM entirely
+  // while a run streams; the composer is always mounted.
+  const view = render(
+    <RunMessage run={baseRun({ status: "running" })} isChatOrigin onRespond={() => {}} />,
+  );
   expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
 });
 
-test("the Stop button hides the instant turn.cancelled lands, before the status frame", () => {
-  // `canceled` is derived from the event stream, so it flips a beat ahead of
-  // the run_status frame — the row must settle immediately, not linger.
-  const view = render(
-    <RunMessage
-      run={baseRun({ status: "running", canceled: true })}
+test("ThreadView puts Stop on the composer while a run is stoppable", async () => {
+  const onStop = mock(() => {});
+  const view = renderWithRouter(
+    <ThreadView
+      header={HEADER}
+      runs={[baseRun({ status: "running" })]}
       isChatOrigin
       onRespond={() => {}}
-      onCancel={() => {}}
+      onStop={onStop}
+      onSend={() => {}}
     />,
   );
-  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
-  expect(view.getByText(/You stopped this run/)).toBeTruthy();
-});
-
-test("Stop shows a busy state while the request is in flight", () => {
-  const view = render(
-    <RunMessage
-      run={baseRun({ status: "running" })}
-      isChatOrigin
-      onRespond={() => {}}
-      onCancel={() => {}}
-      canceling
-    />,
-  );
-  const button = view.getByRole("button", { name: /Stopping/ });
-  expect(button.getAttribute("aria-busy")).toBe("true");
-  expect((button as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(await view.findByRole("button", { name: "Stop" }));
+  expect(onStop).toHaveBeenCalledTimes(1);
 });
 
 // ── session-actions menu (context controls) ─────────────────────────────────

@@ -20,10 +20,10 @@ export interface ThreadViewProps {
   runs: readonly RunView[];
   isChatOrigin: boolean;
   onRespond: (runId: string, response: RunInputRequest) => void;
-  /** Stop an in-flight run (stable identity). */
-  onCancel?: (runId: string) => void;
-  /** The run whose stop request is in flight (disables its button). */
-  cancelingRunId?: string | null;
+  /** Stop whichever run holds the session's slot. Rendered on the composer. */
+  onStop?: () => void;
+  /** True while the stop request is in flight. */
+  stopping?: boolean;
   /**
    * A clear/compact that just landed. eve emits `context.cleared` /
    * `compaction.*` on the SESSION stream, which nothing is tailing when the
@@ -50,8 +50,8 @@ export function ThreadView({
   runs,
   isChatOrigin,
   onRespond,
-  onCancel,
-  cancelingRunId,
+  onStop,
+  stopping,
   contextMarker,
   pendingInput,
   inputError,
@@ -144,8 +144,6 @@ export function ThreadView({
                     run={run}
                     isChatOrigin={isChatOrigin}
                     onRespond={onRespond}
-                    onCancel={onCancel}
-                    canceling={cancelingRunId === run.runId}
                     pendingInput={
                       pendingInput?.runId === run.runId ? pendingInput : null
                     }
@@ -172,6 +170,8 @@ export function ThreadView({
         <Composer
           onSend={onSend}
           disabledReason={composerDisabledReason}
+          onStop={onStop}
+          stopping={stopping}
           sending={sending}
           initialValue={failedDraft}
         />

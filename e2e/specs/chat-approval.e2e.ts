@@ -76,9 +76,12 @@ test("a run parks on an inline HITL card, then responding resumes it; Stop and t
   await card.getByRole("textbox", { name: "Your response" }).fill("Yes, go ahead.");
   await card.getByRole("button", { name: "Send" }).click();
 
-  // The card is dismissed and the run completes (composer re-enabled).
+  // The card is dismissed and the run completes. The composer never disables
+  // any more, so the completion signal is the SUBMIT BUTTON'S NAME: it reads
+  // "Queue message" (or is replaced by Stop) exactly while the session's run
+  // slot is held, and returns to "Send message" when the slot frees.
   await expect(card).toBeHidden({ timeout: RUN_TIMEOUT_MS });
-  await expect(page.getByRole("textbox", { name: "Message" })).toBeEnabled({
+  await expect(page.getByRole("button", { name: "Send message" })).toBeVisible({
     timeout: RUN_TIMEOUT_MS,
   });
 
@@ -102,8 +105,9 @@ test("a run parks on an inline HITL card, then responding resumes it; Stop and t
   // The stale request is retired with the turn — answering it would post a
   // dead requestId that eve replays to the model as ordinary text.
   await expect(card).toBeHidden();
-  // Cancellation leaves the SESSION usable; the composer comes back.
-  await expect(page.getByRole("textbox", { name: "Message" })).toBeEnabled({
+  // Cancellation leaves the SESSION usable: the slot frees, so the submit
+  // button goes back to being a send.
+  await expect(page.getByRole("button", { name: "Send message" })).toBeVisible({
     timeout: RUN_TIMEOUT_MS,
   });
 

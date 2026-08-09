@@ -2,9 +2,9 @@
  * One run rendered in the thread: the inbound user/trigger message bubble
  * (ink), then the run's segments IN THE ORDER THE AGENT PRODUCED THEM — a
  * work segment as a collapsible rail box, a speech segment as markdown prose
- * — then inline HITL cards, a failure banner, and the Stop control. Mid-run
- * narration therefore renders where it happened instead of being hoisted
- * below every tool call.
+ * — then inline HITL cards and a failure banner. Mid-run narration therefore
+ * renders where it happened instead of being hoisted below every tool call.
+ * The Stop control lives on the COMPOSER (2026-08-09 composer spec), not here.
  *
  * STOP IS NOT A FAILURE. eve 0.31 answers a stop with `turn.cancelled` →
  * `session.waiting`, never a failure event, so a stopped run renders in
@@ -12,12 +12,11 @@
  * produced left intact and readable.
  */
 import { memo, useCallback } from "react";
-import { AlertCircle, Ban, Square } from "lucide-react";
+import { AlertCircle, Ban } from "lucide-react";
 
 import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
-import { Button } from "../ui/Button";
 import { ApprovalCard } from "./ApprovalCard";
 import { ContextDivider } from "./ContextDivider";
 import { Markdown } from "./Markdown";
@@ -29,10 +28,6 @@ export interface RunMessageProps {
   isChatOrigin: boolean;
   /** Stable across renders so memoized rows bail out (runId is passed back). */
   onRespond: (runId: string, response: RunInputRequest) => void;
-  /** Stop the in-flight turn (queued/running/waiting). Stable identity. */
-  onCancel?: (runId: string) => void;
-  /** True while this run's stop request is in flight (disables the button). */
-  canceling?: boolean;
   /** requestId → the response being submitted (optimistic). */
   pendingInput?: { requestId: string; optionId?: string; text?: string } | null;
   inputError?: string | null;
@@ -42,31 +37,16 @@ function RunMessageImpl({
   run,
   isChatOrigin,
   onRespond,
-  onCancel,
-  canceling,
   pendingInput,
   inputError,
 }: RunMessageProps) {
   // `run.canceled` comes off the event stream, so it flips a beat BEFORE the
-  // run_status frame — the spinner, caret and Stop button all settle together
-  // rather than lingering for a round trip.
+  // run_status frame — the spinner and caret settle together rather than
+  // lingering for a round trip.
   const isActive = !run.canceled && (run.status === "queued" || run.status === "running");
-  // A parked (waiting) run can also be stopped — it holds the session's one
-  // run slot until it is answered. The ONE exception is a session-limit
-  // prompt: its own "Stop" option already cancels this turn through the same
-  // path, and two adjacent Stops that mean the same thing is worse than one.
-  const onLimitPrompt = run.pendingInputs.some(
-    (input) => input.kind === "session-limit",
-  );
-  const cancelable =
-    !run.canceled && !onLimitPrompt && (isActive || run.status === "waiting");
   const handleRespond = useCallback(
     (response: RunInputRequest) => onRespond(run.runId, response),
     [onRespond, run.runId],
-  );
-  const handleCancel = useCallback(
-    () => onCancel?.(run.runId),
-    [onCancel, run.runId],
   );
   return (
     <div className="flex flex-col gap-1.5">
@@ -170,15 +150,6 @@ function RunMessageImpl({
         {run.segments.length === 0 && run.pendingInputs.length === 0 && run.error === null &&
         isActive ? (
           <p className="py-1 text-[12.5px] text-ink-4">Thinking…</p>
-        ) : null}
-
-        {onCancel && cancelable ? (
-          <div className="pt-1">
-            <Button variant="ghost" size="sm" loading={canceling} onClick={handleCancel}>
-              {!canceling ? <Square size={11} strokeWidth={2.6} aria-hidden="true" /> : null}
-              {canceling ? "Stopping…" : "Stop"}
-            </Button>
-          </div>
         ) : null}
       </div>
     </div>

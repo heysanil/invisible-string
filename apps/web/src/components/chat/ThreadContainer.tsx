@@ -171,6 +171,15 @@ export function ThreadContainer({
   const slotHeld = runViews.some(
     (run) => !run.canceled && (isActiveStatus(run.status) || run.status === "waiting"),
   );
+  // The slot holder, read for its run id. Same predicate as `slotHeld` — only
+  // one run can hold the slot, so "the one to stop" is unambiguous.
+  const stoppableRunId =
+    [...runViews]
+      .reverse()
+      .find(
+        (run) =>
+          !run.canceled && (isActiveStatus(run.status) || run.status === "waiting"),
+      )?.runId ?? null;
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
 
@@ -216,18 +225,16 @@ export function ThreadContainer({
   const postInputMutate = postInput.mutate;
   const reopenStream = streams.reopen;
   const cancelMutate = cancelRun.mutate;
-  const onCancel = useCallback(
-    (runId: string) => {
-      setBusyNotice(null);
-      cancelMutate(
-        { runId },
-        {
-          onError: (mutationError) => setBusyNotice(errorMessage(mutationError)),
-        },
-      );
-    },
-    [cancelMutate],
-  );
+  const onStop = useCallback(() => {
+    if (stoppableRunId === null) return;
+    setBusyNotice(null);
+    cancelMutate(
+      { runId: stoppableRunId },
+      {
+        onError: (mutationError) => setBusyNotice(errorMessage(mutationError)),
+      },
+    );
+  }, [cancelMutate, stoppableRunId]);
   const respond = useCallback(
     (runId: string, response: RunInputRequest) => {
       setInputError(null);
@@ -412,8 +419,8 @@ export function ThreadContainer({
         runs={runViews}
         isChatOrigin={session.origin === "chat"}
         onRespond={respond}
-        onCancel={onCancel}
-        cancelingRunId={cancelRun.isPending ? (cancelRun.variables?.runId ?? null) : null}
+        onStop={stoppableRunId !== null ? onStop : undefined}
+        stopping={cancelRun.isPending}
         // Never two dividers for one clear. The optimistic marker exists for
         // a clear performed while the session is IDLE, where no run is
         // tailing and eve's `context.cleared` reaches nobody. If the newest

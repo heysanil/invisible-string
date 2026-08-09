@@ -12,7 +12,7 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, fireEvent, within } from "@testing-library/react";
+import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { renderWithRouter } from "../test/router";
 
@@ -127,11 +127,14 @@ test("the session-limit fixture renders its own card, not a tool approval", asyn
 
 test("fixture mode can actually stop a running run (backend-free preview)", async () => {
   const view = renderWithRouter(<FixtureChatShell />);
-  // The first session is the live streaming run.
+  // The first session is the live streaming run. Stop now lives on the
+  // composer, so it is reachable without scrolling the virtualized thread.
   const stop = await view.findByRole("button", { name: "Stop" });
   fireEvent.click(stop);
   expect(view.getByText(/You stopped this run/)).toBeTruthy();
-  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  await waitFor(() =>
+    expect(view.queryByRole("button", { name: "Stop" })).toBeNull(),
+  );
 });
 
 test("fixture mode can apply a context control from the session menu", async () => {

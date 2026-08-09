@@ -197,7 +197,15 @@ function FixtureThread({
       runs={runViews}
       isChatOrigin={summary.origin === "chat"}
       onRespond={(_runId, response) => onAnswer(response.requestId)}
-      onCancel={(runId) => setStopped((prev) => new Set(prev).add(runId))}
+      onStop={
+        lastRun !== undefined &&
+        !lastRun.canceled &&
+        (lastRun.status === "queued" ||
+          lastRun.status === "running" ||
+          lastRun.status === "waiting")
+          ? () => setStopped((prev) => new Set(prev).add(lastRun.runId))
+          : undefined
+      }
       contextMarker={contextMarker}
       onSend={() => undefined}
       composerDisabledReason={

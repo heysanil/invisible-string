@@ -156,10 +156,63 @@ describe("agent hash properties", () => {
     );
   });
 
+  test("an ABSENT definition effort hashes like an explicit undefined", () => {
+    // Inheriting is the absence of a value, not a value — canonicalJson drops
+    // undefined object entries, so a draft that never wrote the key and one
+    // that cleared it must land on the same artifact.
+    const { definition: inheriting, deps: inheritingDeps } = basicFixture;
+    const cleared = {
+      ...inheriting,
+      model: { ...inheriting.model, reasoning: undefined },
+    } as typeof inheriting;
+    expect(computeAgentHash(cleared, inheritingDeps)).toBe(
+      computeAgentHash(inheriting, inheritingDeps),
+    );
+  });
+
+  test("an EXPLICIT definition effort differs from inheriting the same value", () => {
+    // The override is part of the published definition even when it happens
+    // to agree with the preset: it pins the effort against a later preset
+    // re-point, so the two are genuinely different agents.
+    const { definition: inheriting, deps: inheritingDeps } = basicFixture;
+    const pinned = {
+      ...inheriting,
+      model: {
+        ...inheriting.model,
+        reasoning: inheritingDeps.resolvedModel.reasoning,
+      },
+    } as typeof inheriting;
+    expect(computeAgentHash(pinned, inheritingDeps)).not.toBe(
+      computeAgentHash(inheriting, inheritingDeps),
+    );
+  });
+
+  test("IDENTICAL definitions resolved under different preset efforts hash differently", () => {
+    // The inheritance proof: nothing in the definition distinguishes these
+    // two agents — only the effort the control plane resolved from their
+    // presets does. If ResolvedModel.reasoning were not hashed, the second
+    // would cache-hit the first's artifact and silently run at its effort.
+    const { definition, deps } = basicFixture;
+    const quick: CompileDeps = {
+      ...deps,
+      resolvedModel: { ...deps.resolvedModel, reasoning: "low" },
+    };
+    expect(computeAgentHash(definition, quick)).not.toBe(
+      computeAgentHash(definition, deps),
+    );
+    expect(compile(definition, quick).hash).not.toBe(
+      compile(definition, deps).hash,
+    );
+  });
+
   test("provider flip changes the hash", () => {
     const flipped: CompileDeps = {
       ...basicFixture.deps,
-      resolvedModel: { provider: "anthropic", modelId: "claude-opus-4-8" },
+      resolvedModel: {
+        ...basicFixture.deps.resolvedModel,
+        provider: "anthropic",
+        modelId: "claude-opus-4-8",
+      },
     };
     expect(
       computeAgentHash(basicFixture.definition, flipped),

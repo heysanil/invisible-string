@@ -15,6 +15,7 @@
  */
 import {
   agentDefinitionSchema,
+  reasoningEffortSchema,
   type AgentDefinition,
 } from "@invisible-string/shared";
 
@@ -40,6 +41,8 @@ import type {
 } from "./types";
 
 const MODEL_PROVIDERS = new Set(["openrouter", "anthropic"]);
+/** The resolved effort is emitted VERBATIM into generated code — gate it. */
+const REASONING_EFFORTS = new Set<string>(reasoningEffortSchema.options);
 
 function assertSlug(kind: string, slug: string): void {
   if (!SLUG_PATTERN.test(slug)) {
@@ -62,6 +65,13 @@ function validateDeps(definition: AgentDefinition, deps: CompileDeps): void {
   if (deps.resolvedModel.modelId.trim().length === 0) {
     throw new CompileError("INVALID_DEPS", "resolvedModel.modelId is empty");
   }
+  if (!REASONING_EFFORTS.has(deps.resolvedModel.reasoning)) {
+    throw new CompileError(
+      "INVALID_DEPS",
+      `unsupported reasoning effort "${String(deps.resolvedModel.reasoning)}"`,
+      { reasoning: deps.resolvedModel.reasoning },
+    );
+  }
   assertSlug("workspace", deps.workspaceSlug);
   assertSlug("agent", deps.agentSlug);
 
@@ -78,6 +88,25 @@ function validateDeps(definition: AgentDefinition, deps: CompileDeps): void {
       {
         definitionModelId: definition.model.modelId,
         resolvedModelId: deps.resolvedModel.modelId,
+      },
+    );
+  }
+
+  // Same contract for the effort: `undefined` means INHERIT (the preset's
+  // effort, or `provider-default` behind a modelId override) and the control
+  // plane already resolved it, but an EXPLICIT effort in the definition must
+  // be the one that was resolved — otherwise the artifact would silently run
+  // at an effort the definition does not describe.
+  if (
+    definition.model.reasoning !== undefined &&
+    definition.model.reasoning !== deps.resolvedModel.reasoning
+  ) {
+    throw new CompileError(
+      "MODEL_MISMATCH",
+      `definition.model.reasoning "${definition.model.reasoning}" does not match deps.resolvedModel.reasoning "${deps.resolvedModel.reasoning}"`,
+      {
+        definitionReasoning: definition.model.reasoning,
+        resolvedReasoning: deps.resolvedModel.reasoning,
       },
     );
   }
@@ -335,7 +364,7 @@ export function compile(
   const files = new Map<string, string>();
   files.set("package.json", emitPackageJson(sortedDeps));
   files.set("tsconfig.json", emitTsconfig());
-  files.set("agent/agent.ts", emitAgentTs(sortedDeps, def.model.reasoning));
+  files.set("agent/agent.ts", emitAgentTs(sortedDeps));
   files.set("agent/instructions.md", rendered.markdown);
   files.set("agent/lib/platform-auth.ts", emitPlatformAuthLib(dev, hash));
   if (connections.some((connection) => connection.auth.kind !== "none")) {

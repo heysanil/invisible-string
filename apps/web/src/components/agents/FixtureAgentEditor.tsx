@@ -11,6 +11,7 @@ import { useEffect, useReducer, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type {
   ModelAllowlistEntryDto,
+  ModelCapabilityDto,
   ModelPresetDto,
   PublishAgentResponse,
 } from "@invisible-string/shared";
@@ -47,21 +48,38 @@ const FIXTURE_WORKSPACE_ID = "org_fixture";
 
 const NOW = "2026-07-09T09:00:00.000Z";
 
+// The seeded defaults: `balanced` and `quick` share a model and differ only
+// in effort — which is exactly why the effort lives on the preset.
 const FIXTURE_MODEL_PRESETS: readonly ModelPresetDto[] = [
-  { id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", slug: "powerful", provider: "openrouter", modelId: "z-ai/glm-5.2", createdAt: NOW, updatedAt: NOW },
-  { id: "aaaaaaaa-2222-4222-8222-aaaaaaaaaaaa", slug: "balanced", provider: "openrouter", modelId: "deepseek/deepseek-v4-pro", createdAt: NOW, updatedAt: NOW },
-  { id: "aaaaaaaa-3333-4333-8333-aaaaaaaaaaaa", slug: "quick", provider: "openrouter", modelId: "deepseek/deepseek-v4-flash", createdAt: NOW, updatedAt: NOW },
+  { id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", slug: "powerful", provider: "openrouter", modelId: "moonshotai/kimi-k3", reasoning: "max", createdAt: NOW, updatedAt: NOW },
+  { id: "aaaaaaaa-2222-4222-8222-aaaaaaaaaaaa", slug: "balanced", provider: "openrouter", modelId: "~deepseek/deepseek-v4-flash-latest", reasoning: "max", createdAt: NOW, updatedAt: NOW },
+  { id: "aaaaaaaa-3333-4333-8333-aaaaaaaaaaaa", slug: "quick", provider: "openrouter", modelId: "~deepseek/deepseek-v4-flash-latest", reasoning: "low", createdAt: NOW, updatedAt: NOW },
 ];
 
-const FIXTURE_ALLOWLIST: readonly ModelAllowlistEntryDto[] =
-  FIXTURE_MODEL_PRESETS.map((preset, index) => ({
-    id: `bbbbbbbb-000${index + 1}-4000-8000-bbbbbbbbbbbb`,
-    provider: preset.provider,
-    modelId: preset.modelId,
-    enabled: true,
-    createdAt: NOW,
-    updatedAt: NOW,
-  }));
+/** Deduped across presets, plus the model the Support triager overrides to. */
+const FIXTURE_ALLOWLIST: readonly ModelAllowlistEntryDto[] = [
+  "moonshotai/kimi-k3",
+  "~deepseek/deepseek-v4-flash-latest",
+  "deepseek/deepseek-v4-pro",
+].map((modelId, index) => ({
+  id: `bbbbbbbb-000${index + 1}-4000-8000-bbbbbbbbbbbb`,
+  provider: "openrouter" as const,
+  modelId,
+  enabled: true,
+  createdAt: NOW,
+  updatedAt: NOW,
+}));
+
+/**
+ * Catalog capabilities, DESCENDING like the live OpenRouter response — the
+ * selectors must sort them back through REASONING_ORDER. The third entry has
+ * no catalog row (`null` = unknown), so it falls back to the full vocabulary.
+ */
+const FIXTURE_MODEL_CAPABILITIES: readonly ModelCapabilityDto[] = [
+  { provider: "openrouter", modelId: "moonshotai/kimi-k3", supportedEfforts: ["max", "high", "low"], defaultEffort: "high", contextWindowTokens: 1_048_576 },
+  { provider: "openrouter", modelId: "~deepseek/deepseek-v4-flash-latest", supportedEfforts: ["max", "high", "low"], defaultEffort: "high", contextWindowTokens: 1_048_576 },
+  { provider: "openrouter", modelId: "deepseek/deepseek-v4-pro", supportedEfforts: null },
+];
 
 const FIXTURE_RESOURCES: ContextResources = (() => {
   const connections = FIXTURE_AGENT_CONNECTIONS.map((connection) => ({
@@ -228,6 +246,7 @@ function FixtureEditor({ fixture }: { fixture: FixtureAgent }) {
                 members={FIXTURE_MEMBERS}
                 modelPresets={FIXTURE_MODEL_PRESETS}
                 allowlist={FIXTURE_ALLOWLIST}
+                capabilities={FIXTURE_MODEL_CAPABILITIES}
                 registerSection={registerSection}
               />
             </div>

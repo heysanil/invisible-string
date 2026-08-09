@@ -50,6 +50,13 @@
       "when": 1783743682495,
       "tag": "0006_groovy_scream",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786231073275,
+      "tag": "0007_tough_famine",
+      "breakpoints": true
     }
   ]
 }

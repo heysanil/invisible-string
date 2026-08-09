@@ -14,6 +14,7 @@ import {
   type AgentDefinition,
   type AgentModel,
   type CopilotProposal,
+  type ReasoningEffort,
 } from "@invisible-string/shared";
 
 import type { AgentEditorAction, AgentSection } from "../agents/model";
@@ -69,7 +70,12 @@ export function agentProposalToActions(
       if (preset !== undefined) actions.push({ type: "setModelPreset", preset });
       if (modelId !== undefined) actions.push({ type: "setModelId", modelId });
       if (reasoning !== undefined) {
-        actions.push({ type: "setReasoning", reasoning });
+        // Three-valued on the wire: `null` is the copilot ASKING to go back to
+        // inheriting, which the reducer spells as a cleared override.
+        actions.push({
+          type: "setReasoning",
+          reasoning: reasoning ?? undefined,
+        });
       }
       return actions;
     }
@@ -104,12 +110,21 @@ function sourceCount(count: number): string {
   return `${count} source${count === 1 ? "" : "s"}`;
 }
 
-/** Compact one-liner for the current model block, e.g. "balanced · reasoning medium". */
+/**
+ * How an effort reads in a proposal card. `undefined`/`null` are NOT missing
+ * data — they are the inherit signal (the preset's effort, or the model's own
+ * default under an override), and must never render as "undefined".
+ */
+function reasoningWord(effort: ReasoningEffort | null | undefined): string {
+  return effort ?? "inherited";
+}
+
+/** Compact one-liner for the current model block, e.g. "balanced · reasoning max". */
 function modelLine(model: AgentModel): string {
   const base = model.modelId
     ? `override → ${shortModelId(model.modelId)}`
     : model.preset;
-  return `${base} · reasoning ${model.reasoning}`;
+  return `${base} · reasoning ${reasoningWord(model.reasoning)}`;
 }
 
 export function describeAgentProposal(
@@ -134,7 +149,9 @@ export function describeAgentProposal(
       const parts: string[] = [];
       if (preset !== undefined) parts.push(`preset ${preset}`);
       if (modelId !== undefined) parts.push(`model ${shortModelId(modelId)}`);
-      if (reasoning !== undefined) parts.push(`reasoning ${reasoning}`);
+      if (reasoning !== undefined) {
+        parts.push(`reasoning ${reasoningWord(reasoning)}`);
+      }
       return {
         icon: Cpu,
         title: `Set model: ${parts.join(" · ")}`,

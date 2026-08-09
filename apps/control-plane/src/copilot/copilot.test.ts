@@ -15,6 +15,7 @@ import type { WorkspaceDeps } from "../workspace";
 import { loadCopilotConfig, type CopilotConfig } from "./config";
 import type { WorkspaceInventory } from "./inventory";
 import { copilotPlugin, type CopilotDeps } from "./plugin";
+import { buildSystemPrompt, buildToolSpecs } from "./prompt";
 import { createScriptedTransport, type ScriptedStep } from "./transport";
 import {
   validateMutation,
@@ -70,14 +71,40 @@ const inventory: WorkspaceInventory = {
     },
   ],
   modelPresets: [
-    { slug: "powerful", provider: "openrouter", modelId: "anthropic/claude-opus-4.8" },
-    { slug: "balanced", provider: "openrouter", modelId: "anthropic/claude-sonnet-5" },
-    { slug: "quick", provider: "openrouter", modelId: "anthropic/claude-haiku-4.5" },
+    {
+      slug: "powerful",
+      provider: "openrouter",
+      modelId: "anthropic/claude-opus-4.8",
+      reasoning: "max",
+    },
+    {
+      slug: "balanced",
+      provider: "openrouter",
+      modelId: "anthropic/claude-sonnet-5",
+      reasoning: "high",
+    },
+    {
+      slug: "quick",
+      provider: "openrouter",
+      modelId: "anthropic/claude-haiku-4.5",
+      reasoning: "low",
+    },
   ],
   allowlist: [
-    { provider: "openrouter", modelId: "anthropic/claude-sonnet-5", enabled: true },
-    { provider: "openrouter", modelId: "vendor/disabled-model", enabled: false },
+    {
+      provider: "openrouter",
+      modelId: "anthropic/claude-sonnet-5",
+      enabled: true,
+      supportedEfforts: ["max", "high", "low"],
+    },
+    {
+      provider: "openrouter",
+      modelId: "vendor/disabled-model",
+      enabled: false,
+      supportedEfforts: null,
+    },
   ],
+  catalogAvailable: true,
 };
 
 /** Cookie-driven fake auth: "user=<id>;org=<org>" grants a session. */
@@ -1166,6 +1193,8 @@ describe("validateMutation", () => {
     surface: "agent",
     connectionIds: new Set(),
     skillIds: new Set(),
+    preset: "balanced",
+    modelId: null,
     ...overrides,
   });
 
@@ -1244,6 +1273,64 @@ describe("validateMutation", () => {
     expect(disabled.ok).toBe(false);
     const empty = validateMutation("setModel", {}, inventory, agentState());
     expect(empty.ok).toBe(false);
+  });
+
+  test("setModel reasoning is checked against the EFFECTIVE model's catalog efforts", () => {
+    // The draft is on `balanced` → anthropic/claude-sonnet-5 → [max, high, low].
+    expect(
+      validateMutation("setModel", { reasoning: "high" }, inventory, agentState()).ok,
+    ).toBe(true);
+    const unsupported = validateMutation(
+      "setModel",
+      { reasoning: "minimal" },
+      inventory,
+      agentState(),
+    );
+    expect(unsupported.ok).toBe(false);
+    expect(!unsupported.ok && unsupported.message).toContain("is not supported by");
+    // The proposal's OWN modelId decides which model is checked; an unknown
+    // model (`quick`'s, which is not allowlisted here) has no efforts to check
+    // against, so the effort passes.
+    expect(
+      validateMutation(
+        "setModel",
+        { preset: "quick", reasoning: "minimal" },
+        inventory,
+        agentState(),
+      ).ok,
+    ).toBe(true);
+  });
+
+  test("inherit (`null`) and `provider-default` are legal for every model", () => {
+    for (const reasoning of [null, "provider-default"]) {
+      expect(
+        validateMutation("setModel", { reasoning }, inventory, agentState()).ok,
+      ).toBe(true);
+    }
+  });
+
+  test("the effort check FAILS OPEN when the catalog is unavailable (an openrouter.ai outage must not start rejecting proposals)", () => {
+    const offline: WorkspaceInventory = {
+      ...inventory,
+      catalogAvailable: false,
+      allowlist: inventory.allowlist.map((entry) => ({
+        ...entry,
+        supportedEfforts: null,
+      })),
+    };
+    expect(
+      validateMutation("setModel", { reasoning: "minimal" }, offline, agentState()).ok,
+    ).toBe(true);
+  });
+
+  test("a specific-model override on the draft decides the effort check, not the preset", () => {
+    const overridden = agentState({ modelId: "anthropic/claude-sonnet-5" });
+    expect(
+      validateMutation("setModel", { reasoning: "max" }, inventory, overridden).ok,
+    ).toBe(true);
+    expect(
+      validateMutation("setModel", { reasoning: "none" }, inventory, overridden).ok,
+    ).toBe(false);
   });
 
   test("addContext rejects disabled connections; removeContext still allows them", () => {
@@ -1354,5 +1441,44 @@ describe("validateMutation", () => {
       workflowState({ trigger: null }),
     );
     expect(lenient.ok).toBe(true);
+  });
+});
+
+describe("agent-surface system prompt — reasoning inventory", () => {
+  const draft = { persona: "Be helpful.", model: { preset: "balanced" } };
+
+  test("presets state the effort agents inherit, and models list the efforts they accept", () => {
+    const prompt = buildSystemPrompt({ surface: "agent", draft, inventory });
+    expect(prompt).toContain(
+      "- balanced → openrouter/anthropic/claude-sonnet-5, reasoning high (inherited by agents on this preset)",
+    );
+    expect(prompt).toContain(
+      "- anthropic/claude-sonnet-5 (openrouter) efforts: max, high, low",
+    );
+  });
+
+  test("an unknown effort set renders as `unknown`, never as an empty list (which would read as 'accepts no effort')", () => {
+    const offline: WorkspaceInventory = {
+      ...inventory,
+      catalogAvailable: false,
+      allowlist: inventory.allowlist.map((entry) => ({
+        ...entry,
+        supportedEfforts: null,
+      })),
+    };
+    const prompt = buildSystemPrompt({
+      surface: "agent",
+      draft,
+      inventory: offline,
+    });
+    expect(prompt).toContain(
+      "- anthropic/claude-sonnet-5 (openrouter) efforts: unknown",
+    );
+  });
+
+  test("the setModel tool spec documents null = inherit", () => {
+    const spec = buildToolSpecs("agent").find((tool) => tool.name === "setModel");
+    expect(spec).toBeDefined();
+    expect(spec!.description).toContain("null to clear an override");
   });
 });

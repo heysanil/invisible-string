@@ -20,8 +20,31 @@ import { z } from "zod";
 export const modelPresetSlugSchema = z.enum(["powerful", "balanced", "quick"]);
 export type ModelPresetSlug = z.infer<typeof modelPresetSlugSchema>;
 
-/** Mirrors pgEnum `reasoning_effort`. */
-export const reasoningEffortSchema = z.enum(["low", "medium", "high"]);
+/**
+ * Mirrors pgEnum `reasoning_effort`. The vocabulary is OpenRouter's
+ * per-model `reasoning.supported_efforts` set (no model supports all of it —
+ * the UI filters against the live catalog), plus one platform value:
+ *
+ * - `provider-default` (name borrowed from the AI SDK's own
+ *   `CallSettings["reasoning"]` union) means OMIT the reasoning field from the
+ *   request entirely. Distinct from `none`, which explicitly DISABLES
+ *   reasoning. It is the escape hatch for the ~1/3 of catalog models with no
+ *   reasoning support at all, where sending a reasoning block is unverified.
+ *
+ * `medium` is retained even though none of the seeded models supports it:
+ * pre-existing drafts and IMMUTABLE published `agent_versions.definition`
+ * snapshots carry it and must keep parsing.
+ */
+export const reasoningEffortSchema = z.enum([
+  "provider-default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
 /**
@@ -34,7 +57,16 @@ export const agentModelSchema = z.object({
   preset: modelPresetSlugSchema.default("balanced"),
   /** Specific-model override; wins over `preset`. Must be allowlisted. */
   modelId: z.string().min(1).optional(),
-  reasoning: reasoningEffortSchema.default("medium"),
+  /**
+   * Reasoning-effort OVERRIDE. `undefined` = inherit — the preset's own
+   * effort when resolving through `preset`, `provider-default` when a
+   * `modelId` override is in play (inheriting a preset's effort onto a
+   * deliberately-chosen different model is the wrong semantic).
+   *
+   * Deliberately NOT `.default(…)`: a default would materialize an explicit
+   * effort on every parse and permanently erase the inherit signal.
+   */
+  reasoning: reasoningEffortSchema.optional(),
 });
 
 export type AgentModel = z.infer<typeof agentModelSchema>;

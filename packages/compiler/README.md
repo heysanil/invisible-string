@@ -11,7 +11,11 @@ import { compile, RUNTIME_VERSIONS } from "@invisible-string/compiler";
 
 const { files, hash } = compile(definition, {   // definition: AgentDefinition
   versions: RUNTIME_VERSIONS,          // versions.json — the ONLY pin source
-  resolvedModel: { provider: "openrouter", modelId: "deepseek/deepseek-v4-flash" },
+  resolvedModel: {                      // preset/override ALREADY resolved
+    provider: "openrouter",
+    modelId: "~deepseek/deepseek-v4-flash-latest",
+    reasoning: "max",                   // required; "provider-default" = omit
+  },
   workspaceSlug: "acme",
   agentSlug: "software-engineer",
   connections,                          // resolved `mcp_connections` rows
@@ -24,7 +28,17 @@ const { files, hash } = compile(definition, {   // definition: AgentDefinition
 (same input → same `files`, same `hash`), and it throws a typed
 `CompileError` on any internally inconsistent input. Model resolution and
 allowlist validation happen in the **control plane before compile** — the
-compiler receives the already-resolved `{ provider, modelId }`.
+compiler receives the already-resolved `{ provider, modelId, reasoning }`.
+
+**The reasoning effort is resolved upstream too.**
+`definition.model.reasoning` is an OPTIONAL override (`undefined` = inherit —
+the preset's effort, or `provider-default` behind a `modelId` override); the
+compiler emits `deps.resolvedModel.reasoning` and only checks consistency (an
+explicit definition effort must equal the resolved one, mirroring the
+`modelId` `MODEL_MISMATCH` guard). Because the resolved effort is part of the
+hash, two identical definitions inheriting different preset efforts get
+different artifacts — and re-pointing a preset's effort takes effect on the
+next **publish**, never for an already-published version.
 
 The reference implementation for everything emitted here is the Phase-0
 spike (`spike/agent-project` + `spike/REPORT.md`); the templates mirror what
@@ -42,13 +56,42 @@ firing and Slack reply delivery live in the control plane.
 |---|---|
 | `package.json` | name `agent--<ws>--<agent>`, `engines.node "24.x"`, EXACT pins from `versions.json`, per-provider dependency. **No lockfile** — the build service owns `npm install`. |
 | `tsconfig.json` | strict NodeNext config (mirrors the spike). |
-| `agent/agent.ts` | explicit `model` (never eve's default), `reasoning` from `definition.model.reasoning`, an explicit `limits` block (below), `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set**, with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string, which is what makes eve bake **gateway** routing so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
+| `agent/agent.ts` | explicit `model` (never eve's default), the resolved reasoning effort (below), an explicit `limits` block (below), `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set**, with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string, which is what makes eve bake **gateway** routing so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
 | `agent/instructions.md` | the persona with compile-time refs resolved, then — only when the agent has context — a `---`-separated generated "Workspace context" appendix (connection/skill descriptions for `connection_search`/`load_skill` routing). Nothing else — workflow instructions never appear here. |
 | `agent/lib/platform-auth.ts` | `platformJwt()` AuthFn (`verifyJwtHmac`, HS256, `PLATFORM_JWT_SECRET`, iss `invisible-string` / version-bound aud `agent-version:<hash>`) + `localDev()` **only on `options.dev` builds**. |
 | `agent/lib/env.ts` | `requireEnv()` helper (only when a connection needs env credentials). |
 | `agent/channels/eve.ts` | default HTTP channel — the ONLY channel — with platform-JWT route auth and an `onMessage` hook injecting platform context blocks (identity line `Platform agent "<agent>" in workspace "<ws>"`; context is an onMessage **return**, never a `send()` option — PLAN correction 2). |
 | `agent/connections/<slug>.ts` | `defineMcpClientConnection`: literal `url`/`description`; auth via env-token `getToken` or lazy `headers` callback; `tools` exactly-one `allow`/`block`; approval `never()`/`once()`/`always()` or a generated per-tool policy matching **qualified** names (`<slug>__<tool>`). |
 | `agent/skills/<slug>.md` or `<slug>/SKILL.md` (+files) | SKILL.md convention with `description` frontmatter. |
+
+### Reasoning effort: `extraBody` on OpenRouter, `reasoning:` on Anthropic
+
+| Resolved effort | openrouter emits | anthropic emits |
+|---|---|---|
+| `max` | `openrouter(MODEL_ID, { extraBody: { reasoning: { effort: "max" } } })` | `reasoning: "xhigh"` (clamped) |
+| any other effort | `…{ extraBody: { reasoning: { effort: "<effort>" } } }` | `reasoning: "<effort>"` |
+| `provider-default` | `openrouter(MODEL_ID)` — **no settings object at all** | *field omitted entirely* |
+
+The asymmetry is not stylistic. eve's `reasoning:` config reaches ai@7 as the
+top-level `LanguageModelV4CallOptions.reasoning` call option, and
+`@openrouter/ai-sdk-provider@3.0.0`'s `getArgs()` **never destructures it** —
+through that route every OpenRouter agent's effort was silently dropped
+(fixed in `COMPILER_VERSION` 4.0.0). The provider's own typed `reasoning`
+*setting* does reach the wire, but its effort union is
+`xhigh|high|medium|low|minimal|none` — no `max`, which is exactly the top
+effort OpenRouter advertises for the seeded models. `settings.extraBody` is
+spread **last** over the request body, so it wins. Anthropic keeps the config
+route: `@ai-sdk/anthropic` is spec-v4 and eve maps the effort onto a thinking
+budget.
+
+Two accepted losses on OpenRouter: the **keyless/gateway** branch carries no
+effort (there is no model object to hang settings on), and eve's agent-info
+introspection route — which reports `config.reasoning` — no longer sees one.
+
+`provider-default` exists because `ResolvedModel.reasoning` is required:
+without it every artifact would send a reasoning block, including on the ~1/3
+of catalog models with no reasoning support, where OpenRouter's behavior is
+unverified.
 
 ### Explicit runtime limits
 
@@ -139,6 +182,18 @@ corrected keyless-guard comment (which ships inside the generated file, so it
 is an emitted-bytes change, not a source-only edit). Semantics and env
 contract are unchanged — the emitted limits equal what eve already enforced.
 
+**4.0.0 is the reasoning-effort major**: the effort now comes from
+`deps.resolvedModel.reasoning` (so inheritance participates in the hash)
+instead of `definition.model.reasoning`, and on OpenRouter it moved from
+eve's dropped `reasoning:` config onto the model's `extraBody` — a genuine
+change in what the artifact sends. `provider-default` suppresses the field on
+both providers, anthropic clamps `max` → `xhigh`, and
+`OPENROUTER_CONTEXT_WINDOW_TOKENS` gained the two new seeded models
+(`moonshotai/kimi-k3`, `~deepseek/deepseek-v4-flash-latest`) while keeping the
+older entries so existing versions recompile byte-identically.
+`BUILD_ENV_EPOCH` is deliberately untouched: the change is inside `compile()`,
+which `COMPILER_VERSION` already re-keys.
+
 The bump is enforced MECHANICALLY: `fixtures/.golden-digest.json` commits a
 sha256 over every fixture's emitted bytes paired with the `COMPILER_VERSION`
 that produced it. A template change without a bump fails
@@ -173,14 +228,39 @@ SPIKE_EVE_BUILD=1 bun test src/eve-build.test.ts
     # gated slow proof: renders every fixture to a temp dir, npm-installs
     # with Node 24 (mise), tsc --noEmit passes strict, and the basic
     # (default-eve-channel-only) + mcp-skill (packaged skill) fixtures
-    # `eve build` KEYLESS to servable .output bundles.
+    # `eve build` KEYLESS to servable .output bundles. Also runs the WIRE
+    # PROBE (src/wire-probe.mjs) — see below.
 TEST_DATABASE_URL=… bun test src/world-isolation.test.ts
     # gated proof of the isolation contract — see WORLD-ISOLATION.md.
 ```
 
-Golden fixtures (`fixtures/<name>/`): `basic` (persona only), `mcp-skill`
-(bearer connection + packaged skill), `custom-approval` (headers auth +
-custom approval policy + tool filters), `flat-skill` (markdown-only skill →
-flat `agent/skills/<slug>.md` + the seeded "powerful" preset model
-z-ai/glm-5.2, pinning its context-window entry), `anthropic-model`
-(anthropic provider + matching modelId override, dev build).
+Golden fixtures (`fixtures/<name>/`): `basic` (persona only; INHERITS its
+effort — no `reasoning` in the definition — resolving to `max`), `mcp-skill`
+(bearer connection + packaged skill; explicit `high`), `custom-approval`
+(headers auth + custom approval policy + tool filters; `provider-default`,
+pinning the OpenRouter suppression branch), `flat-skill` (markdown-only skill
+→ flat `agent/skills/<slug>.md` + the seeded "powerful" preset model
+z-ai/glm-5.2, pinning its context-window entry; keeps the legacy `medium`
+effort so pre-existing definitions stay provably compilable),
+`anthropic-model` (anthropic provider + matching modelId override, dev build;
+`max`, pinning the → `xhigh` clamp).
+
+### The wire probe (`src/wire-probe.mjs`)
+
+String assertions over emitted source cannot tell you whether the provider
+puts the effort on the wire — that is exactly how the pre-4.0.0 no-op
+survived. So the gated lane copies `wire-probe.mjs` into two rendered
+projects, imports the emitted `agent/agent.ts` for real (Node 24 type
+stripping), points the generated `OPENROUTER_BASE_URL` branch at a stub
+gateway, and asserts the captured request **body**:
+
+- `basic` (`max`) → `{"model":"deepseek/deepseek-v4-pro", …, "reasoning":{"effort":"max"}}`;
+- the same call with `reasoning` passed as a CALL OPTION (eve's own route)
+  produces a byte-identical body — the empirical half of spike finding 29;
+- `custom-approval` (`provider-default`) → **no** `reasoning` key at all.
+
+It does not boot eve's tool loop (that needs a world database and a platform
+JWT), and it does not need to: eve's only contribution to the effort is the
+call option the second assertion proves is dropped. What OpenRouter *does*
+with a reasoning block on a model that advertises none is a separate,
+still-open question that only a keyed lane can answer.

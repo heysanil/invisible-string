@@ -24,9 +24,12 @@ import {
   type CreateSessionResponse,
   type GetAgentResponse,
   type GetMcpConnectionResponse,
+  type GetModelPresetResponse,
   type GetSkillResponse,
   type GetWorkflowResponse,
   type ListMcpConnectionsResponse,
+  type ListModelCapabilitiesResponse,
+  type ListModelPresetsResponse,
   type ListSessionsResponse,
   type ListWorkflowsResponse,
   type ListWorkspaceMembersResponse,
@@ -45,6 +48,7 @@ import {
 } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
+import type { OpenRouterModelInfo } from "./openrouter-catalog";
 import type { RegistryClient } from "./registry";
 import {
   derivePlatformJwtSecret,
@@ -82,7 +86,8 @@ const stubCompile: CompileAgentFn = (request) => {
     .update(
       JSON.stringify({
         definition: request.definition,
-        model: request.model.modelId,
+        // The real compiler hashes the resolved EFFORT too (see types.ts).
+        model: [request.model.modelId, request.model.reasoning],
         connections: request.connections.map((c) => [c.name, c.url, c.envTokenVar, c.authHeaders]),
         skills: request.skills.map((s) => [s.name, s.content, s.files ?? null]),
         agent: request.agentSlug,
@@ -342,6 +347,15 @@ async function until<T>(fn: () => Promise<T | undefined | false>, what: string, 
   }
 }
 
+/** Catalog map from partial rows (the fields a test cares about). */
+function catalogOf(
+  ...models: (Partial<OpenRouterModelInfo> & { id: string })[]
+): ReadonlyMap<string, OpenRouterModelInfo> {
+  return new Map(
+    models.map((model) => [model.id, { supportedEfforts: [], ...model }]),
+  );
+}
+
 /** Minimal valid AgentDefinition draft for these tests. */
 function agentDraft(overrides: Partial<AgentDefinitionInput> = {}): AgentDefinitionInput {
   return {
@@ -362,7 +376,7 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
   let stack: AppStack;
   let db: AppStack["dbHandle"]["db"];
   /** Stubbed OpenRouter catalog state: null = unreachable (fail-open). */
-  let openRouterCatalogIds: ReadonlySet<string> | null = null;
+  let openRouterCatalog: ReadonlyMap<string, OpenRouterModelInfo> | null = null;
 
   let ownerCookie: string;
   let orgId: string;
@@ -435,9 +449,9 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
         registry: stubRegistry,
         // Stubbed OpenRouter catalog: null = "unavailable" (fail-open), so
         // the fake `vendor/...` ids used across this suite stay allowlistable
-        // regardless of network; individual tests set `openRouterCatalogIds`
-        // to exercise the catalog check.
-        openRouterModelIds: async () => openRouterCatalogIds,
+        // regardless of network; individual tests set `openRouterCatalog`
+        // to exercise the catalog check and the capabilities join.
+        openRouterCatalog: async () => openRouterCatalog,
       },
     );
     db = stack.dbHandle.db;
@@ -725,8 +739,10 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
 
     // Catalog reachable: unknown id → typed 422; known id → 201. (The
     // gateway-slug/OpenRouter-slug confusion is exactly the keyed-run case:
-    // "moonshot/kimi-k3" vs OpenRouter's real "moonshotai/kimi-k3".)
-    openRouterCatalogIds = new Set(["moonshotai/kimi-k3"]);
+    // "moonshot/kimi-k3" vs OpenRouter's real "moonshotai/kimi-k3".) The
+    // 201 uses a DIFFERENT id because kimi-k3 is now a seeded allowlist entry
+    // — re-adding it would 409 as a duplicate before the catalog matters.
+    openRouterCatalog = catalogOf({ id: "moonshotai/kimi-k3" }, { id: "z-ai/glm-5.2" });
     try {
       const unknown = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
         cookie: ownerCookie,
@@ -737,11 +753,11 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
 
       const known = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
         cookie: ownerCookie,
-        body: { provider: "openrouter", modelId: "moonshotai/kimi-k3" },
+        body: { provider: "openrouter", modelId: "z-ai/glm-5.2" },
       });
       expect(known.status).toBe(201);
     } finally {
-      openRouterCatalogIds = null;
+      openRouterCatalog = null;
     }
 
     // Catalog unreachable (null): fail OPEN — the add succeeds unchecked.
@@ -750,6 +766,134 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
       body: { provider: "openrouter", modelId: "vendor/offline-model" },
     });
     expect(failOpen.status).toBe(201);
+  });
+
+  test("model presets carry a reasoning effort: it persists, and an ABSENT reasoning keeps the stored one (a pre-effort web bundle mid-deploy must not silently reset it)", async () => {
+    const seeded = await api("GET", `/workspaces/${orgId}/model-presets`, { cookie: ownerCookie });
+    const presets = ((await seeded.json()) as ListModelPresetsResponse).presets;
+    // `balanced` is the one preset no earlier test re-points; it carries the
+    // seeded effort (the seed's balanced/quick pair is the same model at
+    // different efforts — the whole reason effort belongs to the preset).
+    expect(presets.find((preset) => preset.slug === "balanced")!.reasoning).toBe("max");
+
+    const repoint = await api("PUT", `/workspaces/${orgId}/model-presets/powerful`, {
+      cookie: ownerCookie,
+      body: { provider: "openrouter", modelId: "vendor/new-model", reasoning: "xhigh" },
+    });
+    expect(repoint.status).toBe(200);
+    expect(((await repoint.json()) as GetModelPresetResponse).preset.reasoning).toBe("xhigh");
+
+    // Same PUT without `reasoning` → the stored effort survives.
+    const withoutEffort = await api("PUT", `/workspaces/${orgId}/model-presets/powerful`, {
+      cookie: ownerCookie,
+      body: { provider: "openrouter", modelId: "vendor/new-model" },
+    });
+    expect(withoutEffort.status).toBe(200);
+    expect(((await withoutEffort.json()) as GetModelPresetResponse).preset.reasoning).toBe("xhigh");
+  });
+
+  test("model capabilities: every ENABLED allowlist entry always, catalog efforts joined where known, unknown stays null", async () => {
+    const add = await api("POST", `/workspaces/${orgId}/model-allowlist`, {
+      cookie: ownerCookie,
+      body: { provider: "openrouter", modelId: "vendor/capability-probe" },
+    });
+    expect(add.status).toBe(201);
+    const probeId = ((await add.json()) as { entry: { id: string } }).entry.id;
+
+    openRouterCatalog = catalogOf(
+      {
+        id: "vendor/capability-probe",
+        contextWindowTokens: 1_048_576,
+        supportedEfforts: ["max", "high", "low"],
+        defaultEffort: "high",
+      },
+      { id: "moonshotai/kimi-k3", supportedEfforts: [] },
+    );
+    try {
+      const res = await api("GET", `/workspaces/${orgId}/model-capabilities`, { cookie: ownerCookie });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ListModelCapabilitiesResponse;
+      expect(body.catalogAvailable).toBeTrue();
+      const probe = body.models.find((model) => model.modelId === "vendor/capability-probe");
+      expect(probe).toEqual({
+        provider: "openrouter",
+        modelId: "vendor/capability-probe",
+        supportedEfforts: ["max", "high", "low"],
+        defaultEffort: "high",
+        contextWindowTokens: 1_048_576,
+      });
+      // Allowlisted but ABSENT from the catalog → unknown, not "supports
+      // nothing" — clients must offer the full vocabulary on null.
+      const seededModel = body.models.find(
+        (model) => model.modelId === "~deepseek/deepseek-v4-flash-latest",
+      );
+      expect(seededModel?.supportedEfforts).toBeNull();
+      // A catalog row that advertises no efforts is KNOWLEDGE (empty list).
+      expect(
+        body.models.find((model) => model.modelId === "moonshotai/kimi-k3")
+          ?.supportedEfforts,
+      ).toEqual([]);
+
+      // Disabling an entry removes it from capabilities entirely.
+      const disable = await api("PATCH", `/workspaces/${orgId}/model-allowlist/${probeId}`, {
+        cookie: ownerCookie,
+        body: { enabled: false },
+      });
+      expect(disable.status).toBe(200);
+      const after = await api("GET", `/workspaces/${orgId}/model-capabilities`, { cookie: ownerCookie });
+      const afterBody = (await after.json()) as ListModelCapabilitiesResponse;
+      expect(
+        afterBody.models.some((model) => model.modelId === "vendor/capability-probe"),
+      ).toBeFalse();
+    } finally {
+      openRouterCatalog = null;
+      await api("DELETE", `/workspaces/${orgId}/model-allowlist/${probeId}`, { cookie: ownerCookie });
+    }
+  });
+
+  test("model capabilities fail OPEN: an unreachable OR malformed catalog still lists every model, with null efforts and catalogAvailable=false (an openrouter.ai outage must never empty the model picker)", async () => {
+    for (const stub of [null, catalogOf()]) {
+      // `catalogOf()` is the malformed/empty-body case: createOpenRouterCatalog
+      // maps an empty catalog to null ("unavailable") rather than to "no model
+      // exists", and the route must treat it identically.
+      openRouterCatalog = stub === null || stub.size === 0 ? null : stub;
+      const res = await api("GET", `/workspaces/${orgId}/model-capabilities`, { cookie: ownerCookie });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ListModelCapabilitiesResponse;
+      expect(body.catalogAvailable).toBeFalse();
+      expect(body.models.length).toBeGreaterThan(0);
+      expect(body.models.every((model) => model.supportedEfforts === null)).toBeTrue();
+    }
+    openRouterCatalog = null;
+  });
+
+  test("model capabilities authz matrix: 401 anonymous, 403 foreign path, member/admin/owner all read, cross-org isolated", async () => {
+    const anon = await api("GET", `/workspaces/${orgId}/model-capabilities`);
+    expect(anon.status).toBe(401);
+
+    const stranger = await signUpWithOrg("Capability Stranger");
+    // Another workspace's path, addressed by a non-member → 403.
+    const foreignPath = await api("GET", `/workspaces/${orgId}/model-capabilities`, { cookie: stranger.cookie });
+    expect(foreignPath.status).toBe(403);
+
+    // Cross-org isolation: the stranger's OWN workspace lists its own seeded
+    // models only — never a model allowlisted in this suite's workspace.
+    const own = await api("GET", `/workspaces/${stranger.orgId}/model-capabilities`, { cookie: stranger.cookie });
+    expect(own.status).toBe(200);
+    const ownModels = ((await own.json()) as ListModelCapabilitiesResponse).models;
+    expect(ownModels.length).toBeGreaterThan(0);
+    expect(ownModels.some((model) => model.modelId === "vendor/new-model")).toBeFalse();
+
+    // Reading is a MEMBER operation (the agent editor's effort selector needs
+    // it), so every role reads it — unlike the admin-gated allowlist writes.
+    for (const role of ["member", "admin", "owner"] as const) {
+      await db
+        .update(schema.member)
+        .set({ role })
+        .where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+      const res = await api("GET", `/workspaces/${orgId}/model-capabilities`, { cookie: ownerCookie });
+      expect(res.status).toBe(200);
+    }
   });
 
   // ── agents CRUD ──────────────────────────────────────────────────────────

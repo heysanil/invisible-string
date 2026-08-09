@@ -22,6 +22,7 @@ import type {
   AgentDefinition,
   AgentDto,
   ModelAllowlistEntryDto,
+  ModelCapabilityDto,
   ModelPresetDto,
   WorkspaceMemberDto,
 } from "@invisible-string/shared";
@@ -63,6 +64,8 @@ export interface AgentEditorScreenProps {
   modelPresets: readonly ModelPresetDto[];
   /** Enabled allowlist entries; null while still loading. */
   allowlist: readonly ModelAllowlistEntryDto[] | null;
+  /** Per-model catalog capabilities; null while loading or catalog-down. */
+  capabilities: readonly ModelCapabilityDto[] | null;
   /** Owner/admin — may delete the agent. */
   canManage: boolean;
 }
@@ -74,6 +77,7 @@ export function AgentEditorScreen({
   members,
   modelPresets,
   allowlist,
+  capabilities,
   canManage,
 }: AgentEditorScreenProps) {
   const navigate = useNavigate();
@@ -281,6 +285,7 @@ export function AgentEditorScreen({
                 members={members}
                 modelPresets={modelPresets}
                 allowlist={allowlist}
+                capabilities={capabilities}
                 registerSection={registerSection}
                 onAskCopilot={askCopilot}
               />
@@ -335,6 +340,8 @@ export interface AgentSectionsProps {
   modelPresets: readonly ModelPresetDto[];
   /** Null while the allowlist query is in flight (checks/options wait). */
   allowlist: readonly ModelAllowlistEntryDto[] | null;
+  /** Null while the capabilities query is in flight (effort list falls back). */
+  capabilities: readonly ModelCapabilityDto[] | null;
   /** Ref-callback factory so the owner can anchor-scroll to each section. */
   registerSection: (section: AgentSection) => (el: HTMLElement | null) => void;
   onAskCopilot?: (prompt: string) => void;
@@ -349,6 +356,7 @@ export function AgentSections({
   members,
   modelPresets,
   allowlist,
+  capabilities,
   registerSection,
   onAskCopilot,
 }: AgentSectionsProps) {
@@ -369,6 +377,7 @@ export function AgentSections({
         dispatch={dispatch}
         modelPresets={modelPresets}
         allowlist={allowlist}
+        capabilities={capabilities}
       />
     ),
     context: (

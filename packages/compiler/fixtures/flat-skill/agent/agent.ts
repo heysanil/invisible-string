@@ -18,6 +18,24 @@ const MODEL_ID = "z-ai/glm-5.2";
  * would therefore NOT fail loudly at build: it would emit a provider model
  * with EXTERNAL routing baked in, build clean, boot clean, and die on the
  * agent's first turn.
+ *
+ * The reasoning effort rides the MODEL's `extraBody`, deliberately, and must
+ * stay there:
+ * - eve's own `reasoning:` config reaches ai@7 as the top-level
+ *   `LanguageModelV4CallOptions.reasoning` call option, and
+ *   @openrouter/ai-sdk-provider@3.0.0's `getArgs()` never destructures it —
+ *   through that route the effort is silently DROPPED from every request.
+ * - the provider's typed `reasoning` SETTING would reach the wire, but its
+ *   effort union is xhigh|high|medium|low|minimal|none — it has no "max",
+ *   which is exactly the top effort OpenRouter advertises for the seeded
+ *   models.
+ * `settings.extraBody` is spread LAST over the request body, so it wins over
+ * anything the provider derived.
+ *
+ * Two known losses, accepted: the keyless/gateway branch below carries no
+ * effort at all (there is no model object to attach settings to), and eve's
+ * agent-info introspection route reports `config.reasoning`, which is now
+ * unset for OpenRouter agents.
  */
 function resolveModel(): LanguageModel {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -28,7 +46,9 @@ function resolveModel(): LanguageModel {
         ? { baseURL: process.env.OPENROUTER_BASE_URL }
         : {}),
     });
-    return openrouter(MODEL_ID);
+    return openrouter(MODEL_ID, {
+      extraBody: { reasoning: { effort: "medium" } },
+    });
   }
   return MODEL_ID;
 }
@@ -43,7 +63,6 @@ export default defineAgent({
   // way "does not have known AI Gateway context window metadata" fails the
   // build (spike/agent-project documented this escape hatch).
   modelContextWindowTokens: 1048576,
-  reasoning: "medium",
   limits: {
     // eve's own default (40M). Crossing it does NOT kill the session: a
     // conversation-mode session parks on a deterministic Approve/Stop

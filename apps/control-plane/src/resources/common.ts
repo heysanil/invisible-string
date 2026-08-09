@@ -23,7 +23,7 @@ import type { CompileAgentFn } from "../build/compiler-contract";
 import type { Db } from "../db";
 import { errors } from "../runtime/errors";
 import type { WorkspaceDeps } from "../workspace";
-import type { OpenRouterModelIds } from "./openrouter-catalog";
+import type { OpenRouterCatalog } from "./openrouter-catalog";
 import type { RegistryClient } from "./registry";
 
 /** Everything the Phase-2 resource CRUD routes need. */
@@ -37,11 +37,13 @@ export interface ResourceDeps {
   artifacts: ArtifactStore | undefined;
   registry: RegistryClient;
   /**
-   * OpenRouter model-catalog lookup for allowlist-add validation (advisory,
-   * fail-open — see resources/openrouter-catalog.ts). Optional: tests and
-   * offline deployments skip the existence check entirely.
+   * OpenRouter model-catalog lookup: allowlist-add validation AND the model
+   * capabilities (supported reasoning efforts, context window) the effort
+   * selectors read (advisory, fail-open — see resources/openrouter-catalog.ts).
+   * Optional: tests and offline deployments skip the existence check entirely
+   * and report every model's capabilities as unknown.
    */
-  openRouterModelIds?: OpenRouterModelIds;
+  openRouterCatalog?: OpenRouterCatalog;
 }
 
 /** Resource owner: an organization (workspace scope) or a user (user scope). */
@@ -141,6 +143,7 @@ export function modelPresetDto(row: ModelPresetRow): ModelPresetDto {
     slug: row.slug,
     provider: row.provider,
     modelId: row.modelId,
+    reasoning: row.reasoning,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

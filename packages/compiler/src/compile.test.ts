@@ -103,21 +103,64 @@ describe("generated content invariants", () => {
     expect(headers).toContain("headers: () =>");
   });
 
-  test("agent.ts: explicit model, definition reasoning, world-postgres world", () => {
+  test("agent.ts: explicit model, resolved reasoning, world-postgres world", () => {
     const openrouter = compile(mcpSkillFixture.definition, mcpSkillFixture.deps)
       .files.get("agent/agent.ts")!;
     expect(openrouter).toContain('const MODEL_ID = "deepseek/deepseek-v4-flash";');
     expect(openrouter).toContain("createOpenRouter({");
     expect(openrouter).toContain("process.env.OPENROUTER_BASE_URL");
-    expect(openrouter).toContain('reasoning: "high",');
+    // The effort rides the MODEL's extraBody, never eve's `reasoning:`
+    // config — the provider drops the call option entirely (version.ts 4.0.0).
+    expect(openrouter).toContain(
+      'extraBody: { reasoning: { effort: "high" } },',
+    );
+    expect(openrouter).not.toMatch(/^\s*reasoning: "/m);
     expect(openrouter).toContain('world: "@workflow/world-postgres"');
 
     const anthropic = compile(anthropicModelFixture.definition, anthropicModelFixture.deps)
       .files.get("agent/agent.ts")!;
     expect(anthropic).toContain('anthropic("claude-opus-4-8")');
     expect(anthropic).not.toContain("createOpenRouter");
-    // Reasoning always comes from the definition — no preset fallback chain.
-    expect(anthropic).toContain('reasoning: "low",');
+    // Anthropic keeps eve's config route (spec-v4 provider), with "max"
+    // clamped to the AI SDK effort union's top member.
+    expect(anthropic).toContain('reasoning: "xhigh",');
+    expect(anthropic).not.toContain("extraBody");
+  });
+
+  test("agent.ts: the effort comes from the RESOLVED model, not the definition", () => {
+    // basic inherits: its definition carries no `reasoning` at all, and the
+    // preset-resolved effort is what lands in the artifact.
+    expect(basicFixture.definition.model.reasoning).toBeUndefined();
+    const inherited = compile(basicFixture.definition, basicFixture.deps)
+      .files.get("agent/agent.ts")!;
+    expect(inherited).toContain('extraBody: { reasoning: { effort: "max" } },');
+  });
+
+  test("agent.ts: provider-default emits NO reasoning field on either provider", () => {
+    const openrouter = compile(
+      customApprovalFixture.definition,
+      customApprovalFixture.deps,
+    ).files.get("agent/agent.ts")!;
+    // A bare model call — no settings object at all, so nothing reaches the
+    // request body and OpenRouter applies the model's own behavior.
+    expect(openrouter).toContain("return openrouter(MODEL_ID);");
+    expect(openrouter).not.toContain("extraBody");
+
+    const anthropic = compile(
+      {
+        ...anthropicModelFixture.definition,
+        // Inherit, so the resolved provider-default is not a MODEL_MISMATCH.
+        model: { ...anthropicModelFixture.definition.model, reasoning: undefined },
+      },
+      {
+        ...anthropicModelFixture.deps,
+        resolvedModel: {
+          ...anthropicModelFixture.deps.resolvedModel,
+          reasoning: "provider-default",
+        },
+      },
+    ).files.get("agent/agent.ts")!;
+    expect(anthropic).not.toMatch(/^\s*reasoning: "/m);
   });
 
   test("localDev() is emitted ONLY on dev builds", () => {
@@ -240,14 +283,35 @@ describe("typed CompileError cases", () => {
     expectCompileError("MODEL_MISMATCH", withOverride, base.deps);
   });
 
-  test("INVALID_DEPS: unknown provider / empty model id / bad slug", () => {
+  test("MODEL_MISMATCH: an EXPLICIT definition effort must be the resolved one", () => {
+    const withEffort: AgentDefinition = {
+      ...base.definition,
+      model: { ...base.definition.model, reasoning: "low" },
+    };
+    expectCompileError("MODEL_MISMATCH", withEffort, base.deps);
+    // …while `undefined` means INHERIT and is always compatible.
+    expect(() =>
+      compile(
+        { ...base.definition, model: { ...base.definition.model, reasoning: undefined } },
+        base.deps,
+      ),
+    ).not.toThrow();
+  });
+
+  test("INVALID_DEPS: unknown provider / empty model id / unknown effort / bad slug", () => {
     expectCompileError("INVALID_DEPS", base.definition, {
       ...base.deps,
-      resolvedModel: { provider: "openai" as never, modelId: "gpt-5.5" },
+      resolvedModel: { ...base.deps.resolvedModel, provider: "openai" as never },
     });
     expectCompileError("INVALID_DEPS", base.definition, {
       ...base.deps,
-      resolvedModel: { provider: "openrouter", modelId: "  " },
+      resolvedModel: { ...base.deps.resolvedModel, modelId: "  " },
+    });
+    // The effort is emitted VERBATIM into generated code — an unknown value
+    // must never reach a template.
+    expectCompileError("INVALID_DEPS", base.definition, {
+      ...base.deps,
+      resolvedModel: { ...base.deps.resolvedModel, reasoning: "ludicrous" as never },
     });
     expectCompileError("INVALID_SLUG", base.definition, {
       ...base.deps,

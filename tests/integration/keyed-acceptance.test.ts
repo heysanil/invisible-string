@@ -1,7 +1,7 @@
 /**
  * KEYED ACCEPTANCE — the full product path with the mock model OFF: a REAL
  * OpenRouter key flows control-plane → agent env → @openrouter/ai-sdk-provider
- * and real deepseek/deepseek-v4-flash turns serve the runs. This is the suite
+ * and real ~deepseek/deepseek-v4-flash-latest turns serve the runs. This is the suite
  * that watches the ai@7 ↔ @openrouter/ai-sdk-provider@6.0.0-alpha.1 pairing
  * (packages/compiler/versions.json) under real API traffic.
  *
@@ -9,7 +9,7 @@
  * but with NO EVE_MOCK_AUTHORED_MODELS and NO dead-port OPENROUTER_BASE_URL
  * override — the AGENT is the compile unit; chat targets published agents):
  *   1. agent publish → real compile + eve build → tarball in Garage (quick
- *      preset → deepseek/deepseek-v4-flash, reasoning low).
+ *      preset → ~deepseek/deepseek-v4-flash-latest, reasoning low).
  *   2. create chat session "ping" → the run streams REAL model tokens
  *      (message.appended deltas over SSE), completes, and the final
  *      message.completed contains "pong".
@@ -27,7 +27,7 @@
  *      "failed" with a populated error, turn.failed in run_events, and a
  *      failed run_status frame on the SSE stream.
  *
- * COST DISCIPLINE: everything runs on deepseek/deepseek-v4-flash (quick
+ * COST DISCIPLINE: everything runs on ~deepseek/deepseek-v4-flash-latest (quick
  * preset) with reasoning "low" and one-line personas; a full green run is a
  * handful of tiny completions.
  *
@@ -587,7 +587,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack (
       })
       .where(eq(schema.mcpConnections.id, connectionId));
 
-    // quick preset → deepseek/deepseek-v4-flash (packages/db seed); reasoning
+    // quick preset → ~deepseek/deepseek-v4-flash-latest (packages/db seed); reasoning
     // low keeps the (reasoning) model's token spend minimal.
     const model = { preset: "quick" as const, reasoning: "low" as const };
 
@@ -621,7 +621,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack (
   }, 90_000);
 
   test(
-    "agent publish (quick preset → deepseek/deepseek-v4-flash) → real eve build → tarball in Garage",
+    "agent publish (quick preset → ~deepseek/deepseek-v4-flash-latest) → real eve build → tarball in Garage",
     async () => {
       const body = await publishAndBuild(pongAgentId);
       expect(body.contentHash).toHaveLength(64);
@@ -641,7 +641,7 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack (
         agentId: pongAgentId,
         contentHash: body.contentHash,
         modelProvider: "openrouter",
-        modelId: "deepseek/deepseek-v4-flash",
+        modelId: "~deepseek/deepseek-v4-flash-latest",
         buildStatus: "succeeded",
       });
     },

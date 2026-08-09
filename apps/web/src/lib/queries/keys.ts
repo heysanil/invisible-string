@@ -82,6 +82,9 @@ export const queryKeys = {
   modelAllowlist: {
     list: (workspaceId: string) => ["model-allowlist", workspaceId] as const,
   },
+  modelCapabilities: {
+    list: (workspaceId: string) => ["model-capabilities", workspaceId] as const,
+  },
   agents: {
     all: (workspaceId: string) => ["agents", workspaceId] as const,
     list: (workspaceId: string) => ["agents", workspaceId, "list"] as const,

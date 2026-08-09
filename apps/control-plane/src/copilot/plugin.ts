@@ -30,6 +30,7 @@ import {
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
+import type { OpenRouterCatalog } from "../resources/openrouter-catalog";
 import {
   resolveWorkspace,
   type WorkspaceContext,
@@ -92,12 +93,19 @@ export function createCopilotDeps(opts: {
   workspaceDeps: WorkspaceDeps;
   config: CopilotConfig;
   transport: CopilotTransport;
+  /**
+   * OpenRouter catalog (shared with the resource routes, so its cache is hit
+   * once for both). The copilot proposes reasoning efforts, so the inventory
+   * has to carry what each model supports — advisory and fail-open, exactly
+   * as on the REST side.
+   */
+  openRouterCatalog?: OpenRouterCatalog;
 }): CopilotDeps {
   return {
     workspaceDeps: opts.workspaceDeps,
     config: opts.config,
     transport: opts.transport,
-    loadInventory: createInventoryLoader(opts.db),
+    loadInventory: createInventoryLoader(opts.db, opts.openRouterCatalog),
     entityExists: createEntityExists(opts.db),
   };
 }

@@ -273,7 +273,9 @@ retired permanently, so the platform closes the row and mints a NEW
 DISPATCH-TIME MODEL ALLOWLIST RE-VALIDATION (spec §7): before running, the
 dispatcher re-checks the version's COMPILED model against the CURRENT workspace
 allowlist; a now-disallowed model FAILS the run (a visible failed run, never
-executed) rather than dispatching.
+executed) rather than dispatching. This is the ONLY thing dispatch reads from
+the live model layer — the model and its reasoning effort come from the
+version's baked artifact, never from `model_presets` (see "Compiler seam").
 
 ## Outbound reply delivery (control-plane DeliveryService)
 
@@ -412,6 +414,30 @@ is a pure `AgentDefinition` — no trigger, no instructions
 (`src/build/compiler-contract.ts`). The production implementation is
 `src/build/compiler-adapter.ts` over `@invisible-string/compiler` (wired as
 the default in `createAppStack`); tests inject stubs.
+
+**`model` is `{provider, modelId, reasoning}` — the REASONING EFFORT is
+resolved here too, and it is not optional at this seam.**
+`definition.model.reasoning` is an agent-level *override*; `undefined` means
+inherit, and `runtime/model-resolution.ts` settles it in the same pass that
+settles the model:
+
+| Branch | Model | Effort |
+|---|---|---|
+| specific-model override (`model.modelId` set) | the override, provider from its allowlist row | `model.reasoning ?? "provider-default"` — never the preset's, and the preset is not even read |
+| preset (`model.preset`) | the workspace's preset mapping | `model.reasoning ?? presetRow.reasoning` |
+
+`compile()` hashes `deps.resolvedModel`, so the effort re-keys the artifact,
+the world database `ag_v_<hash12>`, and the platform-JWT audience: **two
+identical definitions inheriting different preset efforts get different
+artifacts**, by design.
+
+Consequences at DISPATCH: dispatch never re-reads `model_presets`. It runs the
+model and effort **baked into the published version** (and re-validates only
+that model against the current allowlist, below). **Re-pointing a preset — its
+model or its effort — is therefore inert until each agent is published again**;
+the same republish-to-migrate pattern as an eve or `COMPILER_VERSION` bump.
+Settings → Models says so on the panel. Design:
+`docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md`.
 
 ## Control-plane runtime env
 

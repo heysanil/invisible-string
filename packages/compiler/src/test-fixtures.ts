@@ -17,18 +17,27 @@ export interface CompilerFixture {
   readonly deps: CompileDeps;
 }
 
-/** Minimal agent: persona only, no context, openrouter model, prod build. */
+/**
+ * Minimal agent: persona only, no context, openrouter model, prod build.
+ * Also the INHERITANCE fixture: the definition carries no `reasoning`, so the
+ * emitted effort comes purely from the preset the control plane resolved
+ * (`max` — the top effort the seeded models advertise).
+ */
 export const basicFixture: CompilerFixture = {
   name: "basic",
   definition: {
     persona:
       "You are a capable general-purpose assistant for this workspace. Be concise, be accurate, and use the tools available to you rather than guessing.",
-    model: { preset: "balanced", reasoning: "medium" },
+    model: { preset: "balanced" },
     context: { mcpConnectionIds: [], skillIds: [] },
   },
   deps: {
     versions: TEST_VERSIONS,
-    resolvedModel: { provider: "openrouter", modelId: "deepseek/deepseek-v4-pro" },
+    resolvedModel: {
+      provider: "openrouter",
+      modelId: "deepseek/deepseek-v4-pro",
+      reasoning: "max",
+    },
     workspaceSlug: "acme",
     agentSlug: "general-purpose",
     connections: [],
@@ -56,6 +65,7 @@ export const mcpSkillFixture: CompilerFixture = {
     resolvedModel: {
       provider: "openrouter",
       modelId: "deepseek/deepseek-v4-flash",
+      reasoning: "high",
     },
     workspaceSlug: "acme",
     agentSlug: "software-engineer",
@@ -92,13 +102,18 @@ export const mcpSkillFixture: CompilerFixture = {
   },
 };
 
-/** Headers-auth connection + custom per-tool approval policy + tool filters. */
+/**
+ * Headers-auth connection + custom per-tool approval policy + tool filters.
+ * Also the `provider-default` fixture: pins the OpenRouter SUPPRESSION branch
+ * (a bare `openrouter(MODEL_ID)` with no settings object at all), which is
+ * what a specific-model override resolves to.
+ */
 export const customApprovalFixture: CompilerFixture = {
   name: "custom-approval",
   definition: {
     persona:
       "You keep the company CMS in sync: create and update pages in @cms, and consult @deepwiki when the content references a repository. Never publish or delete anything without an explicit go-ahead.",
-    model: { preset: "balanced", reasoning: "medium" },
+    model: { preset: "balanced" },
     context: {
       mcpConnectionIds: [
         "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e",
@@ -109,7 +124,11 @@ export const customApprovalFixture: CompilerFixture = {
   },
   deps: {
     versions: TEST_VERSIONS,
-    resolvedModel: { provider: "openrouter", modelId: "deepseek/deepseek-v4-pro" },
+    resolvedModel: {
+      provider: "openrouter",
+      modelId: "deepseek/deepseek-v4-pro",
+      reasoning: "provider-default",
+    },
     workspaceSlug: "acme",
     agentSlug: "cms-sync",
     connections: [
@@ -153,6 +172,10 @@ export const customApprovalFixture: CompilerFixture = {
  * OPENROUTER_CONTEXT_WINDOW_TOKENS entry for z-ai/glm-5.2 (codegen/agent.ts
  * compaction threshold — a silent change here must fail the version-bump
  * guard, not cache-hit stale artifacts).
+ *
+ * Keeps the LEGACY `medium` effort, which no seeded model supports any more:
+ * drafts and immutable published definitions predating the new vocabulary
+ * still carry it and must keep compiling.
  */
 export const flatSkillFixture: CompilerFixture = {
   name: "flat-skill",
@@ -167,7 +190,11 @@ export const flatSkillFixture: CompilerFixture = {
   },
   deps: {
     versions: TEST_VERSIONS,
-    resolvedModel: { provider: "openrouter", modelId: "z-ai/glm-5.2" },
+    resolvedModel: {
+      provider: "openrouter",
+      modelId: "z-ai/glm-5.2",
+      reasoning: "medium",
+    },
     workspaceSlug: "acme",
     agentSlug: "incident-writer",
     connections: [],
@@ -189,18 +216,26 @@ export const flatSkillFixture: CompilerFixture = {
   },
 };
 
-/** Anthropic provider + explicit modelId override (matching), dev build. */
+/**
+ * Anthropic provider + explicit modelId override (matching), dev build.
+ * Carries `max`, which the anthropic branch must clamp to the AI SDK union's
+ * top member (`xhigh`) — the mapping has no other coverage.
+ */
 export const anthropicModelFixture: CompilerFixture = {
   name: "anthropic-model",
   definition: {
     persona:
       "You are a careful support triage specialist. Classify severity first (S1-S4), then route the report to the right owner with a crisp one-paragraph summary.",
-    model: { preset: "powerful", modelId: "claude-opus-4-8", reasoning: "low" },
+    model: { preset: "powerful", modelId: "claude-opus-4-8", reasoning: "max" },
     context: { mcpConnectionIds: [], skillIds: [] },
   },
   deps: {
     versions: TEST_VERSIONS,
-    resolvedModel: { provider: "anthropic", modelId: "claude-opus-4-8" },
+    resolvedModel: {
+      provider: "anthropic",
+      modelId: "claude-opus-4-8",
+      reasoning: "max",
+    },
     workspaceSlug: "acme",
     agentSlug: "support-triage",
     connections: [],

@@ -12,6 +12,7 @@
  * (`MCP_<SLUG>_TOKEN`, header env names); the worker supervisor injects the
  * decrypted values at spawn.
  */
+import type { ReasoningEffort } from "@invisible-string/shared";
 
 /**
  * Exact runtime version matrix — the shape of `packages/compiler/versions.json`
@@ -37,12 +38,24 @@ export type ModelProvider = "openrouter" | "anthropic";
 /**
  * The model the control plane resolved (preset/override → allowlist check →
  * provider + native model id). For `openrouter` the id is a gateway-style
- * slug (`deepseek/deepseek-v4-flash`); for `anthropic` it is the provider's
- * native hyphenated id (`claude-opus-4-8`).
+ * slug (`deepseek/deepseek-v4-flash`, or a `~`-prefixed `-latest` alias); for
+ * `anthropic` it is the provider's native hyphenated id (`claude-opus-4-8`).
  */
 export interface ResolvedModel {
   readonly provider: ModelProvider;
   readonly modelId: string;
+  /**
+   * The RESOLVED reasoning effort — required, because inheritance is already
+   * settled upstream: `definition.model.reasoning ?? preset.reasoning` on the
+   * preset path, `provider-default` on the specific-model override path.
+   * `provider-default` means "emit no reasoning field at all".
+   *
+   * It lives on ResolvedModel (not just on the definition) so hash.ts's
+   * existing `resolved.resolvedModel` entry re-keys the artifact, world
+   * database, and JWT audience for free: two identical definitions that
+   * INHERIT different preset efforts must never share an artifact.
+   */
+  readonly reasoning: ReasoningEffort;
 }
 
 /**

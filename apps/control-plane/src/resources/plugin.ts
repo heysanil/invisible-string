@@ -34,6 +34,7 @@ import {
 import {
   addModelAllowlistEntry,
   deleteModelAllowlistEntry,
+  getModelCapabilities,
   listModelAllowlist,
   listModelPresets,
   updateModelAllowlistEntry,
@@ -420,6 +421,17 @@ export function resourcesPlugin(deps: ResourceDeps) {
         ({ workspace, params }) =>
           deleteModelAllowlistEntry(deps, workspace.organizationId, params.id),
         { requireWorkspace: "admin" },
+      )
+
+      // ── Model capabilities (what each allowlisted model supports) ─────────
+      // MEMBER-readable, like model-presets: the agent editor's reasoning
+      // selector needs it, and editing agents is a member operation. It lives
+      // under the existing /workspaces prefix, so the prod web gateway
+      // (infra/nginx/web.conf) already routes it — no new top-level prefix.
+      .get(
+        "/workspaces/:workspaceId/model-capabilities",
+        ({ workspace }) => getModelCapabilities(deps, workspace.organizationId),
+        { requireWorkspace: true },
       )
 
       // ── Agents (workspace-scoped; role rules match workflows: member

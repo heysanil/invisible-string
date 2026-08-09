@@ -9,15 +9,26 @@
  *      mapping (slug → provider + modelId)
  *   3. model_allowlist check (enabled)        — ALWAYS, on the final model
  *
- * Reasoning effort lives on the definition itself (`model.reasoning`) and is
- * compiled directly — it is not part of resolution.
+ * Reasoning effort resolves HERE too, because it is INHERITABLE:
+ * `definition.model.reasoning` is an optional override, and what it falls back
+ * to depends on which branch above won —
+ *   - preset branch:   the preset row's own `reasoning`;
+ *   - override branch: `provider-default` (emit no reasoning field at all).
+ * The override branch deliberately does NOT read the preset: inheriting
+ * `balanced`'s `max` onto a deliberately-chosen cheap model is the wrong
+ * semantic, and looking the preset up there would invent a new
+ * `model_preset_not_found` failure for override drafts that publish fine today.
  *
  * Pure core (`resolveModel`) over pre-loaded rows so it unit-tests without a
  * database; `loadModelResolutionData` is the drizzle loader.
  */
 import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type { AgentModel, ModelPresetSlug } from "@invisible-string/shared";
+import type {
+  AgentModel,
+  ModelPresetSlug,
+  ReasoningEffort,
+} from "@invisible-string/shared";
 
 import type { Db } from "../db";
 import { errors } from "./errors";
@@ -27,6 +38,13 @@ export type ModelProvider = "anthropic" | "openrouter";
 export interface ResolvedModel {
   provider: ModelProvider;
   modelId: string;
+  /**
+   * The effort the artifact is compiled with — always concrete (inheritance
+   * is settled here). It rides into the compiler's own ResolvedModel, so it
+   * re-keys the content hash: two identical definitions inheriting different
+   * preset efforts must never share an artifact.
+   */
+  reasoning: ReasoningEffort;
   /** The preset slug the model came through (absent for modelId overrides). */
   presetSlug?: ModelPresetSlug;
 }
@@ -35,6 +53,8 @@ export interface ModelPresetRow {
   slug: ModelPresetSlug;
   provider: ModelProvider;
   modelId: string;
+  /** The preset's default effort, inherited when the agent sets none. */
+  reasoning: ReasoningEffort;
 }
 
 export interface AllowlistRow {
@@ -64,10 +84,17 @@ export function resolveModel(
     );
 
   // 1. Specific-model override wins outright; provider from the allowlist row.
+  //    Returns BEFORE the preset lookup, so an unset effort falls to
+  //    `provider-default` (the model's own behavior) rather than borrowing an
+  //    effort chosen for a different model.
   if (model.modelId !== undefined) {
     const allowed = findAllowed(model.modelId);
     if (!allowed) throw errors.modelNotAllowlisted(model.modelId);
-    return { provider: allowed.provider, modelId: model.modelId };
+    return {
+      provider: allowed.provider,
+      modelId: model.modelId,
+      reasoning: model.reasoning ?? "provider-default",
+    };
   }
 
   // 2. Preset slug → workspace mapping.
@@ -82,6 +109,8 @@ export function resolveModel(
   return {
     provider: mapping.provider,
     modelId: mapping.modelId,
+    // The agent's own effort wins; otherwise the preset's is INHERITED.
+    reasoning: model.reasoning ?? mapping.reasoning,
     presetSlug: model.preset,
   };
 }
@@ -97,6 +126,7 @@ export async function loadModelResolutionData(
         slug: schema.modelPresets.slug,
         provider: schema.modelPresets.provider,
         modelId: schema.modelPresets.modelId,
+        reasoning: schema.modelPresets.reasoning,
       })
       .from(schema.modelPresets)
       .where(eq(schema.modelPresets.organizationId, organizationId)),

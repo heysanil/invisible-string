@@ -232,6 +232,10 @@ export const compileAgent: CompileAgentFn = (
       resolvedModel: {
         provider: request.model.provider,
         modelId: request.model.modelId,
+        // Already-resolved effort (definition override → preset default →
+        // provider-default under a modelId override); the compiler hashes it,
+        // so inheritance re-keys the artifact.
+        reasoning: request.model.reasoning,
       },
       workspaceSlug: request.workspaceSlug,
       agentSlug: request.agentSlug,

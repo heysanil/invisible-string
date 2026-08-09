@@ -50,7 +50,7 @@ import { RunTailerManager } from "./runs/tailer";
 import { resourcesPlugin } from "./resources/plugin";
 import {
   createOpenRouterCatalog,
-  type OpenRouterModelIds,
+  type OpenRouterCatalog,
 } from "./resources/openrouter-catalog";
 import { createRegistryClient, type RegistryClient } from "./resources/registry";
 import type { ResourceDeps } from "./resources/common";
@@ -112,8 +112,11 @@ export interface RuntimeOverrides {
   registry?: RegistryClient;
   /** Slack Web API client (stubbed against a fake Slack server in tests). */
   slackClient?: SlackClient;
-  /** OpenRouter catalog lookup for allowlist validation (stubbed in tests). */
-  openRouterModelIds?: OpenRouterModelIds;
+  /**
+   * OpenRouter catalog lookup for allowlist validation + model capabilities
+   * (stubbed in tests).
+   */
+  openRouterCatalog?: OpenRouterCatalog;
   /** Copilot LLM transport (scripted fake in tests). */
   copilotTransport?: CopilotTransport;
 }
@@ -427,10 +430,11 @@ export function createAppStack(
     registry:
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
-    // Advisory allowlist-add validation against OpenRouter's public model
-    // catalog (fail-open when unreachable — resources/openrouter-catalog.ts).
-    openRouterModelIds:
-      runtimeOverrides?.openRouterModelIds ?? createOpenRouterCatalog(),
+    // Advisory allowlist-add validation + reasoning/context capabilities from
+    // OpenRouter's public model catalog (fail-open when unreachable — see
+    // resources/openrouter-catalog.ts).
+    openRouterCatalog:
+      runtimeOverrides?.openRouterCatalog ?? createOpenRouterCatalog(),
   };
   // Copilot socket: mounted whenever a transport is available — a scripted
   // fake (COPILOT_FAKE_SCRIPT / test override; dev/test ONLY — loadCopilotConfig
@@ -455,6 +459,9 @@ export function createAppStack(
         workspaceDeps,
         config: copilotConfig,
         transport: copilotTransport,
+        // Same catalog instance as the resource routes — one cache, so a
+        // copilot turn does not re-fetch what a settings load just warmed.
+        openRouterCatalog: resourceDeps.openRouterCatalog,
       })
     : null;
   // Deep-health probes: DB always; object store + live-worker count only when

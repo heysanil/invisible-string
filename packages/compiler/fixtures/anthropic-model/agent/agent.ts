@@ -8,7 +8,12 @@ import { defineAgent } from "eve";
  */
 export default defineAgent({
   model: anthropic("claude-opus-4-8"),
-  reasoning: "low",
+  // Platform-resolved reasoning effort. eve maps it onto an Anthropic
+  // thinking budget (a fraction of the output budget), and @ai-sdk/anthropic
+  // is spec-v4, so the config route works here — unlike OpenRouter.
+  // The platform effort "max" is emitted as "xhigh": the AI SDK effort union
+  // tops out there, and both mean "spend the most".
+  reasoning: "xhigh",
   limits: {
     // eve's own default (40M). Crossing it does NOT kill the session: a
     // conversation-mode session parks on a deterministic Approve/Stop

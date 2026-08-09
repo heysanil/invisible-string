@@ -80,6 +80,16 @@ describe("agentProposalToActions", () => {
     ]);
   });
 
+  test("setModel with reasoning: null asks to go back to INHERITING", () => {
+    // `null` on the wire is an ACTION ("clear the override"), not a missing
+    // field — it must reach the reducer as a cleared value, not be dropped.
+    expect(
+      agentProposalToActions(
+        asAgentProposal(proposal("setModel", { reasoning: null })),
+      ),
+    ).toEqual([{ type: "setReasoning", reasoning: undefined }]);
+  });
+
   test("addContext / removeContext map by kind", () => {
     expect(
       agentProposalToActions(
@@ -166,6 +176,20 @@ describe("describeAgentProposal", () => {
     expect(d.title).toBe("Set model: preset powerful · reasoning high");
     expect(d.before).toBe("balanced · reasoning medium");
     expect(d.after).toBe("preset powerful · reasoning high");
+  });
+
+  test("an inheriting agent reads as 'inherited', never 'undefined'", () => {
+    const inheriting: AgentDefinition = {
+      ...definition,
+      model: { preset: "balanced" },
+    };
+    const d = describeAgentProposal(
+      asAgentProposal(proposal("setModel", { reasoning: null })),
+      inheriting,
+      resources,
+    );
+    expect(d.before).toBe("balanced · reasoning inherited");
+    expect(d.after).toBe("reasoning inherited");
   });
 
   test("setModel before-line surfaces an existing override", () => {

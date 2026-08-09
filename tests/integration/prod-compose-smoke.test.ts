@@ -68,6 +68,7 @@ function writeSmokeEnvFile(): string {
     `PLATFORM_JWT_SECRET=${randomBytes(32).toString("base64")}`,
     `BETTER_AUTH_SECRET=${randomBytes(32).toString("base64")}`,
     `WORKER_SHARED_SECRET=${randomBytes(32).toString("base64")}`,
+    `MEILISEARCH_MASTER_KEY=${randomBytes(16).toString("hex")}`,
     `WORKER_ID=${randomUUID()}`,
     // Throwaway, NEVER a real key: dispatch requires a provider key to be
     // CONFIGURED (agent env assembly), but the smoke never awaits a model

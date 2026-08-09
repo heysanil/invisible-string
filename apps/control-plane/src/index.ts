@@ -54,6 +54,7 @@ import {
 } from "./resources/openrouter-catalog";
 import { createRegistryClient, type RegistryClient } from "./resources/registry";
 import type { ResourceDeps } from "./resources/common";
+import { createMeiliClient, ensureRegistryIndex } from "./search/meili";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
@@ -414,6 +415,25 @@ export function createAppStack(
     overrides: runtimeOverrides,
   });
   runtimeSlot.current = runtimeDeps;
+  // Meilisearch registry-search mirror: constructed only when BOTH vars are
+  // configured, and NEVER fatal — an unreachable Meilisearch degrades registry
+  // search, nothing else (connectors redesign spec §5). The index bootstrap is
+  // fire-and-forget; consumers find the index ready or degrade.
+  if (
+    runtimeDeps?.runtime.meilisearchUrl &&
+    runtimeDeps.runtime.meilisearchMasterKey
+  ) {
+    const meili = createMeiliClient({
+      url: runtimeDeps.runtime.meilisearchUrl,
+      apiKey: runtimeDeps.runtime.meilisearchMasterKey,
+    });
+    void ensureRegistryIndex(meili).catch((error) => {
+      logger.warn("search.meili_index_bootstrap_failed", {
+        msg: "meilisearch registry index bootstrap failed — registry search degraded",
+        err: error,
+      });
+    });
+  }
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,

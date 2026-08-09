@@ -51,6 +51,23 @@ services:
       timeout: 3s
       retries: 12
 
+  meilisearch:
+    # Registry search mirror (disposable index — rebuilt by a full resync).
+    # Pin the SAME tag in docker-compose.prod.yml + the external-data variant.
+    image: getmeili/meilisearch:v1.52.0
+    ports:
+      - "${MEILISEARCH_PORT:-7700}:7700"
+    environment:
+      MEILI_MASTER_KEY: dev-meili-master-key
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili-data:/meili_data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:7700/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   dex:
     image: dexidp/dex:v2.45.1
     ports:
@@ -74,3 +91,4 @@ services:
 volumes:
   postgres-data:
   garage-data:
+  meili-data:

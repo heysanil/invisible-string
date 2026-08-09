@@ -23,7 +23,8 @@ private Compose bridge.
                                          ├─▶ control-plane  (Bun + Elysia, :3000)
                                          ├─▶ worker         (Bun supervisor, :4000, docker.sock)
                                          ├─▶ postgres       (:5432 — product + world DBs)
-                                         └─▶ garage         (:3900 — S3 artifact store)
+                                         ├─▶ garage         (:3900 — S3 artifact store)
+                                         └─▶ meilisearch    (:7700 — registry search mirror)
 ```
 
 - **`web`** serves the built SPA and reverse-proxies the control-plane API on
@@ -38,6 +39,12 @@ private Compose bridge.
   `world` DB (eve durability, plus per-agent-version `ag_v_*` databases).
 - **`garage`** is the S3-compatible object store for build-artifact tarballs
   and trigger file payloads.
+- **`meilisearch`** (`getmeili/meilisearch`, same pinned tag as the dev
+  compose) serves MCP-registry connector search. Its `mcp_registry` index is
+  **disposable**: never back it up — an empty index is rebuilt by a full
+  resync from the official registry, which the control plane's sync job runs
+  automatically. The service is optional at runtime: if it is down or
+  unconfigured, registry search degrades and nothing else is affected.
 - **`migrate`** is a one-shot that applies migrations before `control-plane`
   starts; **`cloudflared`** is an optional tunnel (profile-gated).
 
@@ -77,6 +84,7 @@ a filled copy.**
 | `PLATFORM_JWT_SECRET` | HMAC secret for platform JWTs | `openssl rand -base64 32` |
 | `BETTER_AUTH_SECRET` | Better Auth session secret | `openssl rand -base64 32` |
 | `WORKER_SHARED_SECRET` | Worker ↔ control-plane auth secret | `openssl rand -base64 32` |
+| `MEILISEARCH_MASTER_KEY` | Meilisearch master key (registry search) — source it from your secret manager like every other secret; the index it guards is disposable (§9) | `openssl rand -hex 32` |
 | `WORKER_ID` | Pinned worker identity; registration is allowlisted to it. Lowercase — macOS `uuidgen` emits uppercase, and on images ≤ `v0.1.7` an uppercase id breaks every dispatch (§12); images > `v0.1.7` normalize it | `uuidgen \| tr '[:upper:]' '[:lower:]'` |
 | `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | Model provider (at least one) | — |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_SIGNING_SECRET` | Optional platform Slack app — all three or none ([SLACK.md](SLACK.md)) | — |
@@ -198,7 +206,9 @@ would override the throwaway smoke secrets.
 
 `docker-compose.prod.external-data.yml` is a **standalone** compose file — the
 same app services as the base file with the bundled `postgres` and `garage`
-removed. Deploy it alone (paste it into Dokploy exactly like the base file, or
+removed. `meilisearch` stays bundled even here: its index is disposable
+(nothing to manage or back up externally), so only the durable data services
+move out. Deploy it alone (paste it into Dokploy exactly like the base file, or
 run it directly); do not combine it with `docker-compose.prod.yml`:
 
 ```bash
@@ -261,6 +271,10 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
 - **Garage** — snapshot the `garage-data` volume alongside every Postgres
   backup. If you must restore Postgres without it, clear the stale cache first:
   `DELETE FROM builds;` — builds then re-run and re-populate the store.
+- **Meilisearch** — **no backup, ever.** The `mcp_registry` index is a
+  disposable mirror of the official MCP registry: wipe the `meili-data`
+  volume freely; the control plane's registry sync repopulates an empty index
+  automatically via a full resync. There is nothing in it worth restoring.
 
 ---
 

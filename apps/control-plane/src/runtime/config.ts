@@ -119,6 +119,14 @@ export interface RuntimeConfig {
    * (local dev/CI, where worker ids are random per boot).
    */
   workerAllowedIds?: string[];
+  /**
+   * Meilisearch registry-search mirror (MEILISEARCH_URL +
+   * MEILISEARCH_MASTER_KEY). BOTH optional and never validated as required:
+   * absent means registry search is degraded, not a boot failure (connectors
+   * redesign spec §5 — the index is a disposable mirror).
+   */
+  meilisearchUrl?: string;
+  meilisearchMasterKey?: string;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -246,6 +254,8 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
         ? "worker-token"
         : "shared-secret",
     workerAllowedIds: parseWorkerAllowedIds(env.WORKER_ALLOWED_IDS),
+    meilisearchUrl: env.MEILISEARCH_URL?.trim() || undefined,
+    meilisearchMasterKey: env.MEILISEARCH_MASTER_KEY?.trim() || undefined,
   };
 }
 

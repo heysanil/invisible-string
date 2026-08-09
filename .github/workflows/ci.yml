@@ -203,6 +203,7 @@ jobs:
           PLATFORM_JWT_SECRET=lint
           BETTER_AUTH_SECRET=lint
           WORKER_SHARED_SECRET=lint
+          MEILISEARCH_MASTER_KEY=lint
           WORKER_ID=00000000-0000-0000-0000-000000000000
           DATABASE_URL=postgres://lint:lint@db.example.com:5432/product
           WORLD_DATABASE_URL=postgres://lint:lint@db.example.com:5432/world

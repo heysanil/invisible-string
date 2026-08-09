@@ -48,14 +48,14 @@ function asArray(value: unknown): unknown[] {
 }
 
 /** The registry official `_meta` extension (status + isLatest live here). */
-function officialMeta(entry: Json): Json | null {
+export function officialMeta(entry: Json): Json | null {
   const meta = asObject(entry._meta);
   if (!meta) return null;
   return asObject(meta["io.modelcontextprotocol.registry/official"]);
 }
 
 /** A list entry may be `{ server, _meta }` or a flat server object. */
-function serverAndMeta(entry: Json): { server: Json; meta: Json | null } {
+export function serverAndMeta(entry: Json): { server: Json; meta: Json | null } {
   const nested = asObject(entry.server);
   if (nested) return { server: nested, meta: officialMeta(entry) };
   return { server: entry, meta: officialMeta(entry) };

@@ -1,0 +1,53 @@
+[
+  {
+    "slug": "deepwiki",
+    "title": "DeepWiki",
+    "category": "dev-tools",
+    "description": "Ask questions about any public GitHub repo.",
+    "modelDescription": "DeepWiki: look up documentation and answer questions about public GitHub repositories.",
+    "url": "https://mcp.deepwiki.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "none" },
+    "websiteUrl": "https://deepwiki.com",
+    "featured": true
+  },
+  {
+    "slug": "context7",
+    "title": "Context7",
+    "category": "dev-tools",
+    "description": "Up-to-date docs for any library or framework.",
+    "modelDescription": "Context7: fetch current documentation and code examples for libraries, frameworks, SDKs, and APIs.",
+    "url": "https://mcp.context7.com/mcp",
+    "transport": "streamable-http",
+    "auth": {
+      "type": "headers",
+      "headers": [
+        { "name": "CONTEXT7_API_KEY", "description": "Context7 API key (context7.com/dashboard)", "isSecret": true }
+      ]
+    },
+    "websiteUrl": "https://context7.com",
+    "featured": true
+  },
+  {
+    "slug": "hugging-face",
+    "title": "Hugging Face",
+    "category": "data",
+    "description": "Search models, datasets, papers, and Spaces.",
+    "modelDescription": "Hugging Face Hub: search and inspect models, datasets, papers, and Spaces.",
+    "url": "https://huggingface.co/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "bearer", "tokenLabel": "HF access token", "tokenHint": "hf.co/settings/tokens" },
+    "websiteUrl": "https://huggingface.co"
+  },
+  {
+    "slug": "stripe",
+    "title": "Stripe",
+    "category": "commerce",
+    "description": "Query and act on your Stripe account.",
+    "modelDescription": "Stripe: customers, payments, invoices, subscriptions, and docs search.",
+    "url": "https://mcp.stripe.com",
+    "transport": "streamable-http",
+    "auth": { "type": "bearer", "tokenLabel": "Stripe secret or restricted key", "tokenHint": "dashboard.stripe.com/apikeys" },
+    "websiteUrl": "https://stripe.com"
+  }
+]

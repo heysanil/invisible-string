@@ -17,6 +17,7 @@
  */
 export * from "./agent-definition";
 export * from "./api";
+export * from "./connector-catalog";
 export * from "./copilot";
 export * from "./crypto";
 export * from "./eve-events";

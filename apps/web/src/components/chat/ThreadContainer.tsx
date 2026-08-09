@@ -17,17 +17,14 @@ import type {
   RunStatus,
 } from "@invisible-string/shared";
 
-import {
-  isApiErrorCode,
-  isSessionBusy,
-  isSessionNotActive,
-} from "../../lib/api-client";
+import { isSessionBusy } from "../../lib/api-client";
 import {
   EMPTY_FRAME_STORE,
   reduceRunView,
   type FrameStore,
   type RunView,
 } from "../../lib/chat/run-view";
+import { isSessionOver } from "../../lib/chat/session-errors";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
 import { titleFromMessage } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
@@ -82,20 +79,6 @@ interface RunViewCacheEntry {
 
 function isActiveStatus(status: RunStatus): boolean {
   return status === "queued" || status === "running";
-}
-
-/**
- * The session can never take another message. Two codes mean this, with the
- * SAME recovery (start a new chat) and the opposite recovery from
- * `session_busy`:
- * - `session_not_active` — eve retired the id (terminal / timed out / reset).
- * - `session_not_continuable` — the platform row is closed or lost its eve
- *   session id. Control-plane-only, so there is no shared constant for it.
- */
-function isSessionOver(error: unknown): boolean {
-  return (
-    isSessionNotActive(error) || isApiErrorCode(error, "session_not_continuable")
-  );
 }
 
 export function ThreadContainer({

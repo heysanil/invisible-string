@@ -99,4 +99,22 @@ Old stuff.
     const out = insertSection("# Changelog\n\nPreamble.\n", "## v0.3.0 — 2026-08-08\n");
     expect(out).toBe("# Changelog\n\nPreamble.\n\n## v0.3.0 — 2026-08-08\n");
   });
+
+  // Regression: `indexOf(...) + 1` returns 0 both for "no heading" and for
+  // "heading at offset 0", which previously routed a preamble-less file to the
+  // append-at-end branch. That silently inverts the file, and scripts/release/
+  // decide.ts reads the FIRST `## ` as the newest release.
+  test("inserts at the top when the file has no preamble", () => {
+    const out = insertSection(
+      "## v0.2.0 — 2026-07-21\n\nOld stuff.\n",
+      "## v0.3.0 — 2026-08-08\n\n### Features\n- **web** — New.\n",
+    );
+    expect(out.indexOf("v0.3.0")).toBeLessThan(out.indexOf("v0.2.0"));
+    expect(out.startsWith("## v0.3.0 — 2026-08-08\n")).toBe(true);
+  });
+
+  test("writes a clean file when the changelog does not exist yet", () => {
+    const out = insertSection("", "## v0.3.0 — 2026-08-08\n");
+    expect(out).toBe("## v0.3.0 — 2026-08-08\n");
+  });
 });

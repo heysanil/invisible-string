@@ -54,11 +54,17 @@ export function renderSection(
 
 export function insertSection(changelog: string, section: string): string {
   const body = section.endsWith("\n") ? section : `${section}\n`;
-  const index = changelog.startsWith("## ") ? 0 : changelog.indexOf("\n## ") + 1;
 
-  if (index <= 0) {
+  // Offset of the first `## ` heading. `indexOf(...) + 1` alone cannot be
+  // trusted: it yields 0 both when the heading is missing and when it sits at
+  // offset 0, so `hasHeading` carries the found/not-found bit separately.
+  const first = changelog.startsWith("## ") ? 0 : changelog.indexOf("\n## ") + 1;
+  const hasHeading = changelog.startsWith("## ") || first > 0;
+
+  if (!hasHeading) {
+    if (changelog === "") return body;
     const separator = changelog.endsWith("\n") ? "\n" : "\n\n";
     return `${changelog}${separator}${body}`;
   }
-  return `${changelog.slice(0, index)}${body}\n${changelog.slice(index)}`;
+  return `${changelog.slice(0, first)}${body}\n${changelog.slice(first)}`;
 }

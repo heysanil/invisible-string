@@ -56,10 +56,13 @@ export function decide(version: string, tag: TagState): Decision {
 export function extractLatestSection(
   changelog: string,
 ): { heading: string; body: string } | undefined {
-  const start = changelog.startsWith("## ") ? 0 : changelog.indexOf("\n## ") + 1;
-  if (start <= 0) return undefined;
+  const first = changelog.startsWith("## ") ? 0 : changelog.indexOf("\n## ") + 1;
+  // Mirrors insertSection's hasHeading split — `indexOf(...) + 1` conflates
+  // "missing" with "at offset 0", so the found bit must be carried separately.
+  const hasHeading = changelog.startsWith("## ") || first > 0;
+  if (!hasHeading) return undefined;
 
-  const rest = changelog.slice(start);
+  const rest = changelog.slice(first);
   const newlineIndex = rest.indexOf("\n");
   const heading = rest.slice(3, newlineIndex === -1 ? undefined : newlineIndex).trim();
 

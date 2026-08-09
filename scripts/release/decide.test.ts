@@ -76,4 +76,13 @@ Older.
     expect(section?.heading).toBe("v0.3.0 — 2026-08-08");
     expect(section?.body).toBe("Only.");
   });
+
+  // Regression: a file that is nothing but sections. `indexOf(...) + 1` returns
+  // 0 both for "no heading" and "heading at offset 0", so `start <= 0` used to
+  // reject the preamble-less file that insertSection is built to write.
+  test("reads a preamble-less file whose first line is a heading", () => {
+    const section = extractLatestSection("## v0.3.0 — 2026-08-08\n\nOnly.\n");
+    expect(section?.heading).toBe("v0.3.0 — 2026-08-08");
+    expect(section?.body).toBe("Only.");
+  });
 });

@@ -903,9 +903,15 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session1.id));
       return runs.length >= 2 ? true : undefined;
     }, "thread reply continued the session");
-    const continued = worker.sessionMessages.find(
-      (m) => m.kind === "continue" && m.sessionId === session1.eveSessionId,
-    )!;
+    // The run row is inserted BEFORE the eve continue POST reaches the worker
+    // stub — poll for the continue message itself rather than racing it.
+    const continued = await until(
+      async () =>
+        worker.sessionMessages.find(
+          (m) => m.kind === "continue" && m.sessionId === session1.eveSessionId,
+        ),
+      "continue message reached the worker",
+    );
     expect(continued).toBeTruthy();
     expect(continued.message).toContain("and one more thing");
     const slackSessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");

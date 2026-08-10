@@ -140,8 +140,9 @@ type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
  * Rebuilt `connections` row → wire DTO. Secrets are NEVER echoed — only
  * `hasCredentials` (an `oauth` row always counts as credentialed).
  * `oauthStatus` is caller-supplied: create passes the newborn grant's
- * `pending`; readers that have not joined the `connection_oauth` row report
- * null (the grant-status join lands with the token lifecycle work).
+ * `pending`; every reader of an oauth row loads its `connection_oauth`
+ * status (resources/connections.ts `oauthStatusOf`) — a null here means
+ * "not an oauth connection", never "status unknown".
  */
 export function connectionDto(
   row: ConnectionRow,

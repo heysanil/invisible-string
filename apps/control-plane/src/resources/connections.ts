@@ -12,12 +12,13 @@
  * connection filenames/env vars), so a publish can never fail on a slug
  * collision the create quietly allowed.
  */
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   createConnectionRequestSchema,
   newId,
   updateConnectionRequestSchema,
+  type ConnectionOauthStatus,
   type ConnectorCatalogEntry,
   type CreateConnectionResponse,
   type DeleteResourceResponse,
@@ -56,6 +57,21 @@ async function loadOauthGrant(
     .where(eq(schema.connectionOauth.connectionId, connectionId))
     .limit(1);
   return rows[0];
+}
+
+/**
+ * Grant status for one row's DTO: oauth rows read their 1:1 grant (a missing
+ * row — e.g. a PATCHed-to-oauth connection before its first start — reads
+ * `pending`); every other auth type is null. Readers MUST carry this or the
+ * SPA's auth panel can never leave "pending" after a refetch (spec §6/§10).
+ */
+async function oauthStatusOf(
+  db: Db,
+  row: Row,
+): Promise<ConnectionOauthStatus | null> {
+  if (row.authType !== "oauth") return null;
+  const grant = await loadOauthGrant(db, row.id);
+  return grant?.status ?? "pending";
 }
 
 async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
@@ -218,7 +234,29 @@ export async function listConnections(
     .from(schema.connections)
     .where(scopeWhere(schema.connections, scope))
     .orderBy(schema.connections.name);
-  return { connections: rows.map((row) => connectionDto(row)) };
+  // Grant statuses for the oauth rows in ONE query (not per-row).
+  const oauthIds = rows
+    .filter((row) => row.authType === "oauth")
+    .map((row) => row.id);
+  const grants =
+    oauthIds.length === 0
+      ? []
+      : await deps.db
+          .select({
+            connectionId: schema.connectionOauth.connectionId,
+            status: schema.connectionOauth.status,
+          })
+          .from(schema.connectionOauth)
+          .where(inArray(schema.connectionOauth.connectionId, oauthIds));
+  const statusById = new Map(grants.map((g) => [g.connectionId, g.status]));
+  return {
+    connections: rows.map((row) =>
+      connectionDto(
+        row,
+        row.authType === "oauth" ? (statusById.get(row.id) ?? "pending") : null,
+      ),
+    ),
+  };
 }
 
 export async function getConnection(
@@ -227,7 +265,7 @@ export async function getConnection(
   id: string,
 ): Promise<GetConnectionResponse> {
   const row = await loadOwned(deps.db, scope, id);
-  return { connection: connectionDto(row) };
+  return { connection: connectionDto(row, await oauthStatusOf(deps.db, row)) };
 }
 
 export async function createConnection(
@@ -432,7 +470,10 @@ export async function updateConnection(
     .set(patch)
     .where(and(eq(schema.connections.id, id), scopeWhere(schema.connections, scope)))
     .returning();
-  return { connection: connectionDto(rows[0]!) };
+  // The response seeds the SPA's detail cache — carry the grant status.
+  return {
+    connection: connectionDto(rows[0]!, await oauthStatusOf(deps.db, rows[0]!)),
+  };
 }
 
 export async function deleteConnection(
@@ -469,7 +510,10 @@ export async function probeConnectionRoute(
   const row = await loadOwned(deps.db, scope, id);
   try {
     const fresh = await probeAndPersist(deps, row);
-    return { connection: connectionDto(fresh) };
+    // Also seeds the SPA's detail cache — carry the grant status.
+    return {
+      connection: connectionDto(fresh, await oauthStatusOf(deps.db, fresh)),
+    };
   } catch (error) {
     if (isRuntimeApiError(error)) throw error;
     throw errors.probeFailed(

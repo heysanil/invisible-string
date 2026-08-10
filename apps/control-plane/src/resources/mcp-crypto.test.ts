@@ -14,7 +14,11 @@ import {
   mcpTokenEnvName,
 } from "../runtime/agent-env";
 import { RuntimeApiError } from "../runtime/errors";
-import { connectionAuthAad, encryptConnectionAuthConfig } from "./mcp-crypto";
+import {
+  connectionAuthAad,
+  decryptConnectionAuthHeaders,
+  encryptConnectionAuthConfig,
+} from "./mcp-crypto";
 
 const KEY = parseMasterKey(generateMasterKeyBase64());
 const ID = "cn_a1b2c3d4e5f6a7b8";
@@ -82,6 +86,69 @@ describe("encryptConnectionAuthConfig / decrypt round-trip", () => {
     );
     expect(() =>
       decryptMcpAuthConfig(JSON.stringify(envelope), KEY, ID),
+    ).toThrow(RuntimeApiError);
+  });
+});
+
+describe("decryptConnectionAuthHeaders (probe read side)", () => {
+  test("none and oauth contribute no headers", () => {
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "none", authConfigEncrypted: null },
+        KEY,
+      ),
+    ).toEqual({});
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "oauth", authConfigEncrypted: null },
+        KEY,
+      ),
+    ).toEqual({});
+  });
+
+  test("bearer becomes an Authorization header", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "bearer", values: { token: "sk-secret" } },
+      KEY,
+      ID,
+    )!;
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "bearer", authConfigEncrypted: stored },
+        KEY,
+      ),
+    ).toEqual({ Authorization: "Bearer sk-secret" });
+  });
+
+  test("headers decrypt as stored", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "headers", values: { "X-Api-Key": "abc" } },
+      KEY,
+      ID,
+    )!;
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "headers", authConfigEncrypted: stored },
+        KEY,
+      ),
+    ).toEqual({ "X-Api-Key": "abc" });
+  });
+
+  test("an envelope moved to another row fails as a typed error", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "bearer", values: { token: "t" } },
+      KEY,
+      ID,
+    )!;
+    expect(() =>
+      decryptConnectionAuthHeaders(
+        {
+          id: "cn_zzzzzzzzzzzzzzzz",
+          authType: "bearer",
+          authConfigEncrypted: stored,
+        },
+        KEY,
+      ),
     ).toThrow(RuntimeApiError);
   });
 });

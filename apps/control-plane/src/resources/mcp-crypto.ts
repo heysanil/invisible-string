@@ -7,7 +7,14 @@
  * The AAD binds to the row id, so a create must know its id BEFORE encrypting
  * (callers generate the `cn_` id up front and insert it explicitly).
  */
-import { encryptSecret, type MasterKey, type McpAuthWrite } from "@invisible-string/shared";
+import {
+  decryptSecret,
+  encryptSecret,
+  type ConnectionAuthType,
+  type EncryptedEnvelope,
+  type MasterKey,
+  type McpAuthWrite,
+} from "@invisible-string/shared";
 
 import { errors } from "../runtime/errors";
 
@@ -45,4 +52,47 @@ export function encryptConnectionAuthConfig(
     connectionAuthAad(connectionId),
   );
   return JSON.stringify(envelope);
+}
+
+/** The columns {@link decryptConnectionAuthHeaders} reads off a `connections` row. */
+export interface ConnectionAuthSource {
+  id: string;
+  authType: ConnectionAuthType;
+  authConfigEncrypted: string | null;
+}
+
+/**
+ * Decrypt a connection's static auth into the HTTP headers a probe dials
+ * with: `bearer` → `{ Authorization: "Bearer <token>" }`, `headers` → as
+ * stored, `none`/`oauth` → `{}` (OAuth probing arrives with the Plan 3
+ * broker). The plaintext lives in the caller's function scope only — never
+ * logged, never persisted, never in a DTO.
+ */
+export function decryptConnectionAuthHeaders(
+  row: ConnectionAuthSource,
+  masterKey: MasterKey | undefined,
+): Record<string, string> {
+  if (row.authType === "none" || row.authType === "oauth") return {};
+  if (!row.authConfigEncrypted) return {};
+  if (!masterKey) throw errors.encryptionKeyMissing();
+  try {
+    const envelope = JSON.parse(row.authConfigEncrypted) as EncryptedEnvelope;
+    const plaintext = decryptSecret(
+      envelope,
+      masterKey,
+      connectionAuthAad(row.id),
+    );
+    const config = JSON.parse(plaintext) as {
+      type?: string;
+      token?: string;
+      headers?: Record<string, string>;
+    };
+    if (config.type === "headers" && config.headers) return { ...config.headers };
+    if (typeof config.token === "string") {
+      return { Authorization: `Bearer ${config.token}` };
+    }
+    return {};
+  } catch {
+    throw errors.mcpSecretUnavailable(row.id);
+  }
 }

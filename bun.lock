@@ -20,6 +20,7 @@
         "@invisible-string/compiler": "workspace:*",
         "@invisible-string/db": "workspace:*",
         "@invisible-string/shared": "workspace:*",
+        "@modelcontextprotocol/sdk": "1.29.0",
         "@openrouter/ai-sdk-provider": "6.0.0-alpha.1",
         "ai": "7.0.14",
         "better-auth": "^1.6.23",

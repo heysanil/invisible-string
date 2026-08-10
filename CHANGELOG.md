@@ -8,6 +8,17 @@ Entries from `v0.3.0` onward are written at merge time as
 reconstruction** from the conventional-commit log between tags, not authored
 release notes.
 
+## v0.4.0 — 2026-08-10
+
+### Features
+- **web** — Move the chat Stop control onto the composer's send button and queue messages typed during a run, merging them into one send when the session frees.
+- **web** — Render a run as an ordered timeline of work and speech segments so reasoning accumulates instead of overwriting, interim narration renders in chronological position, and streaming text never relocates after it has rendered.
+
+### Fixes & maintenance
+- **worker** — Stop the artifact-cache boot scan from killing worker startup when an entry disappears between readdir and stat.
+- **web** — Stub every server-only `packages/shared` module for the browser, fixing the `node:crypto` crash that made the SPA fail to load, and add a guard test so a new server-only module in the shared barrel can no longer break the client bundle silently.
+- **web** — Replay a rich-text editor focus request that arrives before the editor instance exists instead of silently dropping it.
+
 ## v0.3.0 — 2026-08-09
 
 ### Breaking changes

@@ -141,6 +141,27 @@ export function useDeleteConnection(ref: ScopeRef) {
   });
 }
 
+/**
+ * Manual "Test connection" (and the detail's stale auto re-probe): POST the
+ * probe route, which dials the server NOW, persists the health columns and
+ * returns the fresh DTO — seeded into the detail cache so the health panel
+ * re-renders without a refetch race.
+ */
+export function useProbeConnection(ref: ScopeRef) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: string) =>
+      api.post(
+        `${basePath(ref)}/${connectionId}/probe`,
+        getConnectionResponseSchema,
+      ),
+    onSuccess: async (data) => {
+      seedDetail(queryClient, ref, data);
+      await invalidateConnections(queryClient, ref);
+    },
+  });
+}
+
 /** Optimistic enable/disable toggle. */
 export function useToggleConnection(ref: ScopeRef) {
   const queryClient = useQueryClient();

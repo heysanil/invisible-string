@@ -1,17 +1,10 @@
 import { Blocks, Plus } from "lucide-react";
-import { useState } from "react";
 import type { ConnectionDto } from "@invisible-string/shared";
 
-import { parseBlockingReference, type BlockingReference } from "../../lib/blocker";
 import { errorMessage } from "../../lib/forms";
-import {
-  useConnections,
-  useDeleteConnection,
-  useToggleConnection,
-} from "../../lib/queries/connections";
+import { useConnections, useToggleConnection } from "../../lib/queries/connections";
 import type { ScopeRef } from "../../lib/queries/keys";
 import { Button } from "../ui/Button";
-import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { EmptyState } from "../ui/EmptyState";
 import { ErrorState } from "../ui/ErrorState";
 import { SkeletonList } from "../ui/Skeleton";
@@ -21,35 +14,20 @@ import { McpConnectionCard } from "./McpConnectionCard";
 export interface McpConnectionsGridProps {
   scope: ScopeRef;
   onAdd: () => void;
+  /** Open the connection detail slide-over (delete lives in its danger zone). */
+  onOpen: (connection: ConnectionDto) => void;
   readOnly: boolean;
 }
 
-export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGridProps) {
+export function McpConnectionsGrid({
+  scope,
+  onAdd,
+  onOpen,
+  readOnly,
+}: McpConnectionsGridProps) {
   const connections = useConnections(scope);
   const toggle = useToggleConnection(scope);
-  const remove = useDeleteConnection(scope);
   const { toast } = useToast();
-
-  const [pendingDelete, setPendingDelete] = useState<ConnectionDto | null>(null);
-  const [blocker, setBlocker] = useState<BlockingReference | null>(null);
-
-  async function confirmDelete() {
-    if (!pendingDelete) return;
-    const target = pendingDelete;
-    try {
-      await remove.mutateAsync(target.id);
-      toast({ variant: "success", message: `${target.name} removed.` });
-      setPendingDelete(null);
-    } catch (error) {
-      const blocking = parseBlockingReference(error);
-      if (blocking) {
-        setPendingDelete(null);
-        setBlocker(blocking);
-        return;
-      }
-      toast({ variant: "error", message: errorMessage(error) });
-    }
-  }
 
   return (
     <section className="flex flex-col gap-3">
@@ -101,6 +79,7 @@ export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGri
               key={connection.id}
               connection={connection}
               readOnly={readOnly}
+              onOpen={() => onOpen(connection)}
               onToggle={(enabled) =>
                 toggle.mutate(
                   { connectionId: connection.id, enabled },
@@ -110,45 +89,10 @@ export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGri
                   },
                 )
               }
-              onDelete={() => setPendingDelete(connection)}
             />
           ))}
         </div>
       )}
-
-      <ConfirmDialog
-        open={pendingDelete !== null}
-        onClose={() => setPendingDelete(null)}
-        onConfirm={() => void confirmDelete()}
-        title={`Remove ${pendingDelete?.name ?? "connection"}?`}
-        description="Agents that use this connection will no longer be able to reach its tools."
-        confirmLabel="Remove"
-        destructive
-        loading={remove.isPending}
-      />
-
-      <ConfirmDialog
-        open={blocker !== null}
-        onClose={() => setBlocker(null)}
-        onConfirm={() => setBlocker(null)}
-        blocker
-        title="Still in use"
-        description="The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it."
-      >
-        {blocker && blocker.blockingNames.length > 0 ? (
-          <ul className="mt-1 flex flex-col gap-1.5">
-            {blocker.blockingNames.map((name) => (
-              <li
-                key={name}
-                className="flex items-center gap-2 rounded-card border border-black/[0.06] bg-white/50 px-3 py-2 text-[13px] text-ink-2"
-              >
-                <span className="size-1.5 shrink-0 rounded-full bg-warn" aria-hidden="true" />
-                {name}
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </ConfirmDialog>
     </section>
   );
 }

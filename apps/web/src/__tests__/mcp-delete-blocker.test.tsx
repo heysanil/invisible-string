@@ -2,7 +2,9 @@
  * Deleting an MCP connection that AGENTS still reference must not silently
  * fail: the server's 409 `connection_in_use` carries a bare array of agent
  * names (errors.connectionInUse) which surfaces as a helpful blocker dialog
- * that names the agents and prescribes achievable remediation.
+ * that names the agents and prescribes achievable remediation. Since the
+ * connectors redesign (plan-2 Task 4) delete lives in the connection
+ * detail's danger zone, not on the card.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -15,40 +17,38 @@ import {
   renderWithProviders,
   type FetchMock,
 } from "../test/harness";
-import { McpConnectionsGrid } from "../components/context/McpConnectionsGrid";
+import { ConnectionDetail } from "../components/context/ConnectionDetail";
 
 ensureDomForThisFile();
 
 const NOW = "2026-07-03T00:00:00.000Z";
+const ID = "cn_cccccccccccccccc";
 
-const CONNECTIONS = {
-  connections: [
-    {
-      id: "cn_cccccccccccccccc",
-      scope: "workspace",
-      name: "GitHub",
-      description: null,
-      source: "registry",
-      catalogSlug: null,
-      registryName: "io.github/github",
-      url: "https://mcp.github.dev/mcp",
-      transport: "streamable-http",
-      authType: "headers",
-      hasCredentials: true,
-      oauthStatus: null,
-      toolAllow: null,
-      toolBlock: null,
-      approvalPolicy: null,
-      enabled: true,
-      health: "unknown",
-      lastCheckedAt: null,
-      lastError: null,
-      tools: null,
-      toolsCachedAt: null,
-      createdAt: NOW,
-      updatedAt: NOW,
-    },
-  ],
+const CONNECTION = {
+  id: ID,
+  scope: "workspace",
+  name: "GitHub",
+  description: null,
+  source: "registry",
+  catalogSlug: null,
+  registryName: "io.github/github",
+  url: "https://mcp.github.dev/mcp",
+  transport: "streamable-http",
+  authType: "headers",
+  hasCredentials: true,
+  oauthStatus: null,
+  toolAllow: null,
+  toolBlock: null,
+  approvalPolicy: null,
+  enabled: true,
+  health: "ok",
+  // Fresh so the detail's stale auto re-probe stays quiet in this test.
+  lastCheckedAt: new Date().toISOString(),
+  lastError: null,
+  tools: null,
+  toolsCachedAt: null,
+  createdAt: NOW,
+  updatedAt: NOW,
 };
 
 let fetchMock: FetchMock;
@@ -64,8 +64,8 @@ afterEach(() => {
 
 test("409 on delete opens a blocker dialog naming the agents (real server shape: bare name array)", async () => {
   fetchMock
-    .on("GET", "/connections", () => jsonResponse(CONNECTIONS))
-    .on("DELETE", "/connections/", () =>
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: CONNECTION }))
+    .on("DELETE", `/connections/${ID}`, () =>
       jsonResponse(
         {
           error: {
@@ -80,19 +80,24 @@ test("409 on delete opens a blocker dialog naming the agents (real server shape:
     );
 
   const view = renderWithProviders(
-    <McpConnectionsGrid
+    <ConnectionDetail
       scope={{ scope: "workspace", workspaceId: "org_1" }}
-      onAdd={() => {}}
+      connectionId={ID}
       readOnly={false}
+      onClose={() => {}}
     />,
   );
 
-  await view.findByText("GitHub");
-  fireEvent.click(view.getByRole("button", { name: "Remove" }));
+  // Delete lives in the detail's danger zone.
+  fireEvent.click(await view.findByRole("button", { name: "Remove connection" }));
 
-  // Confirm the destructive action in the first dialog.
-  const confirm = await view.findByRole("dialog");
-  fireEvent.click(within(confirm).getByRole("button", { name: "Remove" }));
+  // Confirm the destructive action in the confirm dialog.
+  const confirm = await view.findByText("Remove GitHub?");
+  fireEvent.click(
+    within(confirm.closest('[role="dialog"]') as HTMLElement).getByRole("button", {
+      name: "Remove",
+    }),
+  );
 
   // The 409 flips it to a blocker dialog listing the blocking AGENTS, with
   // remediation the user can actually perform (the reference lives on the

@@ -10,8 +10,10 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
+import type { QueuedMessage } from "../../lib/chat/use-message-queue";
 import { Composer } from "./Composer";
 import { ContextDivider, type ContextMarkerKind } from "./ContextDivider";
+import { QueuedMessages } from "./QueuedMessages";
 import { RunMessage } from "./RunMessage";
 import { ThreadHeader, type ThreadHeaderProps } from "./ThreadHeader";
 
@@ -20,10 +22,10 @@ export interface ThreadViewProps {
   runs: readonly RunView[];
   isChatOrigin: boolean;
   onRespond: (runId: string, response: RunInputRequest) => void;
-  /** Stop an in-flight run (stable identity). */
-  onCancel?: (runId: string) => void;
-  /** The run whose stop request is in flight (disables its button). */
-  cancelingRunId?: string | null;
+  /** Stop whichever run holds the session's slot. Rendered on the composer. */
+  onStop?: () => void;
+  /** True while the stop request is in flight. */
+  stopping?: boolean;
   /**
    * A clear/compact that just landed. eve emits `context.cleared` /
    * `compaction.*` on the SESSION stream, which nothing is tailing when the
@@ -42,7 +44,16 @@ export interface ThreadViewProps {
   onSend: (message: string) => void;
   composerDisabledReason?: string | null;
   sending?: boolean;
-  failedDraft?: string;
+  /** Messages waiting for the session's run slot to free. */
+  queued?: readonly QueuedMessage[];
+  onRemoveQueued?: (id: string) => void;
+  /** Non-blocking composer notice (queue retry state, transient errors). */
+  composerHint?: string | null;
+  /** Submit means enqueue. */
+  queueing?: boolean;
+  /** Text handed back after a failed send — appended, never replacing. */
+  restoreDraft?: string | null;
+  onRestoreConsumed?: () => void;
 }
 
 export function ThreadView({
@@ -50,15 +61,20 @@ export function ThreadView({
   runs,
   isChatOrigin,
   onRespond,
-  onCancel,
-  cancelingRunId,
+  onStop,
+  stopping,
   contextMarker,
   pendingInput,
   inputError,
   onSend,
   composerDisabledReason,
   sending,
-  failedDraft,
+  queued,
+  onRemoveQueued,
+  composerHint,
+  queueing,
+  restoreDraft,
+  onRestoreConsumed,
 }: ThreadViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -86,16 +102,24 @@ export function ThreadView({
 
   // Autoscroll to the newest content while pinned. Runs on every render of the
   // run set (new frames grow the last item) — measurement drives real height.
+  // The signature must GROW monotonically as the tail streams, or the thread
+  // stops following: a new segment outranks anything inside the previous one.
   const lastRun = runs[runs.length - 1];
+  const lastSegment = lastRun?.segments[lastRun.segments.length - 1];
   const streamSignature =
-    (lastRun?.reply?.text.length ?? 0) +
-    (lastRun?.block?.steps.length ?? 0) * 1000 +
+    (lastRun?.segments.length ?? 0) * 100000 +
+    (lastSegment?.kind === "speech" ? lastSegment.text.length : 0) +
+    (lastSegment?.kind === "work" ? lastSegment.items.length * 1000 : 0) +
     (lastRun?.pendingInputs.length ?? 0) * 100;
+  // The queue strip sits BELOW the scroll container, so a new row shrinks the
+  // transcript's viewport with nothing inside it to re-pin — the newest run
+  // slides out of sight unless the queue length is a scroll trigger too.
+  const queuedCount = queued?.length ?? 0;
   useLayoutEffect(() => {
     if (stickToBottom.current && runs.length > 0) {
       virtualizer.scrollToIndex(runs.length - 1, { align: "end" });
     }
-  }, [runs.length, streamSignature, virtualizer]);
+  }, [runs.length, streamSignature, queuedCount, virtualizer]);
 
   // On first mount of a thread, jump to the bottom.
   useEffect(() => {
@@ -132,13 +156,14 @@ export function ThreadView({
                 className="absolute left-0 top-0 w-full px-5"
                 style={{ transform: `translateY(${item.start}px)` }}
               >
-                <div className="pb-5">
+                {/* Symmetric padding so an exchange is visually a block of its
+                    own — virtualized rows are measured, so this lands in the
+                    row height rather than collapsing against a neighbour. */}
+                <div className="py-5">
                   <RunMessage
                     run={run}
                     isChatOrigin={isChatOrigin}
                     onRespond={onRespond}
-                    onCancel={onCancel}
-                    canceling={cancelingRunId === run.runId}
                     pendingInput={
                       pendingInput?.runId === run.runId ? pendingInput : null
                     }
@@ -162,11 +187,20 @@ export function ThreadView({
             <ContextDivider kind={contextMarker} />
           </div>
         ) : null}
+        <QueuedMessages
+          messages={queued ?? []}
+          onRemove={onRemoveQueued ?? (() => {})}
+        />
         <Composer
           onSend={onSend}
           disabledReason={composerDisabledReason}
+          hint={composerHint}
+          onStop={onStop}
+          stopping={stopping}
+          queueing={queueing}
+          restoreDraft={restoreDraft}
+          onRestoreConsumed={onRestoreConsumed}
           sending={sending}
-          initialValue={failedDraft}
         />
       </div>
     </div>

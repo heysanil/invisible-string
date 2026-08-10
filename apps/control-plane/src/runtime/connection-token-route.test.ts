@@ -399,7 +399,7 @@ describe.skipIf(!TEST_DATABASE_URL)("POST /internal/connections/token", () => {
   // The tailer's authorization latch resolves eve's connection name (the
   // per-version slug) back to a `cn_` row through the SAME published
   // `connection_slugs` map this suite's fixtures carry, then flips health to
-  // `auth_required`. Dormant on eve 0.31.3 (spike finding 30) but wired
+  // `auth_required`. Dormant on eve 0.31.3 (spike finding 34) but wired
   // defensively — proven here against a real publish.
 
   test("authorization health flip: version slug resolves to the row and flips health", async () => {

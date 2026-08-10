@@ -6,7 +6,7 @@
  * `authorization.completed` resolved states.
  *
  * The surface is DORMANT on eve 0.31.3 for platform connections (spike
- * REPORT finding 30) — rendered defensively against eve's declared types.
+ * REPORT finding 34) — rendered defensively against eve's declared types.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -119,8 +119,7 @@ test("RunMessage renders authorization cards from the run view", () => {
     runId: "run1",
     status: "waiting",
     userMessage: "Sync my issues",
-    block: null,
-    reply: null,
+    segments: [],
     pendingInputs: [],
     authorizations: [baseAuth()],
     error: null,

@@ -11,11 +11,14 @@
  *   chip + argument preview, because *what* is about to run is the decision.
  * - `question`      — the agent asking (`ask_question`). No tool chip: the
  *   gating "tool" is plumbing, and showing it reads as a scary approval.
- * - `session-limit` — eve's 40M-input-token guardrail (NEW in 0.31). A
- *   deterministic Approve/Stop prompt: Approve grants a fresh budget window,
- *   Stop cancels the turn through the normal `turn.cancelled` path. Its
- *   backing "tool" (`session_limit_continuation`) and raw token counters are
- *   suppressed; eve's own per-option descriptions carry the consequence.
+ * - `session-limit` — eve's 40M-input-token guardrail (NEW in 0.31). Rendered
+ *   as an APPROVE-ONLY prompt: granting a fresh budget window is the only
+ *   thing this card decides. eve's own "Stop now" option is filtered out — it
+ *   ends the turn through the same `turn.cancelled` path as the composer's
+ *   Stop, which is permanently mounted, so offering both put two controls for
+ *   one decision side by side. Its backing "tool"
+ *   (`session_limit_continuation`) and raw token counters are suppressed;
+ *   eve's own per-option descriptions carry the consequence.
  *
  * An optimistic pending state holds while `POST /runs/:id/input` is in flight.
  */
@@ -86,11 +89,35 @@ export function ApprovalCard({
   const [text, setText] = useState("");
   const isPending = pending != null;
   const showFreeform = input.allowFreeform || input.display === "text";
-  const hasOptions = input.options.length > 0;
   const { icon: KindIcon, groupLabel, eyebrow } = KIND_PRESENTATION[input.kind];
   // Only the budget prompt earns per-option help text — eve authors it there
   // ("Grant a fresh token budget" / "Stop now") and nowhere else.
   const showOptionDescriptions = input.kind === "session-limit";
+
+  // Drop the session-limit prompt's own "Stop now".
+  //
+  // It is eve's option, not ours, and it ends the turn through the SAME
+  // `turn.cancelled` path the composer's Stop uses — so with Stop now living
+  // on the composer, permanently mounted and reachable without scrolling, this
+  // is a second control for one decision sitting a few pixels from the first.
+  // Two buttons that mean the same thing is worse than one, and the one that
+  // survives is the one present for every run, parked or not.
+  //
+  // Routed on eve's own `style === "danger"` marker rather than the label, and
+  // only for `session-limit`: a tool-approval's danger option is a real REFUSAL
+  // ("Deny"), which the composer's Stop cannot express. The `remaining.length`
+  // guard means a future eve build that marks every option danger degrades to
+  // showing them all rather than to a card with nothing to click.
+  const optionsForKind =
+    input.kind === "session-limit"
+      ? (() => {
+          const remaining = input.options.filter(
+            (option) => option.style !== "danger",
+          );
+          return remaining.length > 0 ? remaining : input.options;
+        })()
+      : input.options;
+  const hasOptions = optionsForKind.length > 0;
 
   return (
     <div
@@ -133,7 +160,7 @@ export function ApprovalCard({
             showOptionDescriptions && "flex-col items-stretch sm:flex-row",
           )}
         >
-          {input.options.map((option) => {
+          {optionsForKind.map((option) => {
             const active = pending?.optionId === option.id;
             // eve marks the session-limit "Stop" option `danger`, but stopping
             // is the same user decision the Stop button makes — and this whole

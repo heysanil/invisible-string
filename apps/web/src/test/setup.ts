@@ -32,11 +32,30 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
  * level to bind registration to ITS OWN before/after hooks.
  */
 export function ensureDomForThisFile(): void {
-  beforeAll(() => {
+  beforeAll(async () => {
     if (!GlobalRegistrator.isRegistered) {
       GlobalRegistrator.register();
     }
     globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    // Pin `@tiptap/react`'s SSR latch to the value a BROWSER produces.
+    //
+    // It reads `typeof window === "undefined"` ONCE at module scope and keeps
+    // that answer for the whole process. Whichever module evaluates it first
+    // therefore decides, for every later test, whether `useEditor` returns an
+    // instance on the first render or defers creation to an effect
+    // (`immediatelyRender: false`) — a codepath the real app never runs,
+    // because browsers always have a `window`.
+    //
+    // The registration above is per-FILE (each afterAll unregisters), so a DOM
+    // file that does not touch Tiptap can consume the initial registration and
+    // leave a later file's import phase to evaluate Tiptap with no `window`.
+    // That is exactly how it latched true on CI while staying false locally:
+    // pure filesystem iteration order, differing between ext4 and APFS.
+    //
+    // Importing it here — inside the FIRST DOM file's beforeAll, with the DOM
+    // registered — latches it false before any other file's import phase can
+    // reach it, so the suite tests what ships regardless of file order.
+    await import("@tiptap/react");
   });
   afterAll(async () => {
     // React 19's scheduler drives concurrent work through a MessageChannel;

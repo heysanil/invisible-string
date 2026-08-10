@@ -151,6 +151,43 @@ function composer(): HTMLElement {
   return q().getByLabelText("Ask copilot");
 }
 
+/** Non-throwing lookup — the composer does not exist until the chunk lands. */
+function findComposer(): HTMLElement | null {
+  return q().queryByLabelText("Ask copilot");
+}
+
+/**
+ * Wait for the composer to mount AND take focus, polling both conditions.
+ *
+ * The composer is lazily imported, so until the chunk resolves there is no
+ * "Ask copilot" label at all — which is why this polls a QUERY (nullable)
+ * rather than a `getBy*` (throws). WHEN it resolves is a property of the
+ * machine, not of the code, so a fixed sleep is always a bet.
+ *
+ * This assertion earned its keep: it caught a real production bug where a
+ * focus() arriving before `useEditor` produced an instance was dropped on the
+ * floor (RichTextEditor's `isLive` guard, now queued and replayed). Under
+ * `@tiptap/react`'s module-scope `isSSR` latch the editor is created AFTER the
+ * first render, so that window is wide — the test failed on CI for months of
+ * file-ordering luck away from failing everywhere.
+ *
+ * Deliberately NOT `waitFor`: it wraps every poll in `act()`, which here also
+ * flushes the dock's reconnect timers and fake sockets — measured at ~460s for
+ * this file versus ~1s for this loop.
+ */
+async function waitForComposerFocus(): Promise<void> {
+  // ~3s of budget, which costs nothing when the condition is already true.
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const target = findComposer();
+    if (target !== null && document.activeElement === target) return;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  }
+  // Out of budget — assert so the failure reports the real diff, not a timeout.
+  expect(document.activeElement).toBe(composer());
+}
+
 function sendUserMessage(socket: FakeWebSocket, text = "Help me") {
   const box = composer();
   pasteInto(box, text);
@@ -182,13 +219,12 @@ test("collapsed pill when closed; opening persists to the per-workspace key and 
   fireEvent.click(pill);
   expect(window.localStorage.getItem(OPEN_KEY)).toBe("1");
   expect(FakeWebSocket.instances.length).toBe(1);
-  // Focus lands on the composer, not <body>. Tiptap defers it a frame (the
-  // editor view has to be mounted before it can place a caret).
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  });
-  expect(document.activeElement).toBe(composer());
-});
+  // Focus lands on the composer, not <body>. See waitForComposerFocus for
+  // why this polls rather than sleeping a fixed interval.
+  await waitForComposerFocus();
+  // Explicit budget: the lazy chunk load is what makes this slow on a loaded
+  // runner, and it happens inside render() — before the poll even starts.
+}, 30_000);
 
 test("collapsing returns focus to the pill", () => {
   renderDock();
@@ -568,11 +604,9 @@ test("applying the focused card moves focus to the composer (not <body>)", async
   const card = q().getByTestId("suggestion-card");
   card.focus();
   fireEvent.keyDown(card, { key: "Enter" });
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  });
-  expect(document.activeElement).toBe(q().getByLabelText("Ask copilot"));
-});
+  // Same lazy-editor focus chain as the open-the-dock case above.
+  await waitForComposerFocus();
+}, 30_000);
 
 test("unmount tears the socket down without reconnecting", async () => {
   const { view } = renderDock();

@@ -885,7 +885,7 @@ describe("tailRun — eve 0.31 plumbing", () => {
 
 describe("authorization latch (connectors plan-3 task 9)", () => {
   // NOTE: `authorization.required` is DORMANT on eve 0.31.3 for the
-  // platform's getToken-only connections (spike REPORT finding 30 — a mid-run
+  // platform's getToken-only connections (spike REPORT finding 34 — a mid-run
   // 401 is a plain failed action.result). The latch is implemented
   // defensively against eve's declared wire types: these fixtures are
   // synthetic NDJSON, not live captures.

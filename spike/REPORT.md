@@ -432,6 +432,56 @@ control plane's `6.0.0-alpha.1`). Design:
       `meta-llama/llama-3.2-1b-instruct` during the same sweep was an account
       data-policy/guardrail restriction — unrelated to reasoning.)
 
+## Appended findings — reasoning/message stream shapes (2026-08-09)
+
+Source-read against the pinned `eve@0.31.3` dist — `package/dist/src/harness/emission.js`,
+function `consumeStreamContent` (the single place every `reasoning.*` and
+`message.*` event is constructed). These four supersede the DOCS-DERIVED
+annotation on `reasoning.appended`/`reasoning.completed` in
+`packages/shared/src/eve-events.ts`: the shapes are now read from the emitter,
+though still not captured off a live model. Design consumer:
+`docs/superpowers/specs/2026-08-09-reasoning-timeline-rendering-design.md`.
+
+30. **CRITICAL — `reasoningSoFar` is cumulative PER BLOCK, not per step, and one
+    `stepIndex` can emit MULTIPLE reasoning blocks.** The emitter holds one
+    accumulator `u`; `reasoning-delta` does `u += text` and emits
+    `reasoning.appended({reasoningDelta, reasoningSoFar: u})`. The `text-delta`
+    branch then does `u.trim().length>0 && (emit reasoning.completed({reasoning: u}), u = "")`
+    — it **seals the block and resets the accumulator**. So an interleaving
+    model (reason → speak → reason, all inside one model call) emits *two*
+    `reasoning.completed` events carrying **the same `turnId` AND the same
+    `stepIndex`**, the second `reasoningSoFar` restarting from empty. Any
+    consumer keying reasoning solely on `(turnId, stepIndex)` and upserting
+    will have the second block **overwrite** the first — silently losing it,
+    and losing it in the shorter direction. `sequence` does not disambiguate
+    (it is the turn's sequence, constant within the turn). Consumers need an
+    ordinal per sealed key.
+
+31. **`messageSoFar` has the identical per-block structure, and multiple
+    `message.completed` can share one `(turnId, stepIndex)`.** `flushCurrentMessage`
+    emits `message.completed({finishReason: "tool-calls", message: d})` then
+    resets `d = ""`. It fires from `emitActionRequest`/`collectProviderToolCall`
+    whenever `d.trim().length > 0`, so a step that says something, calls a tool,
+    says something else and calls another tool emits **two** `tool-calls`
+    completions at the same step index. `(turnId, stepIndex)` is therefore NOT
+    a unique key for assistant messages either.
+
+32. **`message.completed(finishReason: "tool-calls")` is emitted BEFORE the
+    `actions.requested` that triggered it.** `emitActionRequest` runs
+    `d.trim().length>0 && await flushCurrentMessage()` *then*
+    `a(createActionsRequestedEvent(...))`. Narration therefore always precedes
+    its tool call in `seq` order — a chronological consumer needs no lookahead,
+    and fixtures asserting the opposite order would be wrong.
+
+33. **A tool call does NOT split a reasoning block — only text does.** The
+    `tool-call` / `tool-result` branches never touch `u`. So
+    reason → tool → reason within one step is ONE block, sealed by a single
+    `reasoning.completed` emitted at **end of stream** (the trailing
+    `u.trim().length>0 && emit reasoning.completed` after the loop) — i.e.
+    *after* that step's `actions.requested` and `action.result` events. A UI
+    that seals a thought on its `reasoning.completed` will therefore keep a
+    thought marked in-progress until the step ends, which is correct but later
+    than a naive "seal on next tool call" heuristic would guess.
 ## Appended finding — mid-run MCP auth rejection (2026-08-10)
 
 Captured by `spike/tests/authorization-events.test.ts` (gated `SPIKE_EVE_BUILD=1`
@@ -446,7 +496,7 @@ plan 3, Task 9). Committed captures:
 `spike/tests/fixtures/authorization-401-events.ndjson` and
 `authorization-gettoken-throw-events.ndjson`.
 
-30. **A mid-run 401 from an MCP server on a getToken-only connection is a
+34. **A mid-run 401 from an MCP server on a getToken-only connection is a
     FAILED TOOL CALL, nothing more — `authorization.required` is NOT
     emitted.** eve's `McpConnectionClient` maps any HTTP 401 in the error
     chain to `ConnectionAuthorizationRequiredError` ("Connection "authprobe"
@@ -525,7 +575,6 @@ plan 3, Task 9). Committed captures:
       `tools/call` (all carrying `Authorization: Bearer <token>`), which is
       what makes a marker-file-controlled `getToken` flip observable
       mid-session without restarting anything.
-
 ## How to run
 
 ```sh

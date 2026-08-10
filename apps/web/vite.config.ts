@@ -5,28 +5,40 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 
-const cryptoStub = fileURLToPath(
-  new URL("./src/lib/shared-crypto-browser-stub.ts", import.meta.url),
+import { SERVER_ONLY_SHARED_MODULES } from "./src/lib/server-only-shared-modules";
+
+const stubsByModule = new Map(
+  SERVER_ONLY_SHARED_MODULES.map(({ module, stub }) => [
+    module,
+    fileURLToPath(new URL(`./src/lib/${stub}`, import.meta.url)),
+  ]),
 );
 
 /**
- * `@invisible-string/shared`'s barrel re-exports server-only envelope crypto
- * (`crypto.ts` → `node:crypto` + Node `Buffer`), which crashes in the browser.
- * Redirect that one module to a browser stub so importing shared DTOs stays
- * client-safe. The web app never runs envelope crypto (the control plane does).
+ * `@invisible-string/shared`'s barrel re-exports server-only modules that
+ * import `node:crypto` (envelope encryption, worker token minting). Vite
+ * externalizes `node:*` and its shim throws on access, so importing ANY shared
+ * DTO would crash the SPA at load. Redirect each to a browser stub so importing
+ * shared contracts stays client-safe. The web app runs none of this code — the
+ * control plane and worker do.
+ *
+ * The module list lives in ./src/lib/server-only-shared-modules.ts so the guard
+ * test can assert it stays complete as the barrel grows.
  */
-function stubServerCrypto(): Plugin {
+function stubServerOnlySharedModules(): Plugin {
   return {
-    name: "stub-shared-server-crypto",
+    name: "stub-server-only-shared-modules",
     enforce: "pre",
     resolveId(source, importer) {
-      if (
-        source === "@invisible-string/shared/crypto" ||
-        (source === "./crypto" &&
-          importer !== undefined &&
-          importer.replace(/\\/g, "/").includes("/packages/shared/src/"))
-      ) {
-        return cryptoStub;
+      for (const [module, stub] of stubsByModule) {
+        if (
+          source === `@invisible-string/shared/${module}` ||
+          (source === `./${module}` &&
+            importer !== undefined &&
+            importer.replace(/\\/g, "/").includes("/packages/shared/src/"))
+        ) {
+          return stub;
+        }
       }
       return null;
     },
@@ -50,7 +62,7 @@ const securityHeaders: Record<string, string> = {
 
 export default defineConfig({
   plugins: [
-    stubServerCrypto(),
+    stubServerOnlySharedModules(),
     tanstackRouter({ target: "react", autoCodeSplitting: true }),
     react(),
     tailwindcss(),

@@ -10,7 +10,7 @@
  *
  * DORMANT on eve 0.31.3 for platform connections: a getToken-only connection
  * surfaces a mid-run 401 as a plain failed tool call and never emits
- * `authorization.required` (spike REPORT finding 30). Rendered defensively
+ * `authorization.required` (spike REPORT finding 34). Rendered defensively
  * against eve's declared wire types so an eve upgrade that starts emitting
  * them gets a consent card, not a dropped event.
  */

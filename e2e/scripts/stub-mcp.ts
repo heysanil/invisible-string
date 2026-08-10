@@ -178,7 +178,7 @@ const httpServer = createServer(async (req, res) => {
   //    401 + the WWW-Authenticate PRM pointer (what discoverOauth reads);
   //  - `tools/call` demands a bearer the stub AS says is active — the
   //    compiled agent's broker-delivered token — else the same 401 challenge
-  //    (eve surfaces it as a failed tool call; spike finding 30);
+  //    (eve surfaces it as a failed tool call; spike finding 34);
   //  - handshake methods pass without auth so plan-2 probes classify `ok`
   //    (the probe never carries broker tokens).
   if (url.pathname === "/mcp-oauth") {

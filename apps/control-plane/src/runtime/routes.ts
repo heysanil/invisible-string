@@ -343,7 +343,7 @@ export async function ensureAgentOnWorker(
  * column existed carry null (`?? {}`); an unknown slug is a logged no-op,
  * never an error (the event is server-influenced content).
  *
- * DORMANT on eve 0.31.3 for platform connections (spike REPORT finding 30):
+ * DORMANT on eve 0.31.3 for platform connections (spike REPORT finding 34):
  * getToken-only strategies surface a mid-run 401 as a plain failed tool call
  * and this path never fires. It is wired defensively for an eve that starts
  * emitting the declared `authorization.*` events.

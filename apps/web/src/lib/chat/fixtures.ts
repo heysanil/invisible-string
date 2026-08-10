@@ -117,7 +117,13 @@ const streamingRun: FixtureRun = {
     { type: "message.received", data: { message: "Draft a launch announcement.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "reasoning.appended", data: { reasoningDelta: "Considering the tone", reasoningSoFar: "Considering the tone and audience for the announcement…", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
-    { type: "message.appended", data: { messageDelta: "We're excited", messageSoFar: "We're excited to announce", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
+    { type: "reasoning.completed", data: { reasoning: "Considering the tone and audience for the announcement…", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(2) } },
+    { type: "message.appended", data: { messageDelta: "Let me check", messageSoFar: "Let me check the product notes first.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
+    { type: "message.completed", data: { finishReason: "tool-calls", message: "Let me check the product notes first.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
+    { type: "actions.requested", data: { actions: [{ callId: "c_notes", kind: "tool-call", toolName: "search_notes", input: { q: "launch" } }], sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(4) } },
+    { type: "action.result", data: { result: { callId: "c_notes", kind: "tool-result", toolName: "search_notes", output: "3 notes" }, status: "completed", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(6) } },
+    { type: "reasoning.appended", data: { reasoningDelta: "The notes", reasoningSoFar: "The notes emphasise reliability over novelty — I'll lead with that.", sequence: 0, stepIndex: 2, turnId: "t0" }, meta: { at: iso(7) } },
+    { type: "message.appended", data: { messageDelta: "We're excited", messageSoFar: "We're excited to announce", sequence: 0, stepIndex: 2, turnId: "t0" }, meta: { at: iso(9) } },
   ]),
 };
 

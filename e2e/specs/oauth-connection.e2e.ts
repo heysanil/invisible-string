@@ -17,7 +17,7 @@
  *      the platform token broker) → CHAT. Connection tools are not advertised
  *      directly on eve 0.31 — the mock-model choreography is a
  *      `connection_search` discovery turn, then explicit
- *      `<slug>__save_note` turns (spike finding 30).
+ *      `<slug>__save_note` turns (spike finding 34).
  *   4. The tool call proves the DELIVERY CHAIN: the compiled agent's
  *      `getToken` self-mints a version-bound platform JWT, hits
  *      `POST /internal/connections/token`, the broker refreshes centrally
@@ -29,7 +29,7 @@
  *      can explain (the AS's refresh-grant counter increments again).
  *   6. The AS flips to `invalid_grant`: the broker lands the grant `expired`
  *      + connection `auth_error`, the run surfaces a FAILED tool call (never
- *      a hang — spike finding 30: a getToken failure is a failed
+ *      a hang — spike finding 34: a getToken failure is a failed
  *      `action.result` and the turn completes), and the detail offers
  *      Reconnect.
  *
@@ -270,7 +270,7 @@ test("oauth consent, broker refresh, and compiled-agent token delivery", async (
   );
   // The emitted lib throws on the broker's 409, eve records a failed
   // action.result, and the turn runs to a normal finish — the error text is
-  // the only auth signal on the wire (spike finding 30).
+  // the only auth signal on the wire (spike finding 34).
   await expect(
     page.getByText(/connection needs re-authorization/).first(),
   ).toBeVisible({ timeout: RUN_TIMEOUT_MS });

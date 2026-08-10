@@ -133,6 +133,163 @@ test("a failed send hands the draft back through initialValue", async () => {
   expect(onSend.mock.calls).toEqual([["retry me"], ["retry me"]]);
 });
 
+// ── Stop on the send button + queueing ──────────────────────────────────────
+
+test("no Stop control when nothing is stoppable", async () => {
+  const view = render(<Composer onSend={() => {}} />);
+  await view.findByLabelText("Message");
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  expect(view.getByRole("button", { name: "Send message" })).toBeTruthy();
+});
+
+test("an empty box during a run shows Stop instead of send", async () => {
+  const onStop = mock(() => {});
+  const view = render(<Composer onSend={() => {}} onStop={onStop} queueing />);
+  await view.findByLabelText("Message");
+
+  fireEvent.click(view.getByRole("button", { name: "Stop" }));
+  expect(onStop).toHaveBeenCalledTimes(1);
+  // The submit button is not competing for the same spot.
+  expect(view.queryByRole("button", { name: /message$/ })).toBeNull();
+});
+
+test("typing during a run shows BOTH Stop and Queue — neither action is mouse-inaccessible", async () => {
+  const onSend = mock((_message: string) => {});
+  const onStop = mock(() => {});
+  const view = render(<Composer onSend={onSend} onStop={onStop} queueing />);
+  const box = await view.findByLabelText("Message");
+
+  paste(box, "and link the images");
+
+  const queue = await view.findByRole("button", { name: "Queue message" });
+  fireEvent.click(queue);
+  expect(onSend.mock.calls).toEqual([["and link the images"]]);
+  expect(view.getByRole("button", { name: "Stop" })).toBeTruthy();
+});
+
+test("Enter queues rather than sends while a run holds the slot", async () => {
+  const onSend = mock((_message: string) => {});
+  const view = render(<Composer onSend={onSend} onStop={() => {}} queueing />);
+  const box = await view.findByLabelText("Message");
+
+  paste(box, "keep it under 200 words");
+  fireEvent.keyDown(box, { key: "Enter" });
+
+  // Same callback either way — the parent routes on `queueing`. What matters
+  // is that the flush still happened: the debounced value is 180 ms behind.
+  expect(onSend.mock.calls).toEqual([["keep it under 200 words"]]);
+  expect(box.textContent).toBe("");
+});
+
+test("Escape stops the run, and does nothing when there is nothing to stop", async () => {
+  const onStop = mock(() => {});
+  const view = render(<Composer onSend={() => {}} onStop={onStop} queueing />);
+  const box = await view.findByLabelText("Message");
+  fireEvent.keyDown(box, { key: "Escape" });
+  expect(onStop).toHaveBeenCalledTimes(1);
+
+  cleanup();
+  const plain = render(<Composer onSend={() => {}} />);
+  const plainBox = await plain.findByLabelText("Message");
+  // No throw, no stop — Escape is inert without a stoppable run.
+  fireEvent.keyDown(plainBox, { key: "Escape" });
+  expect(onStop).toHaveBeenCalledTimes(1);
+});
+
+test("a background flush does not block queuing by mouse", async () => {
+  const onSend = mock((_message: string) => {});
+  // `sending` is true because the QUEUE is flushing, not because this box sent.
+  const view = render(
+    <Composer onSend={onSend} onStop={() => {}} queueing sending />,
+  );
+  const box = await view.findByLabelText("Message");
+
+  paste(box, "one more thing");
+  const queue = await view.findByRole("button", { name: "Queue message" });
+  expect((queue as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(queue);
+  expect(onSend.mock.calls).toEqual([["one more thing"]]);
+});
+
+test("the placeholder never changes when queueing flips — the draft must survive", async () => {
+  const view = render(<Composer onSend={() => {}} placeholder="Message Release Notes…" />);
+  const box = await view.findByLabelText("Message");
+  paste(box, "half a thought");
+
+  // A run starts underneath the user mid-sentence.
+  view.rerender(
+    <Composer
+      onSend={() => {}}
+      placeholder="Message Release Notes…"
+      onStop={() => {}}
+      queueing
+    />,
+  );
+
+  // Same editor instance, same text. Changing `placeholder` (or `ariaLabel`)
+  // is in useEditor's dep array and would have rebuilt the editor, silently
+  // destroying this draft — the exact scenario the queue exists for.
+  const after = await view.findByLabelText("Message");
+  expect(after.textContent).toContain("half a thought");
+});
+
+test("a retired session is the only thing that still freezes the box", async () => {
+  const onSend = mock((_message: string) => {});
+  const view = render(
+    <Composer onSend={onSend} disabledReason="This session has been retired — start a new chat." />,
+  );
+  const box = await view.findByLabelText("Message");
+  paste(box, "anything");
+  fireEvent.keyDown(box, { key: "Enter" });
+  expect(onSend).not.toHaveBeenCalled();
+  expect(view.getByText(/has been retired/)).toBeTruthy();
+});
+
+test("a restored draft appends — it never overwrites what the user is typing", async () => {
+  const onRestoreConsumed = mock(() => {});
+  const view = render(
+    <Composer onSend={() => {}} onRestoreConsumed={onRestoreConsumed} />,
+  );
+  const box = await view.findByLabelText("Message");
+  paste(box, "a new thought");
+
+  // A queued flush gave up ~10 s after the user started typing again.
+  view.rerender(
+    <Composer
+      onSend={() => {}}
+      restoreDraft="the message that failed to send"
+      onRestoreConsumed={onRestoreConsumed}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(box.textContent).toContain("a new thought");
+    expect(box.textContent).toContain("the message that failed to send");
+  });
+  // Consumed exactly once, so a re-render cannot append it twice.
+  expect(onRestoreConsumed).toHaveBeenCalledTimes(1);
+});
+
+test("a restored draft seeds an empty box without a leading blank line", async () => {
+  const view = render(<Composer onSend={() => {}} restoreDraft="just this" onRestoreConsumed={() => {}} />);
+  const box = await view.findByLabelText("Message");
+  await waitFor(() => expect(box.textContent).toBe("just this"));
+});
+
+test("the hint is announced without disabling anything", async () => {
+  const onSend = mock((_message: string) => {});
+  const view = render(
+    <Composer onSend={onSend} hint="Still finishing up — your queued message will send shortly." />,
+  );
+  const box = await view.findByLabelText("Message");
+  const hint = view.getByText(/Still finishing up/);
+  expect(hint.getAttribute("aria-live")).toBe("polite");
+
+  paste(box, "still typeable");
+  fireEvent.keyDown(box, { key: "Enter" });
+  expect(onSend.mock.calls).toEqual([["still typeable"]]);
+});
+
 // ── The other half of the round trip: the bubble the message lands in ───────
 
 function chatRun(userMessage: string): RunView {
@@ -140,8 +297,7 @@ function chatRun(userMessage: string): RunView {
     runId: "run1",
     status: "succeeded",
     userMessage,
-    block: null,
-    reply: null,
+    segments: [],
     pendingInputs: [],
     authorizations: [],
     error: null,

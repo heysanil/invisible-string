@@ -161,10 +161,10 @@ describe("CI installs the toolchain through mise, and only through mise", () => 
       }
     }
     expect({
-      reason: "install host tools via mise.toml + jdx/mise-action@v2 instead",
+      reason: "install host tools via mise.toml + jdx/mise-action@v4 instead",
       offenders,
     }).toEqual({
-      reason: "install host tools via mise.toml + jdx/mise-action@v2 instead",
+      reason: "install host tools via mise.toml + jdx/mise-action@v4 instead",
       offenders: [],
     });
   });
@@ -180,9 +180,9 @@ describe("CI installs the toolchain through mise, and only through mise", () => 
       }
     }
     expect({
-      reason: "add `- uses: jdx/mise-action@v2` to the job",
+      reason: "add `- uses: jdx/mise-action@v4` to the job",
       missing,
-    }).toEqual({ reason: "add `- uses: jdx/mise-action@v2` to the job", missing: [] });
+    }).toEqual({ reason: "add `- uses: jdx/mise-action@v4` to the job", missing: [] });
   });
 
   test("mise-action reads mise.toml — no inline tool versions in workflows", () => {

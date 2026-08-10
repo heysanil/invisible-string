@@ -7,8 +7,9 @@
  * streams (the server replays persisted events on connect). seq is
  * authoritative, so a re-delivered frame after a resume is a no-op.
  */
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useBlocker } from "@tanstack/react-router";
 import { MessageSquare } from "lucide-react";
 
 import type {
@@ -17,17 +18,15 @@ import type {
   RunStatus,
 } from "@invisible-string/shared";
 
-import {
-  isApiErrorCode,
-  isSessionBusy,
-  isSessionNotActive,
-} from "../../lib/api-client";
+import { isSessionBusy } from "../../lib/api-client";
 import {
   EMPTY_FRAME_STORE,
   reduceRunView,
   type FrameStore,
   type RunView,
 } from "../../lib/chat/run-view";
+import { isSessionOver } from "../../lib/chat/session-errors";
+import { useMessageQueue } from "../../lib/chat/use-message-queue";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
 import { titleFromMessage } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
@@ -46,6 +45,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Spinner } from "../ui/Spinner";
 import { useToast } from "../ui/Toast";
 import type { ContextMarkerKind } from "./ContextDivider";
+import { DiscardQueueDialog } from "./DiscardQueueDialog";
 import { ThreadView } from "./ThreadView";
 import type { SessionContextAction, ThreadHeaderProps } from "./ThreadHeader";
 
@@ -63,6 +63,8 @@ export interface ThreadContainerProps {
    * send 409s `session_not_active` forever.
    */
   onSessionReplaced?: (newSessionId: string) => void;
+  /** Lets the owner of session selection guard a switch away from a live queue. */
+  onQueuedCountChange?: (count: number) => void;
 }
 
 interface PendingInput {
@@ -84,26 +86,13 @@ function isActiveStatus(status: RunStatus): boolean {
   return status === "queued" || status === "running";
 }
 
-/**
- * The session can never take another message. Two codes mean this, with the
- * SAME recovery (start a new chat) and the opposite recovery from
- * `session_busy`:
- * - `session_not_active` — eve retired the id (terminal / timed out / reset).
- * - `session_not_continuable` — the platform row is closed or lost its eve
- *   session id. Control-plane-only, so there is no shared constant for it.
- */
-function isSessionOver(error: unknown): boolean {
-  return (
-    isSessionNotActive(error) || isApiErrorCode(error, "session_not_continuable")
-  );
-}
-
 export function ThreadContainer({
   workspaceId,
   sessionId,
   agentName,
   workflowName,
   onSessionReplaced,
+  onQueuedCountChange,
 }: ThreadContainerProps) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -117,7 +106,11 @@ export function ThreadContainer({
 
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
-  const [failedDraft, setFailedDraft] = useState<string | undefined>(undefined);
+  // Text handed back after a send the queue could not land. Its consumer is
+  // the composer's APPEND path, not the replace path — the box stays live
+  // through all of this, so a give-up landing seconds later must not clobber
+  // whatever the user has started typing since.
+  const [restoreDraft, setRestoreDraft] = useState<string | null>(null);
   const [busyNotice, setBusyNotice] = useState<string | null>(null);
   /** Set once eve reports this session id permanently unusable. */
   const [sessionRetired, setSessionRetired] = useState(false);
@@ -188,13 +181,58 @@ export function ThreadContainer({
   const slotHeld = runViews.some(
     (run) => !run.canceled && (isActiveStatus(run.status) || run.status === "waiting"),
   );
+  // The slot holder, read for its run id. Same predicate as `slotHeld` — only
+  // one run can hold the slot, so "the one to stop" is unambiguous.
+  const stoppableRunId =
+    [...runViews]
+      .reverse()
+      .find(
+        (run) =>
+          !run.canceled && (isActiveStatus(run.status) || run.status === "waiting"),
+      )?.runId ?? null;
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
 
+  // `mutateAsync` so the queue can await the outcome of its own flush. The
+  // direct `send` path below keeps using `mutate` with callbacks.
+  const postMessageAsync = postMessage.mutateAsync;
+  const sendForQueue = useCallback(
+    async (message: string) => {
+      await postMessageAsync({ sessionId, message });
+    },
+    [postMessageAsync, sessionId],
+  );
+
+  const queue = useMessageQueue({
+    canFlush: !slotHeld && !sessionRetired && !postMessage.isPending,
+    send: sendForQueue,
+    onGiveUp: setRestoreDraft,
+    onRetired: () => setSessionRetired(true),
+  });
+
+  // A ref, not a render closure: `shouldBlockFn` is registered once, and a
+  // flush that empties the queue mid-navigation must be visible to it.
+  const queuedCountRef = useRef(0);
+  queuedCountRef.current = queue.queued.length;
+
+  useEffect(() => {
+    onQueuedCountChange?.(queue.queued.length);
+  }, [onQueuedCountChange, queue.queued.length]);
+
+  // `enableBeforeUnload` DEFAULTS TO TRUE. Leaving it out installs a
+  // reload/tab-close prompt on every thread with a queue — deliberately out
+  // of scope for a client-side draft.
+  const blocker = useBlocker({
+    shouldBlockFn: () => queuedCountRef.current > 0,
+    enableBeforeUnload: false,
+    withResolver: true,
+  });
+
   // The two 409s have OPPOSITE recoveries and must never share copy:
-  // `session_busy` is transient (the draft is worth keeping — retry shortly),
-  // `session_not_active` is permanent for this id (eve retired it; retrying
-  // can never succeed, so the only honest offer is a new chat).
+  // `session_busy` is transient (the message is worth keeping — the queue
+  // retries it shortly), `session_not_active` is permanent for this id (eve
+  // retired it; retrying can never succeed, so the only honest offer is a
+  // new chat).
   const send = useCallback(
     (message: string) => {
       setBusyNotice(null);
@@ -202,12 +240,17 @@ export function ThreadContainer({
         { sessionId, message },
         {
           onError: (mutationError) => {
-            setFailedDraft(message);
             if (isSessionBusy(mutationError)) {
-              setBusyNotice(
-                "This session is still working. Your message will be kept — try again once it finishes.",
-              );
-            } else if (isSessionOver(mutationError)) {
+              // The slot was taken between the keystroke and the POST (a
+              // stale `slotHeld`, or another tab). Hand it to the queue
+              // rather than making the user re-send: with `queued.length > 0`
+              // forcing the queue path afterwards, the queue is the single
+              // owner of busy recovery.
+              queue.enqueue(message);
+              return;
+            }
+            setRestoreDraft(message);
+            if (isSessionOver(mutationError)) {
               setSessionRetired(true);
               setBusyNotice(
                 "This session has been retired and can’t take new messages. Start a new chat to keep going — your text is still here to copy.",
@@ -217,13 +260,28 @@ export function ThreadContainer({
             }
           },
           onSuccess: () => {
-            setFailedDraft(undefined);
+            setRestoreDraft(null);
             setBusyNotice(null);
           },
         },
       );
     },
-    [postMessage, sessionId],
+    [postMessage, queue, sessionId],
+  );
+
+  // Submit means ENQUEUE whenever the slot is (or is about to be) held. The
+  // `queued.length > 0` term keeps order: once anything is waiting, a later
+  // message must join the tail rather than overtake it down the direct path.
+  const queueing = slotHeld || postMessage.isPending || queue.queued.length > 0;
+  const onSubmit = useCallback(
+    (message: string) => {
+      if (queueing) {
+        queue.enqueue(message);
+        return;
+      }
+      send(message);
+    },
+    [queue, queueing, send],
   );
 
   // Depend on the STABLE pieces (react-query's bound mutate + the reopen
@@ -233,18 +291,16 @@ export function ThreadContainer({
   const postInputMutate = postInput.mutate;
   const reopenStream = streams.reopen;
   const cancelMutate = cancelRun.mutate;
-  const onCancel = useCallback(
-    (runId: string) => {
-      setBusyNotice(null);
-      cancelMutate(
-        { runId },
-        {
-          onError: (mutationError) => setBusyNotice(errorMessage(mutationError)),
-        },
-      );
-    },
-    [cancelMutate],
-  );
+  const onStop = useCallback(() => {
+    if (stoppableRunId === null) return;
+    setBusyNotice(null);
+    cancelMutate(
+      { runId: stoppableRunId },
+      {
+        onError: (mutationError) => setBusyNotice(errorMessage(mutationError)),
+      },
+    );
+  }, [cancelMutate, stoppableRunId]);
   const respond = useCallback(
     (runId: string, response: RunInputRequest) => {
       setInputError(null);
@@ -416,11 +472,19 @@ export function ThreadContainer({
           : null,
   };
 
-  const composerDisabledReason = anyActive
-    ? "Working… you can send a follow-up when this run finishes."
-    : awaitingApproval
-      ? "Waiting for your response above."
-      : busyNotice;
+  // A live run no longer freezes the box — that is the whole point of the
+  // queue. The ONLY thing that disables the composer is a session eve has
+  // retired, where there is genuinely nowhere for the text to go. Everything
+  // else is a non-blocking hint.
+  const composerDisabledReason = sessionRetired
+    ? "This session has been retired — start a new chat."
+    : null;
+  const composerHint =
+    queue.notice ??
+    busyNotice ??
+    (awaitingApproval
+      ? "Waiting for your response above — anything you send now is queued."
+      : null);
 
   return (
     <>
@@ -429,8 +493,8 @@ export function ThreadContainer({
         runs={runViews}
         isChatOrigin={session.origin === "chat"}
         onRespond={respond}
-        onCancel={onCancel}
-        cancelingRunId={cancelRun.isPending ? (cancelRun.variables?.runId ?? null) : null}
+        onStop={stoppableRunId !== null ? onStop : undefined}
+        stopping={cancelRun.isPending}
         // Never two dividers for one clear. The optimistic marker exists for
         // a clear performed while the session is IDLE, where no run is
         // tailing and eve's `context.cleared` reaches nobody. If the newest
@@ -442,10 +506,15 @@ export function ThreadContainer({
         contextMarker={lastRun?.contextCleared === true ? null : contextMarker}
         pendingInput={pendingInput}
         inputError={inputError}
-        onSend={send}
-        composerDisabledReason={composerDisabledReason ?? null}
+        onSend={onSubmit}
+        composerDisabledReason={composerDisabledReason}
+        composerHint={composerHint}
+        queueing={queueing}
+        queued={queue.queued}
+        onRemoveQueued={queue.remove}
+        restoreDraft={restoreDraft}
+        onRestoreConsumed={() => setRestoreDraft(null)}
         sending={postMessage.isPending}
-        failedDraft={failedDraft}
       />
       {/* Reset is the one control that destroys something: the eve session id
           is retired for good, so the dialog names that consequence rather
@@ -465,11 +534,34 @@ export function ThreadContainer({
           message — and starts a fresh one in its place. The messages above stay
           readable here.
         </p>
+        {/* Reset bypasses both discard guards — `onSessionReplaced` remounts
+            the keyed container — so the queue's fate belongs in THIS copy. */}
+        {queue.queued.length > 0 ? (
+          <p className="mt-2 text-[13px] leading-relaxed text-ink-3">
+            The{" "}
+            {queue.queued.length === 1
+              ? "message"
+              : `${queue.queued.length} messages`}{" "}
+            waiting to send {queue.queued.length === 1 ? "is" : "are"} discarded
+            too.
+          </p>
+        ) : null}
         <p className="mt-2 text-[13px] leading-relaxed text-ink-3">
           To keep the conversation and only drop the agent’s memory of it, use{" "}
           <span className="font-medium text-ink-2">Clear context</span> instead.
         </p>
       </ConfirmDialog>
+      {/* Route navigation away from a live queue: the container unmounts and
+          the queue goes with it, so ask before letting the router proceed. */}
+      <DiscardQueueDialog
+        open={blocker.status === "blocked"}
+        count={queue.queued.length}
+        onClose={() => blocker.reset?.()}
+        onConfirm={() => {
+          queue.clear();
+          blocker.proceed?.();
+        }}
+      />
     </>
   );
 }

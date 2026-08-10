@@ -28,7 +28,7 @@
  *   turn 3  authprobe__save_note                      -> tools/call, 401
  *   turn 4  authprobe__save_note (marker file set)    -> getToken THROWS
  *
- * Observed (finding 30): eve builds a FRESH MCP client per turn — every turn
+ * Observed (finding 34): eve builds a FRESH MCP client per turn — every turn
  * that touches the connection re-runs getToken and replays
  * initialize/notifications/initialized/tools/list before tools/call, so the
  * stub's method-scoped flip ("tools/call after the first completed call")
@@ -83,7 +83,7 @@ if (!GATE) {
  * Local stub MCP server port (spike block: proxy 4100, agent 4101). The
  * authprobe connection's DEFAULT url is this address because a connection
  * `url` is resolved at `eve build` time and baked into the compiled manifest
- * — runtime env cannot repoint it (finding 30). Exporting the env var here
+ * — runtime env cannot repoint it (finding 34). Exporting the env var here
  * only matters when THIS file is the one that triggers the shared build; both
  * paths land on the same address.
  */

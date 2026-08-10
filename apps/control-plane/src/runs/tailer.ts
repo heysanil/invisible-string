@@ -53,7 +53,7 @@
  *   platform connections: a getToken-only strategy surfaces a mid-run 401 as
  *   a plain failed action.result and `authorization.required` is emitted only
  *   by interactive auth strategies the platform does not author (spike
- *   REPORT finding 30). Implemented defensively against eve's declared wire
+ *   REPORT finding 34). Implemented defensively against eve's declared wire
  *   types (`authorization.*` in eve-events.ts).
  * - session.waiting otherwise → run succeeded (chat sessions always park on
  *   next-user-message after a completed turn)
@@ -174,7 +174,7 @@ export interface TerminalContext {
    * Latched exactly like {@link pendingInputRequest}: while set, a settling
    * `session.waiting` means the run is WAITING on the user's consent — never
    * succeeded, which would settle its delivery obligation with a truncated
-   * reply. Dormant on eve 0.31.3 for platform connections (finding 30).
+   * reply. Dormant on eve 0.31.3 for platform connections (finding 34).
    */
   pendingAuthorization?: boolean;
   /**
@@ -282,7 +282,7 @@ export function nextPendingInputRequest(
  * DORMANT on eve 0.31.3 for platform connections: getToken-only strategies
  * surface a mid-run 401 as a plain failed action.result, and
  * `authorization.required` is reachable only via interactive auth strategies
- * the platform does not author (spike REPORT finding 30). The latch stays in
+ * the platform does not author (spike REPORT finding 34). The latch stays in
  * defensively — the types are on eve's wire contract, and an eve upgrade that
  * starts emitting them must park the run, not mark it succeeded.
  */

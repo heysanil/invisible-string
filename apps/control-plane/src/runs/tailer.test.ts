@@ -18,6 +18,7 @@ import type { RunStore, RunStatusPatch, StoredRunEvent } from "./store";
 import {
   classifyTerminal,
   ndjsonEvents,
+  nextPendingAuthorization,
   nextPendingInputRequest,
   tailRun,
   RunTailerManager,
@@ -879,6 +880,214 @@ describe("tailRun — eve 0.31 plumbing", () => {
     expect(attempted).toBe(1);
     expect(store.runStatus).toBe("failed");
     expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
+  });
+});
+
+describe("authorization latch (connectors plan-3 task 9)", () => {
+  // NOTE: `authorization.required` is DORMANT on eve 0.31.3 for the
+  // platform's getToken-only connections (spike REPORT finding 30 — a mid-run
+  // 401 is a plain failed action.result). The latch is implemented
+  // defensively against eve's declared wire types: these fixtures are
+  // synthetic NDJSON, not live captures.
+  const waiting = {
+    type: "session.waiting",
+    data: { wait: "next-user-message" },
+  } as EveStreamEvent;
+  const required = {
+    type: "authorization.required",
+    data: {
+      name: "linear",
+      description: "Linear MCP",
+      authorization: {
+        url: "https://as.example.com/authorize?request=abc",
+        userCode: "ABCD-1234",
+        expiresAt: "2026-08-10T12:00:00.000Z",
+      },
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "t0",
+    },
+  } as EveStreamEvent;
+  const completed = {
+    type: "authorization.completed",
+    data: {
+      name: "linear",
+      outcome: "authorized",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "t0",
+    },
+  } as EveStreamEvent;
+
+  test("session.waiting while authorization is pending → run waiting, never succeeded", () => {
+    // The Slack-truncation hazard: an unlatched session.waiting would classify
+    // the run succeeded, settling its delivery obligation with a truncated
+    // reply while the user is still mid-consent.
+    expect(
+      classifyTerminal(waiting, {
+        pendingInputRequest: false,
+        pendingAuthorization: true,
+      }),
+    ).toEqual({ runStatus: "waiting", sessionStatus: "waiting" });
+  });
+
+  test("cancellation outranks a pending authorization", () => {
+    expect(
+      classifyTerminal(waiting, {
+        pendingInputRequest: false,
+        pendingAuthorization: true,
+        canceledTurn: true,
+      }),
+    ).toEqual({ runStatus: "canceled", sessionStatus: "active" });
+  });
+
+  test("latch sets on .required, clears on .completed, invalidates at the same boundaries as input requests", () => {
+    expect(nextPendingAuthorization(false, required)).toBeTrue();
+    expect(nextPendingAuthorization(true, completed)).toBeFalse();
+    expect(
+      nextPendingAuthorization(true, {
+        type: "turn.cancelled",
+        data: { sequence: 0, turnId: "t0" },
+      } as EveStreamEvent),
+    ).toBeFalse();
+    expect(
+      nextPendingAuthorization(true, {
+        type: "context.cleared",
+        data: { sequence: 0, sessionId: "s", turnId: "t0" },
+      } as EveStreamEvent),
+    ).toBeFalse();
+    // Unlike an input request, a tool result does NOT resolve a consent
+    // challenge — only authorization.completed (or a boundary) may clear it.
+    expect(
+      nextPendingAuthorization(true, {
+        type: "action.result",
+        data: {
+          result: { callId: "c1", kind: "tool-result", toolName: "x", output: "y" },
+          status: "completed",
+          sequence: 0,
+          stepIndex: 0,
+          turnId: "t0",
+        },
+      } as EveStreamEvent),
+    ).toBeTrue();
+    expect(nextPendingAuthorization(true, waiting)).toBeTrue();
+  });
+
+  test("authorization park: .required then session.waiting → run waiting, event persisted, health hook fired", async () => {
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      JSON.stringify(required),
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const hookCalls: Array<{ connectionName: string }> = [];
+
+    const handle = tailRun({
+      runId: "run-auth",
+      agentSessionId: "sess-auth",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      onAuthorizationRequired: (info) => hookCalls.push(info),
+    });
+    await handle.done;
+
+    expect(store.runStatus).toBe("waiting");
+    expect(store.sessionStatus).toBe("waiting");
+    // A parked run is not completed.
+    expect(store.runPatches.at(-1)?.completedAt).toBeUndefined();
+    // The event is persisted like any other run event (chat card replay).
+    expect(
+      store.events.some((e) => e.event.type === "authorization.required"),
+    ).toBeTrue();
+    // The health flip seam fired with eve's connection name (the slug).
+    expect(hookCalls).toEqual([{ connectionName: "linear" }]);
+  });
+
+  test("authorization.completed clears the latch — the settling session.waiting means succeeded", async () => {
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      JSON.stringify(required),
+      JSON.stringify(completed),
+      `{"type":"message.completed","data":{"finishReason":"stop","message":"done","sequence":0,"stepIndex":0,"turnId":"t0"}}`,
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+
+    const handle = tailRun({
+      runId: "run-auth-done",
+      agentSessionId: "sess-auth-done",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+    });
+    await handle.done;
+
+    expect(store.runStatus).toBe("succeeded");
+    expect(store.sessionStatus).toBe("active");
+  });
+
+  test("a leftover authorization.required from a previous turn never parks the NEW run", async () => {
+    const lines = [
+      // Previous turn's tail, drained by this fresh run's first connect.
+      JSON.stringify(required),
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+      // The new run's own clean turn.
+      `{"type":"turn.started","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"turn.completed","data":{"sequence":1,"turnId":"t1"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+    const hookCalls: Array<{ connectionName: string }> = [];
+
+    const handle = tailRun({
+      runId: "run-auth-left",
+      agentSessionId: "sess-auth-left",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      onAuthorizationRequired: (info) => hookCalls.push(info),
+    });
+    await handle.done;
+
+    // The stale challenge belonged to t0 — the new run is not parked on it.
+    expect(store.runStatus).toBe("succeeded");
+    // The health flip still fires: a drained challenge is a REAL event the
+    // previous, early-stopped tail never consumed, and connection health is
+    // a fact about the connection, not about this run.
+    expect(hookCalls).toEqual([{ connectionName: "linear" }]);
+  });
+
+  test("a throwing onAuthorizationRequired hook never breaks the tail", async () => {
+    const lines = [
+      `{"type":"turn.started","data":{"sequence":0,"turnId":"t0"}}`,
+      JSON.stringify(required),
+      JSON.stringify(completed),
+      `{"type":"turn.completed","data":{"sequence":0,"turnId":"t0"}}`,
+      `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
+    ];
+    const store = memoryStore();
+
+    const handle = tailRun({
+      runId: "run-auth-throw",
+      agentSessionId: "sess-auth-throw",
+      openStream: async () => ndjsonResponse(lines),
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      onAuthorizationRequired: () => {
+        throw new Error("hook exploded");
+      },
+    });
+    await handle.done;
+
+    expect(store.runStatus).toBe("succeeded");
   });
 });
 

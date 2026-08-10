@@ -323,3 +323,128 @@ test("previewValue compacts whitespace and truncates", () => {
   expect(previewValue({ a: 1 })).toBe('{"a":1}');
   expect(previewValue("x".repeat(300))?.endsWith("…")).toBe(true);
 });
+
+// ── mid-run authorization cards (connectors plan-3 task 9) ──────────────────
+//
+// `authorization.*` is DORMANT on eve 0.31.3 for platform connections (spike
+// REPORT finding 30) — these frames are synthetic, reduced defensively
+// against eve's declared wire types.
+
+function authStore(events: EveStreamEvent[], runId = "run1") {
+  let store = EMPTY_FRAME_STORE;
+  events.forEach((event, index) => {
+    store = addFrame(store, {
+      runId,
+      seq: index,
+      event,
+      at: new Date(index * 1000).toISOString(),
+    });
+  });
+  return store;
+}
+
+const AUTH_REQUIRED: EveStreamEvent = {
+  type: "authorization.required",
+  data: {
+    name: "linear",
+    description: "Linear MCP",
+    authorization: {
+      url: "https://consent.example.com/authorize?req=1",
+      userCode: "ABCD-1234",
+      expiresAt: "2026-08-10T12:00:00.000Z",
+      instructions: "Enter the code shown.",
+    },
+    sequence: 0,
+    stepIndex: 0,
+    turnId: "t",
+  },
+};
+
+test("authorization.required reduces to a pending consent card", () => {
+  const store = authStore([
+    { type: "turn.started", data: { sequence: 0, turnId: "t" } },
+    AUTH_REQUIRED,
+  ]);
+  const view = reduceRunView(runRow("waiting"), store, "waiting");
+
+  expect(view.authorizations.length).toBe(1);
+  const auth = view.authorizations[0]!;
+  expect(auth.name).toBe("linear");
+  expect(auth.description).toBe("Linear MCP");
+  expect(auth.url).toBe("https://consent.example.com/authorize?req=1");
+  // The consent URL is server-supplied content in trusted chrome — the host
+  // is extracted for prominent display (spec §13).
+  expect(auth.host).toBe("consent.example.com");
+  expect(auth.userCode).toBe("ABCD-1234");
+  expect(auth.instructions).toBe("Enter the code shown.");
+  expect(auth.expiresAt).toBe("2026-08-10T12:00:00.000Z");
+  expect(auth.outcome).toBeNull();
+});
+
+test("authorization.completed resolves the card, which survives the run settling", () => {
+  const store = authStore([
+    { type: "turn.started", data: { sequence: 0, turnId: "t" } },
+    AUTH_REQUIRED,
+    {
+      type: "authorization.completed",
+      data: {
+        name: "linear",
+        outcome: "authorized",
+        sequence: 0,
+        stepIndex: 0,
+        turnId: "t",
+      },
+    },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ]);
+  const view = reduceRunView(runRow("succeeded"), store);
+
+  expect(view.authorizations.length).toBe(1);
+  expect(view.authorizations[0]!.outcome).toBe("authorized");
+});
+
+test("an unresolved authorization is retired by turn.cancelled", () => {
+  const store = authStore([
+    { type: "turn.started", data: { sequence: 0, turnId: "t" } },
+    AUTH_REQUIRED,
+    { type: "turn.cancelled", data: { sequence: 0, turnId: "t" } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ]);
+  const view = reduceRunView(runRow("canceled"), store);
+  expect(view.authorizations.length).toBe(0);
+});
+
+test("a settled run hides a dangling unresolved authorization", () => {
+  // Defensive: without the tailer latch parking the run, a stale pending card
+  // on a succeeded run would dangle forever with nothing left to resolve it.
+  const store = authStore([
+    { type: "turn.started", data: { sequence: 0, turnId: "t" } },
+    AUTH_REQUIRED,
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ]);
+  const view = reduceRunView(runRow("succeeded"), store);
+  expect(view.authorizations.length).toBe(0);
+});
+
+test("a malformed authorization payload reduces without crashing", () => {
+  const store = authStore([
+    { type: "turn.started", data: { sequence: 0, turnId: "t" } },
+    {
+      type: "authorization.required",
+      data: {
+        name: "linear",
+        description: "Linear MCP",
+        // No authorization object at all, so no url/code/expiry.
+        sequence: 0,
+        stepIndex: 0,
+        turnId: "t",
+      },
+    } as EveStreamEvent,
+  ]);
+  const view = reduceRunView(runRow("waiting"), store, "waiting");
+  const auth = view.authorizations[0]!;
+  expect(auth.url).toBeNull();
+  expect(auth.host).toBeNull();
+  expect(auth.userCode).toBeNull();
+  expect(auth.outcome).toBeNull();
+});

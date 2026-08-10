@@ -131,6 +131,7 @@ function runningRunView(runId: string): RunView {
     block: null,
     reply: null,
     pendingInputs: [],
+    authorizations: [],
     error: null,
     modelId: null,
     canceled: false,

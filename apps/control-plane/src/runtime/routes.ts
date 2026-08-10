@@ -333,6 +333,48 @@ export async function ensureAgentOnWorker(
   }
 }
 
+/**
+ * Flip a connection's health to `auth_required` off a mid-run
+ * `authorization.required` event (connectors redesign spec §6). eve names the
+ * connection by its per-version SLUG (the emitted `defineMcpClientConnection`
+ * name), which resolves to a `cn_` row through the agent version's
+ * `connection_slugs` map — persisted at publish from the same unique-slug
+ * pass the compiler bakes into the generated files. Rows published before the
+ * column existed carry null (`?? {}`); an unknown slug is a logged no-op,
+ * never an error (the event is server-influenced content).
+ *
+ * DORMANT on eve 0.31.3 for platform connections (spike REPORT finding 30):
+ * getToken-only strategies surface a mid-run 401 as a plain failed tool call
+ * and this path never fires. It is wired defensively for an eve that starts
+ * emitting the declared `authorization.*` events.
+ */
+export async function flipConnectionAuthRequired(
+  deps: Pick<RuntimeDeps, "db" | "logger">,
+  contentHash: string,
+  connectionName: string,
+): Promise<void> {
+  const versions = await deps.db
+    .select({ connectionSlugs: schema.agentVersions.connectionSlugs })
+    .from(schema.agentVersions)
+    .where(eq(schema.agentVersions.contentHash, contentHash))
+    .limit(1);
+  const slugs = versions[0]?.connectionSlugs ?? {};
+  const connectionId = slugs[connectionName];
+  if (connectionId === undefined) {
+    deps.logger.warn("run.authorization_slug_unresolved", {
+      fields: { contentHash, connectionName },
+    });
+    return;
+  }
+  await deps.db
+    .update(schema.connections)
+    .set({ health: "auth_required" })
+    .where(eq(schema.connections.id, connectionId));
+  deps.logger.info("connection.health_auth_required", {
+    fields: { connectionId, contentHash, connectionName },
+  });
+}
+
 export function startTail(
   deps: RuntimeDeps,
   workerAddress: string,
@@ -348,6 +390,21 @@ export function startTail(
   deps.tailers.start({
     runId,
     agentSessionId,
+    // Mid-run consent challenge → the named connection needs authorization.
+    // Fire-and-forget: a health flip must never stall or fail the tail.
+    onAuthorizationRequired: ({ connectionName }) => {
+      void flipConnectionAuthRequired(deps, contentHash, connectionName).catch(
+        (error: unknown) => {
+          deps.logger.warn("run.authorization_health_flip_failed", {
+            runId,
+            fields: {
+              connectionName,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          });
+        },
+      );
+    },
     // `options` carries the tailer's per-connect stream flags (today:
     // includeTailIndex for the bounded catch-up read). The DECISION is the
     // tailer's — call sites stay ignorant of it.

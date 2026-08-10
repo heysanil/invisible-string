@@ -47,6 +47,14 @@
  *   settle the run's Slack delivery obligation and post a truncated reply.
  * - session.waiting + a pending input.requested in THIS run → run waiting
  *   (parked approval; session → waiting)
+ * - session.waiting + a pending authorization.required in THIS run → run
+ *   waiting too (mid-run MCP consent challenge; same Slack-truncation hazard
+ *   as an unlatched approval). NOTE this latch is DORMANT on eve 0.31.3 for
+ *   platform connections: a getToken-only strategy surfaces a mid-run 401 as
+ *   a plain failed action.result and `authorization.required` is emitted only
+ *   by interactive auth strategies the platform does not author (spike
+ *   REPORT finding 30). Implemented defensively against eve's declared wire
+ *   types (`authorization.*` in eve-events.ts).
  * - session.waiting otherwise → run succeeded (chat sessions always park on
  *   next-user-message after a completed turn)
  * - session.completed → run succeeded, session closed (task-mode)
@@ -161,6 +169,15 @@ export interface TerminalContext {
    */
   pendingInputRequest: boolean;
   /**
+   * An `authorization.required` was seen in THIS run without a subsequent
+   * `authorization.completed` resolving it (mid-run MCP consent challenge).
+   * Latched exactly like {@link pendingInputRequest}: while set, a settling
+   * `session.waiting` means the run is WAITING on the user's consent — never
+   * succeeded, which would settle its delivery obligation with a truncated
+   * reply. Dormant on eve 0.31.3 for platform connections (finding 30).
+   */
+  pendingAuthorization?: boolean;
+  /**
    * A `turn.cancelled` was seen in THIS run. eve always follows it with
    * `session.waiting`, and that pair means CANCELED — not succeeded (the
    * default reading of a bare `session.waiting`) and not failed.
@@ -183,10 +200,13 @@ export function classifyTerminal(
 ): TerminalDecision | null {
   // Back-compat with the boolean-only signature used across the tests and the
   // older call sites: a bare boolean is `pendingInputRequest`.
-  const { pendingInputRequest, canceledTurn = false } =
-    typeof context === "boolean"
-      ? { pendingInputRequest: context, canceledTurn: false }
-      : context;
+  const {
+    pendingInputRequest,
+    pendingAuthorization = false,
+    canceledTurn = false,
+  } = typeof context === "boolean"
+    ? { pendingInputRequest: context, canceledTurn: false }
+    : context;
   switch (event.type) {
     case "turn.failed":
       return {
@@ -210,7 +230,9 @@ export function classifyTerminal(
         // a red failure banner over a deliberate Stop.
         return { runStatus: "canceled", sessionStatus: "active" };
       }
-      return pendingInputRequest
+      // A pending consent challenge parks the run exactly like a pending
+      // approval — both mean "eve is waiting on the user, not done".
+      return pendingInputRequest || pendingAuthorization
         ? { runStatus: "waiting", sessionStatus: "waiting" }
         : { runStatus: "succeeded", sessionStatus: "active" };
     default:
@@ -238,6 +260,39 @@ export function nextPendingInputRequest(
   if (event.type === "input.requested") return true;
   if (
     event.type === "action.result" ||
+    event.type === "turn.cancelled" ||
+    event.type === "context.cleared"
+  ) {
+    return false;
+  }
+  return current;
+}
+
+/**
+ * Track whether a mid-run MCP consent challenge (`authorization.required`) is
+ * still unresolved in this run — the authorization latch, mirroring
+ * {@link nextPendingInputRequest}.
+ *
+ * Cleared ONLY by `authorization.completed` or the same invalidation
+ * boundaries as an input request (`turn.cancelled`, `context.cleared`).
+ * Deliberately NOT cleared by `action.result`: a tool result never resolves a
+ * consent challenge — eve declares that resolution with its own
+ * `authorization.completed` event.
+ *
+ * DORMANT on eve 0.31.3 for platform connections: getToken-only strategies
+ * surface a mid-run 401 as a plain failed action.result, and
+ * `authorization.required` is reachable only via interactive auth strategies
+ * the platform does not author (spike REPORT finding 30). The latch stays in
+ * defensively — the types are on eve's wire contract, and an eve upgrade that
+ * starts emitting them must park the run, not mark it succeeded.
+ */
+export function nextPendingAuthorization(
+  current: boolean,
+  event: EveStreamEvent,
+): boolean {
+  if (event.type === "authorization.required") return true;
+  if (
+    event.type === "authorization.completed" ||
     event.type === "turn.cancelled" ||
     event.type === "context.cleared"
   ) {
@@ -300,6 +355,16 @@ export interface TailRunOptions {
   reconnectDelayMs?: number;
   /** Metrics seam: called once when the run reaches a terminal state. */
   onFinish?: RunFinishedHook;
+  /**
+   * Health seam: called once per (non-duplicate) `authorization.required`
+   * event with eve's connection name — the per-version SLUG the compiler
+   * emitted, which the wiring resolves to a `connections` row via the agent
+   * version's `connection_slugs` map and flips to `health: "auth_required"`.
+   * Fired even for a leftover challenge drained from a previous turn:
+   * connection health is a fact about the connection, not about this run.
+   * Exceptions are swallowed (logged) — a health flip must never kill a tail.
+   */
+  onAuthorizationRequired?: (info: { connectionName: string }) => void;
   /** Structured run-lifecycle logging (started/terminal). Optional. */
   logger?: Logger;
 }
@@ -342,6 +407,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     maxReconnectAttempts = 5,
     reconnectDelayMs = 500,
     onFinish,
+    onAuthorizationRequired,
     logger,
   } = options;
 
@@ -452,6 +518,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // reconnect into a duplicate-row generator.
     const seenEventIds = new Set(await store.listEventIds(runId));
     let pendingInput = false;
+    let pendingAuthorization = false;
     let canceledTurn = false;
     // Tail index eve reported at attach (null = header absent/not requested).
     let requestTailIndex = true;
@@ -571,6 +638,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               // further (eve may already have recorded our own turn).
               sawOwnTurn = true;
               pendingInput = false;
+              pendingAuthorization = false;
               canceledTurn = false;
               catchUpBound = null;
               // Remember which turn we are following so a late remote cancel
@@ -578,6 +646,28 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               observedTurnId = event.data.turnId;
             }
             pendingInput = nextPendingInputRequest(pendingInput, event);
+            pendingAuthorization = nextPendingAuthorization(
+              pendingAuthorization,
+              event,
+            );
+            if (!duplicate && event.type === "authorization.required") {
+              // Health flip seam: a re-read duplicate never re-fires (its
+              // first consume already did), and a throwing hook must never
+              // become a stream error the reconnect loop misreads as a drop.
+              try {
+                onAuthorizationRequired?.({ connectionName: event.data.name });
+              } catch (hookError) {
+                log?.warn("run.authorization_hook_failed", {
+                  fields: {
+                    connectionName: event.data.name,
+                    reason:
+                      hookError instanceof Error
+                        ? hookError.message
+                        : String(hookError),
+                  },
+                });
+              }
+            }
             if (sawOwnTurn && event.type === "turn.cancelled") {
               // Latched, not terminal: `session.waiting` always follows and is
               // what actually finishes the run.
@@ -614,6 +704,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               sawOwnTurn || event.type === "session.failed"
                 ? classifyTerminal(event, {
                     pendingInputRequest: pendingInput,
+                    pendingAuthorization,
                     canceledTurn,
                   })
                 : null;
@@ -728,6 +819,8 @@ export class RunTailerManager {
     agentSessionId: string;
     openStream: OpenRunStream;
     cancelRemoteTurn?: CancelRemoteTurn;
+    /** Per-run health seam (see {@link TailRunOptions.onAuthorizationRequired}). */
+    onAuthorizationRequired?: (info: { connectionName: string }) => void;
   }): RunTailHandle {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;

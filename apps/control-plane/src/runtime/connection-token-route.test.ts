@@ -24,6 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { eq } from "drizzle-orm";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   encryptSecret,
@@ -42,6 +43,7 @@ import type { BuildSteps } from "../build/steps";
 import { createAppStack, type AppStack } from "../index";
 import { runMigrations } from "../migrate";
 import { connectionOauthAad } from "../oauth/client-identity";
+import { flipConnectionAuthRequired } from "./routes";
 import {
   derivePlatformJwtSecret,
   mintPlatformJwt,
@@ -390,5 +392,50 @@ describe.skipIf(!TEST_DATABASE_URL)("POST /internal/connections/token", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as ApiErrorBody;
     expect(body.error.code).toBe("oauth_not_connected");
+  });
+
+  // ── mid-run authorization health flip (plan-3 task 9) ────────────────────
+  //
+  // The tailer's authorization latch resolves eve's connection name (the
+  // per-version slug) back to a `cn_` row through the SAME published
+  // `connection_slugs` map this suite's fixtures carry, then flips health to
+  // `auth_required`. Dormant on eve 0.31.3 (spike finding 30) but wired
+  // defensively — proven here against a real publish.
+
+  test("authorization health flip: version slug resolves to the row and flips health", async () => {
+    const versions = await db
+      .select({ connectionSlugs: schema.agentVersions.connectionSlugs })
+      .from(schema.agentVersions)
+      .where(eq(schema.agentVersions.contentHash, hashA))
+      .limit(1);
+    const slugs = versions[0]!.connectionSlugs ?? {};
+    const entry = Object.entries(slugs).find(([, id]) => id === connectedId);
+    expect(entry).toBeDefined();
+
+    await flipConnectionAuthRequired(
+      { db, logger: stack.logger },
+      hashA,
+      entry![0],
+    );
+    const rows = await db
+      .select({ health: schema.connections.health })
+      .from(schema.connections)
+      .where(eq(schema.connections.id, connectedId));
+    expect(rows[0]!.health).toBe("auth_required");
+  });
+
+  test("authorization health flip: an unknown slug is a logged no-op, never a throw", async () => {
+    // eve's event names are server-influenced content — an unresolvable name
+    // must not error a tail or touch any row.
+    await flipConnectionAuthRequired(
+      { db, logger: stack.logger },
+      hashA,
+      "no-such-connection",
+    );
+    const rows = await db
+      .select({ health: schema.connections.health })
+      .from(schema.connections)
+      .where(eq(schema.connections.id, outsideId));
+    expect(rows[0]!.health).toBe("unknown");
   });
 });

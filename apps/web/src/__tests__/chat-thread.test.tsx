@@ -51,6 +51,7 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
     block: null,
     reply: null,
     pendingInputs: [],
+    authorizations: [],
     error: null,
     modelId: "deepseek/deepseek-v4-pro",
     canceled: false,

@@ -304,6 +304,13 @@ export function reduceRunView(
     items: TimelineItem[];
     firstAt: string;
     lastAt: string;
+    /**
+     * Frames attributed to this segment. Needed because two frames landing in
+     * the SAME millisecond are indistinguishable from one frame by timestamps
+     * alone, and the two cases report different durations (see the elapsed
+     * computation below).
+     */
+    frames: number;
   };
   type SpeechBuilder = {
     kind: "speech";
@@ -361,12 +368,14 @@ export function reduceRunView(
         items: [],
         firstAt: at,
         lastAt: at,
+        frames: 0,
       };
       segments.push(seg);
       current = seg;
     }
     seg.items.push(item);
     seg.lastAt = at;
+    seg.frames += 1;
     itemOwner.set(item.key, { seg, item });
   };
 
@@ -377,6 +386,7 @@ export function reduceRunView(
     const index = owner.seg.items.indexOf(owner.item);
     owner.seg.items[index] = next;
     owner.seg.lastAt = at;
+    owner.seg.frames += 1;
     itemOwner.set(key, { seg: owner.seg, item: next });
     return true;
   };
@@ -655,9 +665,20 @@ export function reduceRunView(
         streaming: !seg.completed && runLive,
       };
     }
+    // FLOOR AT ONE SECOND, and key the null case off the frame COUNT, not the
+    // span. A segment is often a single tool call whose request and result land
+    // inside the same millisecond — measuring `ms > 0` there would report no
+    // duration at all and the summary would degrade from "Worked for 1s · 1
+    // step" to "Worked · 1 step". Only a genuinely unmeasurable segment (one
+    // frame) has no duration. Pre-segment code got this for free by spanning
+    // the whole run; per-segment spans are short enough that it must be
+    // explicit. Guard: the two elapsed tests in run-view.test.ts, plus
+    // e2e/specs/agent-workflow.e2e.ts:111 which asserts the exact label.
     const ms = Date.parse(seg.lastAt) - Date.parse(seg.firstAt);
     const elapsedSeconds =
-      Number.isFinite(ms) && ms > 0 ? Math.max(1, Math.round(ms / 1000)) : null;
+      seg.frames >= 2 && Number.isFinite(ms) && ms >= 0
+        ? Math.max(1, Math.round(ms / 1000))
+        : null;
     return {
       kind: "work",
       key: seg.key,

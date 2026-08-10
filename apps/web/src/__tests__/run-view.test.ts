@@ -541,6 +541,33 @@ test("a failed run replayed with an unterminated append shows no caret", () => {
   expect((view.segments[0] as SpeechSegment).streaming).toBe(false);
 });
 
+test("a segment whose frames share one timestamp still reports a duration", () => {
+  // REGRESSION (CI-only, caught by e2e agent-workflow.e2e.ts:111). The summary
+  // must always read "Worked for Ns · N steps" for a settled segment — the e2e
+  // lane asserts that exact shape. Pre-rewrite the span was measured across the
+  // WHOLE RUN (practically never 0ms) and floored with `ms >= 0`; per-segment
+  // spans are short enough that a quick tool call lands entirely inside one
+  // millisecond, and a `ms > 0` guard then dropped the duration to null so the
+  // label silently degraded to "Worked · 1 step".
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    toolCall(0, "t0", 0, "c1", "fast_tool", 0),
+    toolDone(1, "t0", 0, "c1", "fast_tool", "instant", 0),
+  ]));
+  const work = view.segments.filter((s) => s.kind === "work") as WorkSegment[];
+  expect(work).toHaveLength(1);
+  expect(work[0]!.elapsedSeconds).toBe(1);
+});
+
+test("a single-frame segment reports no duration", () => {
+  // The other half of the old contract: one frame is genuinely unmeasurable,
+  // so it stays null and the label falls back to "Worked · N steps".
+  const view = reduceRunView(runRow("succeeded"), addFrames(EMPTY_FRAME_STORE, [
+    toolCall(0, "t0", 0, "c1", "orphan", 0),
+  ]));
+  const work = view.segments.filter((s) => s.kind === "work") as WorkSegment[];
+  expect(work[0]!.elapsedSeconds).toBeNull();
+});
+
 test("only the LAST work segment can be active; earlier ones are sealed", () => {
   const view = reduceRunView(runRow("running"), addFrames(EMPTY_FRAME_STORE, [
     toolCall(0, "t0", 0, "c1", "first"),

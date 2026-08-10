@@ -140,10 +140,17 @@ function buildAgentSystemPrompt(
   inventory: WorkspaceInventory,
 ): string {
   const connections = inventory.connections
-    .map(
-      (c) =>
-        `- id=${c.id} name="${promptSafe(c.name)}" ref=@${c.slug}${c.enabled ? "" : " (disabled)"}${c.description ? ` — ${promptSafe(c.description)}` : ""}`,
-    )
+    .map((c) => {
+      // Cached tool names (bare, loader-capped); the marker carries the count
+      // the cap cut so the model knows the list is not exhaustive.
+      const names = c.tools.map((tool) => promptSafe(tool, 80));
+      const truncated = c.toolCount - c.tools.length;
+      const toolsClause =
+        names.length === 0
+          ? ""
+          : ` tools=[${names.join(", ")}${truncated > 0 ? `, …+${truncated} more` : ""}]`;
+      return `- id=${c.id} name="${promptSafe(c.name)}" ref=@${c.slug} health=${c.health}${c.enabled ? "" : " (disabled)"}${toolsClause}${c.description ? ` — ${promptSafe(c.description)}` : ""}`;
+    })
     .join("\n");
   const skills = inventory.skills
     .map(
@@ -199,7 +206,7 @@ References must start with a letter; segments are letters/digits/_/-.
 ## Hard rules
 1. You NEVER edit the draft yourself. Every change must be proposed through exactly one of the mutation tools; the user previews and accepts or rejects each proposal in the editor.
 2. Each tool result tells you whether the user accepted or rejected the proposal — adapt to rejections instead of re-proposing the same thing.
-3. Use only ids/slugs from the inventory above. Never invent connections, skills, or model ids.
+3. Use only ids/slugs from the inventory above. Never invent connections, skills, or model ids; when a connection lists tools=[…], those are its real callable tool names — never invent others.
 4. Keep the persona consistent with attached context: do not @reference a connection or skill that is not attached to the CONTEXT — propose addContext for it first, then setPersona.
 5. Only models on the allowlist may be set via setModel.modelId; prefer a preset (powerful/balanced/quick) unless a specific model is required.
 6. Reasoning effort is inherited unless the draft sets one. Leave it inherited unless the user asks for a specific level; propose only an effort the effective model lists above ("unknown" means any level is acceptable), and use "provider-default" for "send no reasoning setting at all".

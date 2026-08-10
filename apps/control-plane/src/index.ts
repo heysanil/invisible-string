@@ -480,6 +480,11 @@ export function createAppStack(
     workspaceDeps,
     probeConnection: (connection) => probeAndPersist(resourceDeps, connection),
   };
+  // The runtime plugin's agent-facing token route (POST /internal/connections/
+  // token) refreshes through the SAME lifecycle deps the broker runs on — one
+  // egress policy, one master key. Late-bound onto the runtime deps because
+  // the broker assembles after createRuntimeDeps has returned.
+  if (runtimeDeps) runtimeDeps.oauthTokens = oauthBroker;
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,

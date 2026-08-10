@@ -21,7 +21,7 @@ This plan is the outcome of a brainstorming pass: live eve/Better Auth/OpenRoute
 | Stack (open items) | Drizzle ORM + drizzle-kit · Tailwind v4 + shadcn/ui · TanStack Router + Query · Tiptap 3 (prompt editors — superseded CodeMirror 6, see the 2026-08-08 Tiptap spec) · Elysia TypeBox validation · bun:test + Playwright · monorepo `apps/{control-plane,worker,web}` + `packages/{compiler,db,shared}` |
 | App shell | **B — workspace rail**: floating glass dock with 💬 Chat · ⚡ Workflows · 🧩 Context · ⚙ Settings, each = list panel + main pane |
 | Builder layout | **A+B hybrid**: left pillar-summary rail (live config cards with ✓/warning states; active card "solidifies"), center focused per-pillar editor, right docked copilot; Run draft/Publish in rail |
-| Run rendering in chat | **C — collapsible working block**: steps stream live (tool name + one-line result), folds to "Worked for Ns · N steps" on completion; full detail one click away |
+| Run rendering in chat | **Segment timeline** (2026-08-09 spec, supersedes C): a run reduces to ordered work/speech segments; each work segment is a collapsible rail of thoughts + tool steps that folds to "Worked for Ns · N steps" (thoughts included) the moment the agent starts speaking |
 | Aesthetic | **E1 — monochrome ink × liquid glass, floating islands**: warm-white wallpaper wash, frosted floating panels, capsule controls, ink-black primary; color ONLY as meaning (green ✓ / amber ⏸ / red error) |
 
 ### E1 design tokens (for `apps/web` theme)

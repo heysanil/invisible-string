@@ -432,6 +432,100 @@ control plane's `6.0.0-alpha.1`). Design:
       `meta-llama/llama-3.2-1b-instruct` during the same sweep was an account
       data-policy/guardrail restriction — unrelated to reasoning.)
 
+## Appended finding — mid-run MCP auth rejection (2026-08-10)
+
+Captured by `spike/tests/authorization-events.test.ts` (gated `SPIKE_EVE_BUILD=1`
+on top of the DB gate — it needs the real `eve build`). The spike agent gained a
+getToken-only connection, `agent-project/agent/connections/authprobe.ts`,
+pointed at a local stub MCP server built on the official SDK's
+`StreamableHTTPServerTransport` (the e2e stub-mcp idiom) that serves
+`initialize`/`tools/list` normally and flips to 401-with-`WWW-Authenticate` for
+`tools/call` after the first completed call. This is the empirical branch point
+for the OAuth broker's mid-run authorization design (2026-08-09 connectors
+plan 3, Task 9). Committed captures:
+`spike/tests/fixtures/authorization-401-events.ndjson` and
+`authorization-gettoken-throw-events.ndjson`.
+
+30. **A mid-run 401 from an MCP server on a getToken-only connection is a
+    FAILED TOOL CALL, nothing more — `authorization.required` is NOT
+    emitted.** eve's `McpConnectionClient` maps any HTTP 401 in the error
+    chain to `ConnectionAuthorizationRequiredError` ("Connection "authprobe"
+    requires authorization (the server rejected the token).") after evicting
+    its per-step token cache and closing the client — but the
+    `authorization.required` stream event is only ever emitted when a tool
+    result is an `AuthorizationSignal`, and only the INTERACTIVE auth path
+    (`startAuthorization`/`completeAuthorization`) can produce one. A
+    getToken-only (non-interactive) strategy — the exact shape the platform's
+    compiled agents use for bearer auth today and broker-delivered OAuth
+    tokens tomorrow — rethrows instead, and the harness records a plain
+    failed `action.result` with the GENERIC failure code and runs the turn to
+    a normal finish: no park, no retry, no `turn.failed`/`step.failed`/
+    `session.failed`, terminal `session.waiting`. The only auth signal on the
+    wire is the message TEXT. Captured 401 turn, verbatim (mocked model,
+    eve 0.31.3):
+
+    ```json
+    {"data":{"sequence":2,"turnId":"turn_2"},"type":"turn.started","meta":{"at":"2026-08-10T07:01:48.720Z","id":"evt_01KZN7MGHG40B0C6TDHDE56NMK"}}
+    {"data":{"message":"Call the authprobe__save_note tool with note \"auth-spike-second\".","parts":[{"text":"Call the authprobe__save_note tool with note \"auth-spike-second\".","type":"text"}],"sequence":2,"turnId":"turn_2"},"type":"message.received","meta":{"at":"2026-08-10T07:01:48.720Z","id":"evt_01KZN7MGHG40B0C6TDHDE56NMM"}}
+    {"data":{"sequence":2,"stepIndex":0,"turnId":"turn_2"},"type":"step.started","meta":{"at":"2026-08-10T07:01:48.720Z","id":"evt_01KZN7MGHG40B0C6TDHDE56NMN"}}
+    {"data":{"actions":[{"callId":"call_authprobe_save_note","input":{"note":"auth-spike-second"},"kind":"tool-call","toolName":"authprobe__save_note"}],"sequence":2,"stepIndex":0,"turnId":"turn_2"},"type":"actions.requested","meta":{"at":"2026-08-10T07:01:48.724Z","id":"evt_01KZN7MGHMQH8CKZVZSJFXSZ6B"}}
+    {"data":{"error":{"code":"ACTION_RESULT_FAILED","message":"Connection \"authprobe\" requires authorization (the server rejected the token)."},"result":{"callId":"call_authprobe_save_note","kind":"tool-result","output":"Connection \"authprobe\" requires authorization (the server rejected the token).","toolName":"authprobe__save_note","isError":true},"sequence":2,"stepIndex":0,"status":"failed","turnId":"turn_2"},"type":"action.result","meta":{"at":"2026-08-10T07:01:48.737Z","id":"evt_01KZN7MGJ1BECQRJM0YFFETS2H"}}
+    {"data":{"finishReason":"tool-calls","sequence":2,"stepIndex":0,"turnId":"turn_2","usage":{"inputTokens":860,"outputTokens":5,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-08-10T07:01:48.738Z","id":"evt_01KZN7MGJ285F5XNEFMQ0HEKFY"}}
+    {"data":{"sequence":2,"stepIndex":1,"turnId":"turn_2"},"type":"step.started","meta":{"at":"2026-08-10T07:01:48.782Z","id":"evt_01KZN7MGKE5YQKVDWYSX6A5VMV"}}
+    {"data":{"messageDelta":"Local weather tool failed: ConnectionAuthorizationRequiredError: Connection \"authprobe\" requires authorization (the server rejected the token).","messageSoFar":"Local weather tool failed: ConnectionAuthorizationRequiredError: Connection \"authprobe\" requires authorization (the server rejected the token).","sequence":2,"stepIndex":1,"turnId":"turn_2"},"type":"message.appended","meta":{"at":"2026-08-10T07:01:48.786Z","id":"evt_01KZN7MGKJSZXWESKMQ3JPH024"}}
+    {"data":{"finishReason":"stop","message":"Local weather tool failed: ConnectionAuthorizationRequiredError: Connection \"authprobe\" requires authorization (the server rejected the token).","sequence":2,"stepIndex":1,"turnId":"turn_2"},"type":"message.completed","meta":{"at":"2026-08-10T07:01:48.787Z","id":"evt_01KZN7MGKKJJJ5A1SPZPBZ78TM"}}
+    {"data":{"finishReason":"stop","sequence":2,"stepIndex":1,"turnId":"turn_2","usage":{"inputTokens":860,"outputTokens":36,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-08-10T07:01:48.787Z","id":"evt_01KZN7MGKKJJJ5A1SPZPBZ78TN"}}
+    {"data":{"sequence":2,"turnId":"turn_2"},"type":"turn.completed","meta":{"at":"2026-08-10T07:01:48.799Z","id":"evt_01KZN7MGKZNRP09G5H962PEXPS"}}
+    {"data":{"continuationToken":"wrun_01KZN7MFGG0KBT590HF1YW39B7","wait":"next-user-message"},"type":"session.waiting","meta":{"at":"2026-08-10T07:01:48.799Z","id":"evt_01KZN7MGKZNRP09G5H962PEXPT"}}
+    ```
+
+    An `auth.getToken` that THROWS a plain `Error` (the compiled
+    `platformConnectionToken` helper's failure mode on a non-200 from the
+    broker) produces the IDENTICAL event shape — same generic
+    `ACTION_RESULT_FAILED`, same terminal `session.waiting` — with the
+    Error's message verbatim as the tool output, and the MCP server is never
+    dialed (nothing reached the stub). The two failure modes are
+    distinguishable only by message text. Captured failure event (full turn
+    in the fixture):
+
+    ```json
+    {"data":{"error":{"code":"ACTION_RESULT_FAILED","message":"spike-authprobe-token-mint-failed (deliberate plain-Error throw, mirrors platformConnectionToken on a non-200)"},"result":{"callId":"call_authprobe_save_note","kind":"tool-result","output":"spike-authprobe-token-mint-failed (deliberate plain-Error throw, mirrors platformConnectionToken on a non-200)","toolName":"authprobe__save_note","isError":true},"sequence":3,"stepIndex":0,"status":"failed","turnId":"turn_3"},"type":"action.result","meta":{"at":"2026-08-10T07:01:49.021Z","id":"evt_01KZN7MGTXVRKQJPCPWH4W6EJ2"}}
+    ```
+
+    **Conclusion: eve emits a generic failed `action.result` on a mid-run
+    401; `authorization.required` was NOT observed** (it exists on the 0.31
+    wire — `AuthorizationRequiredStreamEvent` in `protocol/message.d.ts` —
+    but is reachable only via interactive auth strategies, which the platform
+    does not author). Plan-3 Task 9's tailer latch is therefore DORMANT on
+    eve 0.31.3 for platform connections; the mid-run re-auth UX must key off
+    the failed tool call / connection health instead.
+
+    Three supporting facts observed on the way (all load-bearing for the
+    test's design):
+
+    - **Connection `url` is resolved ONCE at `eve build` and baked into the
+      compiled manifest embedded in `.output/server/index.mjs`; the runtime
+      connects to the baked value, so a runtime env override of the url is
+      silently ignored.** (First run: `SPIKE_AUTH_MCP_URL` passed only to
+      `eve start` → the agent kept dialing the build-time default — "fetch
+      failed" in ~6 ms, zero stub connections.) `auth`/`headers` callbacks
+      are NOT serializable, so they DO run from the bundled module at
+      runtime with runtime env — deepwiki.ts's "override at runtime" comment
+      is true only of a variable read INSIDE a callback, never of `url`.
+      This mirrors the platform compiler, which bakes urls as literals.
+    - **Connection tools are not advertised directly on 0.31**: the model
+      must discover them through the framework's `connection_search` dynamic
+      tool (`{connection?, keywords}` — scoping to one connection avoids
+      dialing the others); discovered tools are re-advertised on every later
+      step of the same session by re-reading the durable message history, so
+      discovery survives across turns (and process restarts).
+    - **eve builds a fresh MCP client per turn**: every turn that touches
+      the connection re-runs `getToken` and replays
+      `initialize`/`notifications/initialized`/`tools/list` before
+      `tools/call` (all carrying `Authorization: Bearer <token>`), which is
+      what makes a marker-file-controlled `getToken` flip observable
+      mid-session without restarting anything.
+
 ## How to run
 
 ```sh
@@ -439,6 +533,7 @@ mise install node@24
 POSTGRES_PORT=5443 docker compose -p p0spike up -d postgres   # tests also do this on demand
 TEST_DATABASE_URL=postgres://dev:dev@localhost:5443/product bun test spike/tests/
 # keyed suite additionally needs OPENROUTER_API_KEY
+# authorization-events additionally needs SPIKE_EVE_BUILD=1 (real eve build)
 docker compose -p p0spike down                                 # teardown
 ```
 

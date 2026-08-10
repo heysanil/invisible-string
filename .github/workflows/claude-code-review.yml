@@ -1,0 +1,232 @@
+# Claude Code Review — this repo's automated PR reviewer.
+#
+# Ported from slingshot/willow, which mirrors the shape slingshot/midnights runs
+# in production: Claude Sonnet 5 at `xhigh` effort, billed against the Claude
+# subscription via the OAuth token rather than per-token API credits, driven by
+# a direct review prompt. It is NOT part of `ci.yml` — a red review is advisory,
+# and it must not gate the merge lanes.
+#
+# WHY `track_progress: true` IS LOAD-BEARING — do not remove it.
+# It forces the action into **tag mode**. That matters for two reasons:
+#   1. Tag mode supplies its own `--permission-mode acceptEdits` and
+#      `--allowedTools` (src/modes/tag/index.ts) and wires up the GitHub comment
+#      MCP server. **Agent mode does neither**: passing a bare `prompt:` without
+#      track_progress only *parses* --allowedTools out of claude_args and grants
+#      nothing, so the run is denied on its first tool call and exits in ~15s
+#      having posted nothing — while still reporting success. Willow shipped
+#      four PRs in exactly that state: every run green, not one review posted.
+#   2. It restores the PR tracking comment and the auto-injected PR context that
+#      pre-v1 agent mode provided — the base PR diff arrives over the API, not
+#      local git history, which is why a shallow checkout was originally enough.
+# Because tag mode posts through the action's own GitHub App token, this job
+# needs only *read* scopes — the agent never holds write.
+#
+# WHY fetch-depth: 0 NOW, DESPITE THE ABOVE. Once the reviewer is granted git
+# read commands (below), a shallow clone makes most of them useless: `git log`
+# would show one commit and `git diff <base>...HEAD` would fail outright, since
+# depth 1 fetches only the PR tip, not the base commit it needs to diff against.
+# Cheap here — `git rev-list --count HEAD` is under 150 and the whole .git dir
+# is a few KB — but a much larger repo should reconsider this trade.
+#
+# WHY THERE IS NO GATEWAY CONFIG HERE.
+# Claude Code identifies a model by pattern-matching its ID, so a native
+# `claude-*` ID needs none of the scaffolding a third-party gateway does: no
+# ANTHROPIC_BASE_URL, no per-tier model overrides, no *_SUPPORTED_CAPABILITIES
+# to re-enable reasoning, no CLAUDE_CODE_MAX_CONTEXT_TOKENS (Sonnet 5's real 1M
+# window is already known, so there is no phantom 200k auto-compaction).
+# `--effort xhigh` is native too: Sonnet 5 supports low/medium/high/xhigh/max.
+#
+# WHY A SHAPE LABEL AND NOT A NAMESPACE PROFILE. Willow runs this on the custom
+# profile `namespace-profile-claudes`, but profiles are Namespace-workspace
+# scoped and nothing under this account has ever used one. A `runs-on` label no
+# runner matches does not fail — it queues forever — so this uses the same shape
+# label as `ci.yml`'s `unit` job, which is known to schedule here.
+#
+# THIS WORKFLOW CANNOT REVIEW A PR THAT EDITS IT. The OIDC -> App-token exchange
+# refuses to issue a token when the workflow file on the PR branch differs from
+# the copy on the default branch, and the action self-skips with "workflow
+# validation failed". That control is independent of model auth, so changes here
+# are verified locally (nektos/act) or on the first PR after merge.
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# One in-flight review per PR: a fresh push cancels the previous (now-stale) run
+# so rapid pushes don't stack duplicate reviews or burn subscription quota.
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Drafts aren't ready for review; bot senders would let the reviewer react to
+    # its own pushes and — in this repo specifically — to docs-sentinel's doc-fix
+    # commits. (The `chore(release): version packages` PR never reaches here at
+    # all: a GITHUB_TOKEN-opened PR fires no `pull_request` workflows. See the
+    # release section of AGENTS.md.)
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.sender.type != 'Bot'
+
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    # Without a ceiling a wedged run bills for the full 6h default.
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      # Read-only is sufficient: tag mode posts via the action's own GitHub App
+      # token, not this job's GITHUB_TOKEN, so the agent itself never holds write.
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    # Job-level env may read secrets; step-level `if` may read env but not
+    # secrets — so the secret-presence check is laundered through env for the
+    # step to self-skip (rather than fail) on forks, which have no secrets.
+    env:
+      OAUTH_SET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Installs the pinned host toolchain from mise.toml (bun, node, …) and
+      # puts mise's shims on PATH, so the `bun`/`node`/`npm` calls the reviewer
+      # is allowed to make below are those exact versions. Without this pair the
+      # --allowedTools grants are decorative: `bun run typecheck` on a tree with
+      # no node_modules fails before it checks anything.
+      #
+      # ALL THREE SETUP STEPS ARE continue-on-error BY DESIGN. The review is
+      # advisory, so setup failure must degrade to a review with fewer working
+      # Bash tools rather than to no review at all — otherwise a PR whose
+      # lockfile is out of sync with its package.json (already caught by
+      # ci.yml's `unit` job) would silently go unreviewed, which is the failure
+      # this file's header exists to prevent.
+      - uses: jdx/mise-action@v2
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+
+      - name: Install dependencies
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+        run: bun install --frozen-lockfile
+
+      # Same postgres/garage/dex compose lanes as ci.yml's `integration` job, so
+      # the reviewer can actually run the DB-gated integration tests rather than
+      # only the ones that self-skip without TEST_DATABASE_URL. `--wait` blocks
+      # until healthy so the very next Bash call the agent makes can hit the DB.
+      - name: Compose up (postgres, garage, dex)
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+        run: docker compose up -d --wait postgres garage dex
+
+      - name: Run Claude Code Review
+        id: claude-review
+        if: ${{ env.OAUTH_SET == 'true' }}
+        uses: anthropics/claude-code-action@v1
+        # Same connection string as ci.yml's `integration`/`acceptance` jobs —
+        # the compose service's fixed dev credentials, not a secret. Present
+        # unconditionally: DB-gated tests skip cleanly without it, so there's no
+        # harm in a review run seeing it even when the compose-up step above
+        # failed (continue-on-error) and left nothing listening on 5432.
+        env:
+          TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
+        with:
+          # Subscription billing — draws on the Claude plan's quota instead of
+          # per-token API credits. Deliberately NOT paired with anthropic_api_key:
+          # a second credential alongside it causes spurious model-not-found errors.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # See the header — this is what makes the run able to do anything.
+          track_progress: true
+
+          prompt: |
+            Review this pull request for:
+
+            - Correctness bugs and logic errors.
+            - Security, especially: workspace scoping on every route (Better Auth
+              session + active organization + role via `requireWorkspace`, and row
+              ownership verified — eve does not enforce it), secrets never
+              reaching git, logs, or model context, and anything handling
+              untrusted input (trigger ingress, Slack signature + replay window,
+              MCP tool authorization).
+            - The versioning rituals this repo enforces out-of-band, which a diff
+              can violate silently: `COMPILER_VERSION` must be bumped when emitted
+              bytes change, `BUILD_ENV_EPOCH` when the build environment changes
+              artifacts, and migrations must be additive (never edit an applied one).
+            - Contract drift: API DTOs, WS frames, `TriggerEvent`, and eve event
+              types live in `packages/shared` and are imported by both server and
+              web — flag a shape defined or widened on only one side.
+            - E1 design-system adherence in `apps/web` and `apps/site`: tokens from
+              `packages/design-tokens`, primitives extended rather than forked,
+              color only as meaning, designed empty/loading/error states.
+            - Test coverage for new behavior, in the right lane (see the test-lane
+              table in AGENTS.md) — and whether a change to runtime, worker, or
+              compiler paths needs an acceptance suite rather than a unit test.
+            - A changeset for behavior-affecting changes: one-line summary, naming
+              only shipped workspaces, `**Breaking:**` prefix for breaking changes.
+
+            Docs currency is audited mechanically by the docs-sentinel workflow —
+            don't duplicate it. Do flag a doc that now states something false,
+            which is a different failure than a doc that is merely missing.
+
+            You have a real checkout with full history and a working toolchain,
+            not just the diff — use them rather than guessing. `bun run typecheck`
+            and `bun test` for the areas the PR touches; `git log`/`git blame`/
+            `git show` to check whether a "bug" is pre-existing or genuinely
+            introduced by this PR, and to read the base version of a changed
+            file; `postgres`, `garage`, and `dex` are already up via docker
+            compose, so `TEST_DATABASE_URL`-gated tests in `apps`/`packages` will
+            actually run rather than skip. Don't run anything long-running (a dev
+            server, a full E2E or acceptance suite) — the job has a 30-minute
+            ceiling shared with everything else it does.
+
+            Be constructive, comprehensive, and concise. Prefer a small number of
+            high-confidence findings over an exhaustive list — skip nits, style,
+            and anything tsc would already catch. Cite specific files and lines.
+
+            Ignore review threads that are already resolved; do not re-raise
+            feedback that has been marked resolved. Focus on unresolved threads
+            and newly introduced changes.
+
+          # Model and effort are overridable per-repo without editing this file.
+          # Effort accepts low|medium|high|xhigh|max; xhigh is Claude Code's own
+          # default for coding and agentic work. --allowedTools MERGES with the
+          # tools tag mode already grants — it does not replace them (confirmed
+          # against willow, which relies on exactly this: it sets both
+          # track_progress and its own --allowedTools, and its tracking comment
+          # still posts, which needs the mcp__github_comment tool tag mode grants).
+          #
+          # TEST_DATABASE_URL is set below at STEP level, not typed inline by the
+          # agent (`TEST_DATABASE_URL=… bun test`), because Claude Code's Bash
+          # permission rules are a literal command-PREFIX match: a command that
+          # *starts* with an env-var assignment doesn't match a `Bash(bun:*)`
+          # rule at all — the assignment is part of the string being matched.
+          # Setting it as step env sidesteps that: any `bun test` the agent runs
+          # already has it, with no inline prefix to grant.
+          #
+          # `Bash(bun:*)` is a PREFIX match, so it also covers `bun run dev` —
+          # nothing here stops the agent from starting it. The only guardrail
+          # against that (or any other long-running command) is the job's
+          # 30-min timeout-minutes ceiling above; there is no finer-grained
+          # "don't hang" permission to grant. Deliberately excluded instead:
+          # Write/Edit (tag mode's acceptEdits scope already covers file edits —
+          # listing them here would additionally grant edits outside
+          # $GITHUB_WORKSPACE per the action's own tag-mode source comment), and
+          # anything that could push or open PRs — this workflow is read-only by
+          # design (see the permissions: block above).
+          claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5' }}
+            --effort ${{ vars.CLAUDE_EFFORT || 'xhigh' }}
+            --allowedTools "Bash(bun:*),Bash(bunx:*),Bash(node:*),Bash(npm:*),Bash(npx:*),Bash(jq:*),Bash(rg:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git blame:*),Bash(git rev-parse:*),Bash(git merge-base:*),Bash(git grep:*),Bash(docker compose:*),Bash(docker:*),Bash(./scripts/check-prod-compose-drift.sh)"
+
+      # Runs even if the review step above failed or was skipped (no OAuth
+      # token), matching ci.yml's own `if: always()` teardown — a wedged or
+      # denied run should never leave containers/volumes on a shared runner.
+      - name: Compose down
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,101 @@
+# Claude Code — the on-demand half of the pair, triggered by an `@claude`
+# mention in an issue, a PR comment, a review comment, or a review body.
+# `claude-code-review.yml` is the automatic half; this one only ever runs when a
+# human asks for it, and it answers or acts on whatever the mentioning comment
+# asked — including "@claude fix this failing test", which needs the same
+# working toolchain the review workflow has, not just read access to the repo.
+# So this shares its toolchain-install + compose-up steps and its
+# --allowedTools grant verbatim; see that file's header for the reasoning
+# behind each (the fetch-depth: 0 / git-grant pairing, the continue-on-error
+# degrade-not-skip design, the env-prefix Bash-permission gotcha, why
+# `bun run dev` is bounded only by timeout-minutes, and so on) — it is not
+# repeated here.
+#
+# The `@claude` checks below read `github.event.*.body`, which is attacker-
+# controlled text. That is safe *here* because they are Actions expressions, not
+# shell: nothing in this file interpolates event data into a `run:`.
+#
+# Auth, billing, and runner rationale are identical to claude-code-review.yml —
+# see that file's header for why the OAuth token is unpaired, and why this uses
+# a shape label rather than willow's `namespace-profile-claudes`.
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    # Without a ceiling a wedged run bills for the full 6h default.
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+
+    # Same laundering as the review workflow: step-level `if` can read env but
+    # not secrets, so the run self-skips instead of failing where the secret is
+    # absent (forks, and this repo until CLAUDE_CODE_OAUTH_TOKEN is set).
+    env:
+      OAUTH_SET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v2
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+
+      - name: Install dependencies
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+        run: bun install --frozen-lockfile
+
+      - name: Compose up (postgres, garage, dex)
+        if: ${{ env.OAUTH_SET == 'true' }}
+        continue-on-error: true
+        run: docker compose up -d --wait postgres garage dex
+
+      - name: Run Claude Code
+        id: claude
+        if: ${{ env.OAUTH_SET == 'true' }}
+        uses: anthropics/claude-code-action@v1
+        env:
+          TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Lets Claude read CI results on PRs — the common "@claude why did the
+          # phase-3 acceptance lane fail?" ask.
+          additional_permissions: |
+            actions: read
+
+          # No `prompt:` on purpose — without one the action performs the
+          # instructions in the comment that tagged it, which is the entire point
+          # of this workflow. Setting one would override the human's request.
+          claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5' }}
+            --effort ${{ vars.CLAUDE_EFFORT || 'xhigh' }}
+            --allowedTools "Bash(bun:*),Bash(bunx:*),Bash(node:*),Bash(npm:*),Bash(npx:*),Bash(jq:*),Bash(rg:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git blame:*),Bash(git rev-parse:*),Bash(git merge-base:*),Bash(git grep:*),Bash(docker compose:*),Bash(docker:*),Bash(./scripts/check-prod-compose-drift.sh)"
+
+      - name: Compose down
+        if: always()
+        run: docker compose down -v

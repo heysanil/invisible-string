@@ -1,14 +1,14 @@
 import { Blocks, Plus } from "lucide-react";
 import { useState } from "react";
-import type { McpConnectionDto } from "@invisible-string/shared";
+import type { ConnectionDto } from "@invisible-string/shared";
 
 import { parseBlockingReference, type BlockingReference } from "../../lib/blocker";
 import { errorMessage } from "../../lib/forms";
 import {
-  useDeleteMcpConnection,
-  useMcpConnections,
-  useToggleMcpConnection,
-} from "../../lib/queries/mcp-connections";
+  useConnections,
+  useDeleteConnection,
+  useToggleConnection,
+} from "../../lib/queries/connections";
 import type { ScopeRef } from "../../lib/queries/keys";
 import { Button } from "../ui/Button";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
@@ -25,12 +25,12 @@ export interface McpConnectionsGridProps {
 }
 
 export function McpConnectionsGrid({ scope, onAdd, readOnly }: McpConnectionsGridProps) {
-  const connections = useMcpConnections(scope);
-  const toggle = useToggleMcpConnection(scope);
-  const remove = useDeleteMcpConnection(scope);
+  const connections = useConnections(scope);
+  const toggle = useToggleConnection(scope);
+  const remove = useDeleteConnection(scope);
   const { toast } = useToast();
 
-  const [pendingDelete, setPendingDelete] = useState<McpConnectionDto | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ConnectionDto | null>(null);
   const [blocker, setBlocker] = useState<BlockingReference | null>(null);
 
   async function confirmDelete() {

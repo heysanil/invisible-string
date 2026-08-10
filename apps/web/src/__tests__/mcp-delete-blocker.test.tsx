@@ -24,18 +24,27 @@ const NOW = "2026-07-03T00:00:00.000Z";
 const CONNECTIONS = {
   connections: [
     {
-      id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      id: "cn_cccccccccccccccc",
       scope: "workspace",
       name: "GitHub",
       description: null,
       source: "registry",
-      registryId: "io.github/github",
-      url: null,
+      catalogSlug: null,
+      registryName: "io.github/github",
+      url: "https://mcp.github.dev/mcp",
+      transport: "streamable-http",
+      authType: "headers",
+      hasCredentials: true,
+      oauthStatus: null,
       toolAllow: null,
       toolBlock: null,
       approvalPolicy: null,
       enabled: true,
-      hasCredentials: true,
+      health: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+      tools: null,
+      toolsCachedAt: null,
       createdAt: NOW,
       updatedAt: NOW,
     },
@@ -55,8 +64,8 @@ afterEach(() => {
 
 test("409 on delete opens a blocker dialog naming the agents (real server shape: bare name array)", async () => {
   fetchMock
-    .on("GET", "/mcp-connections", () => jsonResponse(CONNECTIONS))
-    .on("DELETE", "/mcp-connections/", () =>
+    .on("GET", "/connections", () => jsonResponse(CONNECTIONS))
+    .on("DELETE", "/connections/", () =>
       jsonResponse(
         {
           error: {

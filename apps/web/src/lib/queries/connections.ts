@@ -1,10 +1,12 @@
 /**
- * MCP connection hooks — BOTH scopes (workspace + user) behind one
- * {@link ScopeRef}. Credential writes travel in the request `auth` field and
- * are encrypted server-side; reads only ever carry `hasCredentials`.
+ * Connection hooks (rebuilt connections domain, connectors redesign spec §3)
+ * — BOTH scopes (workspace + user) behind one {@link ScopeRef}. One create
+ * route covers all three sources (`catalog` | `registry` | `custom`);
+ * credential writes travel in the request `auth` field and are encrypted
+ * server-side — reads only ever carry `hasCredentials`.
  *
- * `useToggleMcpConnection` is optimistic (a capsule switch must not lag):
- * the list cache flips immediately, rolls back on error, and reconciles on
+ * `useToggleConnection` is optimistic (a capsule switch must not lag): the
+ * list cache flips immediately, rolls back on error, and reconciles on
  * settle.
  */
 import {
@@ -15,64 +17,63 @@ import {
 } from "@tanstack/react-query";
 import {
   deleteResourceResponseSchema,
-  getMcpConnectionResponseSchema,
-  listMcpConnectionsResponseSchema,
-  type CreateMcpConnectionRequest,
-  type GetMcpConnectionResponse,
-  type InstallMcpConnectionRequest,
-  type ListMcpConnectionsResponse,
-  type UpdateMcpConnectionRequest,
+  getConnectionResponseSchema,
+  listConnectionsResponseSchema,
+  type CreateConnectionRequest,
+  type GetConnectionResponse,
+  type ListConnectionsResponse,
+  type UpdateConnectionRequest,
 } from "@invisible-string/shared";
 
 import { api } from "../api-client";
 import { queryKeys, scopeBasePath, type ScopeRef } from "./keys";
 
-const basePath = (ref: ScopeRef) => scopeBasePath(ref, "mcp-connections");
+const basePath = (ref: ScopeRef) => scopeBasePath(ref, "connections");
 
 // ── fetchers ────────────────────────────────────────────────────────────────
 
-export function fetchMcpConnections(ref: ScopeRef, signal?: AbortSignal) {
-  return api.get(basePath(ref), listMcpConnectionsResponseSchema, { signal });
+export function fetchConnections(ref: ScopeRef, signal?: AbortSignal) {
+  return api.get(basePath(ref), listConnectionsResponseSchema, { signal });
 }
 
-export function fetchMcpConnection(
+export function fetchConnection(
   ref: ScopeRef,
   connectionId: string,
   signal?: AbortSignal,
 ) {
   return api.get(
     `${basePath(ref)}/${connectionId}`,
-    getMcpConnectionResponseSchema,
+    getConnectionResponseSchema,
     { signal },
   );
 }
 
 // ── invalidation ────────────────────────────────────────────────────────────
 
-export function invalidateMcpConnections(
+export function invalidateConnections(
   queryClient: QueryClient,
   ref: ScopeRef,
 ): Promise<void> {
   return queryClient.invalidateQueries({
-    queryKey: queryKeys.mcpConnections.all(ref),
+    queryKey: queryKeys.connections.all(ref),
   });
 }
 
 // ── queries ─────────────────────────────────────────────────────────────────
 
-export function useMcpConnections(ref: ScopeRef) {
+export function useConnections(ref: ScopeRef) {
   return useQuery({
-    queryKey: queryKeys.mcpConnections.list(ref),
-    queryFn: ({ signal }) => fetchMcpConnections(ref, signal),
+    queryKey: queryKeys.connections.list(ref),
+    queryFn: ({ signal }) => fetchConnections(ref, signal),
     select: (data) => data.connections,
     staleTime: 60_000,
   });
 }
 
-export function useMcpConnection(ref: ScopeRef, connectionId: string) {
+export function useConnection(ref: ScopeRef, connectionId: string) {
   return useQuery({
-    queryKey: queryKeys.mcpConnections.detail(ref, connectionId),
-    queryFn: ({ signal }) => fetchMcpConnection(ref, connectionId, signal),
+    queryKey: queryKeys.connections.detail(ref, connectionId),
+    queryFn: ({ signal }) => fetchConnection(ref, connectionId, signal),
     select: (data) => data.connection,
     staleTime: 60_000,
   });
@@ -83,62 +84,47 @@ export function useMcpConnection(ref: ScopeRef, connectionId: string) {
 function seedDetail(
   queryClient: QueryClient,
   ref: ScopeRef,
-  data: GetMcpConnectionResponse,
+  data: GetConnectionResponse,
 ) {
-  queryClient.setQueryData<GetMcpConnectionResponse>(
-    queryKeys.mcpConnections.detail(ref, data.connection.id),
+  queryClient.setQueryData<GetConnectionResponse>(
+    queryKeys.connections.detail(ref, data.connection.id),
     data,
   );
 }
 
-/** Add a custom-URL MCP server. */
-export function useCreateMcpConnection(ref: ScopeRef) {
+/** Create a connection — catalog install, registry install, or custom URL. */
+export function useCreateConnection(ref: ScopeRef) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: CreateMcpConnectionRequest) =>
-      api.post(basePath(ref), getMcpConnectionResponseSchema, { body: input }),
+    mutationFn: (input: CreateConnectionRequest) =>
+      api.post(basePath(ref), getConnectionResponseSchema, { body: input }),
     onSuccess: async (data) => {
       seedDetail(queryClient, ref, data);
-      await invalidateMcpConnections(queryClient, ref);
+      await invalidateConnections(queryClient, ref);
     },
   });
 }
 
-/** Install a registry server (chosen remote + prompted secrets). */
-export function useInstallMcpConnection(ref: ScopeRef) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (input: InstallMcpConnectionRequest) =>
-      api.post(`${basePath(ref)}/install`, getMcpConnectionResponseSchema, {
-        body: input,
-      }),
-    onSuccess: async (data) => {
-      seedDetail(queryClient, ref, data);
-      await invalidateMcpConnections(queryClient, ref);
-    },
-  });
-}
-
-export function useUpdateMcpConnection(ref: ScopeRef) {
+export function useUpdateConnection(ref: ScopeRef) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: {
       connectionId: string;
-      patch: UpdateMcpConnectionRequest;
+      patch: UpdateConnectionRequest;
     }) =>
       api.patch(
         `${basePath(ref)}/${input.connectionId}`,
-        getMcpConnectionResponseSchema,
+        getConnectionResponseSchema,
         { body: input.patch },
       ),
     onSuccess: async (data) => {
       seedDetail(queryClient, ref, data);
-      await invalidateMcpConnections(queryClient, ref);
+      await invalidateConnections(queryClient, ref);
     },
   });
 }
 
-export function useDeleteMcpConnection(ref: ScopeRef) {
+export function useDeleteConnection(ref: ScopeRef) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (connectionId: string) =>
@@ -148,29 +134,29 @@ export function useDeleteMcpConnection(ref: ScopeRef) {
       ),
     onSuccess: async (data) => {
       queryClient.removeQueries({
-        queryKey: queryKeys.mcpConnections.detail(ref, data.id),
+        queryKey: queryKeys.connections.detail(ref, data.id),
       });
-      await invalidateMcpConnections(queryClient, ref);
+      await invalidateConnections(queryClient, ref);
     },
   });
 }
 
 /** Optimistic enable/disable toggle. */
-export function useToggleMcpConnection(ref: ScopeRef) {
+export function useToggleConnection(ref: ScopeRef) {
   const queryClient = useQueryClient();
-  const listKey = queryKeys.mcpConnections.list(ref);
+  const listKey = queryKeys.connections.list(ref);
   return useMutation({
     mutationFn: (input: { connectionId: string; enabled: boolean }) =>
       api.patch(
         `${basePath(ref)}/${input.connectionId}`,
-        getMcpConnectionResponseSchema,
+        getConnectionResponseSchema,
         { body: { enabled: input.enabled } },
       ),
     onMutate: async (input) => {
       await queryClient.cancelQueries({ queryKey: listKey });
       const previous =
-        queryClient.getQueryData<ListMcpConnectionsResponse>(listKey);
-      queryClient.setQueryData<ListMcpConnectionsResponse>(listKey, (current) =>
+        queryClient.getQueryData<ListConnectionsResponse>(listKey);
+      queryClient.setQueryData<ListConnectionsResponse>(listKey, (current) =>
         current === undefined
           ? current
           : {
@@ -188,6 +174,6 @@ export function useToggleMcpConnection(ref: ScopeRef) {
         queryClient.setQueryData(listKey, context.previous);
       }
     },
-    onSettled: () => invalidateMcpConnections(queryClient, ref),
+    onSettled: () => invalidateConnections(queryClient, ref),
   });
 }

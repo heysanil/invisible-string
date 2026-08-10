@@ -1,14 +1,15 @@
 /**
  * Custom-URL MCP connection form: name + endpoint URL + auth (none / bearer /
- * headers). Secret values are sent once via the encrypted `auth` field.
+ * headers). Submits `{source:"custom", …}` against the unified create route;
+ * secret values are sent once via the encrypted `auth` field.
  */
 import { Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type {
-  CreateMcpConnectionRequest,
+  CreateConnectionRequest,
   McpAuthWrite,
 } from "@invisible-string/shared";
-import { createMcpConnectionRequestSchema } from "@invisible-string/shared";
+import { createConnectionRequestSchema } from "@invisible-string/shared";
 
 import { errorMessage, fieldErrorsFromZod } from "../../lib/forms";
 import { Button } from "../ui/Button";
@@ -16,7 +17,7 @@ import { Input } from "../ui/Input";
 import { SegmentedControl } from "../ui/SegmentedControl";
 
 export interface CustomConnectionFormProps {
-  onCreate: (input: CreateMcpConnectionRequest) => Promise<unknown>;
+  onCreate: (input: CreateConnectionRequest) => Promise<unknown>;
   creating: boolean;
   error?: unknown;
 }
@@ -67,13 +68,14 @@ export function CustomConnectionForm({
     }
 
     const candidate = {
+      source: "custom",
       name: name.trim(),
       url: url.trim(),
       description: description.trim() || undefined,
       auth: buildAuth(),
-    } satisfies Partial<CreateMcpConnectionRequest>;
+    } satisfies Partial<Extract<CreateConnectionRequest, { source: "custom" }>>;
 
-    const parsed = createMcpConnectionRequestSchema.safeParse(candidate);
+    const parsed = createConnectionRequestSchema.safeParse(candidate);
     if (!parsed.success) {
       Object.assign(errors, fieldErrorsFromZod(parsed.error));
     }

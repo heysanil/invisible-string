@@ -9,18 +9,15 @@ import {
   connectionDtoSchema,
   createAgentRequestSchema,
   createConnectionRequestSchema,
-  createMcpConnectionRequestSchema,
   createSessionRequestSchema,
   createSkillRequestSchema,
   createWorkflowRequestSchema,
   deliveryStatusSchema,
   dryRunCompileResponseSchema,
-  installMcpConnectionRequestSchema,
   isRunStreamTerminalStatus,
   listModelCapabilitiesResponseSchema,
   listSessionsQuerySchema,
   mcpAuthWriteSchema,
-  mcpConnectionDtoSchema,
   modelCapabilityDtoSchema,
   modelIdShapeProblem,
   modelPresetDtoSchema,
@@ -39,7 +36,6 @@ import {
   SESSION_NOT_ACTIVE_ERROR_CODE,
   sessionContextControlResponseSchema,
   updateAgentRequestSchema,
-  updateMcpConnectionRequestSchema,
   updateModelPresetRequestSchema,
   updateSkillRequestSchema,
   updateWorkflowRequestSchema,
@@ -354,57 +350,6 @@ describe("mcp connection schemas", () => {
     );
     expect(mcpAuthWriteSchema.safeParse({ type: "headers", values: {} }).success).toBe(false);
   });
-
-  test("create requires an http(s) URL and at most one tool filter", () => {
-    const base = { name: "Linear", url: "https://mcp.linear.app/mcp" };
-    expect(createMcpConnectionRequestSchema.safeParse(base).success).toBe(true);
-    expect(
-      createMcpConnectionRequestSchema.safeParse({ ...base, url: "ftp://nope" }).success,
-    ).toBe(false);
-    expect(
-      createMcpConnectionRequestSchema.safeParse({
-        ...base,
-        toolAllow: ["create_issue"],
-        toolBlock: ["delete_issue"],
-      }).success,
-    ).toBe(false);
-    expect(
-      createMcpConnectionRequestSchema.safeParse({
-        ...base,
-        toolAllow: ["create_issue"],
-        approvalPolicy: { default: "always" },
-      }).success,
-    ).toBe(true);
-  });
-
-  test("update requires at least one field; auth omitted keeps credentials", () => {
-    expect(updateMcpConnectionRequestSchema.safeParse({}).success).toBe(false);
-    expect(updateMcpConnectionRequestSchema.safeParse({ enabled: false }).success).toBe(true);
-    expect(
-      updateMcpConnectionRequestSchema.safeParse({ auth: { type: "none" } }).success,
-    ).toBe(true);
-  });
-
-  test("DTO carries hasCredentials, never secret material", () => {
-    const parsed = mcpConnectionDtoSchema.safeParse({
-      id: UUID,
-      scope: "workspace",
-      name: "Linear",
-      description: null,
-      source: "registry",
-      registryId: "io.linear/mcp",
-      url: "https://mcp.linear.app/mcp",
-      toolAllow: null,
-      toolBlock: null,
-      approvalPolicy: { default: "always", tools: { delete_issue: "always" } },
-      enabled: true,
-      hasCredentials: true,
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    expect(parsed.success).toBe(true);
-    expect(parsed.success && "authConfigEncrypted" in parsed.data).toBe(false);
-  });
 });
 
 describe("registry schemas", () => {
@@ -429,19 +374,6 @@ describe("registry schemas", () => {
     ).toBe(false);
   });
 
-  test("install request maps a chosen remote + optional auth", () => {
-    expect(
-      installMcpConnectionRequestSchema.safeParse({
-        registryName: "io.github.acme/notes",
-        remoteUrl: "https://notes.example.com/mcp",
-        auth: { type: "headers", values: { "x-api-key": "secret" } },
-      }).success,
-    ).toBe(true);
-    expect(
-      installMcpConnectionRequestSchema.safeParse({ registryName: "io.github.acme/notes" })
-        .success,
-    ).toBe(false);
-  });
 });
 
 describe("skill schemas", () => {

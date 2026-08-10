@@ -12,7 +12,7 @@ import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type {
   McpApprovalDecision,
-  UpdateMcpConnectionRequest,
+  UpdateConnectionRequest,
 } from "@invisible-string/shared";
 
 import {
@@ -21,7 +21,7 @@ import {
   type ScopedConnection,
   type ScopedSkill,
 } from "../../lib/builder/resources";
-import { useUpdateMcpConnection } from "../../lib/queries/mcp-connections";
+import { useUpdateConnection } from "../../lib/queries/connections";
 import { cn } from "../../lib/cn";
 
 // Satisfies React's controlled-input contract; the real handler rides
@@ -250,7 +250,7 @@ function ConnectionSettings({
 }) {
   const { toast } = useToast();
   const scopeRef = scopeRefOf(connection.resourceScope, workspaceId);
-  const update = useUpdateMcpConnection(scopeRef);
+  const update = useUpdateConnection(scopeRef);
 
   const initialMode: FilterMode =
     connection.toolAllow && connection.toolAllow.length > 0
@@ -268,7 +268,7 @@ function ConnectionSettings({
   );
   const approval = connection.approvalPolicy?.default ?? "never";
 
-  function persist(patch: UpdateMcpConnectionRequest) {
+  function persist(patch: UpdateConnectionRequest) {
     update.mutate(
       { connectionId: connection.id, patch },
       {

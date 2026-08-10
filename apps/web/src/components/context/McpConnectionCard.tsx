@@ -1,12 +1,12 @@
 import { Blocks, Globe, ShieldCheck, Trash2 } from "lucide-react";
-import type { McpConnectionDto } from "@invisible-string/shared";
+import type { ConnectionDto } from "@invisible-string/shared";
 
 import { APPROVAL_LABEL } from "../../lib/labels";
 import { Chip } from "../ui/Chip";
 import { Switch } from "../ui/Switch";
 
 export interface McpConnectionCardProps {
-  connection: McpConnectionDto;
+  connection: ConnectionDto;
   onToggle: (enabled: boolean) => void;
   onDelete: () => void;
   /** Members (read-only) get no mutating controls. */
@@ -14,7 +14,7 @@ export interface McpConnectionCardProps {
 }
 
 /** Human summary of the tool filter (allow/block/all). */
-function toolsLabel(connection: McpConnectionDto): string {
+function toolsLabel(connection: ConnectionDto): string {
   if (connection.toolAllow && connection.toolAllow.length > 0) {
     const n = connection.toolAllow.length;
     return `${n} tool${n === 1 ? "" : "s"}`;
@@ -57,8 +57,8 @@ export function McpConnectionCard({
           </div>
           <p className="truncate text-[12px] text-ink-4">
             {connection.source === "registry"
-              ? (connection.registryId ?? "Registry server")
-              : (connection.url ?? "Custom server")}
+              ? (connection.registryName ?? "Registry server")
+              : connection.url}
           </p>
         </div>
         {readOnly ? null : (

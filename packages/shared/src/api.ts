@@ -98,10 +98,6 @@ export type SessionOrigin = z.infer<typeof sessionOriginSchema>;
 export const resourceScopeSchema = z.enum(["workspace", "user"]);
 export type ResourceScope = z.infer<typeof resourceScopeSchema>;
 
-/** Mirrors pgEnum `mcp_source`. */
-export const mcpSourceSchema = z.enum(["registry", "custom"]);
-export type McpSource = z.infer<typeof mcpSourceSchema>;
-
 /** Mirrors pgEnum `model_provider`. */
 export const modelProviderSchema = z.enum(["anthropic", "openrouter"]);
 export type ModelProvider = z.infer<typeof modelProviderSchema>;
@@ -809,18 +805,11 @@ export type RunInputRequest = z.infer<typeof runInputRequestSchema>;
 export const runInputResponseSchema = z.object({ run: runDtoSchema });
 export type RunInputResponse = z.infer<typeof runInputResponseSchema>;
 
-// ── MCP connections (agent context) ─────────────────────────────────────────
+// ── MCP connection auth + approval shapes ───────────────────────────────────
 //
-// BOTH scopes (spec §9 — "Both workspace- and user-level required"):
-//   workspace: /workspaces/:workspaceId/mcp-connections[...]
-//   user:      /me/mcp-connections[...]
-//
-//   GET    <base>                 → ListMcpConnectionsResponse
-//   POST   <base>                 → GetMcpConnectionResponse (201; custom URL)
-//   POST   <base>/install         → GetMcpConnectionResponse (201; from registry)
-//   GET    <base>/:id             → GetMcpConnectionResponse
-//   PATCH  <base>/:id             → GetMcpConnectionResponse
-//   DELETE <base>/:id             → DeleteResourceResponse
+// Shared by the connections domain below (and the compiler adapter): the
+// approval-policy shape stored on the row, and the write-only credential
+// envelope.
 
 /**
  * Per-tool approval decision, exactly as stored on
@@ -845,7 +834,7 @@ export type McpApprovalPolicy = z.infer<typeof mcpApprovalPolicySchema>;
 /**
  * Credential WRITE shape. The server encrypts values (AES-256-GCM envelope,
  * AAD-bound to the row) and NEVER echoes them back — read DTOs carry
- * {@link McpConnectionDto.hasCredentials} only.
+ * {@link ConnectionDto.hasCredentials} only.
  *
  * - none    → clears any stored credentials
  * - bearer  → `values.token` becomes the connection's bearer token
@@ -889,86 +878,12 @@ function refineToolFilter<
 }
 const TOOL_FILTER_MESSAGE = "set toolAllow or toolBlock, not both";
 
-export const mcpConnectionDtoSchema = z.object({
-  id: productId,
-  scope: resourceScopeSchema,
-  name: z.string().min(1),
-  /** Model-facing summary — eve's connection_search routes on it. */
-  description: z.string().nullable(),
-  source: mcpSourceSchema,
-  /** registry.modelcontextprotocol.io server name (source = registry). */
-  registryId: z.string().nullable(),
-  url: z.string().nullable(),
-  toolAllow: z.array(z.string()).nullable(),
-  toolBlock: z.array(z.string()).nullable(),
-  approvalPolicy: mcpApprovalPolicySchema.nullable(),
-  enabled: z.boolean(),
-  /** True when encrypted credentials are stored. Secrets are never echoed. */
-  hasCredentials: z.boolean(),
-  createdAt: isoTimestamp,
-  updatedAt: isoTimestamp,
-});
-export type McpConnectionDto = z.infer<typeof mcpConnectionDtoSchema>;
-
-/** Create a CUSTOM-URL connection (registry installs use .../install). */
-export const createMcpConnectionRequestSchema = z
-  .object({
-    name: mcpConnectionNameSchema,
-    description: z.string().max(2000).optional(),
-    url: httpUrlSchema,
-    auth: mcpAuthWriteSchema.optional(),
-    toolAllow: toolNameListSchema.optional(),
-    toolBlock: toolNameListSchema.optional(),
-    approvalPolicy: mcpApprovalPolicySchema.optional(),
-    enabled: z.boolean().optional(),
-  })
-  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
-export type CreateMcpConnectionRequest = z.infer<
-  typeof createMcpConnectionRequestSchema
->;
-
-/**
- * Partial update. `auth` semantics: omitted = keep stored credentials;
- * `{type:"none"}` = clear; bearer/headers = replace. Explicit nulls clear
- * the nullable fields.
- */
-export const updateMcpConnectionRequestSchema = z
-  .object({
-    name: mcpConnectionNameSchema.optional(),
-    description: z.string().max(2000).nullable().optional(),
-    url: httpUrlSchema.optional(),
-    auth: mcpAuthWriteSchema.optional(),
-    toolAllow: toolNameListSchema.nullable().optional(),
-    toolBlock: toolNameListSchema.nullable().optional(),
-    approvalPolicy: mcpApprovalPolicySchema.nullable().optional(),
-    enabled: z.boolean().optional(),
-  })
-  .refine((patch) => Object.values(patch).some((value) => value !== undefined), {
-    message: "update at least one field",
-  })
-  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
-export type UpdateMcpConnectionRequest = z.infer<
-  typeof updateMcpConnectionRequestSchema
->;
-
-export const listMcpConnectionsResponseSchema = z.object({
-  connections: z.array(mcpConnectionDtoSchema),
-});
-export type ListMcpConnectionsResponse = z.infer<
-  typeof listMcpConnectionsResponseSchema
->;
-
-export const getMcpConnectionResponseSchema = z.object({
-  connection: mcpConnectionDtoSchema,
-});
-export type GetMcpConnectionResponse = z.infer<
-  typeof getMcpConnectionResponseSchema
->;
-
 // ── Connections (connectors redesign) ───────────────────────────────────────
 //
 // The rebuilt connection domain (connectors redesign spec §3), replacing the
-// mcp-connections surface above. BOTH scopes:
+// retired mcp-connections surface (its DTO family is deleted; the dead
+// `mcp_connections` table stays per the additive-migrations rule). BOTH
+// scopes:
 //   workspace: /workspaces/:workspaceId/connections[...]
 //   user:      /me/connections[...]
 //
@@ -1233,33 +1148,6 @@ export const registrySearchResponseSchema = z.object({
 });
 export type RegistrySearchResponse = z.infer<
   typeof registrySearchResponseSchema
->;
-
-/**
- * Install a registry server as an MCP connection
- * (`POST <mcp-connections base>/install`, both scopes). The UI picks one of
- * the server's `remotes[].url`; secret values collected from the
- * declarations travel in `auth` and are encrypted server-side.
- */
-export const installMcpConnectionRequestSchema = z
-  .object({
-    /** RegistryServerSummary.name. */
-    registryName: z.string().min(1),
-    /** Registry version installed; server resolves "latest" when omitted. */
-    version: z.string().min(1).optional(),
-    /** The chosen remotes[].url. */
-    remoteUrl: httpUrlSchema,
-    /** Display name override; defaults to the server's title/name. */
-    name: mcpConnectionNameSchema.optional(),
-    description: z.string().max(2000).optional(),
-    auth: mcpAuthWriteSchema.optional(),
-    toolAllow: toolNameListSchema.optional(),
-    toolBlock: toolNameListSchema.optional(),
-    approvalPolicy: mcpApprovalPolicySchema.optional(),
-  })
-  .refine(refineToolFilter, { message: TOOL_FILTER_MESSAGE });
-export type InstallMcpConnectionRequest = z.infer<
-  typeof installMcpConnectionRequestSchema
 >;
 
 // ── Skills (agent context) ──────────────────────────────────────────────────

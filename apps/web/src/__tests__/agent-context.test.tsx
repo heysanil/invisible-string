@@ -22,8 +22,9 @@ ensureDomForThisFile();
 
 const AGENT_ID = "aaaaaaaa-1111-4111-8111-111111111111";
 const VERSION_ID = "bbbbbbbb-1111-4111-8111-111111111111";
-const DRAFT_CONN = "cccccccc-1111-4111-8111-111111111111";
-const PUBLISHED_CONN = "dddddddd-1111-4111-8111-111111111111";
+// Connection ids are connectors-redesign `cn_` nanoids; skills stay uuid.
+const DRAFT_CONN = "cn_ccccccccccccccc1";
+const PUBLISHED_CONN = "cn_ddddddddddddddd1";
 const PUBLISHED_SKILL = "eeeeeeee-1111-4111-8111-111111111111";
 const NOW = "2026-07-10T00:00:00.000Z";
 

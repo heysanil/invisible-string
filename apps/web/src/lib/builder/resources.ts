@@ -5,17 +5,17 @@
  */
 import { useMemo } from "react";
 import type {
-  McpConnectionDto,
+  ConnectionDto,
   SkillDto,
 } from "@invisible-string/shared";
 
-import { useMcpConnections } from "../queries/mcp-connections";
+import { useConnections } from "../queries/connections";
 import { useSkills } from "../queries/skills";
 import type { ScopeRef } from "../queries/keys";
 
 export type ResourceScope = "workspace" | "user";
 
-export interface ScopedConnection extends McpConnectionDto {
+export interface ScopedConnection extends ConnectionDto {
   resourceScope: ResourceScope;
 }
 
@@ -36,8 +36,8 @@ export function useContextResources(workspaceId: string): ContextResources {
   const workspaceRef: ScopeRef = { scope: "workspace", workspaceId };
   const userRef: ScopeRef = { scope: "user" };
 
-  const wsConnections = useMcpConnections(workspaceRef);
-  const userConnections = useMcpConnections(userRef);
+  const wsConnections = useConnections(workspaceRef);
+  const userConnections = useConnections(userRef);
   const wsSkills = useSkills(workspaceRef);
   const userSkills = useSkills(userRef);
 

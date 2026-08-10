@@ -10,7 +10,7 @@
 import type { AgentSessionStatus } from "@invisible-string/shared";
 
 /**
- * Owner of a scoped context resource (MCP connections, skills — spec §9
+ * Owner of a scoped context resource (connections, skills — spec §9
  * requires BOTH workspace- and user-level).
  */
 export type ScopeRef =
@@ -20,7 +20,7 @@ export type ScopeRef =
 /** REST base path for a scoped resource. */
 export function scopeBasePath(
   ref: ScopeRef,
-  resource: "mcp-connections" | "skills",
+  resource: "connections" | "skills",
 ): string {
   return ref.scope === "user"
     ? `/me/${resource}`
@@ -60,12 +60,12 @@ export const queryKeys = {
     /** Session detail is fetched by id (`GET /sessions/:id`). */
     detail: (sessionId: string) => ["sessions", "detail", sessionId] as const,
   },
-  mcpConnections: {
-    all: (ref: ScopeRef) => ["mcp-connections", ...scopeSegments(ref)] as const,
+  connections: {
+    all: (ref: ScopeRef) => ["connections", ...scopeSegments(ref)] as const,
     list: (ref: ScopeRef) =>
-      ["mcp-connections", ...scopeSegments(ref), "list"] as const,
+      ["connections", ...scopeSegments(ref), "list"] as const,
     detail: (ref: ScopeRef, connectionId: string) =>
-      ["mcp-connections", ...scopeSegments(ref), "detail", connectionId] as const,
+      ["connections", ...scopeSegments(ref), "detail", connectionId] as const,
   },
   registry: {
     search: (q: string) => ["mcp-registry", "search", q] as const,

@@ -9,8 +9,8 @@ import { useState } from "react";
 import type { ScopeRef } from "../../lib/queries/keys";
 import { Panel } from "../ui/Panel";
 import { SegmentedControl } from "../ui/SegmentedControl";
+import { AddConnectionDialog } from "./AddConnectionDialog";
 import { McpConnectionsGrid } from "./McpConnectionsGrid";
-import { RegistryBrowserModal } from "./RegistryBrowserModal";
 import { SkillList } from "./SkillList";
 
 export type ContextScopeTab = "workspace" | "personal";
@@ -71,7 +71,7 @@ export function ContextHome({ workspaceId, canManage, onOpenSkill }: ContextHome
         />
       </div>
 
-      <RegistryBrowserModal
+      <AddConnectionDialog
         open={adding}
         onClose={() => setAdding(false)}
         scope={scope}

@@ -18,7 +18,7 @@ const { files, hash } = compile(definition, {   // definition: AgentDefinition
   },
   workspaceSlug: "acme",
   agentSlug: "software-engineer",
-  connections,                          // resolved `mcp_connections` rows
+  connections,                          // resolved `connections` rows
   skills,                               // resolved `skills` rows
   options: { dev: false },
 });
@@ -59,9 +59,10 @@ firing and Slack reply delivery live in the control plane.
 | `agent/agent.ts` | explicit `model` (never eve's default), the resolved reasoning effort (below), an explicit `limits` block (below), `experimental.workflow.world = "@workflow/world-postgres"`. openrouter: provider constructed **only when `OPENROUTER_API_KEY` is set**, with `OPENROUTER_BASE_URL` passthrough for mock gateways; keyless falls back to the model-id string, which is what makes eve bake **gateway** routing so `eve build`/boot stay alive. anthropic resolves its key/baseURL lazily. |
 | `agent/instructions.md` | the persona with compile-time refs resolved, then — only when the agent has context — a `---`-separated generated "Workspace context" appendix (connection/skill descriptions for `connection_search`/`load_skill` routing). Nothing else — workflow instructions never appear here. |
 | `agent/lib/platform-auth.ts` | `platformJwt()` AuthFn (`verifyJwtHmac`, HS256, `PLATFORM_JWT_SECRET`, iss `invisible-string` / version-bound aud `agent-version:<hash>`) + `localDev()` **only on `options.dev` builds**. |
-| `agent/lib/env.ts` | `requireEnv()` helper (only when a connection needs env credentials). |
+| `agent/lib/env.ts` | `requireEnv()` helper (only when at least one connection authenticates — bearer/headers read env vars, and the OAuth platform-token lib imports it too). |
+| `agent/lib/platform-token.ts` | `platformConnectionToken(connectionId)` — emitted only for OAuth connections; self-mints an HS256 platform JWT and fetches short-lived access tokens from the control-plane broker `POST /internal/connections/token` (reads `PLATFORM_API_URL` + `PLATFORM_JWT_SECRET` lazily inside the call so keyless `eve build` never crashes; no OAuth material in agent env). |
 | `agent/channels/eve.ts` | default HTTP channel — the ONLY channel — with platform-JWT route auth and an `onMessage` hook injecting platform context blocks (identity line `Platform agent "<agent>" in workspace "<ws>"`; context is an onMessage **return**, never a `send()` option — PLAN correction 2). |
-| `agent/connections/<slug>.ts` | `defineMcpClientConnection`: literal `url`/`description`; auth via env-token `getToken` or lazy `headers` callback; `tools` exactly-one `allow`/`block`; approval `never()`/`once()`/`always()` or a generated per-tool policy matching **qualified** names (`<slug>__<tool>`). |
+| `agent/connections/<slug>.ts` | `defineMcpClientConnection`: literal `url`/`description`; auth via env-token `getToken`, lazy `headers` callback, or broker-delivered `getToken` (`platformConnectionToken`, OAuth connections — no OAuth material in agent env); `tools` exactly-one `allow`/`block`; approval `never()`/`once()`/`always()` or a generated per-tool policy matching **qualified** names (`<slug>__<tool>`). |
 | `agent/skills/<slug>.md` or `<slug>/SKILL.md` (+files) | SKILL.md convention with `description` frontmatter. |
 
 ### Reasoning effort: `extraBody` on OpenRouter, `reasoning:` on Anthropic
@@ -194,6 +195,17 @@ older entries so existing versions recompile byte-identically.
 `BUILD_ENV_EPOCH` is deliberately untouched: the change is inside `compile()`,
 which `COMPILER_VERSION` already re-keys.
 
+**4.1.0 is the broker-delivered-OAuth minor**: oauth-auth connections
+(`auth.kind === "oauth"`) emit an `auth.getToken` that calls the new
+`agent/lib/platform-token.ts`, which self-mints an HS256 platform JWT and
+fetches short-lived access tokens from the control plane's
+`POST /internal/connections/token` (two lazy env reads — the new
+`PLATFORM_API_URL` and the existing `PLATFORM_JWT_SECRET` — so keyless
+`eve build` still never crashes; no OAuth material in agent env or generated
+files). New emitted file → minor; bearer/headers/none emissions are
+byte-identical, though every version hash shifts because `COMPILER_VERSION`
+participates.
+
 The bump is enforced MECHANICALLY: `fixtures/.golden-digest.json` commits a
 sha256 over every fixture's emitted bytes paired with the `COMPILER_VERSION`
 that produced it. A template change without a bump fails
@@ -217,6 +229,7 @@ generated files or artifacts**:
 | `OPENROUTER_BASE_URL` / `ANTHROPIC_BASE_URL` | agent.ts / provider | Optional gateway override (mock-model harness). |
 | `MCP_<SLUG_UPPER>_TOKEN` | connections | Bearer token per bearer-auth connection (`connectionTokenEnvVar(slug)`). |
 | custom `MCP_*` names | connections | Header-auth connections read the env vars named in their config. |
+| `PLATFORM_API_URL` | platform-token lib (oauth connections) | Control-plane base URL as seen from the worker network; the broker-delivered `getToken` posts `/internal/connections/token` here. Optional — absent, oauth tool calls fail with a missing-env error, nothing else breaks. |
 | `NODE_ENV` | eve | Supervisor must pin `production` — `NODE_ENV=test` silently mocks authored models (spike finding 5). |
 
 ## Tests
@@ -243,7 +256,10 @@ pinning the OpenRouter suppression branch), `flat-skill` (markdown-only skill
 z-ai/glm-5.2, pinning its context-window entry; keeps the legacy `medium`
 effort so pre-existing definitions stay provably compilable),
 `anthropic-model` (anthropic provider + matching modelId override, dev build;
-`max`, pinning the → `xhigh` clamp).
+`max`, pinning the → `xhigh` clamp), `oauth-connection` (oauth broker-delivered
+connection via `platformConnectionToken` — pins the `agent/lib/platform-token.ts`
+emission and the oauth `auth` branch no other fixture reaches; `balanced` preset,
+`deepseek/deepseek-v4-pro`, `high`).
 
 ### The wire probe (`src/wire-probe.mjs`)
 

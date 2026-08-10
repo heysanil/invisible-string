@@ -1,11 +1,11 @@
 /**
  * Phase-3 trigger UI: the Integrations settings panel (connected-team cards +
- * disconnect), the builder's live webhook-token reveal ("shown once, we store
- * only a hash"), and the chat run-cancel button.
+ * disconnect) and the builder's live webhook-token reveal ("shown once, we
+ * store only a hash").
  */
 import { ensureDomForThisFile } from "../test/setup";
 
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 
 import {
@@ -16,8 +16,6 @@ import {
 } from "../test/harness";
 import { IntegrationsPanel } from "../components/settings/IntegrationsPanel";
 import { LiveTriggerConfig } from "../components/builder/LiveTriggerConfig";
-import { RunMessage } from "../components/chat/RunMessage";
-import type { RunView } from "../lib/chat/run-view";
 
 ensureDomForThisFile();
 
@@ -121,49 +119,5 @@ test("LiveTriggerConfig mints a webhook token, revealing it ONCE with a hash not
   expect(view.getByText(/we store only a hash/i)).toBeTruthy();
 });
 
-// ── Chat Stop button ─────────────────────────────────────────────────────────
-
-function runningRunView(runId: string): RunView {
-  return {
-    runId,
-    status: "running",
-    userMessage: "do the thing",
-    segments: [],
-    pendingInputs: [],
-    error: null,
-    modelId: null,
-    canceled: false,
-    contextCleared: false,
-  };
-}
-
-test("RunMessage renders a Stop button on an active run and fires onCancel", () => {
-  const onCancel = mock((_runId: string) => {});
-  const view = renderWithProviders(
-    <RunMessage
-      run={runningRunView("run_1")}
-      isChatOrigin
-      onRespond={() => {}}
-      onCancel={onCancel}
-    />,
-  );
-  fireEvent.click(view.getByRole("button", { name: "Stop" }));
-  expect(onCancel).toHaveBeenCalledTimes(1);
-  expect(onCancel.mock.calls[0]![0]).toBe("run_1");
-});
-
-test("RunMessage shows no Stop button on a settled run", () => {
-  const view = renderWithProviders(
-    <RunMessage
-      run={{
-        ...runningRunView("run_2"),
-        status: "succeeded",
-        segments: [{ kind: "speech", key: "say:t0:0", text: "done", streaming: false }],
-      }}
-      isChatOrigin
-      onRespond={() => {}}
-      onCancel={() => {}}
-    />,
-  );
-  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
-});
+// The chat Stop control moved off the transcript and onto the composer
+// (2026-08-09 spec); its tests live in __tests__/chat-thread.test.tsx.

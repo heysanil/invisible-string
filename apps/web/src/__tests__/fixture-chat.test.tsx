@@ -12,7 +12,8 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, fireEvent, within } from "@testing-library/react";
+import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
+import { pasteInto, pressEnter } from "../test/editor";
 
 import { renderWithRouter } from "../test/router";
 
@@ -127,11 +128,38 @@ test("the session-limit fixture renders its own card, not a tool approval", asyn
 
 test("fixture mode can actually stop a running run (backend-free preview)", async () => {
   const view = renderWithRouter(<FixtureChatShell />);
-  // The first session is the live streaming run.
+  // The first session is the live streaming run. Stop now lives on the
+  // composer, so it is reachable without scrolling the virtualized thread.
   const stop = await view.findByRole("button", { name: "Stop" });
   fireEvent.click(stop);
   expect(view.getByText(/You stopped this run/)).toBeTruthy();
-  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  await waitFor(() =>
+    expect(view.queryByRole("button", { name: "Stop" })).toBeNull(),
+  );
+});
+
+test("fixture mode previews the live composer and the queue, not the old locked box", async () => {
+  // Fixture mode is the design/E2E preview surface for this feature, so a
+  // preview that still froze the composer during a run would demonstrate the
+  // exact behavior the queue replaced — teaching the wrong thing to anyone
+  // using it to review the change.
+  const view = renderWithRouter(<FixtureChatShell />);
+  const box = await view.findByLabelText("Message");
+
+  // The first session has a live run holding the slot: the box stays typeable.
+  expect(box.getAttribute("contenteditable")).not.toBe("false");
+  // With an EMPTY box, Stop owns the ink circle and there is no submit button
+  // competing for the spot — so the queue action only appears once you type.
+  expect(await view.findByRole("button", { name: "Stop" })).toBeTruthy();
+
+  pasteInto(box, "queue this while it works");
+  expect(await view.findByRole("button", { name: "Queue message" })).toBeTruthy();
+  pressEnter(box);
+
+  await waitFor(() =>
+    expect(view.getByText(/queue this while it works/)).toBeTruthy(),
+  );
+  expect(view.getByText(/sends as one message/)).toBeTruthy();
 });
 
 test("fixture mode can apply a context control from the session menu", async () => {

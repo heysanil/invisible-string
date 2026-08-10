@@ -74,19 +74,30 @@ export function createArtifactCache(options: {
   for (const name of readdirSync(dir)) {
     if (RESERVED_DIRS.has(name) || name.startsWith(".")) continue;
     const path = join(dir, name);
-    if (!statSync(path).isDirectory()) {
-      rmSync(path, { force: true });
-      continue;
+    try {
+      // One stat, reused: between an `isDirectory()` call and a second
+      // `mtimeMs` call the entry can go away, which is the same race this
+      // catch exists for — one syscall is one fewer window.
+      const stat = statSync(path);
+      if (!stat.isDirectory()) {
+        rmSync(path, { force: true });
+        continue;
+      }
+      if (!HASH_RE.test(name) || !existsSync(agentEntrypoint(path))) {
+        log(`cache: discarding invalid/partial entry ${name}`);
+        rmSync(path, { recursive: true, force: true });
+        continue;
+      }
+      entries.set(name, { bytes: dirBytes(path), lastUsedAt: stat.mtimeMs });
+    } catch (error) {
+      // An entry can disappear between `readdirSync` listing it and any
+      // syscall above — a concurrent teardown, an eviction interrupted
+      // partway, a dangling symlink. That must never be fatal: this scan runs
+      // BEFORE the worker listens, so a throw here takes the whole worker down
+      // and shows up as a readiness timeout against an EMPTY log, with nothing
+      // pointing at the cache. An unreadable entry is simply not adoptable.
+      log(`cache: skipping unreadable entry ${name} (${String(error)})`);
     }
-    if (!HASH_RE.test(name) || !existsSync(agentEntrypoint(path))) {
-      log(`cache: discarding invalid/partial entry ${name}`);
-      rmSync(path, { recursive: true, force: true });
-      continue;
-    }
-    entries.set(name, {
-      bytes: dirBytes(path),
-      lastUsedAt: statSync(path).mtimeMs,
-    });
   }
 
   function dirFor(hash: string): string {

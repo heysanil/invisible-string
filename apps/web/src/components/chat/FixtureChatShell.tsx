@@ -17,6 +17,7 @@ import {
   type FixtureSession,
 } from "../../lib/chat/fixtures";
 import { titleFromMessage } from "../../lib/chat/time";
+import { useMessageQueue } from "../../lib/chat/use-message-queue";
 import { EmptyState } from "../ui/EmptyState";
 import { Panel } from "../ui/Panel";
 import { AgentPicker, agentModelLabel } from "./AgentPicker";
@@ -171,6 +172,28 @@ function FixtureThread({
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
   const { summary } = session;
 
+  // The session's one run slot, as the control plane counts it — `waiting`
+  // included, because a parked run still owns the turn.
+  const slotHeld =
+    lastRun !== undefined &&
+    !lastRun.canceled &&
+    (lastRun.status === "queued" ||
+      lastRun.status === "running" ||
+      lastRun.status === "waiting");
+
+  // The REAL queue hook, not a lookalike: fixture mode exists to preview the
+  // shipped behavior, so a hand-rolled array here could drift from production
+  // and quietly teach the wrong thing. `send` resolves without a backend, so
+  // stopping the run frees the slot and the queue flushes and empties exactly
+  // as it does against the control plane.
+  const queue = useMessageQueue({
+    canFlush: !slotHeld,
+    send: async () => {},
+    onGiveUp: () => {},
+    onRetired: () => {},
+  });
+  const queueing = slotHeld || queue.queued.length > 0;
+
   const header: ThreadHeaderProps = {
     title: titleFromMessage(session.runs[0]?.run.triggerEvent.message ?? ""),
     agentName: summary.agentName,
@@ -197,15 +220,31 @@ function FixtureThread({
       runs={runViews}
       isChatOrigin={summary.origin === "chat"}
       onRespond={(_runId, response) => onAnswer(response.requestId)}
-      onCancel={(runId) => setStopped((prev) => new Set(prev).add(runId))}
+      onStop={
+        slotHeld && lastRun !== undefined
+          ? () => setStopped((prev) => new Set(prev).add(lastRun.runId))
+          : undefined
+      }
       contextMarker={contextMarker}
-      onSend={() => undefined}
-      composerDisabledReason={
-        lastRun?.status === "running"
-          ? "Working… (fixture mode)"
-          : lastRun?.status === "waiting"
-            ? "Waiting for your response above."
-            : null
+      // Enter queues while the slot is held — the same routing ThreadContainer
+      // does. With no backend there is nothing to send when the slot is free,
+      // so that branch stays a no-op.
+      onSend={(message) => {
+        if (queueing) queue.enqueue(message);
+      }}
+      queued={queue.queued}
+      onRemoveQueued={queue.remove}
+      queueing={queueing}
+      // NEVER a disabledReason for a live run. This used to read "Working…
+      // (fixture mode)", which froze the box and previewed the exact behavior
+      // this feature removed — a preview that lies is worse than no preview.
+      // Only a retired session disables, and fixture sessions never retire.
+      composerDisabledReason={null}
+      composerHint={
+        queue.notice ??
+        (lastRun?.status === "waiting"
+          ? "Waiting for your response above — anything you send now is queued."
+          : null)
       }
     />
   );

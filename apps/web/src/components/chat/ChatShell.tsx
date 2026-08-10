@@ -25,8 +25,12 @@ import { Panel } from "../ui/Panel";
 import { AgentPicker, agentModelLabel } from "./AgentPicker";
 import { Chip } from "./Chip";
 import { Composer } from "./Composer";
+import { DiscardQueueDialog } from "./DiscardQueueDialog";
 import { SessionList, type SessionListItem } from "./SessionList";
 import { ThreadContainer } from "./ThreadContainer";
+
+/** Where a session switch wants to land: another thread, or the new-chat picker. */
+type SwitchTarget = { kind: "session"; sessionId: string } | { kind: "new" };
 
 export function ChatShell({
   workspaceId,
@@ -50,6 +54,32 @@ export function ChatShell({
   const [pickerOpen, setPickerOpen] = useState(false);
   /** Agent chosen in the picker → the composer collects the first message. */
   const [draftAgent, setDraftAgent] = useState<AgentSummaryDto | null>(null);
+  /**
+   * Queue depth reported by the live thread. The queue is per-thread state
+   * inside a KEYED ThreadContainer, so any switch remounts it and drops the
+   * messages — this shell has to ask before that happens.
+   */
+  const [queuedCount, setQueuedCount] = useState(0);
+  /** A switch the user asked for, held until they resolve the discard prompt. */
+  const [pendingSwitch, setPendingSwitch] = useState<SwitchTarget | null>(null);
+
+  function applySwitch(target: SwitchTarget) {
+    setQueuedCount(0);
+    if (target.kind === "new") {
+      setPickerOpen(true);
+      return;
+    }
+    setDraftAgent(null);
+    setActiveSessionId(target.sessionId);
+  }
+
+  function requestSwitch(target: SwitchTarget) {
+    if (queuedCount > 0) {
+      setPendingSwitch(target);
+      return;
+    }
+    applySwitch(target);
+  }
 
   // Deep-link from the agent editor: once agents load, open the new-chat
   // composer for the requested agent. Honored once so the user can freely
@@ -140,11 +170,8 @@ export function ChatShell({
           error={sessionsQuery.error}
           onRetry={() => void sessionsQuery.refetch()}
           activeSessionId={draftAgent !== null ? null : activeSessionId}
-          onSelect={(id) => {
-            setDraftAgent(null);
-            setActiveSessionId(id);
-          }}
-          onNewChat={() => setPickerOpen(true)}
+          onSelect={(id) => requestSwitch({ kind: "session", sessionId: id })}
+          onNewChat={() => requestSwitch({ kind: "new" })}
         />
       </Panel>
 
@@ -169,6 +196,7 @@ export function ChatShell({
             agentName={activeSession?.agentName}
             workflowName={activeSession?.workflowName ?? null}
             onSessionReplaced={setActiveSessionId}
+            onQueuedCountChange={setQueuedCount}
           />
         ) : (
           <EmptyState
@@ -191,6 +219,17 @@ export function ChatShell({
           onClose={() => setPickerOpen(false)}
         />
       ) : null}
+
+      <DiscardQueueDialog
+        open={pendingSwitch !== null}
+        count={queuedCount}
+        onClose={() => setPendingSwitch(null)}
+        onConfirm={() => {
+          const target = pendingSwitch;
+          setPendingSwitch(null);
+          if (target !== null) applySwitch(target);
+        }}
+      />
     </div>
   );
 }

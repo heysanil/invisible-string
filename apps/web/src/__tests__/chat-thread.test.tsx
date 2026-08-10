@@ -241,10 +241,72 @@ test("a session-limit prompt renders as its own decision, not a tool approval", 
   expect(view.queryByText("session_limit_continuation")).toBeNull();
   // eve's own per-option consequences are shown on this card only.
   expect(view.getByText("Grant a fresh token budget")).toBeTruthy();
+  // eve's own "Stop" option is filtered out: it ends the turn through the same
+  // path as the composer's Stop, which is permanently mounted, so rendering
+  // both would put two controls for one decision next to each other.
+  expect(view.queryByRole("button", { name: /Stop/ })).toBeNull();
   fireEvent.click(view.getByRole("button", { name: /Approve/ }));
   expect(onRespond.mock.calls[0]).toEqual([
     "run1",
     { requestId: "s1:limit:input:40120433", optionId: "continue" },
+  ]);
+});
+
+test("a session-limit prompt whose options are ALL danger still renders them", () => {
+  // Degrade to showing everything rather than to a card with nothing to click:
+  // the filter exists to remove a redundant control, never to strand the user
+  // if a future eve build marks its options differently.
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "s1:limit:input:2",
+        kind: "session-limit",
+        prompt: "This session has hit the input-token limit.",
+        toolName: null,
+        argsPreview: null,
+        options: [
+          { id: "stop", label: "Stop", description: "Stop now", style: "danger" },
+          { id: "abort", label: "Abort", description: "End it", style: "danger" },
+        ],
+        allowFreeform: false,
+        display: "confirmation",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={() => {}} />);
+  expect(view.getByRole("button", { name: /Stop/ })).toBeTruthy();
+  expect(view.getByRole("button", { name: /Abort/ })).toBeTruthy();
+});
+
+test("a tool approval keeps its danger option — Deny is a refusal, not a stop", () => {
+  // The composer's Stop cancels the turn; it cannot express "run everything
+  // else but NOT this side effect". So the filter must stay scoped to
+  // session-limit prompts.
+  const onRespond = mock((_runId: string, _response: RunInputRequest) => {});
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "s1:tool:input:9",
+        kind: "tool-approval",
+        prompt: "Delete the staging bucket?",
+        toolName: "s3_delete_bucket",
+        argsPreview: '{"bucket":"staging"}',
+        options: [
+          { id: "allow", label: "Allow", style: "primary" },
+          { id: "deny", label: "Deny", style: "danger" },
+        ],
+        allowFreeform: false,
+        display: "confirmation",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={onRespond} />);
+  fireEvent.click(view.getByRole("button", { name: /Deny/ }));
+  expect(onRespond.mock.calls[0]).toEqual([
+    "run1",
+    { requestId: "s1:tool:input:9", optionId: "deny" },
   ]);
 });
 
@@ -331,7 +393,6 @@ test("a stopped run reads as a user decision, never as a failure", () => {
       })}
       isChatOrigin
       onRespond={() => {}}
-      onCancel={() => {}}
     />,
   );
   // No error banner: eve emits NO failure event for a cancelled turn.
@@ -339,38 +400,31 @@ test("a stopped run reads as a user decision, never as a failure", () => {
   expect(view.getByText(/You stopped this run/)).toBeTruthy();
   // Whatever streamed before the stop stays readable.
   expect(view.getByText(/142 open issues/)).toBeTruthy();
-  // Nothing left to stop.
+});
+
+test("the transcript never offers Stop — it lives on the composer now", () => {
+  // Virtualization can scroll a transcript button out of the DOM entirely
+  // while a run streams; the composer is always mounted.
+  const view = render(
+    <RunMessage run={baseRun({ status: "running" })} isChatOrigin onRespond={() => {}} />,
+  );
   expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
 });
 
-test("the Stop button hides the instant turn.cancelled lands, before the status frame", () => {
-  // `canceled` is derived from the event stream, so it flips a beat ahead of
-  // the run_status frame — the row must settle immediately, not linger.
-  const view = render(
-    <RunMessage
-      run={baseRun({ status: "running", canceled: true })}
+test("ThreadView puts Stop on the composer while a run is stoppable", async () => {
+  const onStop = mock(() => {});
+  const view = renderWithRouter(
+    <ThreadView
+      header={HEADER}
+      runs={[baseRun({ status: "running" })]}
       isChatOrigin
       onRespond={() => {}}
-      onCancel={() => {}}
+      onStop={onStop}
+      onSend={() => {}}
     />,
   );
-  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
-  expect(view.getByText(/You stopped this run/)).toBeTruthy();
-});
-
-test("Stop shows a busy state while the request is in flight", () => {
-  const view = render(
-    <RunMessage
-      run={baseRun({ status: "running" })}
-      isChatOrigin
-      onRespond={() => {}}
-      onCancel={() => {}}
-      canceling
-    />,
-  );
-  const button = view.getByRole("button", { name: /Stopping/ });
-  expect(button.getAttribute("aria-busy")).toBe("true");
-  expect((button as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(await view.findByRole("button", { name: "Stop" }));
+  expect(onStop).toHaveBeenCalledTimes(1);
 });
 
 // ── session-actions menu (context controls) ─────────────────────────────────

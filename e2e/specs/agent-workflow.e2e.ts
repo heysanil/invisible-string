@@ -90,13 +90,13 @@ test("build an agent in the UI, publish + chat, then delegate a form workflow to
   await publishAgentAndWaitReady(page);
 
   // ── chat with it via the agent picker ──────────────────────────────────────
-  // The published agent really connects to both MCP servers at session start
-  // (the stub logs the initialize + tools/list handshakes). We drive the run
-  // with a tool the eve MOCK model can invoke directly: eve exposes its
-  // built-in tools (todo, read_file, …) to the top-level model, while MCP
-  // connection tools sit behind eve's `connection_search` sub-agent — which
-  // the deterministic mock never delegates to. `todo` yields a real streamed
-  // tool step + a prose reply, exactly exercising the working-block UI.
+  // Under the mock model the published agent never even opens an MCP session
+  // to the stub: MCP connections attach lazily through eve's
+  // `connection_search` sub-agent, which the deterministic mock never
+  // delegates to. So we drive the run with a tool the mock CAN invoke
+  // directly — eve exposes its built-in tools (todo, read_file, …) to the
+  // top-level model. `todo` yields a real streamed tool step + a prose
+  // reply, exactly exercising the working-block UI.
   await startChatAndSend(
     page,
     AGENT_NAME,

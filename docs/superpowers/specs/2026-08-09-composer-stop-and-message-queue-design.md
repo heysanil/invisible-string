@@ -214,7 +214,14 @@ const stoppableRunId =
 
 Same predicate as `slotHeld`, read for its run id — only one run can hold the slot, so "the slot holder" is unambiguous.
 
-**The session-limit exception is dropped deliberately.** `RunMessage.tsx:56-58` suppressed its Stop when a `session-limit` prompt was on screen, because that card offers its own "Stop" through the same path and two adjacent identical Stops is worse than one. In the composer that adjacency no longer exists, so the suppression has no reason to survive — and keeping it would make Stop mysteriously vanish mid-run.
+**The session-limit duplicate is resolved the other way round.** `RunMessage.tsx:56-58` used to suppress *its* Stop when a `session-limit` prompt was on screen, because that card offers its own "Stop" through the same `turn.cancelled` path and two adjacent identical Stops is worse than one. Now that Stop is permanently mounted on the composer, suppressing it there would make the one always-available control vanish exactly when a run is parked — so the **card's** option is the one that goes.
+
+`ApprovalCard` filters options with eve's own `style === "danger"` marker, and only for `session-limit`. Two guards on that:
+
+- **Scoped to `session-limit`.** A tool-approval's danger option is a real **refusal** ("Deny this side effect, continue the turn"), which cancelling cannot express. The filter must never reach those.
+- **Never strands the card.** If filtering would leave no options, all of them render instead — a future eve build that marks its whole option set `danger` degrades to showing everything rather than to a card with nothing to click.
+
+Both are pinned by tests in `chat-thread.test.tsx`.
 
 **Why this is a net accessibility gain:** the transcript is virtualized (`ThreadView.tsx:66-76`), so Stop could be scrolled out of the DOM entirely while a run streamed. The composer is fixed at the bottom, so Stop is always rendered and always reachable — one Tab from the editor rather than an arbitrary distance into a virtualized list.
 

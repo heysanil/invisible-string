@@ -241,10 +241,72 @@ test("a session-limit prompt renders as its own decision, not a tool approval", 
   expect(view.queryByText("session_limit_continuation")).toBeNull();
   // eve's own per-option consequences are shown on this card only.
   expect(view.getByText("Grant a fresh token budget")).toBeTruthy();
+  // eve's own "Stop" option is filtered out: it ends the turn through the same
+  // path as the composer's Stop, which is permanently mounted, so rendering
+  // both would put two controls for one decision next to each other.
+  expect(view.queryByRole("button", { name: /Stop/ })).toBeNull();
   fireEvent.click(view.getByRole("button", { name: /Approve/ }));
   expect(onRespond.mock.calls[0]).toEqual([
     "run1",
     { requestId: "s1:limit:input:40120433", optionId: "continue" },
+  ]);
+});
+
+test("a session-limit prompt whose options are ALL danger still renders them", () => {
+  // Degrade to showing everything rather than to a card with nothing to click:
+  // the filter exists to remove a redundant control, never to strand the user
+  // if a future eve build marks its options differently.
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "s1:limit:input:2",
+        kind: "session-limit",
+        prompt: "This session has hit the input-token limit.",
+        toolName: null,
+        argsPreview: null,
+        options: [
+          { id: "stop", label: "Stop", description: "Stop now", style: "danger" },
+          { id: "abort", label: "Abort", description: "End it", style: "danger" },
+        ],
+        allowFreeform: false,
+        display: "confirmation",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={() => {}} />);
+  expect(view.getByRole("button", { name: /Stop/ })).toBeTruthy();
+  expect(view.getByRole("button", { name: /Abort/ })).toBeTruthy();
+});
+
+test("a tool approval keeps its danger option — Deny is a refusal, not a stop", () => {
+  // The composer's Stop cancels the turn; it cannot express "run everything
+  // else but NOT this side effect". So the filter must stay scoped to
+  // session-limit prompts.
+  const onRespond = mock((_runId: string, _response: RunInputRequest) => {});
+  const run = baseRun({
+    status: "waiting",
+    pendingInputs: [
+      {
+        requestId: "s1:tool:input:9",
+        kind: "tool-approval",
+        prompt: "Delete the staging bucket?",
+        toolName: "s3_delete_bucket",
+        argsPreview: '{"bucket":"staging"}',
+        options: [
+          { id: "allow", label: "Allow", style: "primary" },
+          { id: "deny", label: "Deny", style: "danger" },
+        ],
+        allowFreeform: false,
+        display: "confirmation",
+      },
+    ],
+  });
+  const view = render(<RunMessage run={run} isChatOrigin onRespond={onRespond} />);
+  fireEvent.click(view.getByRole("button", { name: /Deny/ }));
+  expect(onRespond.mock.calls[0]).toEqual([
+    "run1",
+    { requestId: "s1:tool:input:9", optionId: "deny" },
   ]);
 });
 

@@ -137,7 +137,9 @@ export function WorkingBlock({ segment }: { segment: WorkSegment }) {
         : `Worked · ${stepLabel}`;
 
   return (
-    <div className="my-1.5 overflow-hidden rounded-card border border-black/[0.06] bg-white/35">
+    // No vertical margin: RunMessage's segment list owns the rhythm with a
+    // single gap, so a box and a paragraph are spaced identically.
+    <div className="overflow-hidden rounded-card border border-black/[0.06] bg-white/35">
       <button
         type="button"
         onClick={() => { setTouched(true); setOpen((v) => !v); }}

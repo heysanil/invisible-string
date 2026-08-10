@@ -136,7 +136,10 @@ export function ThreadView({
                 className="absolute left-0 top-0 w-full px-5"
                 style={{ transform: `translateY(${item.start}px)` }}
               >
-                <div className="pb-5">
+                {/* Symmetric padding so an exchange is visually a block of its
+                    own — virtualized rows are measured, so this lands in the
+                    row height rather than collapsing against a neighbour. */}
+                <div className="py-5">
                   <RunMessage
                     run={run}
                     isChatOrigin={isChatOrigin}

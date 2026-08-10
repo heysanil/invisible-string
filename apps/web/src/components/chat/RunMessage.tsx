@@ -101,13 +101,28 @@ function RunMessageImpl({
         aria-busy={isActive || undefined}
         aria-relevant="additions text"
       >
-        {run.segments.map((segment) =>
-          segment.kind === "work" ? (
-            <WorkingBlock key={segment.key} segment={segment} />
-          ) : (
-            <Markdown key={segment.key} text={segment.text} streaming={segment.streaming} />
-          ),
-        )}
+        {/* The segment rhythm is owned HERE, by one gap — not by each child's
+            own margins. Flex items do not collapse adjacent margins, so a box's
+            `my-*` plus the prose's outer block margin would ADD, making the
+            box↔text gap silently different from text↔box. WorkingBlock carries
+            no vertical margin and the prose's outer margins are trimmed, so
+            every segment boundary is exactly this gap. */}
+        {run.segments.length > 0 ? (
+          <div className="flex flex-col gap-3.5">
+            {run.segments.map((segment) =>
+              segment.kind === "work" ? (
+                <WorkingBlock key={segment.key} segment={segment} />
+              ) : (
+                <Markdown
+                  key={segment.key}
+                  text={segment.text}
+                  streaming={segment.streaming}
+                  className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+                />
+              ),
+            )}
+          </div>
+        ) : null}
 
         {run.pendingInputs.map((input) => (
           <ApprovalCard

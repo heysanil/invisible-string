@@ -184,3 +184,9 @@ The Agent (PERSONA · MODEL · CONTEXT) becomes the first-class entity and the c
 5. **Acceptance + e2e rewrite, then docs/site messaging pivot** (README, MDX docs tree, landing) per the vocabulary standard.
 
 **Acceptance:** the full lane matrix (unit/typecheck, DB-gated integration incl. `SPIKE_EVE_BUILD=1`, phase-1 and phase-3 acceptance re-keyed agent-first + schedule + control-plane Slack delivery proofs, keyed lanes manual, Playwright e2e, prod-compose smoke) green in its documented lanes.
+
+---
+
+## Phase 6 — Connectors redesign (2026-08-09)
+
+**Design record:** `docs/superpowers/specs/2026-08-09-connectors-redesign-design.md`. **Status: Plan 1 (rebuilt `connections` domain, curated catalog, Meilisearch-mirrored community search) landed; Plan 2 (probe/health/tool cache) and Plan 3 (OAuth broker) pending.**

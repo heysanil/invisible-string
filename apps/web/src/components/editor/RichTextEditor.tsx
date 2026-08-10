@@ -141,6 +141,19 @@ export const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorPro
     // Mirrors `editor` so the unmount cleanup can reach it without taking a
     // dependency that would re-register the cleanup on every recreation.
     const editorRef = useRef<Editor | null>(null);
+    /**
+     * A focus() that arrives before the instance exists must QUEUE, not drop.
+     *
+     * `useEditor` does not always hand back an editor on the first render:
+     * `@tiptap/react` latches an `isSSR` flag at module scope, and when it is
+     * true it forces `immediatelyRender: false` and creates the editor in a
+     * later effect. The StrictMode destroy→recreate gap the `isLive` comment
+     * above describes leaves the same hole. In both cases a caller that asks
+     * for focus during that window used to have its request silently vanish —
+     * no queue, no retry, nothing to re-issue it — so the box just never took
+     * the caret.
+     */
+    const pendingFocusRef = useRef(false);
 
     const editor = useEditor(
       {
@@ -262,7 +275,10 @@ export const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorPro
           applyExternalValue(current.trim().length === 0 ? text : `${current}\n\n${text}`);
         },
         focus: () => {
-          if (!isLive(editor)) return;
+          if (!isLive(editor)) {
+            pendingFocusRef.current = true;
+            return;
+          }
           editor.commands.focus();
         },
       }),
@@ -281,6 +297,13 @@ export const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorPro
       if (!isLive(editor)) return;
       editor.setEditable(!readOnly);
     }, [editor, readOnly]);
+
+    // Replay a focus that was asked for before the instance existed.
+    useEffect(() => {
+      if (!pendingFocusRef.current || !isLive(editor)) return;
+      pendingFocusRef.current = false;
+      editor.commands.focus();
+    }, [editor]);
 
     const onEditorRef = useRef(onEditor);
     onEditorRef.current = onEditor;

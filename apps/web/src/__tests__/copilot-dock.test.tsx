@@ -159,26 +159,24 @@ function findComposer(): HTMLElement | null {
 /**
  * Wait for the composer to mount AND take focus, polling both conditions.
  *
- * WHEN either happens is a property of the machine, not of the code. The
- * dock's `focus()` arrives while the lazy editor chunk is still resolving, so
- * `LazyComposerEditor` parks it in `pendingFocus` and replays it on attach —
- * dynamic import → Suspense re-render → Tiptap mount → replayed focus →
- * deferred caret. Until that resolves there is no "Ask copilot" label at all,
- * which is why this polls a QUERY (nullable) rather than a `getBy*` (throws).
+ * The composer is lazily imported, so until the chunk resolves there is no
+ * "Ask copilot" label at all — which is why this polls a QUERY (nullable)
+ * rather than a `getBy*` (throws). WHEN it resolves is a property of the
+ * machine, not of the code, so a fixed sleep is always a bet.
  *
- * A fixed sleep passed only while an earlier test had already warmed the
- * editor module in bun's single-process module cache; cold, on a loaded CI
- * runner, the chain takes seconds and the assertion fires too early.
+ * This assertion earned its keep: it caught a real production bug where a
+ * focus() arriving before `useEditor` produced an instance was dropped on the
+ * floor (RichTextEditor's `isLive` guard, now queued and replayed). Under
+ * `@tiptap/react`'s module-scope `isSSR` latch the editor is created AFTER the
+ * first render, so that window is wide — the test failed on CI for months of
+ * file-ordering luck away from failing everywhere.
  *
  * Deliberately NOT `waitFor`: it wraps every poll in `act()`, which here also
  * flushes the dock's reconnect timers and fake sockets — measured at ~460s for
  * this file versus ~1s for this loop.
  */
 async function waitForComposerFocus(): Promise<void> {
-  // ~3s of budget. Sized against observed CI, not a fast local box: this test
-  // took 5.3s on the unit runner and 93s on the gated runner (which shares the
-  // machine with compose), where the old 5ms budget was off by three orders of
-  // magnitude. The budget costs nothing when the condition is already true.
+  // ~3s of budget, which costs nothing when the condition is already true.
   for (let attempt = 0; attempt < 300; attempt++) {
     const target = findComposer();
     if (target !== null && document.activeElement === target) return;

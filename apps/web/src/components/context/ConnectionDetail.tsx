@@ -3,10 +3,11 @@
  * the one place a connection is fully managed. Sections — identity
  * (rename/description, 409 name collisions surfaced inline), endpoint
  * (editable for custom servers only), auth (type, credential shield, one-shot
- * rotation form), tool policy (allow/block; Task 5 swaps in the checkbox
- * picker), approvals (default decision + per-tool overrides from the cached
- * tool list), health (badge, last checked, last error, Test connection), and
- * a danger zone carrying delete with the existing in-use blocker.
+ * rotation form), tool policy (the checkbox {@link ToolPicker} over the
+ * cached tool list), approvals (default decision + per-tool overrides from
+ * the cached tool list), health (badge, last checked, last error, Test
+ * connection), and a danger zone carrying delete with the existing in-use
+ * blocker.
  *
  * Stale re-probe (spec §7): opening the detail with `lastCheckedAt` null or
  * older than 15 minutes fires one automatic probe — guarded by a per-open ref
@@ -39,10 +40,10 @@ import { ErrorState } from "../ui/ErrorState";
 import { Input } from "../ui/Input";
 import { Select } from "../ui/Select";
 import { SkeletonList } from "../ui/Skeleton";
-import { TagInput } from "../ui/TagInput";
 import { Textarea } from "../ui/Textarea";
 import { useToast } from "../ui/Toast";
 import { HealthBadge } from "./HealthBadge";
+import { ToolPicker } from "./ToolPicker";
 
 /** Re-probe on open when the last check is older than this (spec §7). */
 const STALE_PROBE_MS = 15 * 60 * 1000;
@@ -563,9 +564,7 @@ function RotateAuthForm({
 
 // ── Tool policy ─────────────────────────────────────────────────────────────
 
-type FilterMode = "none" | "allow" | "block";
-
-/** Allow/block filter — Task 5 replaces the tag input with the checkbox picker. */
+/** Allow/block filter — the checkbox picker over the cached tool list. */
 function ToolPolicySection({
   scope,
   connection,
@@ -578,83 +577,24 @@ function ToolPolicySection({
   const update = useUpdateConnection(scope);
   const { toast } = useToast();
 
-  const initialMode: FilterMode =
-    connection.toolAllow && connection.toolAllow.length > 0
-      ? "allow"
-      : connection.toolBlock && connection.toolBlock.length > 0
-        ? "block"
-        : "none";
-  const [mode, setMode] = useState<FilterMode>(initialMode);
-  const [tools, setTools] = useState<string[]>(
-    initialMode === "allow"
-      ? (connection.toolAllow ?? [])
-      : initialMode === "block"
-        ? (connection.toolBlock ?? [])
-        : [],
-  );
-
-  function saveFilter(nextMode: FilterMode, nextTools: string[]) {
-    setMode(nextMode);
-    setTools(nextTools);
-    update.mutate(
-      {
-        connectionId: connection.id,
-        patch: {
-          toolAllow:
-            nextMode === "allow" ? (nextTools.length ? nextTools : null) : null,
-          toolBlock:
-            nextMode === "block" ? (nextTools.length ? nextTools : null) : null,
-        },
-      },
-      {
-        onError: () =>
-          toast({ variant: "error", message: "Could not save the tool filter." }),
-      },
-    );
-  }
-
   return (
     <Section title="Tool policy">
-      <div className="flex gap-1.5">
-        {(["none", "allow", "block"] as FilterMode[]).map((option) => (
-          <button
-            key={option}
-            type="button"
-            disabled={readOnly}
-            onClick={() => saveFilter(option, option === mode ? tools : [])}
-            className={cn(
-              "lift flex-1 rounded-capsule border px-2 py-1 text-[12px] font-medium capitalize",
-              "disabled:pointer-events-none disabled:opacity-55",
-              option === mode
-                ? "border-ink bg-ink text-white"
-                : "border-black/10 text-ink-3 hover:text-ink",
-            )}
-          >
-            {option === "none" ? "All tools" : option}
-          </button>
-        ))}
-      </div>
-      {mode !== "none" ? (
-        readOnly ? (
-          <div className="flex flex-wrap gap-1.5">
-            {tools.map((tool) => (
-              <span
-                key={tool}
-                className="rounded-capsule bg-chip px-2 py-0.5 font-mono text-[11.5px] text-ink"
-              >
-                {tool}
-              </span>
-            ))}
-          </div>
-        ) : (
-          <TagInput
-            label={mode === "allow" ? "Allowed tools" : "Blocked tools"}
-            values={tools}
-            placeholder="tool name, then Enter"
-            onChange={(next) => saveFilter(mode, next)}
-          />
-        )
-      ) : null}
+      <ToolPicker
+        connection={connection}
+        readOnly={readOnly}
+        onChange={(patch) =>
+          update.mutate(
+            { connectionId: connection.id, patch },
+            {
+              onError: () =>
+                toast({
+                  variant: "error",
+                  message: "Could not save the tool filter.",
+                }),
+            },
+          )
+        }
+      />
     </Section>
   );
 }

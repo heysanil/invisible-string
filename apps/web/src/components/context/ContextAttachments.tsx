@@ -3,9 +3,9 @@
  * attached-ids + callbacks contract, so any owner of a context list (today:
  * the agent editor's CONTEXT section) can embed it. Attached resources render
  * as removable rows; "Browse" opens a searchable picker of workspace + user
- * resources. Each attached connection has an inline settings popover (tool
- * allow/block tag inputs + approval policy) that mutates the connection
- * resource itself.
+ * resources. Each attached connection has an inline settings popover (the
+ * checkbox {@link ToolPicker} + approval policy, mutating the connection
+ * resource itself) with a Manage link into the full connection detail.
  */
 import { Blocks, ExternalLink, FileText, Plug, Plus, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -22,7 +22,6 @@ import {
   type ScopedSkill,
 } from "../../lib/builder/resources";
 import { useUpdateConnection } from "../../lib/queries/connections";
-import { cn } from "../../lib/cn";
 
 // Satisfies React's controlled-input contract; the real handler rides
 // onInput, matching the shared Input primitive (React's onChange for text
@@ -32,8 +31,9 @@ import { Button } from "../ui/Button";
 import { Popover } from "../ui/Popover";
 import { Select } from "../ui/Select";
 import { StatusChip } from "../ui/StatusChip";
-import { TagInput } from "../ui/TagInput";
 import { useToast } from "../ui/Toast";
+import { ConnectionDetail } from "./ConnectionDetail";
+import { ToolPicker } from "./ToolPicker";
 
 export interface ContextAttachmentsProps {
   workspaceId: string;
@@ -239,8 +239,6 @@ const APPROVAL_OPTIONS: { value: McpApprovalDecision; label: string }[] = [
   { value: "always", label: "Always ask" },
 ];
 
-type FilterMode = "none" | "allow" | "block";
-
 function ConnectionSettings({
   workspaceId,
   connection,
@@ -251,21 +249,7 @@ function ConnectionSettings({
   const { toast } = useToast();
   const scopeRef = scopeRefOf(connection.resourceScope, workspaceId);
   const update = useUpdateConnection(scopeRef);
-
-  const initialMode: FilterMode =
-    connection.toolAllow && connection.toolAllow.length > 0
-      ? "allow"
-      : connection.toolBlock && connection.toolBlock.length > 0
-        ? "block"
-        : "none";
-  const [mode, setMode] = useState<FilterMode>(initialMode);
-  const [tools, setTools] = useState<string[]>(
-    initialMode === "allow"
-      ? (connection.toolAllow ?? [])
-      : initialMode === "block"
-        ? (connection.toolBlock ?? [])
-        : [],
-  );
+  const [managing, setManaging] = useState(false);
   const approval = connection.approvalPolicy?.default ?? "never";
 
   function persist(patch: UpdateConnectionRequest) {
@@ -278,78 +262,70 @@ function ConnectionSettings({
     );
   }
 
-  function saveFilter(nextMode: FilterMode, nextTools: string[]) {
-    setMode(nextMode);
-    setTools(nextTools);
-    persist({
-      toolAllow: nextMode === "allow" ? (nextTools.length ? nextTools : null) : null,
-      toolBlock: nextMode === "block" ? (nextTools.length ? nextTools : null) : null,
-    });
-  }
-
   return (
-    <Popover
-      label={`${connection.name} settings`}
-      align="end"
-      className="w-80"
-      trigger={
-        <Button variant="quiet" size="sm" aria-label={`${connection.name} settings`}>
-          Settings
-        </Button>
-      }
-    >
-      <div className="flex flex-col gap-3.5">
-        <div className="flex flex-col gap-1.5">
-          <span className="px-1 text-[12px] font-medium text-ink-2">
-            Tool filter
-          </span>
-          <div className="flex gap-1.5">
-            {(["none", "allow", "block"] as FilterMode[]).map((option) => (
-              <button
-                key={option}
-                type="button"
-                onClick={() => saveFilter(option, option === mode ? tools : [])}
-                className={cn(
-                  "lift flex-1 rounded-capsule border px-2 py-1 text-[12px] font-medium capitalize",
-                  option === mode
-                    ? "border-ink bg-ink text-white"
-                    : "border-black/10 text-ink-3 hover:text-ink",
-                )}
-              >
-                {option === "none" ? "All tools" : option}
-              </button>
-            ))}
+    <>
+      <Popover
+        label={`${connection.name} settings`}
+        align="end"
+        className="w-80"
+        trigger={
+          <Button variant="quiet" size="sm" aria-label={`${connection.name} settings`}>
+            Settings
+          </Button>
+        }
+      >
+        {({ close }) => (
+          <div className="flex flex-col gap-3.5">
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[12px] font-medium text-ink-2">
+                  Tool filter
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    close();
+                    setManaging(true);
+                  }}
+                  className="lift inline-flex items-center gap-1 rounded-capsule px-1.5 py-0.5 text-[11.5px] font-medium text-ink-3 hover:text-ink"
+                >
+                  Manage
+                  <ExternalLink size={11} aria-hidden="true" />
+                </button>
+              </div>
+              <ToolPicker connection={connection} onChange={persist} />
+            </div>
+
+            <Select
+              label="Approval policy"
+              value={approval}
+              options={APPROVAL_OPTIONS}
+              onChange={(event) =>
+                persist({
+                  approvalPolicy: {
+                    ...(connection.approvalPolicy ?? {}),
+                    default: event.currentTarget.value as McpApprovalDecision,
+                  },
+                })
+              }
+            />
+
+            <p className="px-0.5 text-[11.5px] leading-snug text-ink-4">
+              These settings live on the connection and apply everywhere it's used.
+            </p>
           </div>
-        </div>
+        )}
+      </Popover>
 
-        {mode !== "none" ? (
-          <TagInput
-            label={mode === "allow" ? "Allowed tools" : "Blocked tools"}
-            values={tools}
-            placeholder="tool name, then Enter"
-            onChange={(next) => saveFilter(mode, next)}
-          />
-        ) : null}
-
-        <Select
-          label="Approval policy"
-          value={approval}
-          options={APPROVAL_OPTIONS}
-          onChange={(event) =>
-            persist({
-              approvalPolicy: {
-                ...(connection.approvalPolicy ?? {}),
-                default: event.currentTarget.value as McpApprovalDecision,
-              },
-            })
-          }
+      {managing ? (
+        <ConnectionDetail
+          scope={scopeRef}
+          connectionId={connection.id}
+          readOnly={false}
+          onClose={() => setManaging(false)}
         />
-
-        <p className="px-0.5 text-[11.5px] leading-snug text-ink-4">
-          These settings live on the connection and apply everywhere it's used.
-        </p>
-      </div>
-    </Popover>
+      ) : null}
+    </>
   );
 }
 

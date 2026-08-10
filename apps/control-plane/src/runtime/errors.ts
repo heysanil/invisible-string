@@ -216,6 +216,18 @@ export const errors = {
    */
   probeFailed: (detail: string) =>
     new RuntimeApiError(502, "probe_failed", `connection probe failed: ${detail}`),
+  /**
+   * RFC 7591 dynamic client registration with the connection's authorization
+   * server failed (no registration endpoint, unreachable, egress-refused, or
+   * rejected). `detail` carries the HTTP status and the RFC 7591 `error` code
+   * at most — NEVER a response body or any OAuth value (oauth/client-identity.ts).
+   */
+  oauthRegistrationFailed: (detail: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_registration_failed",
+      `OAuth client registration failed: ${detail}`,
+    ),
   noPendingInput: () =>
     new RuntimeApiError(
       409,

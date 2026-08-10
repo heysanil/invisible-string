@@ -13,6 +13,8 @@
  * - POST /t/:token                    webhook + form ingress → dispatcher
  * - POST /integrations/slack/events   Slack Events API (verify → route → dispatch)
  * - GET  /integrations/slack/callback OAuth redirect-back (state-signed)
+ * - GET  /integrations/mcp-oauth/client-metadata.json  CIMD client-id document
+ *        (fetched by MCP authorization servers — must stay unauthenticated)
  *
  * WORKSPACE-SCOPED (Better Auth session, IDOR-guarded):
  * - GET/DELETE /workspaces/:id/integrations[...]         list / disconnect
@@ -99,6 +101,7 @@ import {
 import type { SlackClient } from "./slack-client";
 import { SlackEventDedup, verifySlackRequest } from "./slack-verify";
 import { hashIngressToken, generateIngressToken, tokenSuffix } from "./tokens";
+import { buildClientMetadataDocument } from "../oauth/client-identity";
 
 type WorkflowRow = typeof schema.workflows.$inferSelect;
 
@@ -173,6 +176,21 @@ export function shouldStartNewSlackSession(
   return !binding.mentionOnly;
 }
 
+/**
+ * PUBLIC: the CIMD client-metadata document (oauth/client-identity.ts).
+ * For authorization servers that support client-ID-metadata-document clients
+ * this document's URL IS our OAuth `client_id`, and the AS itself fetches it
+ * during consent — so the route must stay unauthenticated and byte-stable for
+ * a given base URL. Exported standalone so it is unit-testable without the
+ * full integrations dependency graph.
+ */
+export function mcpOauthClientMetadataRoute(publicAppUrl: string) {
+  return new Elysia({ name: "mcp-oauth-client-metadata" }).get(
+    "/integrations/mcp-oauth/client-metadata.json",
+    () => buildClientMetadataDocument(publicAppUrl),
+  );
+}
+
 // ── plugin ───────────────────────────────────────────────────────────────────
 
 export function integrationsPlugin(deps: IntegrationDeps) {
@@ -223,6 +241,8 @@ export function integrationsPlugin(deps: IntegrationDeps) {
   return (
     new Elysia({ name: "integrations" })
       .use(workspacePlugin(runtime.workspaceDeps))
+      // ── PUBLIC: MCP OAuth client-identity metadata (CIMD) ─────────────────
+      .use(mcpOauthClientMetadataRoute(config.publicAppUrl))
       .onError(({ error, set }) => {
         if (isRuntimeApiError(error)) {
           set.status = error.status;

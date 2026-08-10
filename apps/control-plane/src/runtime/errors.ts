@@ -208,6 +208,14 @@ export const errors = {
       `connection name "${name}" collides with existing connection "${clashingName}" — both produce the same identifier; pick a more distinct name`,
       { clashingName },
     ),
+  /**
+   * Infrastructure failure of the probe machinery ITSELF (unexpected throw,
+   * DB write failure) — never an unhealthy probe result: an unreachable or
+   * unauthorized MCP server is a 200 whose DTO carries the classified health
+   * (connectors redesign spec §7/§9).
+   */
+  probeFailed: (detail: string) =>
+    new RuntimeApiError(502, "probe_failed", `connection probe failed: ${detail}`),
   noPendingInput: () =>
     new RuntimeApiError(
       409,

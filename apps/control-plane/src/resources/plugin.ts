@@ -27,6 +27,7 @@ import {
   deleteConnection,
   getConnection,
   listConnections,
+  probeConnectionRoute,
   updateConnection,
 } from "./connections";
 import { listWorkspaceMembers } from "./members";
@@ -218,6 +219,16 @@ export function resourcesPlugin(deps: ResourceDeps) {
           deleteConnection(deps, wsScope(workspace.organizationId), params.id),
         { requireWorkspace: "admin" },
       )
+      // Test-connection: probe now, persist, return the fresh DTO. Mutates
+      // the row's probe columns, so it is gated like the other mutations; an
+      // unhealthy server is still a 200 — 502 `probe_failed` means the probe
+      // machinery itself broke (spec §9).
+      .post(
+        "/workspaces/:workspaceId/connections/:id/probe",
+        ({ workspace, params }) =>
+          probeConnectionRoute(deps, wsScope(workspace.organizationId), params.id),
+        { requireWorkspace: "admin" },
+      )
 
       // ── Connections — user scope (/me; the signed-in user owns the rows,
       // so no role gate applies) ────────────────────────────────────────────
@@ -249,6 +260,12 @@ export function resourcesPlugin(deps: ResourceDeps) {
       .delete(
         "/me/connections/:id",
         ({ authUser, params }) => deleteConnection(deps, userScope(authUser.id), params.id),
+        { requireAuth: true },
+      )
+      .post(
+        "/me/connections/:id/probe",
+        ({ authUser, params }) =>
+          probeConnectionRoute(deps, userScope(authUser.id), params.id),
         { requireAuth: true },
       )
 

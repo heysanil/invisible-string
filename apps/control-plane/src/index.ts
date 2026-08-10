@@ -47,6 +47,7 @@ import {
 } from "./runs/delivery";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
+import { createGuardedFetch } from "./net/guarded-fetch";
 import { resourcesPlugin } from "./resources/plugin";
 import {
   createOpenRouterCatalog,
@@ -474,6 +475,14 @@ export function createAppStack(
     // resources/openrouter-catalog.ts).
     openRouterCatalog:
       runtimeOverrides?.openRouterCatalog ?? createOpenRouterCatalog(),
+    // Guarded egress for MCP probes — the ONLY fetch caller-influenced URLs
+    // ride (SSRF containment: DNS-validated, IP-pinned, redirect-re-validated).
+    // MCP_PROBE_ALLOW_PRIVATE (dev/e2e/self-hosted) admits private targets and
+    // plain http; a runtime-less boot keeps the hardened default.
+    probeFetch: createGuardedFetch({
+      allowPrivate: runtimeDeps?.runtime.mcpProbeAllowPrivate ?? false,
+    }),
+    logger,
   };
   // Copilot socket: mounted whenever a transport is available — a scripted
   // fake (COPILOT_FAKE_SCRIPT / test override; dev/test ONLY — loadCopilotConfig

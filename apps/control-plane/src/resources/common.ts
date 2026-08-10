@@ -12,6 +12,7 @@ import { schema } from "@invisible-string/db";
 import type {
   ConnectionDto,
   ConnectionOauthStatus,
+  Logger,
   MasterKey,
   ModelAllowlistEntryDto,
   ModelPresetDto,
@@ -52,6 +53,18 @@ export interface ResourceDeps {
    * and report every model's capabilities as unknown.
    */
   openRouterCatalog?: OpenRouterCatalog;
+  /**
+   * Guarded egress fetch for MCP probes (net/guarded-fetch.ts): the ONLY path
+   * a caller-influenced URL may leave the control plane on — DNS-validated,
+   * IP-pinned, redirect-re-validated. Constructed ONCE in index.ts from the
+   * runtime config's `mcpProbeAllowPrivate` (MCP_PROBE_ALLOW_PRIVATE).
+   */
+  probeFetch: typeof fetch;
+  /**
+   * Structured logger for fire-and-forget resource work (the after-create
+   * connection probe) — request-path failures surface as typed errors instead.
+   */
+  logger: Logger;
 }
 
 /** Resource owner: an organization (workspace scope) or a user (user scope). */

@@ -28,7 +28,8 @@ import {
 
 import { slugifyName } from "../build/compiler-adapter";
 import type { Db } from "../db";
-import { errors } from "../runtime/errors";
+import { probeAndPersist } from "../probe/service";
+import { errors, isRuntimeApiError } from "../runtime/errors";
 import { loadConnectorCatalog } from "./catalog";
 import {
   connectionDto,
@@ -271,7 +272,18 @@ export async function createConnection(
 
   await assertNameAndSlugFree(deps.db, scope, values.name);
   const rows = await deps.db.insert(schema.connections).values(values).returning();
-  return { connection: connectionDto(rows[0]!) };
+  const row = rows[0]!;
+  // First health probe (spec §7): fire-and-forget — the create response NEVER
+  // waits on or fails from it. The outcome lands on the row's probe columns;
+  // an infrastructure failure only logs (no credential material in the error:
+  // probeAndPersist scrubs classification text, and typed errors carry ids).
+  void probeAndPersist(deps, row).catch((error) => {
+    deps.logger.warn("connections.initial_probe_failed", {
+      fields: { connectionId: row.id },
+      err: error,
+    });
+  });
+  return { connection: connectionDto(row) };
 }
 
 export async function updateConnection(
@@ -344,4 +356,26 @@ export async function deleteConnection(
     .delete(schema.connections)
     .where(and(eq(schema.connections.id, id), scopeWhere(schema.connections, scope)));
   return { id, deleted: true };
+}
+
+/**
+ * Test-connection (spec §7/§9): probe NOW, persist, return the updated DTO.
+ * An unhealthy server is a 200 whose DTO carries the classified health —
+ * `probe_failed` (502) is reserved for failure of the probe machinery itself.
+ */
+export async function probeConnectionRoute(
+  deps: ResourceDeps,
+  scope: Scope,
+  id: string,
+): Promise<GetConnectionResponse> {
+  const row = await loadOwned(deps.db, scope, id);
+  try {
+    const fresh = await probeAndPersist(deps, row);
+    return { connection: connectionDto(fresh) };
+  } catch (error) {
+    if (isRuntimeApiError(error)) throw error;
+    throw errors.probeFailed(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }

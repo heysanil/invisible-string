@@ -90,8 +90,9 @@ flowchart LR
   into the task message and delivers it to the bound agent version over
   eve's session API, version-bound JWTs), outbound Slack reply delivery,
   NDJSON tailer → resumable SSE, the connections domain (curated connector
-  catalog + a registry→Meilisearch sync job backing community search), and
-  the copilot WebSocket tool loop.
+  catalog + a registry→Meilisearch sync job backing community search, plus
+  MCP health probes over an SSRF-guarded egress path that cache each
+  server's tool list), and the copilot WebSocket tool loop.
 - **Worker** (`apps/worker`) — a stateless Bun supervisor that pulls artifacts,
   boots each compiled agent under Node 24, reverse-proxies traffic to it, and
   reaps idle processes, idle sandboxes, and cold artifacts.
@@ -232,7 +233,12 @@ are added through a three-lane dialog: a **curated connector catalog**
 search** over a Meilisearch mirror of the official MCP registry
 (typo-tolerant, verified publishers ranked first; installs re-verify the
 remote against the live registry), or a **custom server URL** — with
-write-once encrypted secrets throughout.
+write-once encrypted secrets throughout. Every connection carries a live
+**health state** (probed automatically after install, re-probed when a stale
+detail panel opens or from its **Test connection** button) and a cached list
+of the tools its server actually exposes — the connection detail panel and
+the agent editor turn that cache into a **checkbox tool picker** for
+allow/block filters, with per-tool approval overrides alongside.
 
 ![Context section](docs/screenshots/context.png)
 

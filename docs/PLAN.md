@@ -189,4 +189,4 @@ The Agent (PERSONA · MODEL · CONTEXT) becomes the first-class entity and the c
 
 ## Phase 6 — Connectors redesign (2026-08-09)
 
-**Design record:** `docs/superpowers/specs/2026-08-09-connectors-redesign-design.md`. **Status: Plan 1 (rebuilt `connections` domain, curated catalog, Meilisearch-mirrored community search) landed; Plan 2 (probe/health/tool cache) and Plan 3 (OAuth broker) pending.**
+**Design record:** `docs/superpowers/specs/2026-08-09-connectors-redesign-design.md`. **Status: Plan 1 (rebuilt `connections` domain, curated catalog, Meilisearch-mirrored community search) and Plan 2 (SSRF-guarded egress, MCP health probes, cached tool discovery, connection detail surface + checkbox tool picker) landed; Plan 3 (OAuth broker) pending.**

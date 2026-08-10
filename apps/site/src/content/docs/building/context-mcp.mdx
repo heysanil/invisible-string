@@ -19,6 +19,9 @@ one-click install, community search over a mirrored index of the official MCP
 registry (every install is re-verified against the live registry), and a custom
 server URL for anything else. Any credentials a connection needs are stored
 write-once and encrypted; the API only ever reports whether a connection has
-credentials, never their values.
+credentials, never their values. Every connection also carries a live health
+state — probed automatically on install and re-checkable any time with Test
+connection — and a discovered list of the tools its server exposes, which
+powers per-agent tool filtering.
 
 <UnderConstruction />

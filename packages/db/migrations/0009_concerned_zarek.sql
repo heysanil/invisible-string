@@ -1,0 +1,1 @@
+ALTER TABLE "agent_versions" ADD COLUMN "connection_slugs" jsonb;

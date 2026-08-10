@@ -724,6 +724,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(
       (versions[0]!.definition as { model: Record<string, unknown> }).model,
     ).not.toHaveProperty("reasoning");
+    // Publish persists the slug → connection-id map (the same slugs the
+    // compiler bakes into generated files) so runtime consumers can resolve
+    // an emitted connection slug back to its `cn_` row.
+    expect(versions[0]!.connectionSlugs).toEqual({
+      linear: mcpConnectionId,
+    });
 
     // Draft is now published.
     const agents = await db
@@ -734,6 +740,13 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   });
 
   test("republish of an identical draft is idempotent by hash (cache hit)", async () => {
+    // Simulate a historical row that predates connection_slugs: republish of
+    // the same hash must backfill the map (republish-to-migrate).
+    await db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: null })
+      .where(eq(schema.agentVersions.id, versionId));
+
     const res = await api("POST", `/workspaces/${orgId}/agents/${agentId}/publish`, {
       cookie: ownerCookie,
     });
@@ -748,6 +761,15 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(provisionedHashes.filter((hash) => hash === contentHash)).toEqual([
       contentHash,
     ]);
+
+    // The adopted row's null map was backfilled from this publish's inputs.
+    const versions = await db
+      .select({ connectionSlugs: schema.agentVersions.connectionSlugs })
+      .from(schema.agentVersions)
+      .where(eq(schema.agentVersions.id, versionId));
+    expect(versions[0]!.connectionSlugs).toEqual({
+      linear: mcpConnectionId,
+    });
   });
 
   test("dry-run-compile: ok+hash for a valid draft; structured errors otherwise", async () => {

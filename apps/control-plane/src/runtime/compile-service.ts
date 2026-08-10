@@ -50,6 +50,14 @@ export interface CompileInputs {
   model: ResolvedModel;
   connections: CompileConnection[];
   skills: CompileSkill[];
+  /**
+   * Slug → connection id for the definition's context connections — the same
+   * slugs the compiler's unique-slug pass bakes into the generated files
+   * (compile validates uniqueness/non-emptiness before anything persists).
+   * Publish persists this on the version row (`agent_versions.connection_slugs`)
+   * so runtime consumers can resolve an emitted slug back to its `cn_` row.
+   */
+  connectionSlugs: Record<string, string>;
   /** Slugified organization slug — baked into the generated project. */
   workspaceSlug: string;
 }
@@ -92,6 +100,7 @@ export async function resolveCompileInputs(
   const workspaceSlug = slugifyName(orgRows[0]?.slug ?? "") || "workspace";
 
   const connections: CompileConnection[] = [];
+  const connectionSlugs: Record<string, string> = {};
   for (const id of definition.context.mcpConnectionIds) {
     const rows = await db
       .select()
@@ -127,6 +136,12 @@ export async function resolveCompileInputs(
       approvalPolicy:
         (row.approvalPolicy as CompileConnection["approvalPolicy"]) ?? null,
     });
+
+    // Mirror the adapter's slug derivation. An empty or clashing slug makes
+    // compileOrThrow fail (422) before anything persists, so the map that
+    // reaches the version row always matches the emitted slugs.
+    const slug = slugifyName(row.name);
+    if (slug !== "") connectionSlugs[slug] = row.id;
   }
 
   const skills: CompileSkill[] = [];
@@ -153,7 +168,7 @@ export async function resolveCompileInputs(
     });
   }
 
-  return { model, connections, skills, workspaceSlug };
+  return { model, connections, connectionSlugs, skills, workspaceSlug };
 }
 
 /**

@@ -408,6 +408,14 @@ export const agentVersions = pgTable(
      */
     modelProvider: modelProvider("model_provider").notNull(),
     modelId: text("model_id").notNull(),
+    /**
+     * Slug → connection id for THIS version's context connections, written at
+     * publish from the same unique-slug pass the compiler bakes into the
+     * generated files — runtime consumers resolve an emitted connection slug
+     * back to its `cn_` row through it. Nullable: rows published before the
+     * column existed carry null (read as `?? {}`; republish backfills).
+     */
+    connectionSlugs: jsonb("connection_slugs").$type<Record<string, string>>(),
     buildStatus: buildStatus("build_status").default("pending").notNull(),
     createdAt,
   },

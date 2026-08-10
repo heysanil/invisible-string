@@ -606,6 +606,18 @@ export async function publishAgent(
     .limit(1);
 
   let version = existing[0];
+  if (version && version.connectionSlugs === null) {
+    // Republish-to-migrate: a row published before `connection_slugs` existed
+    // adopts the map on the next publish of the same hash. Safe to derive from
+    // THIS publish's inputs — slugs are baked into the hashed files, so an
+    // identical content hash implies identical slugs.
+    const backfilled = await deps.db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: inputs.connectionSlugs })
+      .where(eq(schema.agentVersions.id, version.id))
+      .returning();
+    version = backfilled[0] ?? version;
+  }
   if (!version) {
     const inserted = await deps.db
       .insert(schema.agentVersions)
@@ -617,6 +629,7 @@ export async function publishAgent(
         eveVersion: compiled.eveVersion,
         modelProvider: inputs.model.provider,
         modelId: inputs.model.modelId,
+        connectionSlugs: inputs.connectionSlugs,
         buildStatus: "pending",
       })
       .onConflictDoNothing({

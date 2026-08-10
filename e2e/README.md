@@ -30,7 +30,10 @@ Everything except the LLM is real: Better Auth, the compiler, a real
 `eve build`, the worker + a real compiled agent, and eve's built-in mock model
 (`EVE_MOCK_AUTHORED_MODELS`) so no provider key is ever needed. The copilot
 runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
-`support/copilot-script.ts`).
+`support/copilot-script.ts`). The control plane boots with
+`MCP_PROBE_ALLOW_PRIVATE=1`: the connection health probes (after-create and
+Test connection) ride the guarded egress fetch, which would otherwise reject
+the stub MCP server twice over (loopback address, plain http).
 
 ## Specs (`specs/*.e2e.ts`)
 
@@ -45,6 +48,15 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
   proving compile/dispatch on the rebuilt connections domain end-to-end.
   Search degradation (`search_unavailable`) is left to unit tests: it would
   need a second control-plane boot without `MEILISEARCH_URL`.
+- **connection-health** — the probe/tool-picker journey on a custom-URL
+  connection: the fire-and-forget after-create probe lands (green health dot +
+  discovered tool count on the card, asserted through a reload poll), the
+  detail's health panel shows Healthy with a fresh last-checked stamp, the
+  tool picker lists the discovered `save_note` as a checkbox and allow-listing
+  it persists `toolAllow`, Test connection re-probes on demand (the probe POST
+  returns the fresh DTO with `health: "ok"`), and the connection still
+  attaches to an agent. Stops before publish — the build-bearing spine is
+  add-connection's job.
 - **agent-workflow** (THE acceptance, agents-first) — author a skill (with a
   file attachment) and two MCP connections (one installed through the
   dialog's community-search lane, one custom-URL) in `/context`; **build an

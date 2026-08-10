@@ -180,6 +180,11 @@ export function controlPlaneEnv(): Record<string, string> {
     S3_REGION: "us-east-1",
     // Redirect the registry proxy at the local stub (never the real registry).
     MCP_REGISTRY_BASE_URL: REGISTRY_STUB_BASE_URL,
+    // The connection probes (after-create + Test connection) ride the guarded
+    // egress fetch, which rejects private/loopback targets and plain http —
+    // the stub MCP server is both. DEV/E2E ONLY, exactly like the compose
+    // secrets above (never set in production).
+    MCP_PROBE_ALLOW_PRIVATE: "1",
     // Community search rides the harness Meilisearch; the registry→Meilisearch
     // sync ticks fast so global-setup can await the first successful sync
     // (a boot-time run can race the stub's listen — 5 s retries it quickly).

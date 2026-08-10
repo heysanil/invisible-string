@@ -49,5 +49,74 @@
     "transport": "streamable-http",
     "auth": { "type": "bearer", "tokenLabel": "Stripe secret or restricted key", "tokenHint": "dashboard.stripe.com/apikeys" },
     "websiteUrl": "https://stripe.com"
+  },
+  {
+    "slug": "linear",
+    "title": "Linear",
+    "category": "project-management",
+    "description": "Issues, projects, and cycles in your Linear workspace.",
+    "modelDescription": "Linear: search, create, and update issues, projects, cycles, and comments in the connected Linear workspace.",
+    "url": "https://mcp.linear.app/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://linear.app",
+    "featured": true
+  },
+  {
+    "slug": "notion",
+    "title": "Notion",
+    "category": "productivity",
+    "description": "Search and edit pages and databases in your workspace.",
+    "modelDescription": "Notion: search, read, create, and update pages, databases, and comments in the connected Notion workspace.",
+    "url": "https://mcp.notion.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://www.notion.com",
+    "featured": true
+  },
+  {
+    "slug": "sentry",
+    "title": "Sentry",
+    "category": "dev-tools",
+    "description": "Errors, issues, and performance data from Sentry.",
+    "modelDescription": "Sentry: look up projects, issues, stack traces, and performance data in the connected Sentry organization.",
+    "url": "https://mcp.sentry.dev/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://sentry.io",
+    "featured": true
+  },
+  {
+    "slug": "neon",
+    "title": "Neon",
+    "category": "data",
+    "description": "Manage Neon Postgres projects, branches, and queries.",
+    "modelDescription": "Neon: manage Postgres projects, branches, and databases, and run SQL against the connected Neon account.",
+    "url": "https://mcp.neon.tech/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://neon.tech"
+  },
+  {
+    "slug": "paypal",
+    "title": "PayPal",
+    "category": "commerce",
+    "description": "Invoices, payments, and transaction reporting.",
+    "modelDescription": "PayPal: create and manage invoices, payments, and transaction reports for the connected PayPal account.",
+    "url": "https://mcp.paypal.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://www.paypal.com"
+  },
+  {
+    "slug": "vercel",
+    "title": "Vercel",
+    "category": "dev-tools",
+    "description": "Projects, deployments, and logs on Vercel.",
+    "modelDescription": "Vercel: inspect projects, deployments, domains, and logs for the connected Vercel account.",
+    "url": "https://mcp.vercel.com",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://vercel.com"
   }
 ]

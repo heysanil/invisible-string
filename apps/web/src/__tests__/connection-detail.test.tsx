@@ -8,7 +8,7 @@
  */
 import { ensureDomForThisFile } from "../test/setup";
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import type { ConnectionDto } from "@invisible-string/shared";
 
@@ -18,6 +18,7 @@ import {
   renderWithProviders,
   type FetchMock,
 } from "../test/harness";
+import { API_BASE_URL } from "../lib/api-client";
 import { ConnectionDetail } from "../components/context/ConnectionDetail";
 
 ensureDomForThisFile();
@@ -64,15 +65,49 @@ function connectionDto(over: Partial<ConnectionDto>): ConnectionDto {
 }
 
 let fetchMock: FetchMock;
+// Captured per-test: `window` only exists between this file's DOM hooks.
+let realWindowOpen: typeof window.open;
 
 beforeEach(() => {
+  realWindowOpen = window.open;
   fetchMock = installFetchMock();
 });
 
 afterEach(() => {
+  window.open = realWindowOpen;
   fetchMock.restore();
   cleanup();
 });
+
+/** Minimal stand-in for the consent popup window the oauth flow drives. */
+function fakePopup() {
+  const popup = {
+    closed: false,
+    href: "",
+    location: {
+      replace(url: string) {
+        popup.href = url;
+      },
+    },
+    close() {
+      popup.closed = true;
+    },
+  };
+  return popup;
+}
+
+/** A catalog oauth connection in the given grant state. */
+function oauthDto(status: NonNullable<ConnectionDto["oauthStatus"]>): ConnectionDto {
+  return connectionDto({
+    source: "catalog",
+    catalogSlug: "linear",
+    name: "Linear",
+    url: "https://mcp.linear.app/mcp",
+    authType: "oauth",
+    hasCredentials: true,
+    oauthStatus: status,
+  });
+}
 
 function probeCalls() {
   return fetchMock.calls.filter(
@@ -233,4 +268,59 @@ test("auth rotate sends the secret exactly once", async () => {
   expect(secretPatches[0]!.body).toEqual({
     auth: { type: "bearer", values: { token: SECRET } },
   });
+});
+
+test("oauth pending shows Connect; the popup outcome refetches into the connected shield", async () => {
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  let current = oauthDto("pending");
+  fetchMock
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: current }))
+    .on("POST", `/connections/${ID}/oauth/start`, () =>
+      jsonResponse({ authorizeUrl: "https://as.example.com/authorize?state=s1" }),
+    );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  // The oauth auth panel offers Connect — no credential-rotation affordance.
+  const connect = await view.findByRole("button", { name: "Connect" });
+  expect(view.queryByRole("button", { name: "Rotate credentials" })).toBeNull();
+
+  fireEvent.click(connect);
+  await waitFor(() => {
+    expect(popup.href).toBe("https://as.example.com/authorize?state=s1");
+  });
+
+  // Callback success → the detail refetches and renders the connected shield.
+  current = oauthDto("connected");
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: { type: "mcp-oauth", ok: true, connectionId: ID },
+      origin: new URL(API_BASE_URL).origin,
+    }),
+  );
+
+  expect(await view.findByText("Connected")).toBeTruthy();
+  expect(view.queryByRole("button", { name: "Connect" })).toBeNull();
+  const starts = fetchMock.calls.filter(
+    (call) =>
+      call.method === "POST" && call.path.endsWith(`/connections/${ID}/oauth/start`),
+  );
+  expect(starts).toHaveLength(1);
+});
+
+test("oauth expired shows the reconnect affordance", async () => {
+  fetchMock.on("GET", `/connections/${ID}`, () =>
+    jsonResponse({ connection: oauthDto("expired") }),
+  );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  expect(await view.findByRole("button", { name: "Reconnect" })).toBeTruthy();
+  expect(view.getByText(/expired/i)).toBeTruthy();
 });

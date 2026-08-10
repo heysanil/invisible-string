@@ -1,11 +1,15 @@
 /**
- * "Add connection" dialog (connectors redesign spec §10, v1 scope — no OAuth
- * lane, no health dot). Three lanes over ONE unified `POST /connections`:
+ * "Add connection" dialog (connectors redesign spec §10). Three lanes over
+ * ONE unified `POST /connections`:
  *
  *  1. Curated catalog (default): featured row + category-grouped tiles from
  *     the checked-in connector catalog — zero network calls to render.
  *     `{type:"none"}` recipes install on click; secret recipes collect
- *     credentials once via {@link CatalogSecretForm}.
+ *     credentials once via {@link CatalogSecretForm}; `oauth` recipes create
+ *     the pending connection and chain straight into the consent popup
+ *     ({@link useConnectOauth} — spec §6): success closes the dialog, a
+ *     dismissed popup leaves the pending connection reconnectable from its
+ *     detail surface.
  *  2. Community search: one search field pins catalog matches above results
  *     from the control plane's Meilisearch mirror. `search_unavailable`
  *     renders an inline degraded note — the catalog stays fully usable
@@ -28,7 +32,12 @@ import type {
 import { parseConnectorCatalog } from "@invisible-string/shared";
 import rawCatalog from "@invisible-string/shared/connector-catalog.json";
 
-import { useConnections, useCreateConnection } from "../../lib/queries/connections";
+import {
+  openOauthPopup,
+  useConnectOauth,
+  useConnections,
+  useCreateConnection,
+} from "../../lib/queries/connections";
 import type { ScopeRef } from "../../lib/queries/keys";
 import { isSearchUnavailable, useRegistrySearch } from "../../lib/queries/registry";
 import { useDebouncedValue } from "../../lib/use-debounced-value";
@@ -123,7 +132,9 @@ export function AddConnectionDialog({
   const search = useRegistrySearch(debounced);
   const connections = useConnections(scope);
   const create = useCreateConnection(scope);
+  const connectOauth = useConnectOauth(scope);
   const { toast } = useToast();
+  const busy = create.isPending || connectOauth.isPending;
 
   const addedSlugs = new Set(
     (connections.data ?? [])
@@ -150,8 +161,41 @@ export function AddConnectionDialog({
   }
 
   function pickCatalogEntry(entry: ConnectorCatalogEntry) {
+    if (entry.auth.type === "oauth") {
+      if (busy) return;
+      // Open the popup NOW — synchronously with the click — then create the
+      // pending connection and drive the consent flow through it.
+      const popup = openOauthPopup();
+      void (async () => {
+        const result = await create.mutateAsync({
+          source: "catalog",
+          slug: entry.slug,
+        });
+        const outcome = await connectOauth.mutateAsync({
+          connectionId: result.connection.id,
+          popup,
+        });
+        if (outcome.ok) {
+          toast({
+            variant: "success",
+            message: `${result.connection.name} connected.`,
+          });
+          close();
+        } else if (!outcome.dismissed) {
+          toast({
+            variant: "error",
+            message:
+              "Authorization failed. Reconnect from the connection's settings.",
+          });
+        }
+      })().catch((error) => {
+        popup?.close();
+        toast({ variant: "error", message: errorMessage(error) });
+      });
+      return;
+    }
     if (entry.auth.type === "none") {
-      if (create.isPending) return;
+      if (busy) return;
       void install({ source: "catalog", slug: entry.slug }).catch((error) => {
         toast({ variant: "error", message: errorMessage(error) });
       });
@@ -171,7 +215,7 @@ export function AddConnectionDialog({
       setView({ kind: "registry-auth", result, remote });
       return;
     }
-    if (create.isPending) return;
+    if (busy) return;
     void install({
       source: "registry",
       registryName: result.name,
@@ -298,14 +342,14 @@ export function AddConnectionDialog({
           {query.trim().length === 0 ? (
             <CatalogBrowse
               addedSlugs={addedSlugs}
-              busy={create.isPending}
+              busy={busy}
               onPick={pickCatalogEntry}
             />
           ) : (
             <SearchResults
               query={query.trim()}
               addedSlugs={addedSlugs}
-              busy={create.isPending}
+              busy={busy}
               onPickEntry={pickCatalogEntry}
               searchLoading={search.isFetching && search.data === undefined}
               searchUnavailable={search.isError && isSearchUnavailable(search.error)}

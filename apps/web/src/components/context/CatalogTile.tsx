@@ -21,7 +21,9 @@ export interface CatalogTileProps {
 
 /** What the user will be asked for, at a glance. */
 function authLabel(entry: ConnectorCatalogEntry): string {
-  return entry.auth.type === "none" ? "No auth" : "API key";
+  if (entry.auth.type === "none") return "No auth";
+  if (entry.auth.type === "oauth") return "OAuth";
+  return "API key";
 }
 
 export function CatalogTile({ entry, added, busy = false, onPick }: CatalogTileProps) {

@@ -27,6 +27,8 @@ import { cn } from "../../lib/cn";
 import { formatRelativeTime } from "../../lib/format";
 import { errorMessage } from "../../lib/forms";
 import {
+  openOauthPopup,
+  useConnectOauth,
   useConnection,
   useDeleteConnection,
   useProbeConnection,
@@ -411,6 +413,14 @@ function AuthSection({
     !readOnly &&
     (connection.authType === "bearer" || connection.authType === "headers");
 
+  if (connection.authType === "oauth") {
+    return (
+      <Section title="Authentication">
+        <OauthPanel scope={scope} connection={connection} readOnly={readOnly} />
+      </Section>
+    );
+  }
+
   return (
     <Section title="Authentication">
       <div className="flex items-center gap-2">
@@ -439,6 +449,115 @@ function AuthSection({
         />
       ) : null}
     </Section>
+  );
+}
+
+/**
+ * OAuth grant states (spec §6/§10): `pending` offers Connect, `connected`
+ * renders the authorized shield, and `expired`/`revoked`/`error` explain the
+ * dead grant and offer Reconnect. Both buttons run the same popup consent
+ * flow ({@link useConnectOauth}); credential material never reaches the SPA,
+ * so there is nothing to rotate here — re-consent replaces the grant.
+ */
+const OAUTH_STATUS_NOTE: Record<
+  Exclude<NonNullable<ConnectionDto["oauthStatus"]>, "pending" | "connected">,
+  string
+> = {
+  expired:
+    "Authorization expired — the server stopped accepting the stored grant. Reconnect to restore access.",
+  revoked:
+    "Authorization was revoked. Reconnect to grant access again.",
+  error:
+    "Authorization failed. Reconnect to try again.",
+};
+
+function OauthPanel({
+  scope,
+  connection,
+  readOnly,
+}: {
+  scope: ScopeRef;
+  connection: ConnectionDto;
+  readOnly: boolean;
+}) {
+  const connectOauth = useConnectOauth(scope);
+  const { toast } = useToast();
+  const status = connection.oauthStatus ?? "pending";
+
+  function connect() {
+    // Popup opened synchronously with the click (popup blockers).
+    const popup = openOauthPopup();
+    connectOauth
+      .mutateAsync({ connectionId: connection.id, popup })
+      .then((outcome) => {
+        if (outcome.ok) {
+          toast({ variant: "success", message: "Connection authorized." });
+        } else if (!outcome.dismissed) {
+          toast({
+            variant: "error",
+            message: "Authorization failed. Try connecting again.",
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        popup?.close();
+        toast({ variant: "error", message: errorMessage(error) });
+      });
+  }
+
+  if (status === "connected") {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="text-[13px] font-medium text-ink">OAuth</span>
+        <span className="inline-flex items-center gap-1 text-[12px] font-medium text-ok">
+          <ShieldCheck size={13} aria-hidden="true" />
+          Connected
+        </span>
+      </div>
+    );
+  }
+
+  if (status === "pending") {
+    return (
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <span className="text-[13px] font-medium text-ink">OAuth</span>
+          <span className="text-[12px] leading-snug text-ink-4">
+            Not connected yet — authorize access in a popup to finish setup.
+          </span>
+        </div>
+        {readOnly ? null : (
+          <Button
+            size="sm"
+            className="shrink-0"
+            loading={connectOauth.isPending}
+            onClick={connect}
+          >
+            Connect
+          </Button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="text-[13px] font-medium text-ink">OAuth</span>
+      <p className="rounded-card border border-warn/25 bg-warn/[0.06] px-3 py-2 text-[12.5px] leading-relaxed text-ink-2">
+        {OAUTH_STATUS_NOTE[status]}
+      </p>
+      {readOnly ? null : (
+        <div>
+          <Button
+            size="sm"
+            loading={connectOauth.isPending}
+            onClick={connect}
+          >
+            Reconnect
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 

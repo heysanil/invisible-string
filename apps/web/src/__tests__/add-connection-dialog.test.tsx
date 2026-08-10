@@ -8,7 +8,7 @@
 import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import type { ConnectionDto, RegistrySearchResult } from "@invisible-string/shared";
 
 import {
@@ -17,6 +17,7 @@ import {
   renderWithProviders,
   type FetchMock,
 } from "../test/harness";
+import { API_BASE_URL } from "../lib/api-client";
 import { AddConnectionDialog } from "../components/context/AddConnectionDialog";
 
 ensureDomForThisFile();
@@ -80,17 +81,38 @@ const SECRET = "sk-live-super-secret-123";
 const SCOPE = { scope: "workspace", workspaceId: "org_1" } as const;
 
 let fetchMock: FetchMock;
+// Captured per-test: `window` only exists between this file's DOM hooks.
+let realWindowOpen: typeof window.open;
 
 beforeEach(() => {
+  realWindowOpen = window.open;
   fetchMock = installFetchMock();
   // The dialog reads the current scope's connections for its "Added" state.
   fetchMock.on("GET", "/connections", () => jsonResponse({ connections: [] }));
 });
 
 afterEach(() => {
+  window.open = realWindowOpen;
   fetchMock.restore();
   cleanup();
 });
+
+/** Minimal stand-in for the consent popup window the oauth flow drives. */
+function fakePopup() {
+  const popup = {
+    closed: false,
+    href: "",
+    location: {
+      replace(url: string) {
+        popup.href = url;
+      },
+    },
+    close() {
+      popup.closed = true;
+    },
+  };
+  return popup;
+}
 
 function postCalls() {
   return fetchMock.calls.filter(
@@ -312,4 +334,81 @@ test("custom lane still validates against the shared schema before POSTing {sour
     name: "CMS",
     url: "https://cms.example.com/mcp",
   });
+});
+
+test("oauth catalog tile chains create → oauth start → popup consent → close", async () => {
+  const OAUTH_ID = "cn_a1b2c3d4e5f6a7b8";
+  const popup = fakePopup();
+  const openMock = mock(() => popup as unknown as Window);
+  window.open = openMock as unknown as typeof window.open;
+
+  fetchMock
+    .on("POST", "/connections", () =>
+      jsonResponse(
+        {
+          connection: connectionDto({
+            id: OAUTH_ID,
+            name: "Linear",
+            catalogSlug: "linear",
+            url: "https://mcp.linear.app/mcp",
+            authType: "oauth",
+            hasCredentials: true,
+            oauthStatus: "pending",
+          }),
+          oauthStartPath: `/workspaces/org_1/connections/${OAUTH_ID}/oauth/start`,
+        },
+        201,
+      ),
+    )
+    .on("POST", "/oauth/start", () =>
+      jsonResponse({ authorizeUrl: "https://as.example.com/authorize?state=s1" }),
+    );
+
+  const onClose = mock(() => {});
+  const view = renderWithProviders(
+    <AddConnectionDialog open onClose={onClose} scope={SCOPE} scopeLabel="workspace" />,
+  );
+
+  // The tile advertises the OAuth recipe instead of an API-key badge.
+  const tile = await view.findByText("Linear");
+  const tileButton = tile.closest("button")!;
+  expect(within(tileButton).getByText("OAuth")).toBeTruthy();
+
+  fireEvent.click(tileButton);
+
+  // The popup opens synchronously with the click and is navigated to the
+  // authorization URL once create + start have both answered.
+  await waitFor(() => {
+    expect(popup.href).toBe("https://as.example.com/authorize?state=s1");
+  });
+  expect(openMock).toHaveBeenCalledTimes(1);
+
+  const posts = postCalls();
+  expect(posts).toHaveLength(1);
+  expect(posts[0]!.body).toEqual({ source: "catalog", slug: "linear" });
+
+  // A message from a foreign origin is ignored — the dialog stays open.
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: { type: "mcp-oauth", ok: true, connectionId: OAUTH_ID },
+      origin: "https://evil.example",
+    }),
+  );
+  expect(onClose).not.toHaveBeenCalled();
+
+  // The callback page reports success from the API origin → toast + close.
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: { type: "mcp-oauth", ok: true, connectionId: OAUTH_ID },
+      origin: new URL(API_BASE_URL).origin,
+    }),
+  );
+
+  await waitFor(() => {
+    expect(onClose).toHaveBeenCalled();
+  });
+  const starts = fetchMock.calls.filter(
+    (call) => call.method === "POST" && call.path.endsWith("/oauth/start"),
+  );
+  expect(starts).toHaveLength(1);
 });

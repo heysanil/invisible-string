@@ -53,6 +53,8 @@ export const PORTS = {
   postgres: port("E2E_POSTGRES_PORT", 5442),
   garage: port("E2E_GARAGE_PORT", 3910),
   dex: port("E2E_DEX_PORT", 5557),
+  /** Registry-search mirror (offset from the dev stack's :7700). */
+  meilisearch: port("E2E_MEILISEARCH_PORT", 7710),
   controlPlane: port("E2E_CONTROL_PLANE_PORT", 4310),
   worker: port("E2E_WORKER_PORT", 4311),
   preview: port("E2E_PREVIEW_PORT", 5173),
@@ -105,11 +107,29 @@ export const S3_ENDPOINT = `http://127.0.0.1:${PORTS.garage}`;
 /** The stub MCP endpoint (bound to 127.0.0.1 so the agent process reaches it). */
 export const STUB_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp`;
 /**
- * The stub server also serves the MCP registry REST API (search + detail) so
- * the control-plane's registry proxy can be redirected here — the registry
- * browser never touches the real registry.
+ * The stub server also serves the MCP registry REST API (list + detail) so
+ * both the control-plane's registry→Meilisearch sync ETL and the server-side
+ * install re-fetch can be redirected here (MCP_REGISTRY_BASE_URL) — the real
+ * registry is never contacted.
  */
 export const REGISTRY_STUB_BASE_URL = `http://127.0.0.1:${PORTS.stubMcp}`;
+/** Meilisearch endpoint of the harness compose service (server-side client). */
+export const MEILISEARCH_URL = `http://127.0.0.1:${PORTS.meilisearch}`;
+/** The compose service's hardcoded dev master key (see docker-compose.yml). */
+export const MEILISEARCH_MASTER_KEY = "dev-meili-master-key";
+
+// ── The stub registry server's identity (fixtures + specs share it) ─────────
+/** Reverse-DNS name the stub registry lists (NOT io.github.* ⇒ verified). */
+export const REGISTRY_SERVER_NAME = "io.modelcontextprotocol/e2e-notes";
+/**
+ * The stub server's title — ALSO the installed connection's name: the add
+ * dialog derives registry-install names from the server title (no name field).
+ */
+export const REGISTRY_SERVER_TITLE = "E2E Notes";
+/** Secret header the stub's remote declares; the add dialog must collect it. */
+export const REGISTRY_SECRET_HEADER = "X-Api-Key";
+/** The throwaway credential the specs enter for that header (see banner). */
+export const REGISTRY_SECRET_VALUE = "e2e-notes-api-key";
 
 // ── Databases (compose postgres: user dev / pass dev) ───────────────────────
 const PG_BASE = `postgres://dev:dev@127.0.0.1:${PORTS.postgres}`;
@@ -160,6 +180,12 @@ export function controlPlaneEnv(): Record<string, string> {
     S3_REGION: "us-east-1",
     // Redirect the registry proxy at the local stub (never the real registry).
     MCP_REGISTRY_BASE_URL: REGISTRY_STUB_BASE_URL,
+    // Community search rides the harness Meilisearch; the registry→Meilisearch
+    // sync ticks fast so global-setup can await the first successful sync
+    // (a boot-time run can race the stub's listen — 5 s retries it quickly).
+    MEILISEARCH_URL,
+    MEILISEARCH_MASTER_KEY,
+    REGISTRY_SYNC_INTERVAL_MS: "5000",
     // Mock-model harness: the provider key is a dummy and the base URL points
     // at a dead port, so any REAL model call fails loudly (spike finding 5).
     OPENROUTER_API_KEY: "e2e-dummy-openrouter-key",

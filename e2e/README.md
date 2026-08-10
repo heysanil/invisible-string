@@ -9,8 +9,9 @@ it all down.
 
 The global setup (in order):
 
-1. `docker compose -p p2e2e up` — postgres, garage, dex (ports offset from the
-   dev `:5432/:3900/:5556` and phase-1 `:5443` stacks, so all three coexist).
+1. `docker compose -p p2e2e up` — postgres, garage, dex, meilisearch (ports
+   offset from the dev `:5432/:3900/:5556/:7700` and phase-1 `:5443` stacks,
+   so all three coexist; meilisearch rides `:7710`).
 2. Fresh product DB + migrations + demo seed (`scripts/db-setup.ts`, under Bun).
 3. Production `vite build` of the SPA with `VITE_API_URL` baked at the
    control-plane origin.
@@ -19,6 +20,11 @@ The global setup (in order):
    **worker**, **vite preview**. Node 24 (mise) is pinned first on the
    control-plane/worker PATH so the real `eve build` and agent boot never fall
    through to a system Node.
+5. A gate on the **registry→Meilisearch sync**: the control plane's sync ETL
+   (ticking fast — `REGISTRY_SYNC_INTERVAL_MS=5000`) pages the stub registry
+   into the community-search index; setup polls `GET /mcp-registry/search`
+   (through a throwaway Better Auth session) until the stub server is
+   indexed, so the search-lane specs never race the first sync.
 
 Everything except the LLM is real: Better Auth, the compiler, a real
 `eve build`, the worker + a real compiled agent, and eve's built-in mock model
@@ -29,9 +35,20 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
 ## Specs (`specs/*.e2e.ts`)
 
 - **auth** — signup → land in the shell; logout; login (+ a bad-password path).
+- **add-connection** — the add-connection dialog's three lanes: the curated
+  catalog renders its seeded tiles with zero network calls; community search
+  (the Meilisearch mirror) surfaces the stub server with its Verified badge
+  and gates the install behind its declared secret header; a custom-URL
+  server is added on a distinct stub path. The community install then rides
+  the full spine — attach → publish (a real eve build compiled from the
+  `cn_`-id, secret-bearing connection row) → chat to a streamed reply —
+  proving compile/dispatch on the rebuilt connections domain end-to-end.
+  Search degradation (`search_unavailable`) is left to unit tests: it would
+  need a second control-plane boot without `MEILISEARCH_URL`.
 - **agent-workflow** (THE acceptance, agents-first) — author a skill (with a
-  file attachment) and two MCP connections (one via the registry browser, one
-  custom-URL) in `/context`; **build an agent** in `/agents` (persona typed in
+  file attachment) and two MCP connections (one installed through the
+  dialog's community-search lane, one custom-URL) in `/context`; **build an
+  agent** in `/agents` (persona typed in
   the markdown editor, Balanced preset, both connections + the skill
   attached); **publish** it (the agent is the compile unit — real eve build,
   wait for the ready chip); **chat with it** through the "New chat" agent
@@ -79,13 +96,13 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
 
 > eve's mock model exposes its **built-in** tools to the top-level model but
 > routes **MCP connection** tools behind a `connection_search` sub-agent it
-> never delegates to. A published agent genuinely connects to its MCP servers
-> (the stub logs the `initialize`/`tools/list` handshakes), but run
-> assertions are driven with mock-reachable tools (`todo` for the
-> working-block step, `ask_question` for the HITL card) — the same
-> streamed-step and `input.requested` code paths, without a real LLM. A
-> `Reply with exactly: …` line in the persona/instructions makes the mock's
-> prose deterministic.
+> never delegates to — and MCP connections attach lazily through that
+> sub-agent, so under the mock a published agent never even opens an MCP
+> session to the stub. Run assertions are therefore driven with
+> mock-reachable tools (`todo` for the working-block step, `ask_question`
+> for the HITL card) — the same streamed-step and `input.requested` code
+> paths, without a real LLM. A `Reply with exactly: …` line in the
+> persona/instructions makes the mock's prose deterministic.
 
 Note on builds: every fresh workspace also auto-publishes its seeded
 "General Purpose" agent in the background (a real eve build — content hashes
@@ -97,9 +114,11 @@ chip; the others simply ignore it.
 
 - `flows.ts` — signup/login/workspace seeding (Better Auth REST via the
   browser's session cookie).
-- `authoring.ts` — `/context` authoring: skills with attachments, registry +
-  custom-URL MCP connections, and `gotoSection` (Chat · Agents · Workflows ·
-  Context · Settings).
+- `authoring.ts` — `/context` authoring: skills with attachments, the
+  add-connection dialog's community-search install (named after the stub
+  server's title — community installs have no name field) + custom-URL
+  connections, and `gotoSection` (Chat · Agents · Workflows · Context ·
+  Settings).
 - `builder.ts` — the agents-first spine: `openNewAgent` / `writePersona` /
   `setAgentModelPreset` / `attachAgentResource` / `setAgentConnectionApproval`
   / `publishAgentAndWaitReady` (real build) / `waitForAgentPublished` (seeded

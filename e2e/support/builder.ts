@@ -139,7 +139,8 @@ export async function attachAgentResource(
 
   const picker = page.getByRole("dialog", { name: dialogName });
   await picker.getByRole("textbox", { name: searchName }).fill(name);
-  // Anchor at the start so "notes" does not also match "Registry notes".
+  // Anchor at the start so "notes" does not also match "E2E Notes" (whose
+  // picker row's accessible name carries a description containing "notes").
   await picker
     .getByRole("button", { name: new RegExp(`^${escapeRegExp(name)}\\b`) })
     .click();

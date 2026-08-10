@@ -4,8 +4,9 @@
  * unit now, workflows are a standing delegation):
  *
  *   sign in → author a skill (with a file attachment) in /context → install a
- *   registry MCP connection (registry browser, network-stubbed) + add a
- *   custom-URL MCP connection (→ the local stub server) → BUILD an agent in
+ *   community MCP connection (add-connection dialog search lane, backed by
+ *   the Meilisearch mirror of the stubbed registry) + add a custom-URL MCP
+ *   connection (→ the local stub server) → BUILD an agent in
  *   /agents: persona, balanced model preset, both connections + the skill
  *   attached → Publish (real eve build; wait for the ready chip) → CHAT with
  *   it via the "New chat" agent picker: the WORKING BLOCK streams live steps
@@ -43,8 +44,11 @@ import {
   RUN_TIMEOUT_MS,
 } from "../support/builder.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
+import { REGISTRY_SERVER_TITLE } from "../config.ts";
 
-const REGISTRY_CONNECTION = "Registry notes";
+// Community installs are named after the server title (no name field in the
+// add dialog), so the attached connection carries the stub server's title.
+const REGISTRY_CONNECTION = REGISTRY_SERVER_TITLE;
 const CUSTOM_CONNECTION = "notes";
 // Deliberately unrelated to the run message so the mock model's skill matcher
 // never intercepts the tool call we want to exercise.
@@ -68,7 +72,7 @@ test("build an agent in the UI, publish + chat, then delegate a form workflow to
     content: "# Brand voice\n\nWarm, concise, plain language.",
     fileName: "template.md",
   });
-  await installRegistryConnection(page, { name: REGISTRY_CONNECTION, query: "notes" });
+  await installRegistryConnection(page, { query: "notes" });
   await addCustomConnection(page, { name: CUSTOM_CONNECTION });
 
   // ── build the agent: persona · model · context ──────────────────────────────

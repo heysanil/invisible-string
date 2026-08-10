@@ -1,11 +1,12 @@
 /**
  * Playwright global setup — stands up the FULL real stack, zero manual steps:
  *
- *   docker compose (postgres · garage · dex, project p2e2e)
+ *   docker compose (postgres · garage · dex · meilisearch, project p2e2e)
  *     → fresh product DB + migrations + demo seed (bun)
  *     → production build of the SPA (VITE_API_URL baked)
  *     → managed processes: stub MCP · control-plane · worker · vite preview
- *     → readiness gates on every one.
+ *     → readiness gates on every one, then a gate on the registry→Meilisearch
+ *       sync (the community-search specs need the stub server indexed).
  *
  * All child PIDs are recorded to .runtime/state.json for global-teardown to
  * kill. Runs under Node; DB work is delegated to a bun subprocess (Bun SQL +
@@ -22,6 +23,8 @@ import {
   COMPOSE_PROJECT,
   PORTS,
   PREVIEW_URL,
+  REGISTRY_SERVER_NAME,
+  REGISTRY_SERVER_TITLE,
   REPO_ROOT,
   STUB_MCP_URL,
   WORKER_URL,
@@ -33,6 +36,7 @@ import {
   run,
   runQuiet,
   saveState,
+  sleep,
   spawnManaged,
   waitForHttp,
   type ManagedProcess,
@@ -54,7 +58,67 @@ function composeEnv(): Record<string, string | undefined> {
     POSTGRES_PORT: String(PORTS.postgres),
     GARAGE_PORT: String(PORTS.garage),
     DEX_PORT: String(PORTS.dex),
+    MEILISEARCH_PORT: String(PORTS.meilisearch),
   };
+}
+
+/**
+ * Gate on the registry→Meilisearch sync: poll the control plane's OWN search
+ * route until the stub registry server is indexed. The route requires a
+ * session, so mint a throwaway account through Better Auth's REST API first
+ * (the Origin header must be a trusted origin — the SPA preview origin is).
+ */
+async function waitForRegistrySync(): Promise<void> {
+  const signup = await fetch(`${API_BASE_URL}/api/auth/sign-up/email`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: PREVIEW_URL },
+    body: JSON.stringify({
+      name: "E2E sync probe",
+      email: `e2e-sync-probe-${randomUUID().slice(0, 8)}@example.com`,
+      password: "correct-horse-battery-staple",
+    }),
+  });
+  if (!signup.ok) {
+    throw new Error(`registry-sync probe signup failed: ${signup.status}`);
+  }
+  const cookie = signup.headers
+    .getSetCookie()
+    .map((line) => line.split(";", 1)[0])
+    .join("; ");
+  if (cookie.length === 0) {
+    throw new Error("registry-sync probe signup returned no session cookie");
+  }
+
+  // First sync fires at control-plane boot and may race the stub's listen;
+  // REGISTRY_SYNC_INTERVAL_MS=5000 retries it quickly, so poll generously.
+  const search = `${API_BASE_URL}/mcp-registry/search?q=${encodeURIComponent(REGISTRY_SERVER_TITLE)}`;
+  const deadline = Date.now() + 120_000;
+  let last = "no attempt made";
+  for (;;) {
+    try {
+      const res = await fetch(search, {
+        headers: { cookie },
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (res.ok) {
+        const body = (await res.json()) as {
+          results?: Array<{ name?: string }>;
+        };
+        if (body.results?.some((r) => r.name === REGISTRY_SERVER_NAME)) return;
+        last = `indexed ${body.results?.length ?? 0} results, stub server absent`;
+      } else {
+        last = `status ${res.status}`;
+      }
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for the registry→Meilisearch sync to index the stub server (last: ${last})`,
+      );
+    }
+    await sleep(1_000);
+  }
 }
 
 function compose(args: string[]): void {
@@ -85,8 +149,8 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // Reap any agent left squatting the worker's port pool by a crashed run.
   runQuiet("pkill", ["-9", "-f", `${AGENT_ROOT}/`], REPO_ROOT);
 
-  console.log("[e2e:setup] docker compose up (postgres, garage, dex)…");
-  compose(["up", "-d", "--wait", "postgres", "garage", "dex"]);
+  console.log("[e2e:setup] docker compose up (postgres, garage, dex, meilisearch)…");
+  compose(["up", "-d", "--wait", "postgres", "garage", "dex", "meilisearch"]);
 
   // Node powers the eve build + agent runtime. Warm the version mise.toml
   // pins (idempotent), then resolve its bin dir so we can pin it on the
@@ -178,6 +242,9 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     expectOk: true,
   });
   await waitForHttp(PREVIEW_URL, { timeoutMs: 60_000, expectOk: true });
+
+  console.log("[e2e:setup] waiting for the registry→Meilisearch sync…");
+  await waitForRegistrySync();
 
   console.log(
     `[e2e:setup] stack ready in ${Math.round((Date.now() - started) / 1000)}s ` +

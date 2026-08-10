@@ -7,10 +7,13 @@
  *     enough — the transport must speak the real handshake. Exposes one tool,
  *     `save_note` (eve names it `<connection>__save_note`), which the mock
  *     model calls when a message mentions it.
- *  2. The MCP registry REST API (GET /v0.1/servers[/…]) so the control-plane's
- *     registry proxy (redirected here via MCP_REGISTRY_BASE_URL) resolves both
- *     the search and the server-side install re-fetch without the real
- *     registry.
+ *  2. The MCP registry REST API (GET /v0.1/servers[/…]) so the control plane
+ *     (redirected here via MCP_REGISTRY_BASE_URL) resolves both the
+ *     registry→Meilisearch sync ETL (which pages the list into the community
+ *     search index) and the server-side install re-fetch without the real
+ *     registry. The fixture carries `_meta` isLatest/status so the sync's
+ *     entry→action mapping ingests it, and its remote declares a secret
+ *     header so the add-connection dialog's credential form is exercised.
  *
  * Bound to 127.0.0.1 so the agent process (localhost worker) reaches it while
  * nothing external can. GET /__calls reports tool invocations for assertions.
@@ -20,20 +23,41 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-import { PORTS } from "../config.ts";
+import {
+  PORTS,
+  REGISTRY_SECRET_HEADER,
+  REGISTRY_SERVER_NAME,
+  REGISTRY_SERVER_TITLE,
+} from "../config.ts";
 
 const callLog: { name: string; args: unknown }[] = [];
 
 /** Canned registry server (remote points back at this stub's MCP endpoint). */
 const REGISTRY_SERVER = {
-  name: "io.modelcontextprotocol/e2e-notes",
-  title: "E2E Notes (registry)",
+  name: REGISTRY_SERVER_NAME,
+  title: REGISTRY_SERVER_TITLE,
   description: "A registry-listed notes server, stubbed for E2E.",
   version: "1.2.0",
   status: "active",
-  // A DISTINCT path from the custom-URL connection's /mcp so eve loads both
-  // connections (same URL would dedupe to one, hiding a tool prefix).
-  remotes: [{ type: "streamable-http", url: `http://127.0.0.1:${PORTS.stubMcp}/mcp-b` }],
+  remotes: [
+    {
+      type: "streamable-http",
+      // A DISTINCT path from the custom-URL connection's /mcp so eve loads both
+      // connections (same URL would dedupe to one, hiding a tool prefix).
+      url: `http://127.0.0.1:${PORTS.stubMcp}/mcp-b`,
+      // A declared secret header makes the add dialog collect a credential
+      // before installing (the stub itself ignores request headers).
+      headers: [
+        {
+          name: REGISTRY_SECRET_HEADER,
+          description: "Notes API key",
+          isRequired: true,
+          isSecret: true,
+        },
+      ],
+    },
+  ],
+  // The sync ETL's entry→action mapping requires active+isLatest to upsert.
   _meta: {
     "io.modelcontextprotocol.registry/official": { status: "active", isLatest: true },
   },

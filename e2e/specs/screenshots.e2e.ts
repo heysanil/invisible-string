@@ -65,6 +65,7 @@ import {
 } from "../support/copilot-script.ts";
 import { agentRailCard, openCopilotAndSend } from "../support/copilot.ts";
 import { signUp, uniqueAccount } from "../support/flows.ts";
+import { REGISTRY_SERVER_TITLE } from "../config.ts";
 
 /** docs/screenshots/, resolved from this spec (e2e/specs → repo root). */
 const OUT_DIR = resolve(
@@ -84,7 +85,9 @@ const WORKSPACE_NAME = "Acme Support";
 const AGENT_NAME = "Support Concierge";
 const AGENT_DESCRIPTION = "Front-line support triage and warm, on-brand replies.";
 const WORKFLOW_NAME = "Support triage workflow";
-const REGISTRY_CONNECTION = "Registry notes";
+// Community installs are named after the server title (no name field in the
+// add dialog), so the card carries the stub server's title.
+const REGISTRY_CONNECTION = REGISTRY_SERVER_TITLE;
 const CUSTOM_CONNECTION = "notes";
 const SKILL_NAME = "Brand voice";
 
@@ -211,10 +214,7 @@ test("capture the eight product screenshots", async ({ page, browser }) => {
     content: "# Brand voice\n\nWarm, concise, plain language.",
     fileName: "template.md",
   });
-  await installRegistryConnection(page, {
-    name: REGISTRY_CONNECTION,
-    query: "notes",
-  });
+  await installRegistryConnection(page, { query: "notes" });
   await addCustomConnection(page, { name: CUSTOM_CONNECTION });
 
   // ── context.png — /context with two connection cards + one skill row ───────

@@ -41,6 +41,7 @@ export default async function globalTeardown(): Promise<void> {
           POSTGRES_PORT: String(PORTS.postgres),
           GARAGE_PORT: String(PORTS.garage),
           DEX_PORT: String(PORTS.dex),
+          MEILISEARCH_PORT: String(PORTS.meilisearch),
         },
       },
     );

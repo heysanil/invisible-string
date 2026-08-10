@@ -33,14 +33,15 @@ export function connectionAuthAad(connectionId: string): string {
  * credentials. The stored plaintext is a discriminated union the
  * dispatch/compile paths read (agent-env `decryptMcpAuthConfig`): bearer
  * `{type,token}` / headers `{type,headers}` — AAD-bound to the row via
- * {@link connectionAuthAad}.
+ * {@link connectionAuthAad}. `oauth` stores nothing here: its grant lives on
+ * the `connection_oauth` row, envelope-bound to ITS identity (oauth/broker.ts).
  */
 export function encryptConnectionAuthConfig(
   auth: McpAuthWrite,
   masterKey: MasterKey | undefined,
   connectionId: string,
 ): string | null {
-  if (auth.type === "none") return null;
+  if (auth.type === "none" || auth.type === "oauth") return null;
   if (!masterKey) throw errors.encryptionKeyMissing();
   const config =
     auth.type === "bearer"

@@ -4,9 +4,9 @@
  * the control plane parses the JSON at module load (fail-fast at boot), the
  * SPA renders the same entries with zero network calls.
  *
- * Plan 1 ships static-auth recipes only (`none`/`bearer`/`headers`); Plan 3
- * extends the union with the OAuth recipe. No `icon` field — v1 renders E1
- * monogram tiles.
+ * Auth recipes cover static credentials (`none`/`bearer`/`headers`) and
+ * broker-mediated OAuth (`oauth` — no fields: the consent flow supplies the
+ * grant, connectors spec §6). No `icon` field — v1 renders E1 monogram tiles.
  */
 import { z } from "zod";
 import { mcpTransportSchema } from "./api";
@@ -32,10 +32,12 @@ const httpsUrlSchema = z
 /**
  * Auth recipe: what the install form must collect. `bearer` labels the single
  * token field; `headers` enumerates every header (secret headers are required
- * at install — the create route 422s without them).
+ * at install — the create route 422s without them); `oauth` collects nothing —
+ * install yields a pending grant and the UI chains into the consent popup.
  */
 export const connectorAuthRecipeSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("none") }),
+  z.strictObject({ type: z.literal("oauth") }),
   z.strictObject({
     type: z.literal("bearer"),
     tokenLabel: z.string().min(1),

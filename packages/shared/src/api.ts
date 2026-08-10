@@ -839,9 +839,13 @@ export type McpApprovalPolicy = z.infer<typeof mcpApprovalPolicySchema>;
  * - none    → clears any stored credentials
  * - bearer  → `values.token` becomes the connection's bearer token
  * - headers → `values` = header name → header VALUE (each stored encrypted)
+ * - oauth   → no values here EVER: the consent broker owns the credentials
+ *             (connectors spec §6) — the connection pairs with a
+ *             `connection_oauth` row and tokens arrive via the popup flow
  */
 export const mcpAuthWriteSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("none") }),
+  z.object({ type: z.literal("oauth") }),
   z.object({
     type: z.literal("bearer"),
     values: z.object({ token: z.string().min(1) }),
@@ -1053,6 +1057,27 @@ export const getConnectionResponseSchema = z.object({
   connection: connectionDtoSchema,
 });
 export type GetConnectionResponse = z.infer<typeof getConnectionResponseSchema>;
+
+/**
+ * Create response: the DTO plus, when the new connection uses OAuth, the
+ * scope-correct path of the consent start route so the UI can chain straight
+ * into the popup flow (connectors spec §4/§6).
+ */
+export const createConnectionResponseSchema = getConnectionResponseSchema.extend({
+  oauthStartPath: z.string().optional(),
+});
+export type CreateConnectionResponse = z.infer<
+  typeof createConnectionResponseSchema
+>;
+
+/**
+ * `POST /workspaces/:id/connections/:id/oauth/start` (+ `/me/...` mirror) →
+ * the authorization-server consent URL the SPA opens in a popup. The PKCE
+ * verifier and single-use `state` stay server-side on the `connection_oauth`
+ * row (connectors spec §6).
+ */
+export const startOauthResponseSchema = z.object({ authorizeUrl: z.url() });
+export type StartOauthResponse = z.infer<typeof startOauthResponseSchema>;
 
 // ── MCP registry search + install provenance ────────────────────────────────
 //

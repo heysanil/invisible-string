@@ -12,6 +12,7 @@ import { schema } from "@invisible-string/db";
 import type {
   ConnectionDto,
   ConnectionOauthStatus,
+  ConnectorCatalogEntry,
   Logger,
   MasterKey,
   ModelAllowlistEntryDto,
@@ -23,6 +24,7 @@ import type { ArtifactStore } from "../artifacts";
 import type { Auth } from "../auth";
 import type { CompileAgentFn } from "../build/compiler-contract";
 import type { Db } from "../db";
+import type { OauthBrokerDeps } from "../oauth/broker";
 import { errors } from "../runtime/errors";
 import type { MeiliClient } from "../search/meili";
 import type { WorkspaceDeps } from "../workspace";
@@ -60,6 +62,19 @@ export interface ResourceDeps {
    * runtime config's `mcpProbeAllowPrivate` (MCP_PROBE_ALLOW_PRIVATE).
    */
   probeFetch: typeof fetch;
+  /**
+   * OAuth consent broker dependencies (oauth/broker.ts) — the
+   * `/connections/:id/oauth/start` routes run on them. Shares the guarded
+   * egress fetch with the probe (one egress policy for all
+   * caller-influenced URLs).
+   */
+  oauthBroker: OauthBrokerDeps;
+  /**
+   * Test seam: overrides the checked-in connector catalog
+   * (resources/catalog.ts) so gated suites can install synthetic recipes —
+   * production always uses the module-load-validated JSON.
+   */
+  catalog?: ReadonlyMap<string, ConnectorCatalogEntry>;
   /**
    * Structured logger for fire-and-forget resource work (the after-create
    * connection probe) — request-path failures surface as typed errors instead.
@@ -123,8 +138,10 @@ type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
 
 /**
  * Rebuilt `connections` row → wire DTO. Secrets are NEVER echoed — only
- * `hasCredentials` (an `oauth` row counts as credentialed even before Plan 3
- * stores its grant). `oauthStatus` stays null until the OAuth broker lands.
+ * `hasCredentials` (an `oauth` row always counts as credentialed).
+ * `oauthStatus` is caller-supplied: create passes the newborn grant's
+ * `pending`; readers that have not joined the `connection_oauth` row report
+ * null (the grant-status join lands with the token lifecycle work).
  */
 export function connectionDto(
   row: ConnectionRow,

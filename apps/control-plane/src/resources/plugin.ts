@@ -12,6 +12,7 @@
 import { Elysia } from "elysia";
 import { SKILL_FILE_MAX_BYTES } from "@invisible-string/shared";
 
+import { startOauth } from "../oauth/broker";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { workspacePlugin } from "../workspace";
 import {
@@ -229,6 +230,22 @@ export function resourcesPlugin(deps: ResourceDeps) {
           probeConnectionRoute(deps, wsScope(workspace.organizationId), params.id),
         { requireWorkspace: "admin" },
       )
+      // OAuth consent start (spec §6): discovery + client identity + a fresh
+      // PKCE/state pending flow → `{authorizeUrl}` for the popup. Arms a
+      // credential grant, so it is owner/admin-gated like the other mutations;
+      // the callback itself lives on the public integrations prefix
+      // (session-bound — see oauth/broker.ts).
+      .post(
+        "/workspaces/:workspaceId/connections/:id/oauth/start",
+        ({ workspace, params }) =>
+          startOauth(
+            deps.oauthBroker,
+            wsScope(workspace.organizationId),
+            params.id,
+            workspace.userId,
+          ),
+        { requireWorkspace: "admin" },
+      )
 
       // ── Connections — user scope (/me; the signed-in user owns the rows,
       // so no role gate applies) ────────────────────────────────────────────
@@ -266,6 +283,12 @@ export function resourcesPlugin(deps: ResourceDeps) {
         "/me/connections/:id/probe",
         ({ authUser, params }) =>
           probeConnectionRoute(deps, userScope(authUser.id), params.id),
+        { requireAuth: true },
+      )
+      .post(
+        "/me/connections/:id/oauth/start",
+        ({ authUser, params }) =>
+          startOauth(deps.oauthBroker, userScope(authUser.id), params.id, authUser.id),
         { requireAuth: true },
       )
 

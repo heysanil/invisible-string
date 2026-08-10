@@ -14,7 +14,7 @@ import { cors } from "@elysiajs/cors";
 import { eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
-import type { Logger } from "@invisible-string/shared";
+import type { ConnectorCatalogEntry, Logger } from "@invisible-string/shared";
 
 import { createAuth, type Auth } from "./auth";
 import { loadConfig, type Config } from "./config";
@@ -48,6 +48,8 @@ import {
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { createGuardedFetch } from "./net/guarded-fetch";
+import type { OauthBrokerDeps } from "./oauth/broker";
+import { probeAndPersist } from "./probe/service";
 import { resourcesPlugin } from "./resources/plugin";
 import {
   createOpenRouterCatalog,
@@ -76,7 +78,7 @@ import {
   type WorkerClient,
 } from "./runtime/worker-client";
 import { mintDispatchToken } from "@invisible-string/shared";
-import { loadIntegrationsConfig } from "./integrations/config";
+import { loadIntegrationsConfig, publicAppUrlFromEnv } from "./integrations/config";
 import { FixedWindowRateLimiter } from "./integrations/rate-limit";
 import { integrationsPlugin, type IntegrationDeps } from "./integrations/routes";
 import { createSlackClient, type SlackClient } from "./integrations/slack-client";
@@ -127,6 +129,11 @@ export interface RuntimeOverrides {
   workerClient?: WorkerClient;
   /** MCP registry proxy client (stubbed in tests). */
   registry?: RegistryClient;
+  /**
+   * Connector catalog override (gated suites install synthetic recipes);
+   * production always uses the checked-in, boot-validated JSON.
+   */
+  catalog?: ReadonlyMap<string, ConnectorCatalogEntry>;
   /** Slack Web API client (stubbed against a fake Slack server in tests). */
   slackClient?: SlackClient;
   /**
@@ -212,6 +219,8 @@ export function createIntegrationDeps(opts: {
   env: Record<string, string | undefined>;
   runtimeDeps: RuntimeDeps | null;
   slackClient?: SlackClient;
+  /** MCP OAuth consent broker — the mcp-oauth callback route runs on it. */
+  oauthBroker: OauthBrokerDeps;
 }): IntegrationDeps | null {
   const { env, runtimeDeps } = opts;
   if (!runtimeDeps) return null;
@@ -236,6 +245,7 @@ export function createIntegrationDeps(opts: {
       windowMs: 60_000,
     }),
     slackDedup: new SlackEventDedup(),
+    oauthBroker: opts.oauthBroker,
   };
 }
 
@@ -451,10 +461,30 @@ export function createAppStack(
       });
     });
   }
+  // ONE guarded egress fetch for every caller-influenced URL leaving the
+  // control plane: MCP probes AND the whole OAuth broker (discovery, DCR,
+  // token exchange) — a single egress policy, a single allow-private switch.
+  const mcpEgressFetch = createGuardedFetch({
+    allowPrivate: runtimeDeps?.runtime.mcpProbeAllowPrivate ?? false,
+  });
+  // MCP OAuth consent broker (oauth/broker.ts): the start routes ride the
+  // resources plugin, the callback rides the integrations plugin — both run
+  // on this one deps object. `probeConnection` closes over `resourceDeps`
+  // (declared below) — it only runs after assembly, on post-connect probes.
+  const oauthBroker: OauthBrokerDeps = {
+    db: dbHandle.db,
+    masterKey: config.encryptionMasterKey,
+    publicAppUrl: publicAppUrlFromEnv(env),
+    fetchImpl: mcpEgressFetch,
+    logger,
+    workspaceDeps,
+    probeConnection: (connection) => probeAndPersist(resourceDeps, connection),
+  };
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,
     slackClient: runtimeOverrides?.slackClient,
+    oauthBroker,
   });
   const resourceDeps: ResourceDeps = {
     db: dbHandle.db,
@@ -478,10 +508,11 @@ export function createAppStack(
     // Guarded egress for MCP probes — the ONLY fetch caller-influenced URLs
     // ride (SSRF containment: DNS-validated, IP-pinned, redirect-re-validated).
     // MCP_PROBE_ALLOW_PRIVATE (dev/e2e/self-hosted) admits private targets and
-    // plain http; a runtime-less boot keeps the hardened default.
-    probeFetch: createGuardedFetch({
-      allowPrivate: runtimeDeps?.runtime.mcpProbeAllowPrivate ?? false,
-    }),
+    // plain http; a runtime-less boot keeps the hardened default. The same
+    // instance backs the OAuth broker above.
+    probeFetch: mcpEgressFetch,
+    oauthBroker,
+    ...(runtimeOverrides?.catalog ? { catalog: runtimeOverrides.catalog } : {}),
     logger,
   };
   // Copilot socket: mounted whenever a transport is available — a scripted

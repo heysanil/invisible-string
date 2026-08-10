@@ -57,15 +57,25 @@ function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
-export function loadIntegrationsConfig(
-  env: Env,
-  stateSecret: string,
-): IntegrationsConfig {
-  const publicAppUrl = trimTrailingSlash(
+/**
+ * THE public app origin (no trailing slash): PUBLIC_APP_URL →
+ * BETTER_AUTH_URL → localhost fallback. Exported so every consumer — Slack
+ * OAuth redirect URIs, ingress URLs, and the MCP OAuth broker's redirect
+ * URI/CIMD client id/postMessage target — derives the exact same value.
+ */
+export function publicAppUrlFromEnv(env: Env): string {
+  return trimTrailingSlash(
     env.PUBLIC_APP_URL?.trim() ||
       env.BETTER_AUTH_URL?.trim() ||
       "http://localhost:3000",
   );
+}
+
+export function loadIntegrationsConfig(
+  env: Env,
+  stateSecret: string,
+): IntegrationsConfig {
+  const publicAppUrl = publicAppUrlFromEnv(env);
 
   const clientId = env.SLACK_CLIENT_ID?.trim();
   const clientSecret = env.SLACK_CLIENT_SECRET?.trim();

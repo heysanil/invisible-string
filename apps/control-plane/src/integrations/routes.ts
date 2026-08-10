@@ -15,6 +15,10 @@
  * - GET  /integrations/slack/callback OAuth redirect-back (state-signed)
  * - GET  /integrations/mcp-oauth/client-metadata.json  CIMD client-id document
  *        (fetched by MCP authorization servers — must stay unauthenticated)
+ * - GET  /integrations/mcp-oauth/callback  MCP OAuth consent redirect-back —
+ *        public PATH, but SESSION-BOUND inside (the popup shares the app's
+ *        cookies; oauth/broker.ts rejects callers who cannot manage the
+ *        connection's scope before any state claim or token exchange)
  *
  * WORKSPACE-SCOPED (Better Auth session, IDOR-guarded):
  * - GET/DELETE /workspaces/:id/integrations[...]         list / disconnect
@@ -101,6 +105,12 @@ import {
 import type { SlackClient } from "./slack-client";
 import { SlackEventDedup, verifySlackRequest } from "./slack-verify";
 import { hashIngressToken, generateIngressToken, tokenSuffix } from "./tokens";
+import {
+  handleCallback,
+  renderCallbackPage,
+  OAUTH_CALLBACK_CSP,
+  type OauthBrokerDeps,
+} from "../oauth/broker";
 import { buildClientMetadataDocument } from "../oauth/client-identity";
 
 type WorkflowRow = typeof schema.workflows.$inferSelect;
@@ -122,6 +132,8 @@ export interface IntegrationDeps {
   ipRateLimiter: FixedWindowRateLimiter;
   /** Slack retry idempotency (dedup by event_id). */
   slackDedup: SlackEventDedup;
+  /** MCP OAuth consent broker (oauth/broker.ts) — the callback runs on it. */
+  oauthBroker: OauthBrokerDeps;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -250,6 +262,35 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         }
         return undefined;
       })
+
+      // ── PUBLIC path, SESSION-BOUND inside: MCP OAuth consent callback ─────
+      //
+      // The AS redirects the consent popup here; the popup shares the app's
+      // cookies, so handleCallback authenticates the Better Auth session and
+      // authorizes it against the connection's scope BEFORE claiming the
+      // single-use state or exchanging the code (a forwarded callback URL is
+      // useless to an outsider). Always renders the popup page — flow
+      // failures come back as `ok:false` postMessages, never JSON errors.
+      // The per-route CSP admits exactly this page's inline script; the
+      // app-wide `default-src 'self'` would block it.
+      .get(
+        "/integrations/mcp-oauth/callback",
+        async ({ query, request, set }) => {
+          const outcome = await handleCallback(
+            deps.oauthBroker,
+            {
+              ...(typeof query.code === "string" ? { code: query.code } : {}),
+              ...(typeof query.state === "string" ? { state: query.state } : {}),
+              ...(typeof query.error === "string" ? { error: query.error } : {}),
+            },
+            request.headers,
+          );
+          set.headers["content-type"] = "text/html; charset=utf-8";
+          set.headers["cache-control"] = "no-store";
+          set.headers["content-security-policy"] = OAUTH_CALLBACK_CSP;
+          return renderCallbackPage(outcome, config.publicAppUrl);
+        },
+      )
 
       // ── PUBLIC: webhook + form ingress ────────────────────────────────────
       .post(

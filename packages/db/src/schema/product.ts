@@ -790,6 +790,11 @@ export const connectionOauth = pgTable("connection_oauth", {
   authorizationServer: text("authorization_server"),
   authorizationEndpoint: text("authorization_endpoint"),
   tokenEndpoint: text("token_endpoint"),
+  /** Canonical RFC 8707 resource id from PRM discovery — sent on EVERY token
+   * request (exchange + refresh), not assumed equal to the connection URL. */
+  resource: text("resource"),
+  /** RFC 7009 endpoint when the AS advertises one (best-effort revocation). */
+  revocationEndpoint: text("revocation_endpoint"),
   scopes: jsonb("scopes").$type<string[]>(),
   clientId: text("client_id"),
   clientSecretEncrypted: text("client_secret_encrypted"),

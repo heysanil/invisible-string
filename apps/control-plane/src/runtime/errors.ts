@@ -228,6 +228,39 @@ export const errors = {
       "oauth_registration_failed",
       `OAuth client registration failed: ${detail}`,
     ),
+  /**
+   * OAuth discovery against the connection's MCP server failed — no usable
+   * OAuth metadata (this server is not an OAuth resource; use header auth
+   * instead), or its advertised authorization server was unreachable /
+   * egress-refused. `reason` is the discovery module's typed vocabulary
+   * (oauth/discovery.ts); messages carry URLs only, never OAuth values.
+   */
+  oauthDiscoveryFailed: (reason: string, detail?: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_discovery_failed",
+      detail ?? `OAuth discovery failed (${reason})`,
+      { reason },
+    ),
+  /** Consent-callback `state` unknown, expired, superseded, or already used. */
+  oauthStateInvalid: () =>
+    new RuntimeApiError(
+      400,
+      "oauth_state_invalid",
+      "OAuth state is missing, expired, or already used",
+    ),
+  /**
+   * The authorization server rejected the code/token exchange. `detail`
+   * carries the HTTP status and the RFC 6749 `error` code at most — NEVER a
+   * response body, authorization code, verifier, or token value
+   * (oauth/broker.ts).
+   */
+  oauthExchangeFailed: (detail: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_exchange_failed",
+      `OAuth token exchange failed: ${detail}`,
+    ),
   noPendingInput: () =>
     new RuntimeApiError(
       409,

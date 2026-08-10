@@ -19,6 +19,7 @@ import {
   newId,
   updateConnectionRequestSchema,
   type ConnectorCatalogEntry,
+  type CreateConnectionResponse,
   type DeleteResourceResponse,
   type GetConnectionResponse,
   type ListConnectionsResponse,
@@ -54,15 +55,19 @@ async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
   return row;
 }
 
-/** Persisted auth_type for a validated auth WRITE (oauth arrives with Plan 3). */
-function authTypeOf(auth: McpAuthWrite | undefined): "none" | "bearer" | "headers" {
-  if (!auth || auth.type === "none") return "none";
+/** Persisted auth_type for a validated auth WRITE. */
+function authTypeOf(
+  auth: McpAuthWrite | undefined,
+): "none" | "bearer" | "headers" | "oauth" {
+  if (!auth) return "none";
   return auth.type;
 }
 
 /**
  * Validate a caller's auth WRITE against a catalog entry's recipe (spec §4):
  * - recipe `none`    → any supplied credentials are a 422 (the entry takes none);
+ * - recipe `oauth`   → no static credentials allowed — the grant arrives via
+ *                      the consent broker after install (spec §6);
  * - recipe `bearer`  → a non-empty bearer token is required;
  * - recipe `headers` → every SECRET header the recipe declares is required.
  */
@@ -78,6 +83,17 @@ function requireRecipeAuth(
       ]);
     }
     return { type: "none" };
+  }
+  if (recipe.type === "oauth") {
+    if (auth !== undefined && auth.type !== "oauth") {
+      throw errors.invalidBody([
+        {
+          path: "auth",
+          message: `catalog entry "${entry.slug}" uses OAuth — connect it after install instead of supplying credentials`,
+        },
+      ]);
+    }
+    return { type: "oauth" };
   }
   if (recipe.type === "bearer") {
     if (auth?.type !== "bearer" || auth.values.token.trim().length === 0) {
@@ -204,14 +220,14 @@ export async function createConnection(
   deps: ResourceDeps,
   scope: Scope,
   body: unknown,
-): Promise<GetConnectionResponse> {
+): Promise<CreateConnectionResponse> {
   const input = parseBody(createConnectionRequestSchema, body);
   // The auth envelope's AAD binds the row id, so the id exists BEFORE insert.
   const id = newId("cn");
 
   let values: typeof schema.connections.$inferInsert;
   if (input.source === "catalog") {
-    const entry = loadConnectorCatalog().get(input.slug);
+    const entry = (deps.catalog ?? loadConnectorCatalog()).get(input.slug);
     if (!entry) throw errors.catalogEntryNotFound(input.slug);
     const auth = requireRecipeAuth(entry, input.auth);
     values = {
@@ -273,6 +289,20 @@ export async function createConnection(
   await assertNameAndSlugFree(deps.db, scope, values.name);
   const rows = await deps.db.insert(schema.connections).values(values).returning();
   const row = rows[0]!;
+  // OAuth connections pair 1:1 with a `connection_oauth` grant row, born
+  // `pending` (spec §3/§6); the response carries the scope-correct start path
+  // so the UI chains straight into the consent popup.
+  let oauthStartPath: string | undefined;
+  if (row.authType === "oauth") {
+    await deps.db
+      .insert(schema.connectionOauth)
+      .values({ id: newId("co"), connectionId: row.id })
+      .onConflictDoNothing({ target: schema.connectionOauth.connectionId });
+    oauthStartPath =
+      scope.kind === "workspace"
+        ? `/workspaces/${scope.organizationId}/connections/${row.id}/oauth/start`
+        : `/me/connections/${row.id}/oauth/start`;
+  }
   // First health probe (spec §7): fire-and-forget — the create response NEVER
   // waits on or fails from it. The outcome lands on the row's probe columns;
   // an infrastructure failure only logs (no credential material in the error:
@@ -283,7 +313,10 @@ export async function createConnection(
       err: error,
     });
   });
-  return { connection: connectionDto(row) };
+  return {
+    connection: connectionDto(row, row.authType === "oauth" ? "pending" : null),
+    ...(oauthStartPath !== undefined ? { oauthStartPath } : {}),
+  };
 }
 
 export async function updateConnection(

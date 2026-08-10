@@ -151,6 +151,45 @@ function composer(): HTMLElement {
   return q().getByLabelText("Ask copilot");
 }
 
+/** Non-throwing lookup — the composer does not exist until the chunk lands. */
+function findComposer(): HTMLElement | null {
+  return q().queryByLabelText("Ask copilot");
+}
+
+/**
+ * Wait for the composer to mount AND take focus, polling both conditions.
+ *
+ * WHEN either happens is a property of the machine, not of the code. The
+ * dock's `focus()` arrives while the lazy editor chunk is still resolving, so
+ * `LazyComposerEditor` parks it in `pendingFocus` and replays it on attach —
+ * dynamic import → Suspense re-render → Tiptap mount → replayed focus →
+ * deferred caret. Until that resolves there is no "Ask copilot" label at all,
+ * which is why this polls a QUERY (nullable) rather than a `getBy*` (throws).
+ *
+ * A fixed sleep passed only while an earlier test had already warmed the
+ * editor module in bun's single-process module cache; cold, on a loaded CI
+ * runner, the chain takes seconds and the assertion fires too early.
+ *
+ * Deliberately NOT `waitFor`: it wraps every poll in `act()`, which here also
+ * flushes the dock's reconnect timers and fake sockets — measured at ~460s for
+ * this file versus ~1s for this loop.
+ */
+async function waitForComposerFocus(): Promise<void> {
+  // ~3s of budget. Sized against observed CI, not a fast local box: this test
+  // took 5.3s on the unit runner and 93s on the gated runner (which shares the
+  // machine with compose), where the old 5ms budget was off by three orders of
+  // magnitude. The budget costs nothing when the condition is already true.
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const target = findComposer();
+    if (target !== null && document.activeElement === target) return;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  }
+  // Out of budget — assert so the failure reports the real diff, not a timeout.
+  expect(document.activeElement).toBe(composer());
+}
+
 function sendUserMessage(socket: FakeWebSocket, text = "Help me") {
   const box = composer();
   pasteInto(box, text);
@@ -182,13 +221,12 @@ test("collapsed pill when closed; opening persists to the per-workspace key and 
   fireEvent.click(pill);
   expect(window.localStorage.getItem(OPEN_KEY)).toBe("1");
   expect(FakeWebSocket.instances.length).toBe(1);
-  // Focus lands on the composer, not <body>. Tiptap defers it a frame (the
-  // editor view has to be mounted before it can place a caret).
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  });
-  expect(document.activeElement).toBe(composer());
-});
+  // Focus lands on the composer, not <body>. See waitForComposerFocus for
+  // why this polls rather than sleeping a fixed interval.
+  await waitForComposerFocus();
+  // Explicit budget: the lazy chunk load is what makes this slow on a loaded
+  // runner, and it happens inside render() — before the poll even starts.
+}, 30_000);
 
 test("collapsing returns focus to the pill", () => {
   renderDock();
@@ -568,11 +606,9 @@ test("applying the focused card moves focus to the composer (not <body>)", async
   const card = q().getByTestId("suggestion-card");
   card.focus();
   fireEvent.keyDown(card, { key: "Enter" });
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  });
-  expect(document.activeElement).toBe(q().getByLabelText("Ask copilot"));
-});
+  // Same lazy-editor focus chain as the open-the-dock case above.
+  await waitForComposerFocus();
+}, 30_000);
 
 test("unmount tears the socket down without reconnecting", async () => {
   const { view } = renderDock();

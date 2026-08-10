@@ -60,6 +60,8 @@ export const PORTS = {
   preview: port("E2E_PREVIEW_PORT", 5173),
   /** Local stub MCP server the built agent's tools call. */
   stubMcp: port("E2E_STUB_MCP_PORT", 4315),
+  /** Stub OAuth authorization server (the oauth-connection spec's AS). */
+  stubAs: port("E2E_STUB_AS_PORT", 4316),
   /** Pool the worker draws AGENT ports from — see the invariant below. */
   agentMin: port("E2E_AGENT_PORT_MIN", 4320),
   agentMax: port("E2E_AGENT_PORT_MAX", 4399),
@@ -81,6 +83,7 @@ export const PORTS = {
     ["controlPlane", PORTS.controlPlane],
     ["worker", PORTS.worker],
     ["stubMcp", PORTS.stubMcp],
+    ["stubAs", PORTS.stubAs],
     ["preview", PORTS.preview],
   ];
   const clashes = services
@@ -113,6 +116,14 @@ export const STUB_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp`;
  * registry is never contacted.
  */
 export const REGISTRY_STUB_BASE_URL = `http://127.0.0.1:${PORTS.stubMcp}`;
+/**
+ * The stub server's OAuth-protected MCP endpoint (oauth-connection spec): a
+ * third path on the stub whose `tools/call` demands a bearer token the stub
+ * AS issued — 401 + RFC 9728 `WWW-Authenticate` PRM pointer otherwise.
+ */
+export const STUB_OAUTH_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp-oauth`;
+/** The stub OAuth authorization server (scripts/stub-as.ts). */
+export const STUB_AS_URL = `http://127.0.0.1:${PORTS.stubAs}`;
 /** Meilisearch endpoint of the harness compose service (server-side client). */
 export const MEILISEARCH_URL = `http://127.0.0.1:${PORTS.meilisearch}`;
 /** The compose service's hardcoded dev master key (see docker-compose.yml). */
@@ -185,6 +196,11 @@ export function controlPlaneEnv(): Record<string, string> {
     // the stub MCP server is both. DEV/E2E ONLY, exactly like the compose
     // secrets above (never set in production).
     MCP_PROBE_ALLOW_PRIVATE: "1",
+    // Broker-delivered OAuth (plan-3): compiled agents mint a version-bound
+    // platform JWT and call POST /internal/connections/token here. The agents
+    // run as local Node processes, so the control plane under test IS the
+    // reachable base URL (127.0.0.1 explicitly — see the URL note above).
+    PLATFORM_API_URL: `http://127.0.0.1:${PORTS.controlPlane}`,
     // Community search rides the harness Meilisearch; the registry→Meilisearch
     // sync ticks fast so global-setup can await the first successful sync
     // (a boot-time run can race the stub's listen — 5 s retries it quickly).

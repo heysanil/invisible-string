@@ -26,6 +26,7 @@ import {
   REGISTRY_SERVER_NAME,
   REGISTRY_SERVER_TITLE,
   REPO_ROOT,
+  STUB_AS_URL,
   STUB_MCP_URL,
   WORKER_URL,
   controlPlaneEnv,
@@ -188,9 +189,17 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     ...extra,
   });
 
-  console.log("[e2e:setup] starting stub MCP · control-plane · worker · preview…");
+  console.log(
+    "[e2e:setup] starting stub MCP · stub OAuth AS · control-plane · worker · preview…",
+  );
   processes.push(
     spawnManaged("stub-mcp", "bun", ["e2e/scripts/stub-mcp.ts"], {
+      cwd: REPO_ROOT,
+      env: fullEnv({}),
+    }),
+  );
+  processes.push(
+    spawnManaged("stub-as", "bun", ["e2e/scripts/stub-as.ts"], {
       cwd: REPO_ROOT,
       env: fullEnv({}),
     }),
@@ -234,6 +243,10 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     expectOk: true,
   });
   await waitForHttp(`http://127.0.0.1:${PORTS.stubMcp}/__calls`, {
+    timeoutMs: 20_000,
+    expectOk: true,
+  });
+  await waitForHttp(`${STUB_AS_URL}/__stats`, {
     timeoutMs: 20_000,
     expectOk: true,
   });

@@ -1,5 +1,6 @@
 /**
- * Local stub server (run under BUN) that fronts two things the harness needs:
+ * Local stub server (run under BUN) that fronts three things the harness
+ * needs:
  *
  *  1. A protocol-correct MCP server at POST /mcp, built on the official SDK's
  *     StreamableHTTPServerTransport (stateless). eve connects here with the AI
@@ -14,9 +15,22 @@
  *     registry. The fixture carries `_meta` isLatest/status so the sync's
  *     entry→action mapping ingests it, and its remote declares a secret
  *     header so the add-connection dialog's credential form is exercised.
+ *  3. An OAUTH-PROTECTED MCP endpoint at /mcp-oauth (oauth-connection spec):
+ *     `tools/call` demands `Authorization: Bearer <token>` validated against
+ *     the stub AS (scripts/stub-as.ts, POST /__introspect) — 401 with the
+ *     RFC 9728 `WWW-Authenticate` `resource_metadata` pointer otherwise. The
+ *     PRM at the path-aware well-known names the stub AS, so the control
+ *     plane's real discovery → DCR → consent → token chain runs against it.
+ *     MCP HANDSHAKE methods (initialize/tools/list) stay open: the control
+ *     plane's probe dials with static headers only (OAuth probes carry no
+ *     broker token — plan-2 probe semantics), and the empirical gate is
+ *     `tools/call`, which only the compiled agent's broker-delivered bearer
+ *     can pass.
  *
  * Bound to 127.0.0.1 so the agent process (localhost worker) reaches it while
- * nothing external can. GET /__calls reports tool invocations for assertions.
+ * nothing external can. GET /__calls reports tool invocations (plus the
+ * /mcp-oauth request log — rpc method and whether a VALID bearer was carried;
+ * token values never appear in any response or log line) for assertions.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -28,9 +42,15 @@ import {
   REGISTRY_SECRET_HEADER,
   REGISTRY_SERVER_NAME,
   REGISTRY_SERVER_TITLE,
+  STUB_AS_URL,
+  STUB_OAUTH_MCP_URL,
 } from "../config.ts";
 
 const callLog: { name: string; args: unknown }[] = [];
+/** Tool invocations that arrived through the OAuth-gated /mcp-oauth. */
+const oauthCallLog: { name: string; args: unknown }[] = [];
+/** Every /mcp-oauth rpc request: method + bearer validity (never values). */
+const oauthRequestLog: { rpcMethod: string; authValid: boolean }[] = [];
 
 /** Canned registry server (remote points back at this stub's MCP endpoint). */
 const REGISTRY_SERVER = {
@@ -64,7 +84,7 @@ const REGISTRY_SERVER = {
 };
 
 /** A fresh MCP server per request (stateless transport). */
-function buildMcpServer(): McpServer {
+function buildMcpServer(log: { name: string; args: unknown }[] = callLog): McpServer {
   const server = new McpServer({ name: "e2e-stub-notes", version: "1.0.0" });
   server.registerTool(
     "save_note",
@@ -73,11 +93,42 @@ function buildMcpServer(): McpServer {
       inputSchema: { note: z.string().describe("The note text to save.") },
     },
     async ({ note }) => {
-      callLog.push({ name: "save_note", args: { note } });
+      log.push({ name: "save_note", args: { note } });
       return { content: [{ type: "text", text: `note saved: ${note}` }] };
     },
   );
   return server;
+}
+
+/** RFC 9728 challenge for the OAuth-protected endpoint. */
+const OAUTH_PRM_URL = `http://127.0.0.1:${PORTS.stubMcp}/.well-known/oauth-protected-resource/mcp-oauth`;
+
+function sendUnauthorized(res: ServerResponse): void {
+  res.statusCode = 401;
+  res.setHeader(
+    "WWW-Authenticate",
+    `Bearer resource_metadata="${OAUTH_PRM_URL}", error="invalid_token"`,
+  );
+  sendJson(res, { error: "invalid_token" });
+}
+
+/** Validate a bearer against the stub AS. Unreachable AS ⇒ invalid. */
+async function introspectBearer(authorization: string | undefined): Promise<boolean> {
+  const token = /^Bearer\s+(.+)$/i.exec(authorization ?? "")?.[1];
+  if (token === undefined) return false;
+  try {
+    const res = await fetch(`${STUB_AS_URL}/__introspect`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token }).toString(),
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { active?: boolean };
+    return body.active === true;
+  } catch {
+    return false;
+  }
 }
 
 function sendJson(res: ServerResponse, body: unknown): void {
@@ -96,7 +147,20 @@ const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORTS.stubMcp}`);
 
   if (url.pathname === "/__calls") {
-    sendJson(res, { calls: callLog });
+    sendJson(res, {
+      calls: callLog,
+      oauthCalls: oauthCallLog,
+      oauthRequests: oauthRequestLog,
+    });
+    return;
+  }
+  // RFC 9728 protected-resource metadata for /mcp-oauth (path-aware
+  // well-known — the same URL the 401 challenge points at).
+  if (url.pathname === "/.well-known/oauth-protected-resource/mcp-oauth") {
+    sendJson(res, {
+      resource: STUB_OAUTH_MCP_URL,
+      authorization_servers: [STUB_AS_URL],
+    });
     return;
   }
   // MCP registry REST API (control-plane proxy is redirected here).
@@ -106,6 +170,52 @@ const httpServer = createServer(async (req, res) => {
   }
   if (url.pathname.startsWith("/v0.1/servers/")) {
     sendJson(res, REGISTRY_SERVER);
+    return;
+  }
+
+  // The OAuth-protected MCP endpoint. Auth gate BEFORE any transport work:
+  //  - a non-SSE GET is the control plane's unauthenticated discovery probe →
+  //    401 + the WWW-Authenticate PRM pointer (what discoverOauth reads);
+  //  - `tools/call` demands a bearer the stub AS says is active — the
+  //    compiled agent's broker-delivered token — else the same 401 challenge
+  //    (eve surfaces it as a failed tool call; spike finding 30);
+  //  - handshake methods pass without auth so plan-2 probes classify `ok`
+  //    (the probe never carries broker tokens).
+  if (url.pathname === "/mcp-oauth") {
+    if (
+      req.method === "GET" &&
+      !(req.headers.accept ?? "").includes("text/event-stream")
+    ) {
+      sendUnauthorized(res);
+      return;
+    }
+    let body: unknown;
+    try {
+      body = req.method === "POST" ? await readJsonBody(req) : undefined;
+    } catch {
+      body = undefined;
+    }
+    const rpcMethod =
+      body && typeof body === "object" && "method" in body
+        ? ((body as { method?: string }).method ?? "?")
+        : "?";
+    const authValid = await introspectBearer(req.headers.authorization);
+    oauthRequestLog.push({ rpcMethod, authValid });
+    console.log(`[e2e:stub-mcp] ${req.method} /mcp-oauth ${rpcMethod} authValid=${authValid}`);
+    if (rpcMethod === "tools/call" && !authValid) {
+      sendUnauthorized(res);
+      return;
+    }
+    const server = buildMcpServer(oauthCallLog);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless
+    });
+    res.on("close", () => {
+      void transport.close();
+      void server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
     return;
   }
 

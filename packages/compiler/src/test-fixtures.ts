@@ -244,10 +244,54 @@ export const anthropicModelFixture: CompilerFixture = {
   },
 };
 
+/**
+ * OAuth (broker-delivered) connection — connectors redesign spec §6. The
+ * agent holds NO OAuth material: the generated connection's `getToken` calls
+ * `platformConnectionToken`, which self-mints a version-bound platform JWT
+ * and fetches a short-lived access token from the control plane's
+ * `POST /internal/connections/token`. Pins the `agent/lib/platform-token.ts`
+ * emission and the oauth `auth` branch (no other fixture reaches either).
+ */
+export const oauthConnectionFixture: CompilerFixture = {
+  name: "oauth-connection",
+  definition: {
+    persona:
+      "You are the team's project coordinator. Track work in @linear, keep issue statuses accurate, and never close an issue without an explicit confirmation.",
+    model: { preset: "balanced" },
+    context: {
+      mcpConnectionIds: ["cn_ab12cd34ef56gh78"],
+      skillIds: [],
+    },
+  },
+  deps: {
+    versions: TEST_VERSIONS,
+    resolvedModel: {
+      provider: "openrouter",
+      modelId: "deepseek/deepseek-v4-pro",
+      reasoning: "high",
+    },
+    workspaceSlug: "acme",
+    agentSlug: "project-coordinator",
+    connections: [
+      {
+        id: "cn_ab12cd34ef56gh78",
+        slug: "linear",
+        url: "https://mcp.linear.app/mcp",
+        description:
+          "Linear: search, create, and update issues, projects, and comments in the team's Linear workspace.",
+        auth: { kind: "oauth", connectionId: "cn_ab12cd34ef56gh78" },
+        approval: { mode: "once" },
+      },
+    ],
+    skills: [],
+  },
+};
+
 export const ALL_FIXTURES: readonly CompilerFixture[] = [
   basicFixture,
   mcpSkillFixture,
   customApprovalFixture,
   flatSkillFixture,
   anthropicModelFixture,
+  oauthConnectionFixture,
 ];

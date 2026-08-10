@@ -116,8 +116,14 @@ export async function resolveCompileInputs(
     if (!owned) throw errors.contextResourceNotFound("mcp_connection", id);
 
     // Learn the auth shape (bearer vs headers) + header NAMES without ever
-    // baking a secret value into the generated files.
-    const shape = mcpAuthShape(row.authConfigEncrypted, deps.masterKey, row.id);
+    // baking a secret value into the generated files. OAuth rows carry no
+    // static credentials at all (their grant lives on `connection_oauth`):
+    // the adapter maps the flag to the compiler's broker-delivered
+    // `{kind:"oauth", connectionId}` auth.
+    const oauth = row.authType === "oauth";
+    const shape = oauth
+      ? ({ kind: "none" } as const)
+      : mcpAuthShape(row.authConfigEncrypted, deps.masterKey, row.id);
     connections.push({
       id: row.id,
       name: row.name,
@@ -131,6 +137,7 @@ export async function resolveCompileInputs(
               envVar: mcpHeaderEnvName(row.name, header),
             }))
           : null,
+      oauth,
       toolAllow: row.toolAllow ?? null,
       toolBlock: row.toolBlock ?? null,
       approvalPolicy:

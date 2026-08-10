@@ -9,6 +9,7 @@ import {
   basicFixture,
   customApprovalFixture,
   mcpSkillFixture,
+  oauthConnectionFixture,
   ALL_FIXTURES,
 } from "./test-fixtures";
 import type { CompileDeps } from "./types";
@@ -200,6 +201,64 @@ describe("generated content invariants", () => {
       .files.get("agent/connections/deepwiki.ts")!;
     expect(deepwiki).toContain("approval: never(),");
     expect(deepwiki).not.toContain("auth:");
+  });
+
+  test("oauth connection: broker getToken + platform-token lib, no OAuth material anywhere", () => {
+    const { files } = compile(
+      oauthConnectionFixture.definition,
+      oauthConnectionFixture.deps,
+    );
+    expect([...files.keys()].sort()).toEqual([
+      "agent/agent.ts",
+      "agent/channels/eve.ts",
+      "agent/connections/linear.ts",
+      "agent/instructions.md",
+      "agent/lib/env.ts",
+      "agent/lib/platform-auth.ts",
+      "agent/lib/platform-token.ts",
+      "package.json",
+      "tsconfig.json",
+    ]);
+    const connection = files.get("agent/connections/linear.ts")!;
+    // The generated auth defers ENTIRELY to the platform token broker.
+    expect(connection).toContain(
+      'getToken: async () => ({ token: await platformConnectionToken("cn_ab12cd34ef56gh78") }),',
+    );
+    expect(connection).toContain(
+      'import { platformConnectionToken } from "../lib/platform-token.js";',
+    );
+    // No static-credential env var reads on the oauth branch.
+    expect(connection).not.toContain("requireEnv");
+
+    const lib = files.get("agent/lib/platform-token.ts")!;
+    // Env reads live INSIDE the call (keyless `eve build` must never crash).
+    expect(lib).toContain('requireEnv("PLATFORM_API_URL")');
+    expect(lib).toContain('requireEnv("PLATFORM_JWT_SECRET")');
+    expect(lib).toContain("/internal/connections/token");
+    // The JWT is hand-rolled on node:crypto — no runtime deps in generated
+    // projects, and the version-bound audience comes from platform-auth.
+    expect(lib).toContain('import { createHmac } from "node:crypto";');
+    expect(lib).toContain("PLATFORM_JWT_AUDIENCE");
+    expect(lib).toContain("connection needs re-authorization");
+  });
+
+  test("oauth vs bearer auth on the SAME definition hash differently (spec §8)", () => {
+    const oauth = compile(
+      oauthConnectionFixture.definition,
+      oauthConnectionFixture.deps,
+    );
+    const bearerDeps = {
+      ...oauthConnectionFixture.deps,
+      connections: [
+        {
+          ...oauthConnectionFixture.deps.connections[0]!,
+          auth: { kind: "bearerToken" as const },
+        },
+      ],
+    };
+    const bearer = compile(oauthConnectionFixture.definition, bearerDeps);
+    expect(bearer.hash).not.toBe(oauth.hash);
+    expect(bearer.files.has("agent/lib/platform-token.ts")).toBe(false);
   });
 
   test("package.json pins exactly per provider, names agent--<ws>--<agent>, never emits a lockfile", () => {

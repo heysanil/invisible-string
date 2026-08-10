@@ -165,7 +165,14 @@ function resolveConnection(
     ]);
   }
   let auth: ResolvedMcpConnection["auth"] = { kind: "none" };
-  if (connection.envTokenVar !== null) {
+  if (connection.oauth === true) {
+    // Broker-delivered OAuth (spec §6): the generated `getToken` calls the
+    // platform token broker by CONNECTION ID — no env var, no static
+    // credential. The env-name agreement guard for this path lives in
+    // runtime/agent-env.ts: it injects PLATFORM_API_URL (the compiler's
+    // PLATFORM_API_URL_ENV) which the emitted platform-token lib reads.
+    auth = { kind: "oauth", connectionId: connection.id };
+  } else if (connection.envTokenVar !== null) {
     const canonical = connectionTokenEnvVar(slug);
     if (connection.envTokenVar !== canonical) {
       // Dispatcher (mcpTokenEnvName) and generated code (connectionTokenEnvVar)

@@ -41,6 +41,7 @@ import {
   basicFixture,
   customApprovalFixture,
   mcpSkillFixture,
+  oauthConnectionFixture,
   type CompilerFixture,
 } from "./test-fixtures";
 
@@ -257,6 +258,30 @@ describe.skipIf(!GATE)("eve build (gated)", () => {
         expect(body).toMatchObject({ model: "deepseek/deepseek-v4-pro" });
         expect("reasoning" in body).toBe(false);
       }
+    },
+    1_200_000,
+  );
+
+  // The broker-delivered OAuth artifact (connectors redesign spec §6): the
+  // emitted platform-token lib (hand-rolled node:crypto JWT + fetch against
+  // the runtime token route) must survive a KEYLESS eve build — its env
+  // reads (PLATFORM_API_URL, PLATFORM_JWT_SECRET) live inside the call, so
+  // the build needs neither.
+  test(
+    "oauth-connection fixture (platform-token lib) eve-builds keyless",
+    async () => {
+      const projectDir = await ensureInstalled(oauthConnectionFixture);
+      expect(existsSync(join(projectDir, "agent", "lib", "platform-token.ts"))).toBe(
+        true,
+      );
+      const build = await run(
+        [node24Bin(), join(projectDir, "node_modules", "eve", "bin", "eve.js"), "build"],
+        projectDir,
+        env,
+        420_000,
+      );
+      expect(build.exitCode, `eve build failed:\n${build.output.slice(-4000)}`).toBe(0);
+      expect(existsSync(join(projectDir, ".output", "server", "index.mjs"))).toBe(true);
     },
     1_200_000,
   );

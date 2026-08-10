@@ -140,6 +140,17 @@ export interface RuntimeConfig {
    * set in production: it disables the SSRF containment.
    */
   mcpProbeAllowPrivate: boolean;
+  /**
+   * PLATFORM_API_URL — the control-plane base URL as reachable from the
+   * WORKER network (prod compose: `http://control-plane:3000`; dev:
+   * `http://localhost:3000`). Injected into every agent env under the same
+   * name (compiler PLATFORM_API_URL_ENV): compiled agents with broker-
+   * delivered OAuth connections call `POST /internal/connections/token` on
+   * it. Optional: absent, agents boot fine but any oauth connection's tool
+   * calls fail with a missing-env error — a degraded state, not a boot
+   * failure.
+   */
+  platformApiUrl?: string;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -278,7 +289,14 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     meilisearchMasterKey: env.MEILISEARCH_MASTER_KEY?.trim() || undefined,
     registrySyncIntervalMs,
     mcpProbeAllowPrivate: env.MCP_PROBE_ALLOW_PRIVATE?.trim() === "1",
+    platformApiUrl: normalizeBaseUrl(env.PLATFORM_API_URL),
   };
+}
+
+/** Trim + drop a trailing slash so path joins never double up. */
+function normalizeBaseUrl(raw: string | undefined): string | undefined {
+  const value = raw?.trim().replace(/\/+$/, "");
+  return value || undefined;
 }
 
 function parseWorkerAllowedIds(raw: string | undefined): string[] | undefined {

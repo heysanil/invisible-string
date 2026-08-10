@@ -22,7 +22,11 @@ import {
 import { emitAgentTs } from "./codegen/agent";
 import { emitEveChannel } from "./codegen/channels";
 import { emitConnection } from "./codegen/connections";
-import { emitEnvLib, emitPlatformAuthLib } from "./codegen/libs";
+import {
+  emitEnvLib,
+  emitPlatformAuthLib,
+  emitPlatformTokenLib,
+} from "./codegen/libs";
 import { emitPackageJson, emitTsconfig } from "./codegen/project";
 import { emitSkill } from "./codegen/skills";
 import {
@@ -201,6 +205,17 @@ function validateConnection(connection: ResolvedMcpConnection): void {
       { slug: connection.slug },
     );
   }
+  if (connection.auth.kind === "oauth") {
+    // The broker resolves tokens BY THIS ID — a mismatch would let one
+    // connection's generated module fetch another connection's token.
+    if (connection.auth.connectionId !== connection.id) {
+      throw new CompileError(
+        "INVALID_DEPS",
+        `connection "${connection.slug}" oauth auth names connectionId "${connection.auth.connectionId}" but the connection's id is "${connection.id}"`,
+        { slug: connection.slug, connectionId: connection.auth.connectionId },
+      );
+    }
+  }
   if (connection.auth.kind === "headers") {
     const entries = Object.entries(connection.auth.headers);
     if (entries.length === 0) {
@@ -369,6 +384,13 @@ export function compile(
   files.set("agent/lib/platform-auth.ts", emitPlatformAuthLib(dev, hash));
   if (connections.some((connection) => connection.auth.kind !== "none")) {
     files.set("agent/lib/env.ts", emitEnvLib());
+  }
+  if (connections.some((connection) => connection.auth.kind === "oauth")) {
+    // Broker-delivered OAuth (spec §6): the lib self-mints a version-bound
+    // platform JWT and fetches short-lived access tokens from the control
+    // plane. It imports requireEnv (env lib emitted above — oauth ≠ none)
+    // and the audience/issuer constants from platform-auth.
+    files.set("agent/lib/platform-token.ts", emitPlatformTokenLib());
   }
   files.set("agent/channels/eve.ts", emitEveChannel(sortedDeps));
 

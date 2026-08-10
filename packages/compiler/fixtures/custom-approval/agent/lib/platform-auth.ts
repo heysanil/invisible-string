@@ -12,7 +12,7 @@ import {
  * Claim constants mirror the platform contract (packages/shared).
  */
 export const PLATFORM_JWT_ISSUER = "invisible-string";
-export const PLATFORM_JWT_AUDIENCE = "agent-version:4b190270568c91966c890cc16019ad063772ba69644ff41382643b607f3ca8e2";
+export const PLATFORM_JWT_AUDIENCE = "agent-version:243f655b479871533f340b84d556e895d0593b9251d67d13b3dbe8f43db1ba67";
 
 export function platformJwt(): AuthFn<Request> {
   return async (request) => {

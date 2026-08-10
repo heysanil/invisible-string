@@ -60,9 +60,14 @@ export interface ResolvedModel {
 
 /**
  * How the generated connection authenticates against the MCP server. Values
- * name ENV VARS, never secrets:
+ * name ENV VARS or row IDS, never secrets:
  * - `bearerToken`: `auth.getToken` reads `MCP_<SLUG_UPPER>_TOKEN`.
  * - `headers`: each header reads the named env var lazily per request.
+ * - `oauth`: BROKER-DELIVERED (connectors redesign spec §6) — no OAuth
+ *   material ever enters agent env or generated files. `auth.getToken`
+ *   calls the emitted `platformConnectionToken(connectionId)`, which
+ *   self-mints a version-bound platform JWT and fetches a short-lived
+ *   access token from the control plane's `POST /internal/connections/token`.
  */
 export type ConnectionAuthSpec =
   | { readonly kind: "none" }
@@ -71,6 +76,15 @@ export type ConnectionAuthSpec =
       readonly kind: "headers";
       /** header name → ENV VAR NAME holding its value. */
       readonly headers: Readonly<Record<string, string>>;
+    }
+  | {
+      readonly kind: "oauth";
+      /**
+       * The `connections` row id the broker resolves tokens for — must equal
+       * the connection's own `id` (enforced at compile; a mismatch would let
+       * one connection's module fetch another's token).
+       */
+      readonly connectionId: string;
     };
 
 /** Per-tool decision inside a custom approval policy. */

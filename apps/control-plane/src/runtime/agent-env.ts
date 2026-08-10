@@ -16,12 +16,20 @@
  * - WORKFLOW_POSTGRES_MAX_POOL_SIZE / _WORKER_CONCURRENCY → connection budget
  * - PLATFORM_JWT_SECRET        → channel-auth verification secret, DERIVED
  *                                per version (never the platform master)
+ * - PLATFORM_API_URL           → control-plane base URL (when configured) for
+ *                                the emitted platform-token lib's
+ *                                POST /internal/connections/token — the
+ *                                broker-delivered OAuth path; access tokens
+ *                                themselves NEVER enter agent env
  * - exactly ONE provider key   → matching the version's RESOLVED provider
  * - OPENROUTER_BASE_URL        → passthrough when set (test harnesses)
  * - MCP_<CONN>_TOKEN           → decrypted from `connections` auth envelopes
  */
 import { inArray } from "drizzle-orm";
-import { connectionTokenEnvVar } from "@invisible-string/compiler";
+import {
+  connectionTokenEnvVar,
+  PLATFORM_API_URL_ENV,
+} from "@invisible-string/compiler";
 import { schema } from "@invisible-string/db";
 import {
   decryptSecret,
@@ -195,6 +203,14 @@ export function buildAgentEnv(input: BuildAgentEnvInput): Record<string, string>
       runtime.platformJwtSecret,
       input.contentHash,
     ),
+    // Control-plane base URL for the broker-delivered OAuth path: the
+    // generated platform-token lib reads the compiler's PLATFORM_API_URL_ENV
+    // (env-name agreement — same constant on both sides, like
+    // connectionTokenEnvVar above). Absent config degrades oauth tool calls
+    // only, never the boot.
+    ...(runtime.platformApiUrl
+      ? { [PLATFORM_API_URL_ENV]: runtime.platformApiUrl }
+      : {}),
     // TEST HARNESS ONLY (see runtime/config.ts): eve's built-in mock model.
     ...(runtime.mockAuthoredModels ? { EVE_MOCK_AUTHORED_MODELS: "1" } : {}),
     ...(provider === "openrouter"

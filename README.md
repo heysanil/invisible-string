@@ -90,9 +90,11 @@ flowchart LR
   into the task message and delivers it to the bound agent version over
   eve's session API, version-bound JWTs), outbound Slack reply delivery,
   NDJSON tailer → resumable SSE, the connections domain (curated connector
-  catalog + a registry→Meilisearch sync job backing community search, plus
-  MCP health probes over an SSRF-guarded egress path that cache each
-  server's tool list), and the copilot WebSocket tool loop.
+  catalog + a registry→Meilisearch sync job backing community search, MCP
+  health probes over an SSRF-guarded egress path that cache each server's
+  tool list, and an MCP OAuth 2.1 broker — popup consent, envelope-encrypted
+  tokens refreshed centrally, just-in-time token delivery to compiled
+  agents), and the copilot WebSocket tool loop.
 - **Worker** (`apps/worker`) — a stateless Bun supervisor that pulls artifacts,
   boots each compiled agent under Node 24, reverse-proxies traffic to it, and
   reaps idle processes, idle sandboxes, and cold artifacts.
@@ -233,7 +235,11 @@ are added through a three-lane dialog: a **curated connector catalog**
 search** over a Meilisearch mirror of the official MCP registry
 (typo-tolerant, verified publishers ranked first; installs re-verify the
 remote against the live registry), or a **custom server URL** — with
-write-once encrypted secrets throughout. Every connection carries a live
+write-once encrypted secrets throughout. Connectors that speak MCP OAuth
+(Linear, Notion, Sentry, Neon, PayPal, Vercel) connect in one click: the
+platform brokers the consent popup and keeps the tokens — encrypted at rest,
+refreshed centrally, handed to a running agent only at tool-call time, never
+stored in agent env. Every connection carries a live
 **health state** (probed automatically after install, re-probed when a stale
 detail panel opens or from its **Test connection** button) and a cached list
 of the tools its server actually exposes — the connection detail panel and

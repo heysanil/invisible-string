@@ -19,7 +19,10 @@ one-click install, community search over a mirrored index of the official MCP
 registry (every install is re-verified against the live registry), and a custom
 server URL for anything else. Any credentials a connection needs are stored
 write-once and encrypted; the API only ever reports whether a connection has
-credentials, never their values. Every connection also carries a live health
+credentials, never their values. Connectors that support MCP OAuth — Linear,
+Notion, Sentry, and more — connect in one click through a consent popup: the
+platform holds and refreshes the tokens for you, so neither you nor your
+Agents ever handle a credential. Every connection also carries a live health
 state — probed automatically on install and re-checkable any time with Test
 connection — and a discovered list of the tools its server exposes, which
 powers per-agent tool filtering.

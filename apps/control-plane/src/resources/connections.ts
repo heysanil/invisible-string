@@ -29,6 +29,7 @@ import {
 
 import { slugifyName } from "../build/compiler-adapter";
 import type { Db } from "../db";
+import { revokeBestEffort } from "../oauth/tokens";
 import { probeAndPersist } from "../probe/service";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { loadConnectorCatalog } from "./catalog";
@@ -43,6 +44,19 @@ import {
 import { encryptConnectionAuthConfig } from "./mcp-crypto";
 
 type Row = typeof schema.connections.$inferSelect;
+type OauthGrantRow = typeof schema.connectionOauth.$inferSelect;
+
+async function loadOauthGrant(
+  db: Db,
+  connectionId: string,
+): Promise<OauthGrantRow | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.connectionOauth)
+    .where(eq(schema.connectionOauth.connectionId, connectionId))
+    .limit(1);
+  return rows[0];
+}
 
 async function loadOwned(db: Db, scope: Scope, id: string): Promise<Row> {
   const rows = await db
@@ -369,6 +383,50 @@ export async function updateConnection(
     patch.authType = authTypeOf(input.auth);
   }
 
+  // OAuth mutation transitions (spec §6). Switching auth OFF oauth ends the
+  // grant's life: revoke best-effort, then delete the 1:1 row. A URL change
+  // while STAYING oauth (custom rows only — others 422'd above) invalidates
+  // the grant a different way: the tokens, discovery metadata, and client
+  // registration were all bound to the OLD resource/AS, so revoke and reset
+  // the row to a blank `pending` for a fresh consent flow against the new URL.
+  if (existing.authType === "oauth") {
+    const leavingOauth = input.auth !== undefined && input.auth.type !== "oauth";
+    const urlChanging = input.url !== undefined && input.url !== existing.url;
+    if (leavingOauth || urlChanging) {
+      const grant = await loadOauthGrant(deps.db, id);
+      if (grant !== undefined) {
+        await revokeBestEffort(deps.oauthBroker, grant);
+        if (leavingOauth) {
+          await deps.db
+            .delete(schema.connectionOauth)
+            .where(eq(schema.connectionOauth.id, grant.id));
+        } else {
+          await deps.db
+            .update(schema.connectionOauth)
+            .set({
+              status: "pending",
+              authorizationServer: null,
+              authorizationEndpoint: null,
+              tokenEndpoint: null,
+              resource: null,
+              revocationEndpoint: null,
+              scopes: null,
+              clientId: null,
+              clientSecretEncrypted: null,
+              accessTokenEncrypted: null,
+              accessTokenExpiresAt: null,
+              refreshTokenEncrypted: null,
+              pendingState: null,
+              pendingCodeVerifierEncrypted: null,
+              pendingExpiresAt: null,
+              connectedBy: null,
+            })
+            .where(eq(schema.connectionOauth.id, grant.id));
+        }
+      }
+    }
+  }
+
   const rows = await deps.db
     .update(schema.connections)
     .set(patch)
@@ -382,9 +440,16 @@ export async function deleteConnection(
   scope: Scope,
   id: string,
 ): Promise<DeleteResourceResponse> {
-  await loadOwned(deps.db, scope, id);
+  const row = await loadOwned(deps.db, scope, id);
   const referencing = await connectionReferences(deps.db, scope, id);
   if (referencing.length > 0) throw errors.connectionInUse(referencing);
+  // Ending an OAuth connection revokes its grant at the AS best-effort
+  // (spec §6) before the row — and its cascading `connection_oauth` grant —
+  // is deleted. Revocation failures never block the delete.
+  if (row.authType === "oauth") {
+    const grant = await loadOauthGrant(deps.db, id);
+    if (grant !== undefined) await revokeBestEffort(deps.oauthBroker, grant);
+  }
   await deps.db
     .delete(schema.connections)
     .where(and(eq(schema.connections.id, id), scopeWhere(schema.connections, scope)));

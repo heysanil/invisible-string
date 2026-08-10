@@ -261,6 +261,19 @@ export const errors = {
       "oauth_exchange_failed",
       `OAuth token exchange failed: ${detail}`,
     ),
+  /**
+   * The connection's OAuth grant is not in a usable `connected` state — never
+   * connected, expired (refresh rejected with `invalid_grant`), revoked, or
+   * errored. Re-running the consent flow is the only recovery; thrown by the
+   * token lifecycle (oauth/tokens.ts) and surfaced as 409 on the agent-facing
+   * token route.
+   */
+  oauthNotConnected: () =>
+    new RuntimeApiError(
+      409,
+      "oauth_not_connected",
+      "connection is not OAuth-connected — run the consent flow first",
+    ),
   noPendingInput: () =>
     new RuntimeApiError(
       409,

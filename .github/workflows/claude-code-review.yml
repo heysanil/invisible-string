@@ -106,7 +106,7 @@ jobs:
       # lockfile is out of sync with its package.json (already caught by
       # ci.yml's `unit` job) would silently go unreviewed, which is the failure
       # this file's header exists to prevent.
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         if: ${{ env.OAUTH_SET == 'true' }}
         continue-on-error: true
 

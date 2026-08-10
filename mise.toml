@@ -1,5 +1,5 @@
 # Host toolchain pins — the single source of truth for the tools every lane
-# runs ON. CI installs exactly this via `jdx/mise-action@v2` (no `install_args`:
+# runs ON. CI installs exactly this via `jdx/mise-action@v4` (no `install_args`:
 # the action reads this file); locally, `mise trust && mise install` reproduces
 # it. Pins are EXACT, per AGENTS.md.
 #

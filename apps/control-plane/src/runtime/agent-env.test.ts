@@ -37,6 +37,7 @@ const RUNTIME: RuntimeConfig = {
   allowInsecureWorkerTransport: false,
   workerAuthMode: "shared-secret",
   registrySyncIntervalMs: 21_600_000,
+  mcpProbeAllowPrivate: false,
 };
 
 const HASH = "abcdef0123456789abcdef0123456789";

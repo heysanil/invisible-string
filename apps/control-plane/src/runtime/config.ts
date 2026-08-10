@@ -133,6 +133,13 @@ export interface RuntimeConfig {
    * search index. Only consulted when the Meilisearch client exists.
    */
   registrySyncIntervalMs: number;
+  /**
+   * MCP_PROBE_ALLOW_PRIVATE=1 — DEV/E2E/SELF-HOSTED ONLY: the guarded egress
+   * helper (net/guarded-fetch.ts) stops rejecting private/loopback targets
+   * AND allows plain http://, so probes can reach stubs on 127.0.0.1. Never
+   * set in production: it disables the SSRF containment.
+   */
+  mcpProbeAllowPrivate: boolean;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -270,6 +277,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     meilisearchUrl: env.MEILISEARCH_URL?.trim() || undefined,
     meilisearchMasterKey: env.MEILISEARCH_MASTER_KEY?.trim() || undefined,
     registrySyncIntervalMs,
+    mcpProbeAllowPrivate: env.MCP_PROBE_ALLOW_PRIVATE?.trim() === "1",
   };
 }
 

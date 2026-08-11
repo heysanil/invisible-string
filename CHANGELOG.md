@@ -8,6 +8,15 @@ Entries from `v0.3.0` onward are written at merge time as
 reconstruction** from the conventional-commit log between tags, not authored
 release notes.
 
+## v0.5.0 — 2026-08-11
+
+### Breaking changes
+- **control-plane, db, shared, web** — Rebuild the connections domain on new `connections` tables with a curated connector catalog, Meilisearch-mirrored community registry search, and unified create routes replacing the registry install flow.
+
+### Features
+- **compiler, control-plane, db, shared, web** — Add the MCP OAuth 2.1 broker: path-aware discovery, CIMD/DCR client identity, PKCE popup consent, envelope-encrypted tokens with single-flight central refresh, an agent-facing token route with audience-derived version binding, oauth codegen via getToken, and OAuth connectors in the catalog.
+- **control-plane, web** — Add connection health probes, cached tool discovery with a checkbox tool picker, a connection detail surface with test-connection, and a hardened SSRF-guarded egress path for all caller-influenced control-plane fetches.
+
 ## v0.4.0 — 2026-08-10
 
 ### Features

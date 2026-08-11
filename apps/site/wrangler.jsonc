@@ -4,9 +4,12 @@
   // Assets-only Worker: no `main` script — requests never invoke compute.
   "assets": {
     "directory": "./dist",
-    // Unmatched paths get index.html with HTTP 200 (replaces the GitHub
-    // Pages 404.html hack and its 404-status tradeoff).
-    "not_found_handling": "single-page-application"
+    // Every route is now a real prerendered file, so SPA fallback would serve
+    // the HOMEPAGE at 200 for every mistyped URL — an unbounded set of
+    // soft-404s all duplicating `/`. "404-page" serves dist/404.html with a
+    // genuine 404 status instead; real deep links still return 200 because
+    // they are real files.
+    "not_found_handling": "404-page"
   },
   // First deploy creates the apex DNS record + cert on the Cloudflare zone.
   "routes": [{ "pattern": "invisiblestring.io", "custom_domain": true }],

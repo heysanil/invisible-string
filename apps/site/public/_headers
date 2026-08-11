@@ -1,0 +1,7 @@
+# vite.config.ts sets these for the dev server and `vite preview` only —
+# Workers adds neither on its own, so production had no sniffing or referrer
+# protection at all. No X-Frame-Options: this is a public marketing site and
+# framing is fine (unlike the authenticated SPA).
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

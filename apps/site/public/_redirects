@@ -1,0 +1,6 @@
+# `/docs` has no page of its own — src/routes/docs.index.tsx redirects to the
+# overview in-app. A client-side redirect leaves `/docs` competing with
+# `/docs/getting-started/overview` for the same content, so consolidate it at
+# the edge with a real 301. Workers static assets reads this file from the
+# root of the asset directory (public/ is copied to dist/).
+/docs  /docs/getting-started/overview  301

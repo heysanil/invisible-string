@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && bun run build:client && bun run build:server && bun run prerender",
+    "build:client": "vite build",
+    "build:server": "vite build --ssr src/entry-server.tsx --outDir .ssr",
+    "prerender": "bun scripts/prerender.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

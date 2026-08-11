@@ -48,8 +48,39 @@ const LLMS_TEMPLATE = join(APP_ROOT, "scripts/llms-template.md");
 
 const SEO_MARKER = "<!--seo-->";
 const ROOT_MARKER = '<div id="root"></div>';
-/** Below this, a "rendered" page is really an empty shell. */
-const MIN_PAGE_BYTES = 2000;
+
+/**
+ * Below this, a "rendered" page is really an empty shell.
+ *
+ * Measured against `appHtml`, NOT the finished `html`: the template plus a
+ * page's JSON-LD head is already 2.2–3.8 kB on its own, so a threshold
+ * applied to the whole document is satisfied by a completely empty `#root`
+ * and can never fire. The smallest real page (404) renders 4337 bytes, so
+ * this sits ~4× below the floor — loose on purpose, since it exists to catch
+ * catastrophe, and `renderPage` already rejects genuinely empty output.
+ */
+const MIN_APP_BYTES = 1000;
+
+/**
+ * Every page's markup must OPEN with React's completed-Suspense-boundary
+ * marker. `PrerenderRootSuspense` (src/router.tsx) wraps the whole app so the
+ * emitted HTML carries the boundary the browser renders, and `hydrateRoot`
+ * matches a `<Suspense>` against exactly this comment pair.
+ *
+ * This is deliberately HALF a guard, and the half matters: it catches the
+ * SERVER side going out of shape — `InnerWrap` dropped, or moved inside the
+ * `isServer` branch by a router upgrade, or something rendering ahead of it.
+ * It CANNOT see the client side. If a future `@tanstack/react-router` changes
+ * what the browser wraps `Matches` in, this check still passes and hydration
+ * still silently breaks; only a real browser catches that.
+ *
+ * One related hazard it also cannot see: `router-core/isServer/server.js` is
+ * `process.env.NODE_ENV === "test" ? undefined : true`, so a build run under
+ * `NODE_ENV=test` makes `Matches` emit its own boundary IN ADDITION to
+ * `PrerenderRootSuspense` — a doubled boundary that still starts with this
+ * marker and still fails to hydrate. Don't build the site with NODE_ENV=test.
+ */
+const ROOT_BOUNDARY = "<!--$-->";
 
 /**
  * Markers React leaves behind when a page's content is streamed, swapped in by
@@ -58,13 +89,24 @@ const MIN_PAGE_BYTES = 2000;
  * suspended subtree is missing, so both pass while the page ships empty. A
  * page carrying any of these has content a crawler will never see, which
  * defeats the entire point of prerendering.
+ *
+ * ANCHORED to React's emitted form rather than matched as loose substrings.
+ * Bare `Loading…`, `div hidden` or `$RC(` are all things a doc page could
+ * legitimately say — prose, a code sample, an HTML snippet — and a false
+ * positive here fails the build with a message blaming React for the author's
+ * paragraph. Nothing in the tree collides today; anchoring keeps it that way.
+ * The two comment markers need no anchor: React escapes `<` in rendered text,
+ * so they cannot appear except as real markers.
  */
 const FORBIDDEN_ARTIFACTS: ReadonlyArray<[marker: string, why: string]> = [
   ["<!--$?-->", "an unresolved streaming Suspense boundary"],
   ["<!--$!-->", "an errored Suspense boundary — its fallback shipped instead"],
-  ["div hidden", "React's hidden parking div for a streamed segment"],
-  ["$RC(", "React's Fizz swap-script runtime"],
-  ["Loading…", "the docs route's Suspense fallback (routes/docs.$.tsx)"],
+  ['<div hidden id="S:', "React's hidden parking div for a streamed segment"],
+  ['$RC("B:', "React's Fizz swap-script runtime"],
+  [
+    'class="text-sm text-ink-3">Loading…<',
+    "the docs route's Suspense fallback (routes/docs.$.tsx)",
+  ],
 ];
 
 const problems: string[] = [];
@@ -94,7 +136,9 @@ async function main(): Promise<void> {
 
   if (!template.includes(SEO_MARKER) || !template.includes(ROOT_MARKER)) {
     throw new Error(
-      `dist/index.html is missing ${SEO_MARKER} or ${ROOT_MARKER} — the client build has changed shape and every injection would silently no-op`,
+      `dist/index.html is missing ${SEO_MARKER} or ${ROOT_MARKER}, so every injection below would silently no-op.\n` +
+        `  Most likely: this script was run on its own. It reads dist/index.html as its template AND overwrites it, so a second run in a row finds a rendered page with nothing left to substitute — re-run \`bun run build\` (or at least \`build:client\`) first.\n` +
+        `  Otherwise the client build has changed shape and index.html no longer carries both markers.`,
     );
   }
 
@@ -142,8 +186,13 @@ async function main(): Promise<void> {
       .replace(SEO_MARKER, () => renderHeadHtml(page.seo))
       .replace(ROOT_MARKER, () => `<div id="root">${appHtml}</div>`);
 
-    if (html.length < MIN_PAGE_BYTES) {
-      fail(`${page.out}: only ${html.length} bytes — the render produced an empty shell`);
+    if (appHtml.length < MIN_APP_BYTES) {
+      fail(`${page.out}: rendered only ${appHtml.length} bytes into #root — an empty shell`);
+    }
+    if (!appHtml.startsWith(ROOT_BOUNDARY)) {
+      fail(
+        `${page.out}: markup does not open with ${ROOT_BOUNDARY} — the root Suspense boundary is missing or displaced, so no browser can hydrate this page (see PrerenderRootSuspense in src/router.tsx)`,
+      );
     }
     if (!html.includes("<h1")) {
       fail(`${page.out}: no <h1> in the output — the route rendered nothing`);

@@ -9,7 +9,7 @@ import {
 } from "../lib/sidebar";
 
 function fm(title: string, section: string, order: number): DocFrontmatter {
-  return { title, section, order };
+  return { title, section, order, description: `${title} description` };
 }
 
 describe("buildSidebar", () => {

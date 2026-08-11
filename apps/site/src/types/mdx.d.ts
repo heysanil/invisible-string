@@ -6,6 +6,7 @@ declare module "*.mdx" {
     title: string;
     section: string;
     order: number;
+    description: string;
   };
 
   const MDXContent: ComponentType<Record<string, unknown>>;

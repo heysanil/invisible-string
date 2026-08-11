@@ -3,32 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>invisible-string — describe the work, consider it done</title>
-    <meta
-      name="description"
-      content="Build an agent with a role, a model, and the tools it needs. Chat with it directly — or put it on standing duty from Slack, forms, webhooks, or a schedule. More time for the work only you can do."
-    />
     <meta name="theme-color" content="#f7f7f7" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="canonical" href="%VITE_SITE_URL%/" />
 
-    <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="invisible-string" />
-    <meta property="og:url" content="%VITE_SITE_URL%/" />
-    <meta property="og:title" content="invisible-string — describe the work, consider it done" />
-    <meta
-      property="og:description"
-      content="Build an agent with a role, a model, and the tools it needs. Chat with it directly — or put it on standing duty from Slack, forms, webhooks, or a schedule. More time for the work only you can do."
-    />
-    <meta property="og:image" content="%VITE_SITE_URL%/og.png" />
+    <!-- Replaced per page by scripts/prerender.ts with the output of
+         renderHeadHtml() — title, description, robots, canonical, OG/Twitter
+         and JSON-LD. Left as a bare comment by the dev server, where
+         components/HeadSync.tsx populates the head on mount instead. -->
+    <!--seo-->
 
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="invisible-string — describe the work, consider it done" />
-    <meta
-      name="twitter:description"
-      content="Build an agent with a role, a model, and the tools it needs. Chat with it directly — or put it on standing duty from Slack, forms, webhooks, or a schedule. More time for the work only you can do."
-    />
-    <meta name="twitter:image" content="%VITE_SITE_URL%/og.png" />
+    <!-- Landing-page entrance animations render their INITIAL state during
+         prerender, so without JavaScript the hero headline ships at opacity 0
+         and blurred. Any client that does not run the animations gets the
+         final state instead. -->
+    <noscript>
+      <style>
+        [data-reveal] {
+          opacity: 1 !important;
+          transform: none !important;
+          filter: none !important;
+        }
+      </style>
+    </noscript>
   </head>
   <body>
     <div id="root"></div>

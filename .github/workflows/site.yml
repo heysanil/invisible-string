@@ -41,7 +41,13 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # SITE_INDEXABLE is set here and ONLY here. Every other build — the
+      # preview job below, a local build, a manual `wrangler versions upload`
+      # — emits noindex on every page and `Disallow: /` in robots.txt, so a
+      # preview copy of the site can never compete with production in search.
       - name: Build site
+        env:
+          SITE_INDEXABLE: "1"
         run: bun run --cwd apps/site build
 
       # wrangler comes from mise (`npm:wrangler` in mise.toml), NOT from

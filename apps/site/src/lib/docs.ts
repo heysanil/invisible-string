@@ -44,6 +44,11 @@ export const docEntries: DocEntry[] = Object.entries(frontmatterModules).map(
 export const docFrontmatterList: Array<[string, DocFrontmatter]> =
   docEntries.map((e) => [e.slug, e.frontmatter]);
 
+/** Slug → frontmatter, the lookup shape `seoForPath` wants. */
+export const docFrontmatterMap: ReadonlyMap<string, DocFrontmatter> = new Map(
+  docFrontmatterList,
+);
+
 /**
  * Lazy loader for a doc body by slug, or `undefined` for an unknown slug
  * (→ designed not-found). Pass the result to `React.lazy`.

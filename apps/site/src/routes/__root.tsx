@@ -1,6 +1,7 @@
 import { createRootRoute, Link, Outlet } from "@tanstack/react-router";
 import { MotionConfig } from "motion/react";
 
+import { HeadSync } from "../components/HeadSync";
 import { SiteFooter } from "../components/SiteFooter";
 import { SiteNav } from "../components/SiteNav";
 import { Wash } from "../components/Wash";
@@ -17,6 +18,7 @@ function RootLayout() {
     // reducedMotion="user" makes every whileInView entrance render its final
     // state statically for users who ask for less motion.
     <MotionConfig reducedMotion="user">
+      <HeadSync />
       <Wash />
       <div className="flex min-h-full flex-col">
         <SiteNav />

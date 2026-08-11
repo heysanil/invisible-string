@@ -5,6 +5,10 @@ export interface DocFrontmatter {
   title: string;
   section: string;
   order: number;
+  /** Meta description for this page. Required — `scripts/prerender.ts` fails
+   *  the build on a missing or empty value, so a new doc cannot ship without
+   *  one. Aim for 110–155 characters: longer is truncated in search results. */
+  description: string;
 }
 
 export interface SidebarItem {

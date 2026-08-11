@@ -123,8 +123,25 @@ function TocReporter({
   return null;
 }
 
-/** Designed not-found for an unknown doc slug. */
+/**
+ * Designed not-found for an unknown doc slug.
+ *
+ * The requested path is rendered only AFTER mount, and that is load-bearing.
+ * `dist/docs/404.html` is a single prerendered file that Cloudflare serves for
+ * every unknown `/docs/*` URL (`not_found_handling: "404-page"` → the nearest
+ * 404.html), so the slug it was BUILT with is never the slug the browser is
+ * on. Rendering it in the first pass is therefore a guaranteed hydration text
+ * mismatch on every 404 under /docs — React discards the whole prerendered
+ * tree and re-renders client-side (minified error #418), measured, not
+ * theorised. Deferring by one commit hydrates exactly and keeps the build-time
+ * sentinel slug out of the shipped file; the pre-mount sentence stands on its
+ * own, so a crawler or a JS-less reader still gets grammatical copy.
+ * `scripts/prerender.ts` guards the emitted HTML against a regression here.
+ */
 function DocNotFound({ slug }: { slug: string }) {
+  const [requested, setRequested] = useState<string | null>(null);
+  useEffect(() => setRequested(slug), [slug]);
+
   return (
     <div className="flex min-h-[40vh] flex-col items-start justify-center gap-4">
       <p className="text-[13px] font-medium uppercase tracking-[0.14em] text-ink-4">
@@ -132,8 +149,14 @@ function DocNotFound({ slug }: { slug: string }) {
       </p>
       <h1 className="text-display-2">No page at that path.</h1>
       <p className="max-w-md text-ink-3">
-        <code className="mono-chip">{slug || "(empty)"}</code> doesn&rsquo;t match any
-        documentation page.
+        {requested === null ? (
+          <>That path doesn&rsquo;t match any documentation page.</>
+        ) : (
+          <>
+            <code className="mono-chip">{requested || "(empty)"}</code> doesn&rsquo;t match
+            any documentation page.
+          </>
+        )}
       </p>
       <Link
         to="/docs"

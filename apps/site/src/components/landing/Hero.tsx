@@ -30,6 +30,7 @@ export function Hero() {
     <section className="site-container flex flex-col items-center pt-28 text-center sm:pt-32">
       {/* The spool the string unwinds from. */}
       <motion.div
+        data-reveal
         initial={{ opacity: 0, scale: 0.9 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.4, ease: EASE }}
@@ -44,15 +45,16 @@ export function Hero() {
         animate="show"
         className="text-display-1 text-balance"
       >
-        <motion.span variants={line} className="block">
+        <motion.span data-reveal variants={line} className="block">
           Describe the work,
         </motion.span>
-        <motion.span variants={line} className="block">
+        <motion.span data-reveal variants={line} className="block">
           consider it done.
         </motion.span>
       </motion.h1>
 
       <motion.p
+        data-reveal
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.4, ease: EASE, delay: 0.28 }}
@@ -64,6 +66,7 @@ export function Hero() {
       </motion.p>
 
       <motion.div
+        data-reveal
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.4, ease: EASE, delay: 0.36 }}
@@ -81,6 +84,7 @@ export function Hero() {
 
       {/* Centerpiece vignette. */}
       <motion.div
+        data-reveal
         initial={{ opacity: 0, y: 26 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, ease: EASE, delay: 0.46 }}

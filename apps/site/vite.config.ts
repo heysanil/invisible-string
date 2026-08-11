@@ -23,13 +23,6 @@ function normalizeBase(raw: string | undefined): string {
   return base;
 }
 
-// Default the canonical site URL for local dev so index.html's `%VITE_SITE_URL%`
-// substitutions (canonical, OG, Twitter) resolve without a set env var. CI
-// overrides this with the real Pages URL.
-if (!process.env.VITE_SITE_URL) {
-  process.env.VITE_SITE_URL = "http://localhost:5173";
-}
-
 /**
  * Sniffing + referrer hardening for the public site. Emitted by the dev server
  * and `vite preview`; GitHub Pages fronts the static build with its own

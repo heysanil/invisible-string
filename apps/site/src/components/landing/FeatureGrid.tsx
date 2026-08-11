@@ -34,12 +34,12 @@ const FEATURES: ReadonlyArray<{
   },
   {
     title: "You approve the big steps",
-    copy: "A workflow can pause and wait — for hours if it has to — until someone signs off, then pick up right where it stopped.",
+    copy: "An agent can pause and wait — for hours if it has to — until someone signs off, then pick up right where it stopped.",
     icon: UserCheck,
   },
   {
     title: "Your models, your rules",
-    copy: "Powerful, balanced, or quick per agent — chosen from the models your workspace has approved.",
+    copy: "Powerful, balanced, or quick per agent — the model and how deeply it thinks, from the ones your workspace has approved.",
     icon: SlidersHorizontal,
   },
   {

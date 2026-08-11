@@ -8,9 +8,14 @@
 - [Quickstart](/docs/getting-started/quickstart): build, publish, chat, delegate
 - [Agents](/docs/concepts/agents): persona, model, context — and how publishing versions them
 - [Workflows](/docs/concepts/workflows): standing delegations — trigger, agent, instructions
+- [Sessions & runs](/docs/concepts/sessions-and-runs): one run per session, resumable streams, how runs end
+- [Chat](/docs/building/chat): the run timeline, stopping a run, queued messages, context controls
 - [Triggers](/docs/building/triggers): chat, webhook, form, Slack, and schedule ingress
+- [Context & MCP](/docs/building/context-mcp): connector catalog, registry search, OAuth, tool filters
+- [Models](/docs/building/models): presets, reasoning effort, and how both get pinned at publish
 - [Architecture](/docs/platform/architecture): control plane, stateless workers, compiler
 - [Durability](/docs/platform/durability): runs survive worker death and resume anywhere
+- [Security](/docs/platform/security): credential custody, workspace scoping, guarded egress
 
 ## Source
 

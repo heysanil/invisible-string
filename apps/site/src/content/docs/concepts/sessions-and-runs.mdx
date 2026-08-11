@@ -11,8 +11,9 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 A **session** is a conversation with a published Agent; a **run** is a single
 execution within it. Whether you open it from chat or a workflow trigger starts
 it, a session pins the agent version it began with, and each run streams its
-progress back to the browser live: working blocks, the streamed reply, and any
-inline human-in-the-loop approvals.
+progress back to the browser live — an ordered timeline of what the Agent said
+and what it did, with any human-in-the-loop pauses inline. How that renders is
+covered in [Chat](/docs/building/chat).
 
 Runs stream over **resumable SSE** — reconnecting with a `Last-Event-ID` replays
 missed events rather than restarting — so a dropped connection never loses run
@@ -22,6 +23,23 @@ history.
 
 A session runs one execution at a time. While a run is active the session is
 busy, and a waiting run (parked on a human approval) counts as busy too — new
-run requests against a busy session are refused rather than interleaved.
+run requests against a busy session are refused rather than interleaved. In
+chat that rule is invisible: messages you send during a run are queued and
+delivered when the session frees.
+
+## How a run ends
+
+A run finishes in one of three states. It **succeeds**, it **fails**, or it is
+**canceled** — the state a run lands in when you stop it. Cancellation is a
+decision rather than an error, and the platform keeps the two apart: a stopped
+run is never reported as a failure, and a workflow's outbound reply is never
+delivered from a run someone cut short.
+
+## Sessions end, too
+
+A session is not forever. Resetting one retires it permanently — a retired
+session can never accept another message, and a new one takes its place. Long
+sessions also age out on their own; when that happens, the next message starts
+a fresh session against the Agent's current published version.
 
 <UnderConstruction />

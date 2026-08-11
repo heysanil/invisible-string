@@ -1,7 +1,7 @@
 ---
 title: Context & MCP
 section: Building
-order: 34
+order: 35
 ---
 
 import { UnderConstruction } from "../../../components/docs/UnderConstruction";
@@ -14,17 +14,43 @@ scope — and authored **skills** with drag-and-drop attachments. Equipping an
 Agent packages both straight into its compiled artifact, so a published Agent
 carries its tools and knowledge with it.
 
-Adding a connection is a three-lane flow: a curated connector catalog with
-one-click install, community search over a mirrored index of the official MCP
-registry (every install is re-verified against the live registry), and a custom
-server URL for anything else. Any credentials a connection needs are stored
-write-once and encrypted; the API only ever reports whether a connection has
-credentials, never their values. Connectors that support MCP OAuth — Linear,
-Notion, Sentry, and more — connect in one click through a consent popup: the
-platform holds and refreshes the tokens for you, so neither you nor your
-Agents ever handle a credential. Every connection also carries a live health
-state — probed automatically on install and re-checkable any time with Test
-connection — and a discovered list of the tools its server exposes, which
-powers per-agent tool filtering.
+## Adding a connection
+
+Three lanes, depending on where the server comes from:
+
+- **Catalog** — a curated set of connectors (Linear, Notion, Sentry, Stripe,
+  Vercel, and more) that install in one click, already knowing each server's
+  URL, transport, and what credentials it wants.
+- **Community search** — typo-tolerant search across a mirrored index of the
+  official MCP registry, verified publishers first. Search runs against the
+  mirror; every install is re-verified against the live registry, so what you
+  install is what the registry actually says it is.
+- **Custom URL** — any other MCP server you can reach.
+
+## Credentials and OAuth
+
+Credentials are stored write-once and encrypted at rest. The API only ever
+reports *whether* a connection has credentials, never their values, and they
+are never echoed back to you after you save them.
+
+Connectors that support MCP OAuth connect in one click through a consent
+popup. The platform holds and refreshes the tokens centrally, and hands your
+Agents a short-lived access token only at the moment of a tool call — so
+neither you nor your Agents ever handle a credential directly. If a grant
+expires or is revoked, the tool call fails cleanly and asks you to reconnect
+rather than hanging.
+
+## Health and tools
+
+Every connection carries a live health state. The platform probes the server
+when you add it and any time you press **Test connection**, and reports back
+whether it's reachable, needs authorization, or rejected the credentials it
+was given.
+
+A successful probe also caches the list of tools the server exposes. That list
+is what the connection's **tool filter** works from: leave it open to expose
+everything, or set an allow or block list to narrow what the server offers.
+The filter belongs to the connection, so every Agent equipped with it sees the
+same filtered set of tools.
 
 <UnderConstruction />

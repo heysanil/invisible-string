@@ -1,0 +1,73 @@
+---
+title: Chat
+section: Building
+order: 32
+---
+
+import { UnderConstruction } from "../../../components/docs/UnderConstruction";
+
+# Chat
+
+Chat is where you hand work to a published Agent and watch it happen. Pick an
+Agent, start a session, and every run streams back live — what the Agent said,
+what it did, and anything it needs from you before it can continue.
+
+## The run timeline
+
+A run renders as an ordered timeline of everything that happened, in the order
+it happened. The Agent's prose appears where it was said, and each contiguous
+stretch of interior work — thinking and tool calls — collects into one
+collapsible box beside a rail. Every thinking pass is kept, not just the last
+one, so a run that thinks, calls a tool, then thinks again shows both passes in
+place.
+
+A work box is open while it's live and folds itself away once the Agent moves
+on, leaving what it said as the thing you read. Open any of them back up to see
+what happened.
+
+## Stopping a run
+
+While a run holds the session, the composer's send button becomes **Stop**.
+Stopping is a decision, not an error: the run lands as **canceled** rather than
+failed, and the conversation stays exactly where it is.
+
+Cancellation is cooperative — it takes effect at the next durable step
+boundary, so a tool call already in flight finishes rather than being torn in
+half.
+
+## Queueing while it works
+
+A session runs one execution at a time, so a message sent mid-run would
+otherwise be refused. Instead the composer stays live and **Enter queues**:
+messages you type while a run is working stack up above the composer, and the
+moment the session frees they merge into a single message and send as one turn.
+
+Queued messages are yours until they send — remove any of them, and leaving a
+thread that still has a queue asks before dropping it.
+
+## When it needs you
+
+A run can pause and wait for a person. Three things park a run:
+
+- **Tool approvals** — the Agent asks before running a gated tool.
+- **Questions** — the Agent asks you something directly.
+- **Session limits** — a long-running session that crosses its input-token
+  budget stops and asks whether to continue, instead of failing.
+
+Each renders inline in the thread with its own controls. A waiting run still
+holds the session, so anything you type meanwhile is queued.
+
+## Context controls
+
+The thread menu carries three ways to manage what the Agent remembers:
+
+- **Clear context** — the Agent forgets the messages so far; the thread stays.
+- **Compact context** — earlier messages are summarized to free up room.
+- **Reset session** — retires this session and starts a fresh one. This is
+  destructive and asks for confirmation: a retired session can never accept
+  another message.
+
+Clear and compact leave a marker in the thread where they happened, so the
+transcript never silently disagrees with what the Agent knows.
+
+<UnderConstruction />

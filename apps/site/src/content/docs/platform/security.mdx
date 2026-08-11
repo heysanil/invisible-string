@@ -19,6 +19,35 @@ organization, and the caller's role, then verifies row ownership before acting.
 The authorization matrix — outsider, member, and admin-or-owner operations — is
 covered by tests.
 
+## Connected servers
+
+An MCP connection points the platform at a server *you* choose, so every
+outbound request made on your behalf runs through a guarded egress path. Each
+address is resolved and validated before anything is dialed, and the connection
+is then made to the validated address while TLS still verifies the real
+hostname — so a name that resolves differently the second time around can't
+redirect the platform somewhere it already refused to go. Requests are
+HTTPS-only, redirects are same-origin and re-checked at every hop, and both
+time and response size are capped.
+
+Credentials decrypted to probe a server exist only for the length of the call:
+they are never logged, never persisted in the clear, and never returned in an
+API response. Error text from a failed probe is scrubbed against the
+credentials it was given before it is stored.
+
+## OAuth tokens
+
+For connectors that authenticate with OAuth, the platform is the only party
+that holds a token. Access and refresh tokens are encrypted at rest with the
+same envelope scheme as every other credential, and refreshes happen centrally,
+one at a time per connection.
+
+Compiled agents never receive a refresh token or a client secret. When an Agent
+makes a tool call against an OAuth connection, it asks the control plane for a
+short-lived access token, proving which agent version it is; it gets back that
+token and nothing else. If the grant is gone, the request is refused and the
+tool call fails with a reconnect prompt rather than hanging.
+
 ## Compiled agents
 
 Model routing is baked in at build time behind a placeholder key, so real

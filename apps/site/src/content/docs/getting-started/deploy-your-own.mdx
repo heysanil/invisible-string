@@ -10,14 +10,20 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 invisible-string is self-hostable. The whole platform runs as one single-host
 Docker Compose stack: a `web` service (nginx serving the SPA and reverse-proxying
-the API on the same origin) fronts the control plane, worker, Postgres, and a
-Garage object store on a private bridge.
+the API on the same origin) fronts the control plane, worker, Postgres, a
+Garage object store, and a Meilisearch index on a private bridge.
 
 Only `web` is exposed to the public internet; everything else talks over the
-internal Compose network. Images are pulled from GHCR and pinned by `IMAGE_TAG`,
-and a one-shot `migrate` service applies database migrations before the control
-plane starts. An optional Cloudflare tunnel is profile-gated for hosts without a
-public IP.
+internal Compose network. Images are pulled from GHCR and pinned by `IMAGE_TAG`
+— every release tags all three images with the same version, so one value pins
+the whole stack — and a one-shot `migrate` service applies database migrations
+before the control plane starts. An optional Cloudflare tunnel is profile-gated
+for hosts without a public IP.
+
+Postgres and the object store hold the data worth protecting. The Meilisearch
+index does not: it is a disposable mirror of the public MCP registry that
+rebuilds itself, so it needs no backup, and the platform runs without it —
+losing only community connector search.
 
 ## Prerequisites
 

@@ -26,13 +26,13 @@ const FACETS: ReadonlyArray<{
     label: "Model",
     icon: Gauge,
     hint: "How it thinks",
-    copy: "Powerful for hard problems, balanced for everyday work, quick for the rest — from the models your workspace allows.",
+    copy: "Powerful for hard problems, balanced for everyday work, quick for the rest — the model and how hard it thinks it through.",
   },
   {
     label: "Context",
     icon: Plug,
     hint: "What it's equipped with",
-    copy: "The connections and skills it works with — GitHub, web search, your own tools.",
+    copy: "The connections and skills it works with — Linear, Notion, Sentry and more in a click, or bring your own.",
   },
 ];
 

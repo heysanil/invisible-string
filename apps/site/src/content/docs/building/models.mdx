@@ -1,7 +1,7 @@
 ---
 title: Models
 section: Building
-order: 35
+order: 36
 ---
 
 import { UnderConstruction } from "../../../components/docs/UnderConstruction";
@@ -14,9 +14,41 @@ section selects among them. Presets are resolved against the workspace's
 provider and model **allowlist**, so an Agent can only ever reference a model
 the workspace has sanctioned.
 
+A preset is a provider, a model, *and* a reasoning effort. That third part is
+what lets two tiers share a model: the seeded `balanced` and `quick` presets
+point at the same model and differ only in how hard it is asked to think.
+
+## Reasoning effort
+
+Effort is how much thinking the model does before it answers, drawn from the
+vocabulary providers actually publish:
+
+`none · minimal · low · medium · high · xhigh · max`
+
+Alongside those sits `provider-default`, which sends no reasoning instruction
+at all. The two quiet options are not the same: `none` explicitly disables
+reasoning, while `provider-default` leaves the decision to the model. Roughly a
+third of catalog models advertise no reasoning support, and it is the honest
+answer for those.
+
+An Agent **inherits** its preset's effort by default, and the Model section
+shows what it inherited. Override it and the Agent pins that effort instead.
+The selector offers only the efforts the effective model is known to support,
+falling back to the full list when the catalog can't say.
+
+If you override the *model* rather than the preset, the effort falls to that
+model's provider default rather than following the preset — inheriting a
+preset's `max` onto a deliberately chosen cheaper model is the wrong default.
+
+## Resolution and pinning
+
+Both the model and the effort are resolved when you **publish**, and both are
+folded into the artifact's content hash. A published agent version therefore
+carries a stable, pinned model configuration for its whole life — and editing a
+workspace preset changes nothing that is already running. The new setting lands
+on the next publish.
+
 Presets and the allowlist are seeded when a workspace is created and managed
-under Settings. Model routing itself is baked into the compiled artifact at
-build time, giving each published agent version a stable, pinned model
-configuration.
+under Settings.
 
 <UnderConstruction />

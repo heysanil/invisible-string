@@ -27,9 +27,15 @@ built.** — your Agent now has a real, version-pinned artifact behind it.
 ## Chat with it
 
 Start a chat and hand it work. The session binds your Agent and streams each
-run live over resumable SSE — working blocks, the streamed reply, inline
-human-in-the-loop approvals — and because durability is Postgres-backed, a
-worker dying mid-run resumes on any live worker instead of losing the run.
+run live over resumable SSE — an ordered timeline of what it said and what it
+did, with inline human-in-the-loop approvals — and because durability is
+Postgres-backed, a worker dying mid-run resumes on any live worker instead of
+losing the run.
+
+You can stop a run from the composer, keep typing while one is working (your
+messages queue and send as one when the session frees), and manage what the
+Agent remembers with the thread's context controls. See
+[Chat](/docs/building/chat).
 
 ## Delegate standing work
 

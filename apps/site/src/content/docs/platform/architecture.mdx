@@ -8,16 +8,23 @@ import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Architecture
 
-invisible-string is three services over Postgres and an object store.
+invisible-string is three services over Postgres and an object store, plus one
+optional search index.
 
 ## Control plane
 
 The API host (Bun + Elysia): authentication and organizations, agent and
-workflow CRUD, compiler invocation with `eve build` and artifact upload, the
-scheduler, trigger ingress and dispatch, the SSE tailer, and the copilot
-WebSocket loop. The
+workflow CRUD, connections and their health probes, the MCP OAuth broker,
+compiler invocation with `eve build` and artifact upload, the scheduler,
+trigger ingress and dispatch, outbound reply delivery, the SSE tailer, and the
+copilot WebSocket loop. The
 scheduler routes work by session affinity first, then to an artifact-warm
 worker, then to any live worker, with a dead-worker sweep and fencing.
+
+Every outbound request the control plane makes on your behalf — probing an MCP
+server, discovering its authorization server, exchanging or refreshing tokens —
+goes through a guarded egress path that resolves and validates the address
+before dialing it.
 
 ## Worker pool
 
@@ -31,5 +38,14 @@ workers hold no durable state, any of them can pick up a run.
 A pure function from an agent definition to an eve project. It is
 golden-digest-guarded and versioned, so any change to the emitted bytes is
 caught in CI and folded into the artifact content hash.
+
+## Search index
+
+Community connector search runs against a Meilisearch mirror of the official
+MCP registry, refreshed on a timer. It is deliberately optional and entirely
+disposable: the registry remains the source of truth, an empty index rebuilds
+itself on the next sync, and if the index is absent or down, only community
+search degrades — the catalog and custom-URL lanes keep working, and installs
+are still verified against the live registry either way.
 
 <UnderConstruction />

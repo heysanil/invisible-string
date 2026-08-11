@@ -24,7 +24,9 @@ version the Agent publishes.
 
 How the Agent thinks. You pick a preset — `powerful`, `balanced`, or `quick` —
 resolved against the workspace's provider and model allowlist, so an Agent can
-never reference a model the workspace hasn't sanctioned.
+never reference a model the workspace hasn't sanctioned. A preset carries a
+reasoning effort as well as a model; the Agent inherits it and can override it.
+See [Models](/docs/building/models).
 
 ## Context
 
@@ -39,9 +41,9 @@ with it.
 Publishing an Agent compiles its definition — persona, model, context — into a
 real [eve](https://eve.dev) agent project, runs the build, and uploads the
 resulting artifact to object storage. The artifact is cached by a **content
-hash** — a digest of the definition, its resolved dependencies, the compiler
-version, the pinned eve version, and the build environment — so an identical
-definition never rebuilds.
+hash** — a digest of the definition, the resolved model and reasoning effort,
+the compiler version, the pinned eve version, and the build environment — so an
+identical definition never rebuilds.
 
 Each published **agent version** is immutable and independently addressable on
 the worker pool. Versions matter because runs are bound to them: a session pins

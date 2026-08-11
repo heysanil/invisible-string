@@ -59,6 +59,17 @@ describe("applyHead", () => {
     expect(document.head.querySelector('link[rel="canonical"]')).toBeNull();
   });
 
+  test("removes a stale og:url too, not just the canonical", () => {
+    applyHead(docSeo("concepts/agents", agents, ctx), document);
+    expect(
+      document.head.querySelector('meta[property="og:url"]')?.getAttribute("content"),
+    ).toBe("https://example.com/docs/concepts/agents");
+
+    applyHead(notFoundSeo(ctx), document);
+
+    expect(document.head.querySelector('meta[property="og:url"]')).toBeNull();
+  });
+
   test("never writes the robots meta — the build owns it", () => {
     const robots = document.createElement("meta");
     robots.setAttribute("name", "robots");

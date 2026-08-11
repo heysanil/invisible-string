@@ -150,10 +150,17 @@ Asset URLs are absolute (`base` is `/`), so the same template works at every dir
 |---|---|
 | `/` | `dist/index.html` |
 | `/docs/<slug>` × 28 | `dist/docs/<slug>/index.html` |
-| unmatched | `dist/404.html` — root `notFoundComponent`, `noindex` |
+| unmatched, outside `/docs` | `dist/404.html` — root `notFoundComponent`, `noindex` |
+| unmatched, under `/docs/*` | `dist/docs/404.html` — the docs **shell** with `DocNotFound`, `noindex` |
 | `/docs` | *not prerendered* — a 301 (§7) |
 
-`html_handling` stays at its default `auto-trailing-slash`, so `dist/docs/concepts/agents/index.html` serves at `/docs/concepts/agents`. **Every existing URL is unchanged**; nothing that is currently linked or indexed moves.
+**Correction to this section as originally written** (caught in the final whole-branch review, measured against `workerd` via `wrangler dev --local`, and fixed before merge):
+
+The spec said `html_handling` stays at its default `auto-trailing-slash` and that "every existing URL is unchanged". Both were wrong. `auto-trailing-slash` serves a folder index only **with** the slash: `/docs/concepts/agents` **307s** to `/docs/concepts/agents/`, and only the slashed form returns 200. That is the no-trailing-slash form — the only form the site advertises, in every `<link rel="canonical">`, `og:url`, sitemap `<loc>`, internal `<Link>` and `llms.txt` line — so as specced, all 28 doc pages answered their own canonical URL with a redirect. It was also a regression against `main`, where SPA fallback answered them 200.
+
+The shipped setting is **`html_handling: "drop-trailing-slash"`**, which inverts it: `/docs/concepts/agents` is 200, and the trailing-slash form 307s to it. Emitted paths, advertised URLs and this setting are one decision spread across three files; changing any one requires changing all three.
+
+Two 404 documents, likewise a review correction. `not_found_handling: "404-page"` serves the **nearest** `404.html`, and the client router renders a different tree depending on where the miss landed — `/nope` matches nothing (root not-found), `/docs/bogus` matches the `docs.$` splat (the docs shell). A single root-level 404 under `/docs/*` therefore hydrated the docs shell against root-404 markup and was rejected outright (`Minified React error #418`), discarding every prerendered byte on a whole URL class. Relatedly, `DocNotFound` now renders the requested path only **after mount**: one file serves an unbounded URL set, so the slug it was built with is never the slug the browser is on, and rendering it in the first pass is a guaranteed text mismatch (also measured as a real `#418`).
 
 Also emitted: `dist/sitemap.xml`, `dist/robots.txt`, `dist/llms.txt` (§6).
 
@@ -180,13 +187,13 @@ Auto-deriving from the first paragraph was considered and rejected: the derived 
 
 - **Landing** — current title and description, canonical `/`, OG/Twitter as today, JSON-LD `SoftwareApplication` + `Organization`.
 - **Docs page** — `<Title> — invisible-string docs`, frontmatter description, own canonical, `og:type=article`, JSON-LD `TechArticle` + `BreadcrumbList` (Docs → Section → Page).
-- **404** — `noindex`, no JSON-LD.
+- **404** (both documents) — `noindex`, no JSON-LD, `canonical: null`.
 
 One shared `og.png` for every page. Per-page OG images are out of scope (§11).
 
 ### `sitemap.xml`
 
-One `<url>` per prerendered page that **has a canonical**, absolute `<loc>` — which excludes exactly one page, the 404 (`notFoundSeo` sets `canonical: null`, and `renderSitemap` keys off precisely that null rather than a separate flag, so the two facts cannot diverge).
+One `<url>` per prerendered page that **has a canonical**, absolute `<loc>` — which excludes the two 404 documents and nothing else (`notFoundSeo` sets `canonical: null`, and `renderSitemap` keys off precisely that null rather than a separate flag, so the two facts cannot diverge; adding the second 404 in the final review therefore needed no sitemap change at all).
 
 Keying off the canonical rather than an indexability flag is what keeps the sitemap correct in a `noindex` preview build: there every page is `noindex`, and a flag-driven filter would emit an empty `<urlset>`. The sitemap stays well-formed and complete; `robots.txt`'s `Disallow: /` is what actually holds crawlers off a preview.
 
@@ -209,11 +216,16 @@ The 2026-07-09 spec chose SPA fallback to fix a real problem: GitHub Pages serve
 
 Once every route is a real file, the same setting inverts: `/docs/concpets/agents`, `/dcos`, and every scanner probe now return the **homepage** at HTTP 200. That is a soft-404 — an unbounded set of URLs serving identical content with a success status, which is the canonical duplicate-content trap. `"404-page"` serves the nearest `404.html` with a genuine 404 status, and real deep links keep returning 200 because they are real files.
 
+"Nearest" is load-bearing rather than incidental, which this section originally missed: it is what lets `dist/docs/404.html` cover `/docs/*` while `dist/404.html` covers everything else, and what makes two documents necessary in the first place (§5).
+
 ### `public/_redirects`
 
 ```
-/docs  /docs/getting-started/overview  301
+/docs   /docs/getting-started/overview  301
+/docs/  /docs/getting-started/overview  301
 ```
+
+The slashed form is a final-review addition: `html_handling` normalizes slashes only for paths that resolve to an **asset**, and `/docs` resolves to no file at all, so without the second rule `/docs/` falls through to the 404.
 
 `docs.index.tsx` currently throws a client-side `redirect()` in `beforeLoad`. A crawler that does not run JS sees `/docs` return 200 with the app shell; one that does sees the overview's content at the `/docs` URL. Either way `/docs` competes with `/docs/getting-started/overview`. A 301 consolidates the signal at the edge. The route file stays for in-app navigation.
 
@@ -227,7 +239,7 @@ Once every route is a real file, the same setting inverts: `/docs/concpets/agent
   Referrer-Policy: no-referrer
 ```
 
-`vite.config.ts`'s `securityHeaders` applies these to the dev server and `vite preview` only, and its comment still claims "GitHub Pages fronts the static build with its own headers" — stale since the Cloudflare migration, and **not yet corrected in that file**. Workers adds neither header on its own. This restores dev/prod parity. No `X-Frame-Options`, matching the existing rationale: this is a public marketing site, framing is fine.
+`vite.config.ts`'s `securityHeaders` applies these to the dev server and `vite preview` only. Its comment used to claim "GitHub Pages fronts the static build with its own headers" — stale since the Cloudflare migration; corrected in the final review to point at `public/_headers`. Workers adds neither header on its own. This restores dev/prod parity. No `X-Frame-Options`, matching the existing rationale: this is a public marketing site, framing is fine.
 
 ---
 
@@ -258,7 +270,7 @@ Fix: `Reveal` gains `data-reveal`, and `index.html` carries
 
 `!important` beats the inline style. `filter` is in the shipped rule and not optional: the hero headline spans serialize as `opacity:0;filter:blur(7px);transform:translateY(18px)`, so resetting only opacity and transform would leave the largest text on the page blurred.
 
-Measured on the shipped build: `dist/index.html` carries ~35 inline `opacity:0` styles; `dist/docs/**` and `dist/404.html` carry **none**. The residual human cost is that `/` shows nav, wash and footer with a blank middle until hydration runs the reveals — accepted deliberately, since the alternative is dropping the landing entrance animations. Docs pages are unaffected — `.doc-prose` has no motion wrapper, so the SEO-valuable long-form content was never at risk.
+Measured on the shipped build: `dist/index.html` carries ~35 inline `opacity:0` styles; `dist/docs/**` and both 404 documents carry **none**. The residual human cost is that `/` shows nav, wash and footer with a blank middle until hydration runs the reveals — accepted deliberately, since the alternative is dropping the landing entrance animations. Docs pages are unaffected — `.doc-prose` has no motion wrapper, so the SEO-valuable long-form content was never at risk.
 
 ### `ThreadCanvas` hydration mismatch
 
@@ -283,7 +295,9 @@ Prerendering does not fix the `INEFFECTIVE_DYNAMIC_IMPORT` single-chunk problem 
 These fail `vite build`, so they run in both `ci.yml`'s `unit` job and `site.yml` with no new CI job:
 
 - every doc frontmatter has a non-empty `title`, `section`, and `description` — checked *before* any rendering
-- the emitted page count matches `docEntries.length + 2`
+- a doc exists matching `DOCS_INDEX_SLUG` — also *before* any rendering. That slug is hardcoded in `src/lib/seo.ts`, `src/routes/docs.index.tsx` and `public/_redirects`, and the two outside the build are silent on failure, so renaming one `.mdx` file would otherwise pass every guard while the edge 301 pointed at a URL that 404s
+- no page embeds the build-time sentinel path it was rendered at (`__prerender_not_found__`) — the hydration contract for the two 404 documents, each of which is served for an unbounded set of URLs
+- ~~the emitted page count matches `docEntries.length + 2`~~ — **specced, built, then removed in the final review as tautological.** `pages` is *constructed* as exactly that sum, so the check could never fire; a documented guard that cannot fire is worse than none, because it is counted as coverage
 - every page's `#root` markup exceeds a minimum byte length and the document contains `<h1` — catches a silently-empty render, the characteristic SSG failure. Measured against the **app markup**, not the finished document: the template plus a page's JSON-LD head is 2.2–3.8 kB on its own, so a threshold applied to the whole file is satisfied by a completely empty `#root` and can never fire
 - markup **opens** with `<!--$-->` — the root Suspense boundary is present and not displaced, without which no browser can hydrate the page (§3)
 - no output contains a surviving `%VITE_SITE_URL%` or an unreplaced `<!--seo-->`
@@ -292,17 +306,32 @@ These fail `vite build`, so they run in both `ci.yml`'s `unit` job and `site.yml
 
 ### Not `vite preview`
 
-`vite preview` cannot verify this build's serving behaviour and will mislead anyone who tries. It SPA-falls-back, so `/docs/concepts/agents` — the no-trailing-slash form every canonical, sitemap entry and internal link uses — returns the **landing page** at HTTP 200, and nothing ever returns 404. Only the trailing-slash form works. Cloudflare's `auto-trailing-slash` + `404-page` do the opposite on both counts. Verify serving against a PR preview version or production.
+`vite preview` cannot verify this build's serving behaviour and will mislead anyone who tries. It SPA-falls-back, so `/docs/concepts/agents` — the no-trailing-slash form every canonical, sitemap entry and internal link uses — returns the **landing page** at HTTP 200, nothing ever returns 404, and `_redirects` is inert so `/docs` is the landing page rather than a 301 (all measured).
+
+Cloudflare differs on every one of those counts. **Verify against the real router**, which runs offline against `dist/` and needs no deploy — `wrangler` is already pinned in the repo-root `mise.toml`:
+
+```sh
+bun run --cwd apps/site build
+cd apps/site && wrangler dev --local
+```
+
+This is not optional for a change in this area: a hand-rolled static server abstracts away exactly the redirect that made the original `html_handling` decision wrong (§5). Note `wrangler dev` watches the asset directory, so `rm -rf dist && bun run build` beneath a running server leaves it serving 404 for everything until restarted.
 
 ### Post-merge
 
+Every line below was run against `wrangler dev --local` before merge and matched. As originally written the first line asserted `# 200` where the shipped config would have printed **307** — the check was correct, the config was not (§5).
+
 ```sh
-curl -sI https://invisiblestring.io/docs/concepts/agents | head -1        # 200
-curl -sI https://invisiblestring.io/docs/nonexistent-page | head -1       # 404
-curl -sI https://invisiblestring.io/docs | grep -i '^location'            # /docs/getting-started/overview
+curl -sI https://invisiblestring.io/docs/concepts/agents  | head -1        # 200, NOT a 307
+curl -sI https://invisiblestring.io/docs/concepts/agents/ | head -1        # 307 → the unslashed form
+curl -sI https://invisiblestring.io/docs/nonexistent-page | head -1        # 404
+curl -sI https://invisiblestring.io/docs  | grep -i '^location'            # /docs/getting-started/overview
+curl -sI https://invisiblestring.io/docs/ | grep -i '^location'            # /docs/getting-started/overview
 curl -s  https://invisiblestring.io/docs/concepts/agents | grep -o '<title>[^<]*'
-curl -s  https://invisiblestring.io/sitemap.xml | grep -c '<loc>'         # 29
+curl -s  https://invisiblestring.io/sitemap.xml | grep -c '<loc>'          # 29 — the two 404s are excluded
 ```
+
+Then load `/docs/nonexistent-page` in a browser with the console open: it must render the docs shell (sidebar + TOC rail) with **no** `Minified React error #418`.
 
 ---
 

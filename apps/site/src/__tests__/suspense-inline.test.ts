@@ -83,7 +83,11 @@ describe("inlineResolvedSuspense", () => {
     const html =
       '<!--$?--><template id="B:0"></template><!--/$-->' +
       '<div hidden id="S:0">content never closes';
-    expect(() => inlineResolvedSuspense(html)).toThrow();
+    // Asserted by message, not a bare `.toThrow()`: three different failures
+    // upstream of findDivClose (no placeholder number, an unterminated comment
+    // boundary, a missing S:0 segment) also throw here, so a bare check would
+    // pass while this case silently stopped exercising findDivClose at all.
+    expect(() => inlineResolvedSuspense(html)).toThrow(/findDivClose: unterminated <div>/);
   });
 
   test("throws on a surviving errored-boundary marker (<!--$!-->) that never matched the resolvable placeholder shape", () => {

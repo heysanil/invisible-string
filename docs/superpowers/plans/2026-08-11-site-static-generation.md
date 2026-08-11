@@ -17,7 +17,7 @@
 - **E1 design system is law.** No task in this plan changes any visual style. `data-reveal` is a behavioral attribute only.
 - **Conventional commits, and commit messages never mention AI assistance.** No `Co-Authored-By` trailers.
 - **TypeScript strict.** `bun run --cwd apps/site typecheck` must pass at the end of every task.
-- **Every URL currently served must keep working.** `html_handling` stays at its default `auto-trailing-slash`; no route path changes.
+- **Every URL currently served must keep working.** ~~`html_handling` stays at its default `auto-trailing-slash`~~; no route path changes. **Superseded during the final review** — the default 307s the extension-less form, i.e. it broke exactly the constraint this bullet states. Shipped as `html_handling: "drop-trailing-slash"`; see the design spec §5.
 - **`SITE_INDEXABLE` is fail-safe.** Only the literal value `1` makes a build indexable. Anything else — including unset — emits `noindex` on every page and `Disallow: /` in robots.txt.
 - **Canonical site URL** is `https://invisiblestring.io`; local default is `http://localhost:5173`.
 - **Never `git clean -fd .changeset`** — Task 9 writes an untracked changeset file.
@@ -1882,7 +1882,7 @@ In `apps/site/wrangler.jsonc`, replace the `assets` block:
   },
 ```
 
-Leave `compatibility_date`, `routes`, `workers_dev` and `preview_urls` exactly as they are. `html_handling` stays unset, i.e. the default `auto-trailing-slash`, which is what serves `dist/docs/concepts/agents/index.html` at `/docs/concepts/agents`.
+Leave `compatibility_date`, `routes`, `workers_dev` and `preview_urls` exactly as they are. ~~`html_handling` stays unset, i.e. the default `auto-trailing-slash`, which is what serves `dist/docs/concepts/agents/index.html` at `/docs/concepts/agents`.~~ **Wrong, and superseded during the final review**: `auto-trailing-slash` serves that file at `/docs/concepts/agents/` and **307s** the unslashed form — the only form the site advertises. Shipped as `"html_handling": "drop-trailing-slash"`; measured against `workerd` via `wrangler dev --local`. See the design spec §5.
 
 - [ ] **Step 2: Add the `/docs` redirect**
 

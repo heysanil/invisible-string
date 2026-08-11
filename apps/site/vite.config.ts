@@ -25,9 +25,10 @@ function normalizeBase(raw: string | undefined): string {
 
 /**
  * Sniffing + referrer hardening for the public site. Emitted by the dev server
- * and `vite preview`; GitHub Pages fronts the static build with its own
- * headers. No `X-Frame-Options` here — this is a public marketing site, framing
- * is fine (unlike the authenticated SPA).
+ * and `vite preview`; the deployed site gets the same two headers from
+ * `public/_headers`, which Workers static assets reads. No `X-Frame-Options`
+ * here — this is a public marketing site, framing is fine (unlike the
+ * authenticated SPA).
  */
 const securityHeaders: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -39,8 +40,17 @@ const mdxPlugin = mdx({
   rehypePlugins: [rehypeSlug],
 });
 
-export default defineConfig({
+export default defineConfig(({ isSsrBuild }) => ({
   base: normalizeBase(process.env.SITE_BASE),
+  build: {
+    // The SSR bundle is a module `scripts/prerender.ts` imports — nothing ever
+    // serves files out of `.ssr/`, so copying `public/` in means writing a
+    // 477 kB `og.png` (and `_headers`, `_redirects`, the favicons…) into a
+    // directory where they mean nothing, on every build. The CLIENT build must
+    // keep the default `true`: that copy is how they reach `dist/`, which is
+    // what Cloudflare uploads.
+    copyPublicDir: !isSsrBuild,
+  },
   plugins: [
     // MDX must run before the router/react transforms so `.mdx` becomes JSX
     // that they can process.
@@ -52,4 +62,4 @@ export default defineConfig({
   ],
   server: { headers: securityHeaders },
   preview: { headers: securityHeaders },
-});
+}));

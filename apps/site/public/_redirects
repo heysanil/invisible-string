@@ -3,4 +3,9 @@
 # `/docs/getting-started/overview` for the same content, so consolidate it at
 # the edge with a real 301. Workers static assets reads this file from the
 # root of the asset directory (public/ is copied to dist/).
-/docs  /docs/getting-started/overview  301
+#
+# Both forms are listed because `html_handling: "drop-trailing-slash"` only
+# normalizes slashes for paths that resolve to an ASSET, and `/docs` resolves
+# to no file at all — so `/docs/` would otherwise fall through to the 404.
+/docs   /docs/getting-started/overview  301
+/docs/  /docs/getting-started/overview  301

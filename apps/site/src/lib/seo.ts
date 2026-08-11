@@ -267,6 +267,10 @@ function setMeta(
   el.setAttribute("content", content);
 }
 
+function removeMeta(doc: Document, attr: "name" | "property", key: string): void {
+  doc.head.querySelector<HTMLMetaElement>(`meta[${attr}="${key}"]`)?.remove();
+}
+
 function setCanonical(doc: Document, href: string | null): void {
   const el = doc.head.querySelector<HTMLLinkElement>('link[rel="canonical"]');
   if (!href) {
@@ -300,5 +304,9 @@ export function applyHead(seo: PageSeo, doc: Document): void {
   setMeta(doc, "name", "twitter:title", seo.title);
   setMeta(doc, "name", "twitter:description", seo.description);
   setCanonical(doc, seo.canonical);
+  // `og:url` tracks the canonical exactly, INCLUDING its absence: navigating
+  // from a doc to an unknown path must not leave the previous page's URL
+  // behind claiming to be this one's.
   if (seo.canonical) setMeta(doc, "property", "og:url", seo.canonical);
+  else removeMeta(doc, "property", "og:url");
 }

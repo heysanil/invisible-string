@@ -42,24 +42,44 @@ Two things about the build steps that are easy to get wrong:
   corruption, and the full `build` is unaffected) — but the fix is always to
   re-run `bun run build`, or at minimum `build:client` first.
 
-### `vite preview` cannot verify this build
+### Verify serving with `wrangler dev`, not `vite preview`
 
 `bun run --cwd apps/site preview` still works for eyeballing styles, but it
-**cannot** tell you how the deployed site serves anything, and it fails on
-exactly the URL shape that matters:
+**cannot** tell you how the deployed site serves anything, and it is wrong on
+exactly the URL shape that matters (all four measured):
 
 - `/docs/concepts/agents` — the no-trailing-slash form every canonical,
   sitemap entry and internal link uses — SPA-falls-back and returns the
   **landing page** at HTTP 200. Only `/docs/concepts/agents/` works.
-- Nothing ever returns 404; `/nope` is the landing page at 200 too.
+- Nothing ever returns 404; `/nope` and `/docs/bogus` are the landing page at
+  200 too.
+- `_redirects` is inert, so `/docs` is the landing page rather than a 301.
 
-Cloudflare's static assets do the opposite on both counts (`html_handling`'s
-default `auto-trailing-slash` maps the extension-less path to
-`<path>/index.html`, and `not_found_handling: "404-page"` serves `404.html`
-with a real 404). To check serving behaviour locally you need a server with
-those two properties; otherwise verify against a PR preview deploy or
-production. Don't reach for `vite preview` to confirm a status code or a deep
-link.
+Cloudflare differs on every one of those counts, so run the **real router**
+instead — `wrangler` is pinned in the repo-root `mise.toml` and this runs
+offline against `dist/`:
+
+```sh
+bun run --cwd apps/site build
+cd apps/site && wrangler dev --local
+```
+
+What that serves (verified against workerd, not inferred):
+
+| request | result |
+|---|---|
+| `/` | 200 |
+| `/docs/concepts/agents` | 200 |
+| `/docs/concepts/agents/` | 307 → `/docs/concepts/agents` |
+| `/docs` and `/docs/` | 301 → `/docs/getting-started/overview` → 200 |
+| `/nope` | 404 (root `dist/404.html`) |
+| `/docs/bogus` | 404 (`dist/docs/404.html`) |
+
+One operational note: `wrangler dev` watches the asset directory, so a
+`rm -rf dist && bun run build` underneath a running server leaves it holding an
+empty manifest and answering 404 for everything. Restart it after a clean
+rebuild. It also writes an untracked `apps/site/.wrangler/` (gitignored at the
+repo root).
 
 `og.html` (at the app root, outside `public/` so it's never deployed) is the
 source for the social card `public/og.png` — regenerate the PNG with a
@@ -97,13 +117,15 @@ bun scripts/prerender.ts                            # .ssr + dist/index.html →
 page list is derived, never hand-maintained**. A new `.mdx` file is
 prerendered, sitemapped and added to `llms.txt` on the next build with no
 registry edit anywhere. It emits `dist/index.html` (landing), one
-`dist/docs/<slug>/index.html` per doc, `dist/404.html`, plus `sitemap.xml`,
+`dist/docs/<slug>/index.html` per doc, **two** not-found documents
+(`dist/404.html` and `dist/docs/404.html` — see [Serving
+behaviour](#serving-behaviour-404s-docs-headers)), plus `sitemap.xml`,
 `robots.txt` and `llms.txt`.
 
-The page list is deliberately **closed** — `docEntries` + `/` + the 404, never
-an arbitrary path. `/docs` in particular is not prerendered: it has no page of
-its own (`public/_redirects` 301s it to the overview), so no file may exist at
-that path.
+The page list is deliberately **closed** — `docEntries` + `/` + the two 404s,
+never an arbitrary path. `/docs` in particular is not prerendered: it has no
+page of its own (`public/_redirects` 301s it to the overview), so no file may
+exist at that path.
 
 ### One metadata model, two renderers
 
@@ -185,7 +207,7 @@ populates the head on mount instead.
 `dist/index.html` carries ~35 inline `opacity:0` styles, including both hero
 `<h1>` spans at `opacity:0;filter:blur(7px)` — `motion` serializes each
 entrance animation's `initial` state during the render pass. `dist/docs/**`
-and `dist/404.html` carry none.
+and both 404 documents carry none (measured: 35 / 0 / 0 / 0).
 
 There is **no SEO cost**: the text is in the HTML, and `index.html`'s
 `<noscript>` block forces `[data-reveal]` elements to their final state
@@ -221,6 +243,11 @@ not.
    never settles would otherwise leave the page permanently un-hydrated and
    *silent*: inert markup, no error, no fallback. Hydrating anyway degrades to
    "React discards the markup and client-renders", which is a working site.
+3. **A 404 document must match the tree the router renders where it is
+   served, and must render nothing derived from the requested URL.** Both
+   halves were measured as real `#418`s in Chromium; both are why there are
+   two 404 files and why `DocNotFound` defers the slug past mount. See
+   [Serving behaviour](#not_found_handling-404-page-and-why-there-are-two-404-documents).
 
 **Rejected, verified broken, do not retry:** setting `router.ssr = {...}` (what
 TanStack Start's `hydrate()` does) makes the *browser* skip the boundary
@@ -236,7 +263,7 @@ All three are emitted by the prerender script rather than living in `public/`,
 because all three embed the build-time site URL or the derived page list.
 
 - **`sitemap.xml`** — one `<url>` per page that has a canonical, which is every
-  page except the 404 (`notFoundSeo` sets `canonical: null` on purpose, and
+  page except the two 404s (`notFoundSeo` sets `canonical: null` on purpose, and
   `renderSitemap` keys off exactly that). No `<lastmod>` — see Future work.
 - **`robots.txt`** — `Allow: /` plus `Sitemap: <siteUrl>/sitemap.xml` on the
   production deploy; `Disallow: /` on every other build.
@@ -253,13 +280,23 @@ no new CI job was needed.
 
 - a doc whose frontmatter is missing `title`, `section` or `description`
   (checked *before* any rendering)
+- **no doc matching `DOCS_INDEX_SLUG`** (also before any rendering). That slug
+  is hardcoded in three places nothing else ties together — `src/lib/seo.ts`,
+  `src/routes/docs.index.tsx` and `public/_redirects` — and the two outside
+  this build are silent on failure. Without the guard, renaming one `.mdx`
+  file is an ordinary content edit that leaves the edge 301 pointing at a URL
+  that 404s and in-app `/docs` landing on `DocNotFound`, with a green build
 - a page whose `#root` markup is under 1 000 bytes — an empty shell (measured
   against the app markup, not the finished document, which the template and
   JSON-LD alone would push past any useful threshold)
 - markup that does not open with `<!--$-->` (the root Suspense boundary is
   missing or displaced → nothing can hydrate)
 - no `<h1>`, a surviving `<!--seo-->`, or a surviving `%VITE_SITE_URL%`
-- two pages claiming the same canonical, or a page count ≠ `docEntries + 2`
+- two pages claiming the same canonical
+- a page embedding the build-time sentinel path it was rendered at
+  (`__prerender_not_found__`). This is the hydration contract for the two 404
+  documents: each is served for an unbounded set of URLs, so anything either
+  renders *from the requested path* mismatches in every browser that loads it
 - **any React streaming artifact in the output**: `<!--$?-->` (unresolved
   boundary), `<!--$!-->` (errored boundary — its fallback shipped),
   `<div hidden id="S:` (the parking div), `$RC("B:` (the swap script), or the
@@ -308,10 +345,43 @@ on the Bun `workspace:*` protocol in `package.json`.
 
 ## Serving behaviour: 404s, `/docs`, headers
 
-### `not_found_handling: "404-page"`
+### `html_handling: "drop-trailing-slash"`
+
+**Not the default, and it must not go back to one.** `prerender.ts` emits
+`dist/docs/<slug>/index.html`, while every canonical, `og:url`, sitemap
+`<loc>`, internal `<Link>` and `llms.txt` line advertises the **no**-trailing-
+slash form `/docs/concepts/agents`. Cloudflare's default `auto-trailing-slash`
+serves a folder index only *with* the slash, so it answers all 28 advertised
+doc URLs with a **307 to their trailing-slash twin** — a redirect on the
+canonical form of the entire docs tree. `drop-trailing-slash` inverts it:
+`/docs/concepts/agents` is 200 and the trailing-slash form 307s to it.
+
+Emitted paths, advertised URLs, and this setting are one decision in three
+files. Change any one and you must change all three.
+
+### `not_found_handling: "404-page"`, and why there are two 404 documents
 
 Real files serve **200** — every route is one, so deep links are unaffected.
-Everything else gets `dist/404.html` at a **genuine 404**.
+Everything else gets a **genuine 404**, whose body is the *nearest* `404.html`
+walking up the tree. That "nearest" is why the build emits two:
+
+| miss | file served | what the client router renders there |
+|---|---|---|
+| `/nope` | `dist/404.html` | root `notFoundComponent` (no docs chrome) |
+| `/docs/bogus` | `dist/docs/404.html` | the docs **shell** — sidebar, mobile nav, TOC rail — with `DocNotFound` in the content column |
+
+One document cannot be both trees. Serving the root 404 under `/docs/*` means
+the browser hydrates the docs shell against root-404 markup, which React
+rejects outright (`Minified React error #418`), discarding every prerendered
+byte — a guaranteed console error across a whole URL class. Both files keep
+`notFoundSeo`'s `canonical: null`, which is exactly what keeps them out of
+`sitemap.xml`, and both are `noindex`.
+
+`DocNotFound` renders the requested path only **after mount** for the same
+reason: `dist/docs/404.html` is one file serving an unbounded set of URLs, so
+the slug it was built with is never the slug the browser is on, and rendering
+it in the first pass is a guaranteed text mismatch. The build guards the
+emitted HTML against that regression (see [Build guards](#build-guards)).
 
 SPA fallback (`"single-page-application"`) was the correct setting *before*
 prerendering: the shell was the page, and GitHub Pages' 404-status deep links
@@ -324,8 +394,13 @@ duplicate-content trap, so `404-page` it is.
 ### `public/_redirects`
 
 ```
-/docs  /docs/getting-started/overview  301
+/docs   /docs/getting-started/overview  301
+/docs/  /docs/getting-started/overview  301
 ```
+
+Both forms are listed because `html_handling` normalizes slashes only for
+paths that resolve to an **asset**, and `/docs` resolves to no file at all —
+without the second rule `/docs/` falls through to the 404.
 
 `routes/docs.index.tsx` redirects client-side, which leaves `/docs` competing
 with `/docs/getting-started/overview` for the same content (a crawler that runs

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .ssr/
+# `wrangler dev`'s local state dir (apps/site) — workerd cache, config, IDs.
+.wrangler/
 .output/
 .eve/
 .workflow-data/

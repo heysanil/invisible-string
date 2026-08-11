@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { renderLlmsTxt } from "../src/lib/llms";
 import {
+  DOCS_INDEX_SLUG,
   docSeo,
   landingSeo,
   normalizeSiteUrl,
@@ -60,6 +61,12 @@ const ROOT_MARKER = '<div id="root"></div>';
  * catastrophe, and `renderPage` already rejects genuinely empty output.
  */
 const MIN_APP_BYTES = 1000;
+
+/**
+ * A path segment no route pattern and no doc slug can ever claim, so rendering
+ * it is guaranteed to drive a not-found tree rather than a real page.
+ */
+const NOT_FOUND_SEGMENT = "__prerender_not_found__";
 
 /**
  * Every page's markup must OPEN with React's completed-Suspense-boundary
@@ -152,16 +159,28 @@ async function main(): Promise<void> {
       }
     }
   }
+
+  // The `/docs` landing slug is hardcoded in THREE places that nothing else
+  // ties together, and the two outside this build are both silent on failure.
+  // Renaming or moving one .mdx file — an ordinary content edit — would
+  // otherwise leave the edge 301 pointing at a URL that 404s and in-app
+  // `/docs` landing on DocNotFound, with a green build.
+  if (!docEntries.some((entry) => entry.slug === DOCS_INDEX_SLUG)) {
+    fail(
+      `DOCS_INDEX_SLUG is "${DOCS_INDEX_SLUG}" but no doc has that slug — bare /docs would resolve to nothing.\n` +
+        `    Update all three together: src/lib/seo.ts (DOCS_INDEX_SLUG), src/routes/docs.index.tsx (the redirect target), and public/_redirects (both 301 rules).`,
+    );
+  }
   if (problems.length > 0) report();
 
-  // CLOSED list: the landing page, one page per doc entry, and the 404. It is
-  // built from `docEntries` and accepts no arbitrary path, so what lands in
-  // dist/ is exactly the site's real page set — in particular, `/docs` must
-  // NEVER appear here. `renderPage("/docs")` succeeds (it follows the route
-  // redirect and returns markup byte-identical to /docs/getting-started/
-  // overview), which makes adding it look harmless, but `/docs` has no page of
-  // its own: public/_redirects 301s it to the overview, so no file should
-  // exist at that path.
+  // CLOSED list: the landing page, one page per doc entry, and the two 404
+  // documents. It is built from `docEntries` and accepts no arbitrary path, so
+  // what lands in dist/ is exactly the site's real page set — in particular,
+  // `/docs` must NEVER appear here. `renderPage("/docs")` succeeds (it follows
+  // the route redirect and returns markup byte-identical to
+  // /docs/getting-started/overview), which makes adding it look harmless, but
+  // `/docs` has no page of its own: public/_redirects 301s it to the overview,
+  // so no file should exist at that path.
   //
   // To be clear about what the hazard is NOT: the file would not shadow the
   // redirect. Cloudflare's static-asset redirects take PRECEDENCE over assets
@@ -178,11 +197,27 @@ async function main(): Promise<void> {
       route: `/docs/${entry.slug}`,
       seo: docSeo(entry.slug, entry.frontmatter, ctx),
     })),
-    // Rendering an unmatched route drives the root route's notFoundComponent.
-    { out: "404.html", route: "/__prerender_not_found__", seo: notFoundSeo(ctx) },
+    // TWO not-found documents, because `not_found_handling: "404-page"` serves
+    // the NEAREST 404.html and the client router renders a different tree
+    // depending on where the miss landed:
+    //
+    //  - `/nope` matches no route at all → the root notFoundComponent.
+    //  - `/docs/bogus` matches the `docs.$` splat → the docs SHELL (sidebar,
+    //    mobile nav, TOC rail) with DocNotFound in the content column.
+    //
+    // One document cannot be both. Serving the root 404 under /docs/* means the
+    // browser hydrates the docs shell against root-404 markup, which React
+    // rejects outright (error #418) and throws every prerendered byte away — a
+    // guaranteed console error across a whole URL class. So each not-found tree
+    // gets its own file at the depth Cloudflare will reach for it.
+    //
+    // Both keep `notFoundSeo`'s `canonical: null`, which is exactly what keeps
+    // them out of sitemap.xml, and both are noindex.
+    { out: "404.html", route: `/${NOT_FOUND_SEGMENT}`, seo: notFoundSeo(ctx) },
+    { out: "docs/404.html", route: `/docs/${NOT_FOUND_SEGMENT}`, seo: notFoundSeo(ctx) },
   ];
 
-  // Sequential: 30 pages, and a shared module registry makes concurrency here
+  // Sequential: ~31 pages, and a shared module registry makes concurrency here
   // a false economy.
   for (const page of pages) {
     const appHtml = await renderPage(page.route);
@@ -217,6 +252,18 @@ async function main(): Promise<void> {
         fail(`${page.out}: contains ${marker} — ${why}; its content is not really in the file`);
       }
     }
+    // No page may embed the sentinel path it was rendered at. For the two 404
+    // documents this is the hydration contract: each is served for an
+    // unbounded set of URLs, so anything derived from the requested path is a
+    // text mismatch against every browser that loads it (React discards the
+    // whole tree — see DocNotFound in routes/docs.$.tsx). For every other page
+    // it is unreachable, which is the point: the check costs nothing and fires
+    // the moment a not-found tree starts rendering its own path again.
+    if (html.includes(NOT_FOUND_SEGMENT)) {
+      fail(
+        `${page.out}: embeds the build-time sentinel "${NOT_FOUND_SEGMENT}" — this document is served for MANY URLs, so anything it renders from the requested path breaks hydration on all of them (see DocNotFound in src/routes/docs.$.tsx)`,
+      );
+    }
 
     await emit(page.out, html);
   }
@@ -228,11 +275,6 @@ async function main(): Promise<void> {
       fail(`duplicate canonical ${page.seo.canonical} — two pages claim the same URL`);
     }
     canonicals.add(page.seo.canonical);
-  }
-
-  const expected = docEntries.length + 2;
-  if (pages.length !== expected) {
-    fail(`emitted ${pages.length} pages, expected ${expected}`);
   }
 
   await emit("sitemap.xml", renderSitemap(pages.map((p) => p.seo)));

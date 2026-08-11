@@ -4,11 +4,23 @@
   // Assets-only Worker: no `main` script — requests never invoke compute.
   "assets": {
     "directory": "./dist",
+    // MUST match the shape scripts/prerender.ts emits and the URLs the site's
+    // own metadata advertises. It emits dist/docs/<slug>/index.html, and every
+    // canonical, og:url, sitemap <loc>, internal <Link> and llms.txt line uses
+    // the NO-trailing-slash form (`/docs/concepts/agents`). The default
+    // "auto-trailing-slash" serves a folder index only WITH the slash, so it
+    // 307s every advertised URL to its trailing-slash twin — a redirect on the
+    // canonical form of all 28 doc pages. "drop-trailing-slash" inverts that:
+    // `/docs/concepts/agents` is 200 and `/docs/concepts/agents/` 307s to it.
+    // Change one of these three (emitted paths, advertised URLs, this setting)
+    // and you must change all three.
+    "html_handling": "drop-trailing-slash",
     // Every route is now a real prerendered file, so SPA fallback would serve
     // the HOMEPAGE at 200 for every mistyped URL — an unbounded set of
-    // soft-404s all duplicating `/`. "404-page" serves dist/404.html with a
-    // genuine 404 status instead; real deep links still return 200 because
-    // they are real files.
+    // soft-404s all duplicating `/`. "404-page" serves the NEAREST 404.html
+    // with a genuine 404 status instead — dist/docs/404.html under /docs/*,
+    // dist/404.html everywhere else (see scripts/prerender.ts on why there are
+    // two). Real deep links still return 200 because they are real files.
     "not_found_handling": "404-page"
   },
   // First deploy creates the apex DNS record + cert on the Cloudflare zone.

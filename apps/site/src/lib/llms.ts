@@ -34,5 +34,9 @@ export function renderLlmsTxt(
     blocks.push(lines.join("\n"));
   }
 
-  return template.replace(LLMS_DOCS_MARKER, blocks.join("\n\n"));
+  // Callback form, deliberately: `String.replace` expands `$&`, `$1`, "$`" and
+  // `$'` inside a replacement STRING even when the pattern is a plain string,
+  // so a frontmatter description containing one would silently corrupt the
+  // output. A function replacement is inserted verbatim. Don't "simplify" it.
+  return template.replace(LLMS_DOCS_MARKER, () => blocks.join("\n\n"));
 }

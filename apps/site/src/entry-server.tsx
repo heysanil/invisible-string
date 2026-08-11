@@ -71,6 +71,10 @@ async function renderResolvedPage(path: string, redirectChain: readonly string[]
   const router = createSiteRouter({
     history: createMemoryHistory({ initialEntries: [path] }),
     defaultPreload: false,
+    // Emits the root Suspense boundary the browser renders but this build
+    // cannot — see `PrerenderRootSuspense` in router.tsx. Without it every
+    // page fails to hydrate and is thrown away client-side.
+    prerendering: true,
   });
 
   await router.load();

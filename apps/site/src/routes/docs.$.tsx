@@ -18,7 +18,7 @@ import {
   MobileDocNav,
   useActiveHeading,
 } from "../components/docs";
-import { docFrontmatterList, getDocLoader } from "../lib/docs";
+import { docFrontmatterList, getCachedDocComponent, getDocLoader } from "../lib/docs";
 import { buildSidebar, docNeighbours, flattenSidebar } from "../lib/sidebar";
 import { extractToc, type TocEntry } from "../lib/toc";
 
@@ -34,7 +34,17 @@ function DocPage() {
   const { prev, next } = useMemo(() => docNeighbours(flat, slug), [flat, slug]);
 
   const loader = getDocLoader(slug);
-  const MdxDoc = useMemo(() => (loader ? lazy(loader) : null), [loader]);
+  // The SSR entry preloads the matched doc's body (`preloadDoc`) before
+  // rendering, so on the server this cache is warm and the component mounts
+  // synchronously — no `lazy()`, so the Suspense boundary below never
+  // actually suspends and the built HTML gets the article inline instead of
+  // React's streaming placeholder. In the browser the cache is always empty,
+  // so visitors still get the lazy import unchanged.
+  const cached = getCachedDocComponent(slug);
+  const MdxDoc = useMemo(
+    () => cached ?? (loader ? lazy(loader) : null),
+    [cached, loader],
+  );
 
   const [toc, setToc] = useState<TocEntry[]>([]);
   const activeId = useActiveHeading(toc);

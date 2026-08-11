@@ -58,3 +58,32 @@ export function getDocLoader(
 ): (() => Promise<{ default: ComponentType }>) | undefined {
   return bodyModules[`${PREFIX}${slug}.mdx`];
 }
+
+/**
+ * Warmed only by `preloadDoc` (entry-server.tsx). The client never populates
+ * this — it stays empty in the browser, so `docs.$.tsx`'s lazy-import path
+ * there is unchanged: same chunking, same network behaviour.
+ */
+const preloadedDocs = new Map<string, ComponentType>();
+
+/**
+ * Resolves one doc body ahead of render, for the SSR entry only. `docs.$.tsx`
+ * mounts `getCachedDocComponent`'s result directly instead of wrapping the
+ * loader in `React.lazy` when a warmed entry exists: `lazy()` always suspends
+ * on its first touch, even against an already-resolved dynamic import, which
+ * pushes React's Fizz renderer into its streaming-placeholder output (a
+ * visible fallback plus a hidden, script-swapped copy of the real content)
+ * for that boundary — regardless of whether `prerender()` later waits for it.
+ * A no-op for an unknown slug.
+ */
+export async function preloadDoc(slug: string): Promise<void> {
+  const loader = getDocLoader(slug);
+  if (!loader) return;
+  const mod = await loader();
+  preloadedDocs.set(slug, mod.default);
+}
+
+/** Synchronous lookup into the `preloadDoc` cache; `undefined` until warmed. */
+export function getCachedDocComponent(slug: string): ComponentType | undefined {
+  return preloadedDocs.get(slug);
+}

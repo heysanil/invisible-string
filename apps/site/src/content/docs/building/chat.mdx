@@ -4,13 +4,34 @@ section: Building
 order: 32
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Chat
 
 Chat is where you hand work to a published Agent and watch it happen. Pick an
 Agent, start a session, and every run streams back live — what the Agent said,
 what it did, and anything it needs from you before it can continue.
+
+## Starting a session
+
+The "New chat" picker is searchable and lists every published Agent in the
+workspace, each with a resolved-model chip — or, for an Agent whose build
+hasn't finished, a **Building…** or **Build failed** status in place of the
+chip. Picking an Agent opens a new thread that targets its currently published
+version and pins that version for the session's life: republishing the Agent
+later never moves a thread that's already running.
+
+## The composer
+
+| Key | Effect |
+|---|---|
+| `Enter` | Send — or queue, if a run currently holds the session |
+| `Shift+Enter` | Newline; never submits |
+| `Escape` | Stop the active run (no-op if there's nothing to stop) |
+
+Typing accented or CJK characters goes through your input method's own
+composing state, and `Enter` there commits the composing candidate instead of
+submitting — a second `Enter` sends. See
+[Keyboard and accessibility](/docs/reference/keyboard-and-accessibility) for
+the full shortcut inventory across the platform.
 
 ## The run timeline
 
@@ -19,17 +40,27 @@ it happened. The Agent's prose appears where it was said, and each contiguous
 stretch of interior work — thinking and tool calls — collects into one
 collapsible box beside a rail. Every thinking pass is kept, not just the last
 one, so a run that thinks, calls a tool, then thinks again shows both passes in
-place.
+place. A tool call on the rail shows its own status as it happens — running,
+succeeded, failed, rejected, or awaiting your approval.
 
-A work box is open while it's live and folds itself away once the Agent moves
-on, leaving what it said as the thing you read. Open any of them back up to see
-what happened.
+A work box's header tells you what it's doing: **Working** while it's live,
+with a running M:SS counter; **Waiting on you** while it's parked on an
+approval, with no counter; and **Worked for Ns · M steps** once it settles,
+counting every rail item, not just tool calls. A box defaults open only if the
+run was still active when the page loaded — a completed run replayed from
+history opens collapsed. It auto-folds once the Agent starts speaking or the
+run stops being live, unless you toggled it yourself, in which case your
+toggle wins for that box for the rest of its life. While it's actively
+streaming, a box's body is height-capped with its own internal scroll so a
+long reasoning pass doesn't push the composer down the page; the cap lifts
+once the run settles.
 
 ## Stopping a run
 
-While a run holds the session, the composer's send button becomes **Stop**.
-Stopping is a decision, not an error: the run lands as **canceled** rather than
-failed, and the conversation stays exactly where it is.
+While a run holds the session, the composer's send button becomes **Stop**,
+rendered in neutral ink, never red — cancellation is a decision, not a
+failure. The run lands as **canceled** rather than failed, and the
+conversation stays exactly where it is.
 
 Cancellation is cooperative — it takes effect at the next durable step
 boundary, so a tool call already in flight finishes rather than being torn in
@@ -39,27 +70,59 @@ half.
 
 A session runs one execution at a time, so a message sent mid-run would
 otherwise be refused. Instead the composer stays live and **Enter queues**:
-messages you type while a run is working stack up above the composer, and the
-moment the session frees they merge into a single message and send as one turn.
+messages you type while a run is working stack up in a "Queued" strip between
+the transcript and the composer, each one removable individually. The moment
+the session frees, everything queued merges into a single message — joined by
+blank lines — and sends as one turn: one send, one run, one reply.
 
-Queued messages are yours until they send — remove any of them, and leaving a
-thread that still has a queue asks before dropping it.
+Leaving a thread with a non-empty queue — switching sessions, starting a new
+chat, navigating away — asks for confirmation first, since anything still
+queued has not been sent. Closing or reloading the browser tab is the one
+exception: that drops a queue with no prompt.
 
 ## When it needs you
 
 A run can pause and wait for a person. Three things park a run:
 
-- **Tool approvals** — the Agent asks before running a gated tool.
-- **Questions** — the Agent asks you something directly.
+- **Tool approvals** — an amber card names the tool, previews its arguments,
+  and offers approve/deny-style buttons styled by what each option does.
+- **Questions** — the Agent asks you something directly, with no tool chip,
+  and a free-text reply box when the question allows one.
 - **Session limits** — a long-running session that crosses its input-token
-  budget stops and asks whether to continue, instead of failing.
+  budget stops and asks whether to continue. This prompt is approve-only in
+  the UI, since stopping the run outright is already always available from
+  the composer's Stop control.
 
 Each renders inline in the thread with its own controls. A waiting run still
 holds the session, so anything you type meanwhile is queued.
 
+## When something goes wrong
+
+A failed run shows up in the timeline like any other — its work boxes and
+prose stay exactly as they streamed, with the failure itself surfaced in
+place rather than erasing what already happened. The session survives a
+failed run; sending another message starts a new run against the same
+session.
+
+The composer itself can go disabled with an explanatory hint instead of
+accepting input — for example while the session is busy with another run, or
+if the Agent behind the thread isn't published. See
+[Troubleshooting](/docs/reference/troubleshooting) for what each of those
+states means and how to recover.
+
+## Origin and editing
+
+A session started by something other than chat — a webhook, a Slack event, a
+schedule, a form — shows a chip naming that origin, plus a second chip naming
+the Workflow that started it, in both the session list and the open thread.
+Runs in that kind of thread show a `Triggered · {message}` line in place of an
+outbound chat bubble. An **Edit agent ↗** link in the thread header jumps
+straight to the agent editor for the Agent behind the session.
+
 ## Context controls
 
-The thread menu carries three ways to manage what the Agent remembers:
+The thread's "Session actions" menu carries three ways to manage what the
+Agent remembers:
 
 - **Clear context** — the Agent forgets the messages so far; the thread stays.
 - **Compact context** — earlier messages are summarized to free up room.
@@ -67,7 +130,12 @@ The thread menu carries three ways to manage what the Agent remembers:
   destructive and asks for confirmation: a retired session can never accept
   another message.
 
-Clear and compact leave a marker in the thread where they happened, so the
-transcript never silently disagrees with what the Agent knows.
+Clear and compact both fire immediately with no confirmation, and leave a
+marker in the thread where they happened, so the transcript never silently
+disagrees with what the Agent knows. If a run is in flight, every row in this
+menu is disabled.
 
-<UnderConstruction />
+See [Sessions & runs](/docs/concepts/sessions-and-runs) for how a session and
+its runs relate, [Agents](/docs/concepts/agents) for what gets published into
+a thread in the first place, and [Durability](/docs/platform/durability) for
+what keeps a run's history intact across a worker failure.

@@ -1,0 +1,51 @@
+---
+title: Build a webhook Workflow
+section: Guides
+order: 47
+---
+
+# Build a webhook Workflow
+
+Say your site's support form POSTs a JSON submission somewhere. This guide wires that POST to a Workflow that triages the submission and files a Linear issue through the Agent's connector — the request lands, a run starts, and the result shows up in the run's history.
+
+## Before you start
+
+- A published Agent already equipped with whatever the Workflow needs it to do — for this scenario, a Linear connector. See [Equip an Agent with a connector](/docs/guides/equip-an-agent).
+- Familiarity with how a Workflow's three parts fit together — see [Workflows](/docs/concepts/workflows).
+- A way to send a JSON POST for testing (`curl` is enough).
+
+## Steps
+
+1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor).
+2. In the Trigger section, pick **Webhook**. The draft shows a note that a signing token is minted at publish — there's nothing live to copy yet.
+3. Choose the Agent — it must already be published; the picker only lists published Agents.
+4. Write the instructions, referencing the submitted fields with `@trigger.email`, `@trigger.subject`, and `@trigger.body`. The entire submitted JSON body becomes the event's data verbatim — there's no schema, so whatever top-level keys the POST body has are the keys you can reference.
+5. Click **Publish**. It's instant — a Workflow builds nothing — and publish is what unlocks the token: an Agent and non-empty instructions are both required before it will go through.
+6. The Trigger section now shows a live "Ingress token" card. Click **Generate token**. The plaintext token appears exactly once, in an amber card: "Copy this now — we store only a hash, so it won't be shown again." The card also shows the live ingress URL. Copy the token now — there is no way to retrieve it again later, only to rotate it for a new one.
+
+Send a request to the ingress URL from step 6:
+
+```bash
+curl -X POST https://your-domain.example/t/whk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  -H 'content-type: application/json' \
+  -d '{"email":"user@example.com","subject":"Login broken","body":"Cannot sign in since this morning."}'
+```
+
+## What you should see
+
+The response to that `curl` is only an acknowledgement that the trigger was accepted — it is never the Agent's answer. Read the actual result in the Workflow's run history: a new run appears, its instructions rendered with `@trigger.email`, `@trigger.subject`, and `@trigger.body` resolved against the JSON you posted, followed by whatever the Agent did with it (a tool call to file the Linear issue, then its summary).
+
+## Operational notes
+
+- Request bodies are capped at 256 KiB — larger requests are rejected before a run starts.
+- Both the token and the caller's IP are rate-limited independently; sending too fast gets a `429` with a `Retry-After` header rather than queuing.
+- If you lose the token, there's no way to reveal it again — mint a new one instead. Rotating immediately invalidates the old token; every caller still using it starts failing until it switches to the new one.
+
+## If it doesn't work
+
+- **`401` on the request** — the token is wrong, expired, or was rotated out from under you. Mint a fresh one and update the caller.
+- **`413` on the request** — the body is over the 256 KiB cap. Trim the payload; the platform doesn't accept partial or streamed bodies.
+- **`429` on the request** — you're sending faster than the per-token or per-IP limit allows. Back off for the number of seconds in the `Retry-After` header.
+- **A run starts but the Agent's tool call fails** — the Agent isn't actually equipped with the connector the instructions assume. Revisit [Equip an Agent with a connector](/docs/guides/equip-an-agent) and republish the Agent.
+
+See [Triggers](/docs/building/triggers) for how the other trigger kinds compare, [limits & defaults](/docs/reference/limits-and-defaults) for the platform's other ceilings, and [troubleshooting](/docs/reference/troubleshooting) for anything not covered above.

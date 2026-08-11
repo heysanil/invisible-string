@@ -1,16 +1,14 @@
 ---
 title: Models
 section: Building
-order: 36
+order: 37
 ---
-
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Models
 
-Rather than pick a raw model per Agent, you choose a **preset**. Each workspace
-defines three — `powerful`, `balanced`, and `quick` — and each Agent's Model
-section selects among them. Presets are resolved against the workspace's
+Rather than pick a raw model per [Agent](/docs/concepts/agents), you choose a **preset**. Each workspace
+defines three — `powerful`, `balanced`, and `quick` — and each Agent's [Model
+section](/docs/building/agent-editor) selects among them. Presets are resolved against the workspace's
 provider and model **allowlist**, so an Agent can only ever reference a model
 the workspace has sanctioned.
 
@@ -18,18 +16,47 @@ A preset is a provider, a model, *and* a reasoning effort. That third part is
 what lets two tiers share a model: the seeded `balanced` and `quick` presets
 point at the same model and differ only in how hard it is asked to think.
 
+## What a fresh workspace starts with
+
+Creating a workspace seeds all three presets against OpenRouter:
+
+| Preset | Model | Effort |
+|---|---|---|
+| `powerful` | `moonshotai/kimi-k3` | `max` |
+| `balanced` | `~deepseek/deepseek-v4-flash-latest` | `max` |
+| `quick` | `~deepseek/deepseek-v4-flash-latest` | `low` |
+
+That leading `~` on the `-latest` alias is literal — part of the model id, not a typo — and it's how OpenRouter marks a floating alias. An owner or admin can repoint any preset to a different model or effort under [Settings → Models](/docs/building/settings); this table describes only the starting point, not a fixed default.
+
+## Choosing a preset
+
+The three presets are calibrated for different kinds of work rather than different qualities of answer:
+
+- `powerful` — deepest reasoning for hard, open-ended work.
+- `balanced` — the everyday default, capable and fast.
+- `quick` — snappy and cheap for simple, high-volume steps.
+
 ## Reasoning effort
 
 Effort is how much thinking the model does before it answers, drawn from the
 vocabulary providers actually publish:
 
-`none · minimal · low · medium · high · xhigh · max`
+| Value | Meaning | Reach for it when |
+|---|---|---|
+| `provider-default` | Sends no reasoning field at all — "Model default" | You want the one universally safe choice |
+| `none` | Explicitly disables reasoning | You want to *guarantee* no reasoning step, as distinct from leaving it up to the model |
+| `minimal` | The lightest reasoning a model offers | Latency matters more than depth |
+| `low` | Light reasoning | Simple, well-scoped steps |
+| `medium` | Moderate reasoning | Everyday tasks with some ambiguity |
+| `high` | Heavy reasoning | Work that benefits from working through alternatives |
+| `xhigh` ("Extra high") | Near-maximum reasoning | Hard problems where depth is worth the wait |
+| `max` | The model's maximum reasoning | The hardest, highest-stakes work |
 
-Alongside those sits `provider-default`, which sends no reasoning instruction
-at all. The two quiet options are not the same: `none` explicitly disables
-reasoning, while `provider-default` leaves the decision to the model. Roughly a
-third of catalog models advertise no reasoning support, and it is the honest
-answer for those.
+`provider-default` and `none` are easy to conflate but mean opposite things:
+`none` explicitly disables reasoning, while `provider-default` leaves the
+decision to the model entirely by omitting the field. It is the honest answer
+for the roughly one-third of catalog models that don't advertise reasoning
+support at all. See the [glossary](/docs/reference/glossary) for how this vocabulary maps onto the raw values providers publish.
 
 An Agent **inherits** its preset's effort by default, and the Model section
 shows what it inherited. Override it and the Agent pins that effort instead.
@@ -40,6 +67,22 @@ If you override the *model* rather than the preset, the effort falls to that
 model's provider default rather than following the preset — inheriting a
 preset's `max` onto a deliberately chosen cheaper model is the wrong default.
 
+## When a model isn't available
+
+An Agent's model override is checked against the workspace allowlist at
+publish time, not just when you pick it. If the override isn't on the
+allowlist — or was removed from it since — publishing is blocked with the
+error shown right on the Model section, not buried in a generic failure.
+
+## Cost and latency
+
+Effort trades speed and cost for depth, in relative terms: a higher effort
+spends more reasoning tokens before it answers, which means a slower response
+and a higher cost for that run. There's no universal number to quote here —
+how much slower or costlier depends on the model — so treat the vocabulary as
+a dial, not a fixed multiplier, and reach for the lowest effort that gets the
+job done.
+
 ## Resolution and pinning
 
 Both the model and the effort are resolved when you **publish**, and both are
@@ -49,6 +92,4 @@ workspace preset changes nothing that is already running. The new setting lands
 on the next publish.
 
 Presets and the allowlist are seeded when a workspace is created and managed
-under Settings.
-
-<UnderConstruction />
+under [Settings](/docs/building/settings).

@@ -4,43 +4,96 @@ section: Concepts
 order: 21
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Workflows
 
-A workflow is a **standing delegation** — the way you'd tell an assistant
+A Workflow is a **standing delegation** — the way you'd tell an assistant
 "watch these Slack messages and prepare a report." It reads like a delegation
 memo in three parts: *when it happens* (**Trigger**), *who handles it*
 (**Agent**), and *what they should do* (**Instructions**).
 
 ## Trigger
 
-When the workflow fires: manually with **Run now** in the workflow editor, a
+When the Workflow fires: manually from the workflow editor's **Run** popover, a
 webhook, a form submission, a Slack event, or a schedule. (Manual runs land in
 Chat where you can follow them live — Chat itself starts conversations with
-Agents, not workflows.) Each kind is covered in
+Agents, not Workflows.) Each kind is covered in
 [Triggers](/docs/building/triggers).
 
 ## Agent
 
-Which published Agent handles the work. A workflow binds one Agent and attaches
+Which published Agent handles the work. A Workflow binds one Agent and attaches
 no extra context — the Agent's own equipment (connections, skills) is the
 context, and the instructions may reference it but never extend it.
 
 ## Instructions
 
 What to do when the trigger fires, with `@trigger` references into the event's
-data. Instructions aren't compiled into anything: when the workflow fires, the
+data. Instructions aren't compiled into anything: when the Workflow fires, the
 platform renders them — `@trigger` references resolved against the live event —
 and delivers them to the Agent as its task message.
 
 ## No builds
 
-Publishing a workflow builds nothing. Publish validates the delegation — the
-Agent exists and is published, the instructions are non-empty, every
-`@`-reference is legal — and snapshots it, so edits go live instantly. When the
+Publishing a Workflow builds nothing. Publish validates the delegation — the
+trigger's shape is valid, the Agent exists and is published, the instructions
+are non-empty — and snapshots it, so edits go live instantly. When the
 trigger fires, the platform starts a session against the Agent's current
 published version, and that session pins the exact agent version it started
 with, just like chat.
 
-<UnderConstruction />
+## What a Workflow is not
+
+A Workflow has no model of its own, no persona of its own, and no context of
+its own — every one of those belongs to the Agent it's bound to. Instructions
+can *reference* the Agent's connections and skills with `@`, but a Workflow
+can never extend or override what the Agent is equipped with. And a Workflow
+is not something you converse with: there's no chat surface for a Workflow the
+way there is for an [Agent](/docs/concepts/agents) — its only interface is its
+trigger.
+
+## What happens when it fires
+
+A trigger firing doesn't hand the Agent two separate things. The platform
+renders the Workflow's instructions and the trigger event into **one task
+message** and dispatches it to the Agent's current published version — from
+the Agent's side, it's a single message like any other. The trigger event
+itself is stored on the resulting run as provenance, so you can see what
+caused it later, but it isn't a side channel the Agent reads independently of
+that rendered message.
+
+## `@` references
+
+Instructions can reference two things with `@`: fields from the trigger event's
+data, and items from the bound Agent's context — its connections and skills.
+Both resolve at dispatch time, against the live event and the Agent's current
+context. A reference that no longer resolves — a trigger field that isn't in
+this event, a connection the Agent no longer has — surfaces as a staleness
+warning rather than a save-blocking error; see
+[Agents: renaming, deleting, and dependents](/docs/concepts/agents) for how
+that degrades at dispatch.
+
+## Where the result goes
+
+A Workflow's outcome always lands in the run itself, readable in its
+[run history](/docs/concepts/sessions-and-runs) regardless of trigger kind.
+Beyond that, where else it shows up depends on how it fired:
+
+- **Slack triggers** — the control plane posts the Agent's final reply back
+  into the originating Slack thread, at least once. A rare duplicate reply
+  after a crash is expected behavior, not a bug.
+- **Webhook triggers** — the HTTP response returned to the caller is only an
+  acknowledgement that the trigger was accepted. It is never the Agent's
+  answer; that only ever lands in the run. See
+  [Build a webhook Workflow](/docs/guides/webhook-workflow) for a worked
+  example.
+- **Everything else** — wherever the Agent's own tool calls put it. If the
+  Agent's job is to write a row to a spreadsheet or send an email, that
+  happens through its own equipped tools, not through the Workflow.
+
+## Repeated triggers and busy sessions
+
+A Workflow's dispatch still obeys the platform's one-run-per-session rule. If
+a trigger fires while the Agent's session for that Workflow is already busy —
+mid-run, or parked waiting on a human — the new run request is refused rather
+than interleaved with the one in progress. See
+[sessions & runs](/docs/concepts/sessions-and-runs) for what "busy" covers.

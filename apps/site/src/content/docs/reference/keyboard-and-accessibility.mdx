@@ -1,0 +1,70 @@
+---
+title: Keyboard and accessibility
+section: Reference
+order: 63
+---
+
+# Keyboard and accessibility
+
+Every real keyboard shortcut in invisible-string is listed on this page, in
+one table, alongside the platform's accessibility commitments. Nothing here
+is aspirational — if a shortcut or behavior isn't shipped, it isn't listed.
+
+## Shortcuts
+
+| Surface | Keys | Effect |
+|---|---|---|
+| Chat composer | `Enter` | Send — or queue, if a run holds the session |
+| Chat composer | `Shift+Enter` | Newline |
+| Chat composer | `Escape` | Stop the active run (no-op if there's nothing to stop) |
+| Copilot composer | `Enter` | Send to the copilot |
+| Copilot composer | `Shift+Enter` | Newline |
+| `@` reference popup (workflow instructions editor) | `Enter` / `Tab` | Accept the highlighted reference |
+| `@` reference popup | `↑` / `↓` | Move the highlighted option |
+| `@` reference popup | `Escape` | Close the popup |
+| A focused copilot suggestion card | `Enter` | Apply the suggestion |
+| A focused copilot suggestion card | `Delete` / `Backspace` | Dismiss the suggestion |
+| Any popover, tooltip, drawer, or modal | `Escape` | Close it |
+| "New chat" agent picker | `Escape` | Close the picker |
+| A tag input (tool-picker free text) | `Enter` / `,` | Commit the current value as a tag |
+| A tag input | `Backspace` on an empty draft | Remove the last tag |
+| An inline rename field (agent name, workflow name) | `Enter` | Commit the new name |
+| An inline rename field | `Escape` | Revert the edit |
+| Primary app navigation (Chat / Agents / Workflows / Context / Settings) | Arrow keys / `Home` / `End` | Move focus among the five nav icons |
+| A card radio-group (e.g. the workflow editor's Agent picker) | Arrow keys / `Home` / `End` | Move focus and selection among cards |
+| A segmented control (model preset, auth type, etc.) | Arrow keys | Move the selected segment |
+
+The chat composer row is the same behavior described in
+[Chat](/docs/building/chat) — this table exists so it doesn't have to be
+looked up per surface.
+
+## Typing in another language
+
+`Enter` behaves differently while an input method is mid-composition — typing
+accented characters, or composing CJK candidates. In that state `Enter`
+commits the composing candidate rather than submitting, in the chat composer,
+the copilot composer, and anywhere else that accepts free text. A second,
+separate `Enter` press is what actually sends or commits.
+
+## Accessibility
+
+The interface is built against a small set of real, verifiable commitments:
+
+- Every interactive control has a visible `focus-visible` ring.
+- The interface is monochrome, and color is used only as meaning — status is
+  always paired with an icon or a label, never signaled by color alone.
+- Empty, loading, and error states are designed throughout; nothing renders a
+  blank screen while it figures out what to show.
+- `prefers-reduced-motion` and `prefers-reduced-transparency` are both
+  respected — glass and blur effects and animation ease off automatically
+  when either is set.
+
+## Honest scope
+
+There is no command palette and no global keyboard-shortcut layer today — no
+`Cmd/Ctrl+K` or equivalent. Every shortcut on this page is scoped to the
+surface it's listed under; none of them work from elsewhere in the app.
+
+See [Chat](/docs/building/chat), [Copilot](/docs/building/copilot), and the
+[agent editor](/docs/building/agent-editor) for the surfaces these shortcuts
+live on.

@@ -4,45 +4,100 @@ section: Getting started
 order: 11
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Quickstart
 
-Build your first agent, publish it, chat with it, and put it on standing duty —
+Build your first Agent, publish it, chat with it, and put it on standing duty —
 end to end in a few minutes.
 
-## Build your first agent
+## Before you start
 
-Open **Agents** and create one: write the persona (who it is and how it works),
-pick a model preset, and equip its context — MCP connections and skills from
-your workspace's library. The editor autosaves as you go, and the docked
-copilot can draft any of it from a plain-language description.
+Creating a workspace already seeds three starter Agents — "General Purpose",
+"Software Engineer", "Product Designer" — plus the three model presets and the
+allowlist that backs them. Only "General Purpose" publishes on its own during
+workspace creation, so a brand-new workspace can chat immediately without
+touching the editor. The steps below build a second Agent from scratch so the
+full path — draft, publish, chat, delegate — is visible end to end.
 
-## Publish
+## Step 1: Build your first Agent
 
-Press **Publish**. The platform compiles the Agent's definition, runs the
-build, stores the artifact by content hash, and reports back **Published and
-built.** — your Agent now has a real, version-pinned artifact behind it.
+Open the [agent editor](/docs/building/agent-editor) and create an Agent.
+Persona is a rich-text editor with a toggle for raw markdown; paste something
+like this to start:
 
-## Chat with it
+```text
+You are a release-notes summarizer. Given a list of merged pull requests,
+group them into Features, Fixes, and Chores, and write one plain-English
+sentence per group's most important change. Skip internal-only work (CI,
+tests, refactors) unless it changes user-facing behavior. Keep the whole
+summary under 200 words.
+```
 
-Start a chat and hand it work. The session binds your Agent and streams each
-run live over resumable SSE — an ordered timeline of what it said and what it
-did, with inline human-in-the-loop approvals — and because durability is
-Postgres-backed, a worker dying mid-run resumes on any live worker instead of
-losing the run.
+Model defaults to a segmented control — **Powerful**, **Balanced**, **Quick**
+— resolved against the workspace's allowlist; see [Models](/docs/building/models)
+for what each preset actually resolves to. Context equips the Agent from the
+workspace library through a **Browse** popover over connections and skills —
+see [Context & MCP](/docs/building/context-mcp). Skip Context for this first
+Agent; a summarizer needs no tools.
 
-You can stop a run from the composer, keep typing while one is working (your
-messages queue and send as one when the session frees), and manage what the
-Agent remembers with the thread's context controls. See
-[Chat](/docs/building/chat).
+The editor autosaves as you go. If you'd rather describe the Agent in plain
+language and let the docked copilot draft the persona, model, and context for
+you, that works too.
 
-## Delegate standing work
+## Step 2: Publish
 
-Create a **workflow**: pick a trigger (webhook, form, Slack, or a schedule),
-bind your published Agent, and write instructions with `@trigger` references
-into the event's data. Publishing is instant — workflows build nothing — and
-from then on, every time the trigger fires, the platform delivers the event and
-your instructions to the Agent as its task.
+Press **Publish**. The platform compiles the Agent's definition — persona,
+model, context — into a real `eve build`, and stores the resulting artifact by
+content hash. The button tracks the phase as it goes — **Compiling…**, then
+**Building…** — and settles on **Published**, with the rail reporting
+"Published and built." An identical definition never rebuilds, so republishing
+after an unrelated edit usually settles on **Published (cached)** instead,
+against a rail that reads "Published — build served from cache."
 
-<UnderConstruction />
+If a build fails, the editor surfaces the error inline — see
+[Troubleshooting](/docs/reference/troubleshooting) if it's not obvious what to
+fix.
+
+## Step 3: Chat with it
+
+Start a chat and hand the Agent work. Enter sends a message and Shift+Enter
+inserts a newline; each run streams live over resumable SSE. While a run holds
+the session, the composer's send button becomes **Stop**, and anything you
+type in the meantime queues — it merges into a single message and sends the
+moment the session frees, rather than being refused. See
+[Chat](/docs/building/chat) for the full run timeline, human-in-the-loop
+pauses, and context controls.
+
+## Step 4: Delegate standing work
+
+Open the [workflow editor](/docs/building/workflow-editor) and create a
+Workflow. Pick a **Schedule** trigger and set a cron expression — `0 9 * * 1-5`
+runs every weekday at 9am, evaluated on the platform clock in UTC — then bind
+the Agent from step 1 and write instructions for what it should do when the
+trigger fires.
+
+Instructions can pull from the trigger's own data with `@trigger.<path>` — a
+Slack-triggered Workflow, for instance, can reference the incoming message
+with `@trigger.text`. A schedule trigger carries no event data of its own, so
+its instructions typically don't need one; the Agent just does the same thing
+on the same cadence. See [Triggers](/docs/building/triggers) for what each
+trigger kind actually delivers.
+
+Press **Publish** — a Workflow builds nothing, so it's instant. Then press
+**Run** in the header and submit with **Fire now** to fire it immediately and
+watch it run, instead of waiting for the next scheduled tick. Runs always
+dispatch the published Workflow, which is why publishing comes first.
+
+## You now have
+
+- A published Agent with a persona, a model preset, and a version-pinned,
+  content-hashed build behind it.
+- A chat thread that streamed a run live and can queue more work at any time.
+- A Workflow that delegates the same Agent to a schedule, testable on demand
+  from the header's **Run** popover.
+
+Go deeper on any piece: [the agent editor](/docs/building/agent-editor),
+[models](/docs/building/models), [context & MCP](/docs/building/context-mcp),
+[chat](/docs/building/chat), [the workflow editor](/docs/building/workflow-editor),
+[triggers](/docs/building/triggers), and
+[troubleshooting](/docs/reference/troubleshooting) if anything above didn't go
+as described.

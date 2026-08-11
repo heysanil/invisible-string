@@ -1,0 +1,59 @@
+---
+title: Personas and instructions
+section: Guides
+order: 46
+---
+
+# Personas and instructions
+
+A persona and a set of instructions look similar — both are prose you write for an [Agent](/docs/concepts/agents) — but they live on opposite sides of publishing. A persona is durable identity: it's written once on the Agent, compiled into every version it publishes, and a change to it only takes effect the next time that Agent is republished. Instructions are per-delegation task text on a [Workflow](/docs/concepts/workflows): they render fresh against the live trigger event on every dispatch, and a change to them goes live the instant you publish the Workflow — no build, no wait.
+
+That difference should drive what you put where. If it's true of the Agent no matter what work it's handed, it belongs in the persona. If it's specific to one standing job — what to do with this trigger's data, what shape the output should take — it belongs in the Workflow's instructions.
+
+## Writing a persona
+
+A persona is role and working style, not a job description. The most common mistake is writing something too generic to change how the Agent actually behaves — it compiles fine and does nothing.
+
+| Vague | Specific |
+|---|---|
+| "You are a helpful assistant." | "You are a support-triage specialist for a B2B SaaS product. You read incoming tickets, judge urgency, and file well-formed issues in Linear for anything that's a real bug. You never promise a fix timeline, and you escalate billing disputes to a human instead of trying to resolve them yourself." |
+| "You write good code." | "Pragmatic senior engineer. Reads before it writes. Prefers the smallest correct diff over a rewrite, and flags anything touching authentication or billing for human review instead of changing it unilaterally." |
+| "You are a marketing assistant." | "You draft launch announcements and social copy in a direct, confident voice — no exclamation points. You never publish anything yourself; every draft goes back to a human for review before it goes out." |
+
+Each specific version does three things the vague one doesn't: it names a domain, it names a working style, and it names an explicit boundary — something the Agent should refuse or hand off rather than attempt. That boundary is doing real work; without it, a persona only describes competence, not judgment.
+
+Keep a persona about role and working style, not procedure. A step-by-step process — "when a ticket mentions billing, do X then Y then Z" — belongs in a [skill](/docs/building/skills) the Agent is equipped with, or in a Workflow's instructions if the process is specific to one standing job, not in the persona itself.
+
+## Writing instructions
+
+Instructions are the task: what to do when the trigger fires, what shape you want the output in, and what to do with the specific fields the event carries. They are not context — the Agent's own equipment (its connections and skills) is the context, and instructions may reference that equipment but never extend it. Writing "use the Linear connection to file this" in instructions is fine; writing instructions that assume a connection the Agent was never equipped with is not — see [Anti-patterns](#anti-patterns) below.
+
+## Working with `@trigger`
+
+Instructions reference fields from the trigger event with `@trigger.<field>`. Say a support-form Workflow's trigger has fields keyed `email`, `subject`, and `body`. Instructions like this resolve those fields at dispatch, against whatever the form submission actually contained:
+
+```text
+A new support request came in.
+
+From: @trigger.email
+Subject: @trigger.subject
+
+@trigger.body
+
+File this as a Linear issue if it describes a bug. Summarize the request in
+the issue description rather than pasting it verbatim.
+```
+
+A reference that doesn't resolve — a typo'd field key, or a field that belongs to a different trigger's shape — is underlined amber in the instructions editor, with a diagnostic naming exactly what's wrong, for example `No form field is keyed "eamil".` That underline is a warning rather than a block — the editor will let you publish past it — but it isn't cosmetic either: at dispatch the reference resolves to nothing at all, so the Agent reads the instruction with a hole in it. Fix it before you publish.
+
+## Anti-patterns
+
+- **Instructions assuming a tool the Agent isn't equipped with.** Referencing a connection or skill the Agent doesn't actually have attached doesn't silently succeed — the reference fails to resolve, surfaced as the same amber-underline diagnostic covered above.
+- **A persona naming a specific model.** Which model an Agent runs on is chosen in the Model section, not written in prose — see [Models](/docs/building/models). A persona that says "you are running on GPT-4" is not just noise, it's actively wrong the moment someone changes the preset, and there's nothing that keeps prose like that in sync with the real setting.
+- **Instructions expecting a reply where the trigger delivers none.** A webhook's HTTP response is only an acknowledgement that the trigger was accepted — never the Agent's answer. Instructions that talk about "responding to the request" are describing something that doesn't happen on that path; the actual result only ever lands in the run. See [Triggers](/docs/building/triggers).
+
+## The iteration loop
+
+Instructions are cheap to change precisely because they don't build anything: edit the text, click **Run** in [the workflow editor](/docs/building/workflow-editor) and then **Start run**, and read the run that comes back. If the output isn't shaped the way you wanted, or a reference didn't resolve the way you expected, adjust the instructions and run it again — there's no publish-and-wait cycle between iterations the way there is for a persona edit on the Agent side.
+
+See [Agents](/docs/concepts/agents) and [Workflows](/docs/concepts/workflows) for how persona and instructions fit into the rest of each concept, and [the agent editor](/docs/building/agent-editor) for where a persona is actually written.

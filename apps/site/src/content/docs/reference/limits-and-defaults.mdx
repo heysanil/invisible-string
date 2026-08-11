@@ -1,0 +1,71 @@
+---
+title: Limits and defaults
+section: Reference
+order: 61
+---
+
+# Limits and defaults
+
+These are the platform's real limits, not rough guidance — every number on
+this page is verified against the running system. Where a value is
+configurable by a self-hoster, the environment variable that controls it is
+named alongside it; unnamed values are fixed.
+
+## Ingress
+
+Everything a [trigger](/docs/building/triggers) accepts from the outside
+world is capped before it's parsed.
+
+| Limit | Value | Configurable via |
+|---|---|---|
+| Webhook/trigger request body | 256 KiB | — |
+| Trigger rate limit, per token | 60 requests/minute | `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` |
+| Trigger rate limit, per IP | 120 requests/minute | `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` |
+| Slack signature replay window | 5 minutes | — |
+| Inline trigger file payload (base64, decoded) | 1 MiB | — |
+
+Both rate limits return a `Retry-After` header when exceeded. A file payload
+larger than 1 MiB decoded can't ride inline on a trigger event — send an
+object-store URL instead.
+
+## Authored content
+
+Limits on what you write directly into the platform: personas,
+[skills](/docs/building/skills), and workspace naming.
+
+| Limit | Value | Notes |
+|---|---|---|
+| Skill markdown body | 256 KiB | Rejected outright over the cap |
+| Skill attachment, each | 5 MiB | Text formats only — a binary upload is rejected with an HTTP 415 |
+| Persona | 50,000 characters (hard cap) | A separate, non-enforced advisory suggests aiming under 1,500 characters |
+| Workspace name | 64 characters | Enforced on creation and on rename |
+
+The persona's 1,500-character guideline is only ever a hint in the editor —
+nothing stops you from publishing a longer persona, up to the hard cap.
+
+## Runtime
+
+| Limit | Value | Configurable via |
+|---|---|---|
+| Concurrent runs per session | 1 (a waiting run counts as busy) | — |
+| SSE heartbeat | 15 seconds | `SSE_HEARTBEAT_MS` |
+| Schedule ticker interval | 30 seconds | `SCHEDULE_TICK_MS` |
+| MCP registry sync interval | 6 hours | `REGISTRY_SYNC_INTERVAL_MS` |
+| Connection health probe auto-refresh | Refreshes when a detail view opens and the last check is older than 15 minutes | — |
+| eve session input-token budget | 40 million input tokens, then a session-limit prompt appears | eve's own limit — not something invisible-string configures |
+
+See [Durability](/docs/platform/durability) for what a session-limit prompt
+means for a run in progress, and how state survives a worker restart in
+between.
+
+## Worker housekeeping
+
+Self-hosters can tune all three of these — see
+[Deploy your own](/docs/getting-started/deploy-your-own) for the full
+deployment reference.
+
+| Limit | Value | Configurable via |
+|---|---|---|
+| Idle agent process stop | 15 minutes of inactivity | `AGENT_IDLE_STOP_MS` |
+| Idle sandbox stop | 30 minutes of inactivity | `SANDBOX_IDLE_STOP_MS` |
+| Worker artifact cache size | 20 GiB, evicted LRU | `ARTIFACT_CACHE_MAX_BYTES` |

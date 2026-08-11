@@ -1,10 +1,8 @@
 ---
 title: Architecture
 section: Platform
-order: 40
+order: 50
 ---
-
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Architecture
 
@@ -17,9 +15,9 @@ The API host (Bun + Elysia): authentication and organizations, agent and
 workflow CRUD, connections and their health probes, the MCP OAuth broker,
 compiler invocation with `eve build` and artifact upload, the scheduler,
 trigger ingress and dispatch, outbound reply delivery, the SSE tailer, and the
-copilot WebSocket loop. The
-scheduler routes work by session affinity first, then to an artifact-warm
-worker, then to any live worker, with a dead-worker sweep and fencing.
+copilot WebSocket loop. Its scheduler routes work by session affinity first,
+then to an artifact-warm worker, then to any live worker, with a dead-worker
+sweep and fencing.
 
 Every outbound request the control plane makes on your behalf — probing an MCP
 server, discovering its authorization server, exchanging or refreshing tokens —
@@ -48,4 +46,54 @@ itself on the next sync, and if the index is absent or down, only community
 search degrades — the catalog and custom-URL lanes keep working, and installs
 are still verified against the live registry either way.
 
-<UnderConstruction />
+## Life of a chat message
+
+Your browser sends the message to the control plane, which resolves your
+session and, if this is a new run, asks the scheduler to place it — session
+affinity first (send it back to whatever worker is already running that
+session), then a worker that already has the [Agent](/docs/concepts/agents)'s
+artifact warm, then any live worker as a last resort. The chosen worker
+ensures the compiled agent process is running, booting it from a
+pulled-and-extracted artifact if it's cold, and the message is dispatched into
+eve's session API.
+
+As the Agent works, its event stream is tailed by the control plane and
+written durably, and your browser receives it live over resumable SSE —
+reconnecting with a `Last-Event-ID` replays anything missed rather than
+starting over. See [Sessions & runs](/docs/concepts/sessions-and-runs) for
+what that stream contains, and [Durability](/docs/platform/durability) for
+what happens when the worker that was running it disappears mid-message.
+
+## Life of a publish
+
+Publishing an Agent turns its definition — persona, resolved model and
+reasoning effort, and context — into a compiled artifact. The compiler is a
+pure function that takes that definition and emits an eve project; `eve build`
+compiles the project into a runnable artifact; the artifact uploads to the
+object store; and a row keyed by the definition's content hash records the
+build.
+
+A cache hit — an identical content hash — skips the compile-and-build step
+entirely and just confirms the existing artifact still exists. This is why
+republishing an Agent you haven't actually changed is instant: nothing was
+rebuilt, only reconfirmed.
+
+## Where data lives
+
+| Data | Lives in |
+|---|---|
+| Agents, Workflows, sessions, runs, connections | Postgres (control-plane database) |
+| Durable execution state for one agent version's runs | Postgres (that version's own world database) |
+| Compiled artifacts, skill attachments | Object store |
+| Mirror of the MCP registry, for community search | Search index (disposable) |
+
+## Deployment shape today
+
+The shipped deployment is one control plane, one or more workers, and the
+supporting data services, all running as a single-host Docker Compose stack —
+see [Deploy your own](/docs/getting-started/deploy-your-own) for the compose
+file and the environment variables it needs. See
+[Durability](/docs/platform/durability) for how the platform behaves when a
+worker in that stack goes away, and
+[Security](/docs/platform/security) for how requests and credentials are
+handled along the way.

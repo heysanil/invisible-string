@@ -4,25 +4,80 @@ section: Concepts
 order: 23
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Workspaces
 
-Every Agent, workflow, session, connection, and secret belongs to a
-**workspace**. Multi-tenancy rides on Better Auth organizations, and a fresh
+Every Agent, Workflow, session, connection, and secret belongs to a
+workspace. Multi-tenancy rides on Better Auth organizations, and a fresh
 account lands on a first-run screen to name its workspace — creating it seeds
 the default model presets, the provider/model allowlist, and a set of starter
 Agents.
 
-Membership carries a role — `owner`, `admin`, or `member` — and every route is
+Membership carries a role — owner, admin, or member — and every route is
 scoped to the active workspace, verifying both membership and row ownership.
 Teammates join through invite links from Settings → Members; a signed-out
-recipient round-trips through login or signup and lands back on the invitation.
+recipient round-trips through login or signup and lands back on the
+invitation.
+
+## What belongs to a workspace
+
+Agents, Workflows, connections and skills at workspace scope, sessions, runs,
+model presets, the provider/model allowlist, and the Slack integration are all
+workspace-owned — shared with every member, subject to their role. Connections
+and skills can also be scoped to you personally instead: a personal connection
+or skill is private to you, and it follows you across every workspace you
+belong to rather than living inside one. The Context page's Workspace/Personal
+tabs are where that split shows up; see [Context & MCP](/docs/building/context-mcp).
+
+## Roles
+
+| | Member | Admin | Owner |
+|---|---|---|---|
+| Invite teammates | No | Yes | Yes |
+| Change member roles | No | Yes | Yes |
+| Rename the workspace | No | Yes | Yes |
+| Edit model presets and the allowlist | No | Yes | Yes |
+| Connect Slack | No | Yes | Yes |
+
+Where a member can't act, the equivalent Settings panel renders read-only
+rather than disappearing. Role changes are never available for your own row or
+for the workspace owner's row — you can't demote yourself out of a mistake,
+and the owner can't be demoted by an admin. See
+[Settings](/docs/building/settings) for where these controls live.
+
+## First run
+
+A brand-new account lands on a "Create your workspace" screen — just a
+workspace name, up to 64 characters. Creating it seeds three model presets
+(`powerful`, `balanced`, `quick`), the provider/model allowlist those presets
+draw from, and three starter Agents: General Purpose, Software Engineer, and
+Product Designer. Only General Purpose is published automatically, fire-and-
+forget, in the background — so the first chat you open needs no manual publish
+step. The other two starters are left as drafts to build on.
+
+## Invites
+
+Invite a teammate from Settings → Members with an email and a role of Member
+or Admin. There's no mailer configured, so the invite isn't emailed: the
+invite link (`{origin}/accept-invitation/{id}`) is shown directly with a copy
+button and a note that you need to share it yourself. A signed-out recipient
+who opens the link is routed through login or signup and lands back on the
+invitation afterward; a signed-in recipient goes straight to an invitation
+card with **Accept invitation** and **Decline**.
 
 ## Authentication
 
-Sign-in is email and password or OIDC single sign-on. Because the SPA and API
-are served from the same origin in production, sessions use first-party cookies
-with no CORS.
+Sign-in is email and password or OIDC single sign-on. OIDC is something the
+operator configures for the deployment — it isn't a per-user, self-serve
+setting. Because the SPA and API are served from the same origin in
+production, sessions use first-party cookies with no CORS.
 
-<UnderConstruction />
+## Deleting a workspace
+
+Not available yet. The setting exists in Settings as an explicit, disabled
+control describing what it would do — remove the workspace's Workflows,
+connections, and run history — but there's currently no way to act on it.
+
+See [Agents](/docs/concepts/agents) for how workspace-scoped model presets and
+context feed into what an Agent can do, and
+[Security](/docs/platform/security) for how workspace boundaries are enforced
+underneath the role checks.

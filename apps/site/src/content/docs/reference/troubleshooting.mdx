@@ -1,0 +1,144 @@
+---
+title: Troubleshooting
+section: Reference
+order: 62
+---
+
+# Troubleshooting
+
+Organized by where you are, not by error code. Find your situation below,
+read what's actually happening, then what to do about it.
+
+## Publishing and builds
+
+**A draft won't publish.** The [agent editor](/docs/building/agent-editor)'s
+Publish button stays unavailable until every blocking issue is resolved, and
+diagnostics point at exactly which section is at fault. For an Agent, the
+confirmed blocking cases are an empty persona (required to publish — the
+editor flags it as a warning while you're still typing, but Publish stays
+disabled until you write one) and a model override that isn't on the
+workspace allowlist. For a Workflow, publish is blocked when no Agent is
+chosen, the chosen Agent has no published version, or the instructions are
+empty. Resolve the flagged section — the diagnostics tell you which one.
+
+**A connection referenced by an Agent's context was deleted or disabled.**
+The Agent won't compile until you re-equip a replacement connection or remove
+the reference from its [Context section](/docs/building/context-mcp).
+
+**Publish fails after a build error.** The build itself failed compiling —
+check the error text shown in the red-bordered box on the agent editor's
+rail. If the message doesn't point at anything you can fix by editing the
+persona, model, or context, that's a genuine platform-side issue, not
+something you can self-correct by re-editing prose.
+
+## Chat and runs
+
+**A message is rejected because the session is busy (`session_busy`).** A
+run is already active on that session, or one is parked waiting on you —
+either way, this is transient. In [Chat](/docs/building/chat)'s own UI this
+is handled automatically: your message queues instead of failing, and sends
+the moment the session frees.
+
+**A thread stops accepting any new message, permanently
+(`session_not_active`).** The underlying session itself is gone — unknown to
+eve, already finished, reset, or timed out after a long period of
+inactivity. This is permanent for that session: never retry it. Start a new
+chat instead.
+
+These two are easy to conflate but are never the same fix: `session_busy`
+means wait and retry: the session is still alive, just occupied.
+`session_not_active` means start over: the session itself no longer exists.
+
+**Cancelling a run doesn't stop an in-flight tool call immediately.**
+Cancellation is cooperative — it takes effect at the next durable step
+boundary, so a tool call already running finishes rather than being torn in
+half. This is intentional, not a bug: it avoids leaving a half-finished side
+effect (like a partially sent message) in an undefined state. The run still
+lands `canceled`, never `failed`.
+
+**A session-limit prompt interrupts a long conversation.** This is eve's own
+input-token budget guardrail, not something invisible-string imposes —
+approve to continue with a fresh budget, or stop. See
+[Limits and defaults](/docs/reference/limits-and-defaults) for the exact
+threshold.
+
+## Connections and OAuth
+
+**A connection shows Unreachable.** The server itself couldn't be reached —
+check its URL and that it's actually running.
+
+**A connection shows Auth required.** No credentials are configured yet —
+add them, or complete OAuth consent.
+
+**A connection shows Auth error.** Credentials are configured, but they were
+rejected — they're wrong, expired, or revoked. Rotate them or reconnect.
+
+**A tool call fails mid-run asking you to reconnect a connection.** The
+stored OAuth grant is dead — an expired refresh token, a revoked grant, or a
+connection that never fully completed consent. Re-run the OAuth consent flow
+on the connection; there's no automatic recovery from a dead grant.
+
+**A connection won't delete.** Something still references it — typically an
+Agent's context, in its draft or a published version. Remove the reference
+first, then delete the connection.
+
+**Community search stops returning results, but the catalog still installs
+fine.** The search index (Meilisearch) is down or unconfigured. This
+degrades only community search — the [catalog](/docs/building/context-mcp)
+and custom-URL lanes keep working — and it self-heals with a full resync
+once the index is back.
+
+## Triggers and delivery
+
+**A webhook returns 401.** The ingress token is wrong or was rotated — mint
+a fresh [trigger](/docs/building/triggers) token and update whatever calls
+it.
+
+**A webhook returns 413.** The request body exceeds the size cap — see
+[Limits and defaults](/docs/reference/limits-and-defaults).
+
+**A webhook returns 429.** You're over the rate limit — back off per the
+`Retry-After` header the response carries.
+
+**A scheduled Workflow fired once instead of catching up on several missed
+windows after downtime.** This is the intended no-backfill design, not a
+bug: the schedule ticker always advances the next fire time from now, so a
+control plane that was down across several windows fires once on recovery
+and resumes its normal cadence.
+
+**A Workflow's `@` references look broken after the bound Agent changed.**
+This is the staleness diagnostic: the Agent was republished missing
+something the instructions reference. It degrades gracefully rather than
+breaking dispatch — a dangling reference just doesn't resolve to anything —
+but you should update the reference in the workflow editor.
+
+**A Slack reply arrives twice after a crash or restart.** Expected — reply
+delivery is at-least-once, not exactly-once. A crash between posting the
+reply and recording that it was delivered can cause a rare duplicate.
+
+## Self-hosting
+
+Full detail lives in [Deploy your own](/docs/getting-started/deploy-your-own);
+the short version of the three most common issues:
+
+- **Every chat send fails instantly with a 502**, even though health checks
+  look fine — check for an uppercase `WORKER_ID`. It must be lowercase.
+- **Instant 502s on chat sends or run streams through the edge proxy on an
+  older image** — a disabled idle timeout cutting quiet connections. Upgrade
+  the image, or set `SSE_HEARTBEAT_MS` lower as a stopgap.
+- **Builds reference artifacts that are missing after a partial restore** —
+  clear the stale `builds` rows so they re-run instead of reusing a tarball
+  that no longer exists in object storage.
+
+## Where to read more
+
+| Situation | Where to read more |
+|---|---|
+| Understanding how an Agent is built and published | [The agent editor](/docs/building/agent-editor) |
+| How a session, a run, and waiting states relate | [Sessions & runs](/docs/concepts/sessions-and-runs) |
+| How chat, cancellation, and the message queue work | [Chat](/docs/building/chat) |
+| Connections, health states, and the tool filter | [Context & MCP](/docs/building/context-mcp) |
+| Trigger kinds and how each one dispatches | [Triggers](/docs/building/triggers) |
+| Model presets, overrides, and reasoning effort | [Models](/docs/building/models) |
+| What survives a worker crash, and what doesn't | [Durability](/docs/platform/durability) |
+| Running your own instance | [Deploy your own](/docs/getting-started/deploy-your-own) |

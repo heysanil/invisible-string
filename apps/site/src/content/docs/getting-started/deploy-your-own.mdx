@@ -4,8 +4,6 @@ section: Getting started
 order: 12
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Deploy your own
 
 invisible-string is self-hostable. The whole platform runs as one single-host
@@ -23,7 +21,8 @@ for hosts without a public IP.
 Postgres and the object store hold the data worth protecting. The Meilisearch
 index does not: it is a disposable mirror of the public MCP registry that
 rebuilds itself, so it needs no backup, and the platform runs without it —
-losing only community connector search.
+losing only community connector search. For how these services fit together at
+runtime, see [Architecture](/docs/platform/architecture).
 
 ## Prerequisites
 
@@ -32,4 +31,178 @@ losing only community connector search.
   as sibling containers on the host daemon.
 - A domain pointed at the host (or at your reverse proxy).
 
-<UnderConstruction note="The full production runbook — Dokploy, external managed data services, backups, and upgrades — is being ported here from the repo's DEPLOY guide." />
+## Topology
+
+| Service | Role | Reachable from |
+|---|---|---|
+| `web` | nginx: serves the built SPA and reverse-proxies the control-plane API on the same origin | Public internet |
+| `control-plane` | The API host (Bun + Elysia), port 3000 | Internal bridge only |
+| `worker` | Boots compiled agents under Node 24, port 4000; mounts `/var/run/docker.sock` | Internal bridge only |
+| `postgres` | Postgres 16 — holds the `product` and `world` databases | Internal bridge only |
+| `garage` | S3-compatible object store for build-artifact tarballs, port 3900 | Internal bridge only |
+| `meilisearch` | Disposable registry-search mirror, port 7700 | Internal bridge only |
+| `migrate` | One-shot: applies migrations before `control-plane` starts | N/A — runs once and exits |
+| `cloudflared` | Optional tunnel ingress, profile-gated | N/A — opt in with `--profile cloudflared` |
+
+Nothing publishes host ports. Ingress is whatever proxy sits in front of `web`
+— a hoster's Traefik, your own nginx, or the Cloudflare tunnel — joined to the
+external `dokploy-network`.
+
+## Configuration
+
+Every secret is supplied through the environment; the compose file uses
+`${VAR:?}` interpolation, so a missing required value fails fast at `config` or
+`up` time rather than at runtime. The canonical, always-current list of every
+variable — with its purpose and a generation command — lives in
+[`.env.prod.example`](https://github.com/heysanil/invisible-string/blob/main/.env.prod.example);
+copy it and fill it in, but never commit a filled copy.
+
+| Group | Variables | Notes |
+|---|---|---|
+| Database & storage secrets (required) | `POSTGRES_PASSWORD`, `GARAGE_RPC_SECRET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | `POSTGRES_PASSWORD` via `openssl rand -hex 24`; `GARAGE_RPC_SECRET` and `S3_SECRET_ACCESS_KEY` via `openssl rand -hex 32`. `S3_ACCESS_KEY_ID` must be `GK` followed by 32 lowercase hex characters — Garage validates that shape and auto-provisions the key and the `artifacts` bucket on first boot. |
+| Platform secrets (required) | `ENCRYPTION_MASTER_KEY`, `PLATFORM_JWT_SECRET`, `BETTER_AUTH_SECRET`, `WORKER_SHARED_SECRET`, `MEILISEARCH_MASTER_KEY` | Each via `openssl rand -base64 32`, except `MEILISEARCH_MASTER_KEY` via `openssl rand -hex 32`. See [Security](/docs/platform/security) for how these are used at rest. |
+| Worker identity (required) | `WORKER_ID` | Generate with `uuidgen \| tr '[:upper:]' '[:lower:]'` — it must be lowercase. Uppercase breaks every dispatch on older images; see Common failures below. |
+| Domain & images (required) | `APP_DOMAIN`, `IMAGE_TAG` | `IMAGE_TAG` is a `release.yml`-published `vX.Y.Z` tag. |
+| Model provider (required, at least one) | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | Compiled agents and the copilot both need a provider key. |
+| Optional | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`, `CLOUDFLARED_TUNNEL_TOKEN` | The three Slack variables are all-or-none — see [Connect Slack](/docs/guides/connect-slack). `CLOUDFLARED_TUNNEL_TOKEN` is required only with `--profile cloudflared`. |
+
+External-data mode (below) additionally needs `DATABASE_URL`,
+`WORLD_DATABASE_URL`, and `S3_ENDPOINT` in place of the bundled Postgres and
+Garage secrets.
+
+> Never set `ALLOW_INSECURE_WORKER_TRANSPORT=1` on a routable network. The
+> bundled compose sets it because worker-to-control-plane traffic never leaves
+> the private `internal` bridge — it is compensated by `WORKER_AUTH_MODE=worker-token`,
+> the pinned `WORKER_ID`, and a `WORKER_ALLOWED_IDS` registration allowlist.
+
+## Deploying
+
+### On Dokploy
+
+1. Create a Compose service pointing at `docker-compose.prod.yml` — the file's
+   config files ride inline, so no repo checkout is needed on the host; you can
+   also paste its contents directly into Dokploy.
+2. Paste the environment variables into Dokploy's environment UI.
+3. Attach your domain to service `web`, container port 80. Dokploy's Traefik
+   joins the external `dokploy-network` that the compose file declares, so no
+   host ports need publishing.
+4. Deploy, then verify: `curl -fsS https://<APP_DOMAIN>/api/health?deep=1`
+   returns `200`.
+
+### On a generic host
+
+Create the external network once, then bring the stack up directly:
+
+```bash
+docker network create dokploy-network
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --wait
+```
+
+The **deep health** endpoint, `GET /api/health?deep=1`, is the load-bearing
+readiness check — it answers `200` only once Postgres and Garage are reachable
+**and** at least one worker has registered. A plain `GET /api/health` can be
+`200` before the stack is actually usable, so prefer the deep variant when
+scripting a wait.
+
+## External and managed data services
+
+`docker-compose.prod.external-data.yml` is a standalone compose file — the same
+app services as the base file, with the bundled `postgres` and `garage`
+removed. Meilisearch stays bundled even here, since its index is disposable and
+has nothing worth managing externally. Deploy it in place of the base file, not
+alongside it:
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.external-data.yml up -d
+```
+
+The managed Postgres role must have `CREATEDB` — the migrate step and the
+per-agent-version world-database provisioner both create databases on demand,
+one `ag_v_*` database per published agent version. The S3-compatible endpoint
+must support SigV4 presigned `GET` URLs reachable from the `worker` container,
+and its configured bucket and region must match what you set here.
+
+## Cloudflare Tunnel
+
+For hosts without a public IP, bring the stack up with the `cloudflared`
+profile:
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml \
+  --profile cloudflared up -d
+```
+
+Set `CLOUDFLARED_TUNNEL_TOKEN`, then in the Cloudflare dashboard map the
+tunnel's public hostname to `http://web:80`.
+
+## Backups
+
+Postgres is what makes the platform's [durability](/docs/platform/durability)
+guarantee — a crashed worker never loses a run — actually hold up over time: it
+is the state worth protecting, and it belongs on a backup schedule.
+
+```bash
+docker compose exec postgres pg_dump -U app -Fc product > product-$(date +%F).dump
+```
+
+Dump `world` the same way if you want in-flight run durability to survive a
+restore too. Snapshot the `garage-data` volume alongside every Postgres backup
+rather than on its own schedule — the build cache (the `builds` table) trusts
+`succeeded` rows without re-verifying the tarball still exists in the object
+store, so restoring Postgres without the matching Garage volume strands builds
+pointing at missing artifacts. Recovery without a Garage snapshot is
+`DELETE FROM builds;`; builds simply re-run and repopulate the store.
+
+Never back up Meilisearch. Its `mcp_registry` index is a disposable mirror of
+the official MCP registry — wipe it freely, and the sync job rebuilds it with a
+full resync.
+
+## Upgrades and rollback
+
+The release workflow keeps a PR titled `chore(release): version packages` open
+on `main`; merging it bumps versions, writes the changelog, tags the release,
+and builds all three GHCR images under one version. To upgrade: change
+`IMAGE_TAG` to the new tag and redeploy — `up -d` re-pulls the images. To roll
+back, set `IMAGE_TAG` back to the previous tag and redeploy; migrations are
+additive, so rolling back against an already-migrated database is safe. See
+[GitHub Releases](https://github.com/heysanil/invisible-string/releases) for
+what changed in each version.
+
+## Smoke checklist
+
+Run against the deployed domain after every deploy:
+
+1. `curl -fsS https://<domain>/api/health` returns `200`.
+2. `curl -fsS "https://<domain>/api/health?deep=1"` returns `200` JSON.
+3. Sign up a user:
+   ```bash
+   curl -si https://<domain>/api/auth/sign-up/email \
+     -H 'content-type: application/json' \
+     -d '{"email":"you@example.com","password":"a-strong-password","name":"You"}'
+   ```
+   Expect `200` with a `set-cookie` header.
+4. In the UI, create an Agent, press **Publish**, and chat with it.
+5. Fire a webhook trigger, using a minted token from a published Workflow:
+   ```bash
+   curl -sS -X POST https://<domain>/t/<token> -H 'content-type: application/json' -d '{}'
+   ```
+
+## Common failures
+
+- **Every chat send fails instantly with a 502**, even though health checks,
+  login, and worker registration all look fine — `WORKER_ID` contains
+  uppercase letters. Fix: lowercase both `WORKER_ID` and `WORKER_ALLOWED_IDS`
+  and redeploy, or use an image newer than `v0.1.7`, which normalizes the id
+  automatically.
+- **Instant 502s on chat sends or run streams through the edge proxy**, on
+  images predating 2026-07-10 — Bun's default ~10-second idle timeout was
+  never disabled, so quiet SSE run tails got cut mid-response. Stopgap on an
+  affected image: set `SSE_HEARTBEAT_MS=8000`; the real fix is upgrading.
+- **`succeeded` build rows point at artifacts that no longer exist** in object
+  storage, but Postgres still thinks they do — this follows a Postgres restore
+  without the matching Garage volume. Fix: `DELETE FROM builds;`; the platform
+  re-runs and repopulates the store.
+
+For the full self-hosting troubleshooting reference, including error codes and
+platform-wide limits, see [Troubleshooting](/docs/reference/troubleshooting)
+and [Limits and defaults](/docs/reference/limits-and-defaults).

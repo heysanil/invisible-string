@@ -4,53 +4,65 @@ section: Building
 order: 35
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Context & MCP
 
-Context is the library your Agents are equipped from. It comes in two forms:
-**MCP connections** — Model Context Protocol servers, at workspace or personal
-scope — and authored **skills** with drag-and-drop attachments. Equipping an
-Agent packages both straight into its compiled artifact, so a published Agent
-carries its tools and knowledge with it.
+Context is the library your Agents are equipped from. MCP connections give an Agent tools — a server it can call out to — and equipping one packages it straight into the Agent's compiled artifact. Skills are covered separately — see [Skills](/docs/building/skills) — this page is about connections: adding them, their credentials, and how their health and tools surface.
+
+## Workspace and personal scope
+
+The Context page opens on a **Workspace | Personal** segmented control. Workspace connections are shared with everyone in the workspace — "Connections and skills available to everyone in this workspace" — and mutating one requires the owner or admin role. Personal connections are private to you and follow you across every workspace you belong to, and you can always fully edit your own.
 
 ## Adding a connection
 
-Three lanes, depending on where the server comes from:
+The **Add connection** dialog offers three lanes.
 
-- **Catalog** — a curated set of connectors (Linear, Notion, Sentry, Stripe,
-  Vercel, and more) that install in one click, already knowing each server's
-  URL, transport, and what credentials it wants.
-- **Community search** — typo-tolerant search across a mirrored index of the
-  official MCP registry, verified publishers first. Search runs against the
-  mirror; every install is re-verified against the live registry, so what you
-  install is what the registry actually says it is.
-- **Custom URL** — any other MCP server you can reach.
+**Catalog** renders entirely from a checked-in list — no network call — as a Featured row plus tiles grouped by category (Productivity, Project management, Developer tools, Data, Communication, Commerce, Other). Each tile shows a monogram, a title, a one-line description, and an auth-type hint: `No auth`, `OAuth`, or `API key`. A no-auth recipe installs on one click. A secret-based recipe (bearer token or headers) opens a short credentials form with the note "Stored encrypted and sent to the server on your behalf. You will not see these values again." An OAuth recipe opens the consent popup the instant you click — synchronously, so browsers don't block it as an unsolicited popup.
 
-## Credentials and OAuth
+The catalog grows over time; as of writing it holds ten entries:
 
-Credentials are stored write-once and encrypted at rest. The API only ever
-reports *whether* a connection has credentials, never their values, and they
-are never echoed back to you after you save them.
+| Connector | Category | Auth |
+|---|---|---|
+| DeepWiki | Developer tools | No auth |
+| Context7 | Developer tools | API key |
+| Hugging Face | Data | Bearer token |
+| Stripe | Commerce | Bearer (secret or restricted key) |
+| Linear | Project management | OAuth |
+| Notion | Productivity | OAuth |
+| Sentry | Developer tools | OAuth |
+| Neon | Data | OAuth |
+| PayPal | Commerce | OAuth |
+| Vercel | Developer tools | OAuth |
 
-Connectors that support MCP OAuth connect in one click through a consent
-popup. The platform holds and refreshes the tokens centrally, and hands your
-Agents a short-lived access token only at the moment of a tool call — so
-neither you nor your Agents ever handle a credential directly. If a grant
-expires or is revoked, the tool call fails cleanly and asks you to reconnect
-rather than hanging.
+**Community search** replaces the browse view the moment you start typing. Catalog matches pin above a "Community" group of results pulled from a Meilisearch mirror of the official MCP registry, each carrying a "Verified" badge for verified publishers and a lock icon when credentials are required. If Meilisearch is unconfigured or down, the lane degrades in place — "Community search is unavailable right now. Curated connectors and custom servers still work." — rather than blocking the dialog. Whatever you install from this lane is re-verified against the live official registry at install time; the mirror is search convenience only, never the trust source.
 
-## Health and tools
+**Custom URL** is bring-your-own: a name, the server URL, an optional description, and an auth mode of `None`, `Bearer`, or `Headers` (repeatable name/value rows, values password-masked as you type).
 
-Every connection carries a live health state. The platform probes the server
-when you add it and any time you press **Test connection**, and reports back
-whether it's reachable, needs authorization, or rejected the credentials it
-was given.
+## The connection detail view
 
-A successful probe also caches the list of tools the server exposes. That list
-is what the connection's **tool filter** works from: leave it open to expose
-everything, or set an allow or block list to narrow what the server offers.
-The filter belongs to the connection, so every Agent equipped with it sees the
-same filtered set of tools.
+Opening a connection shows its name and slug, transport, live health, cached tool list, and a **Test connection** button, alongside the same write-once credential fields the add flow used — editing them replaces the stored value, and you never see what was there before. Deleting is blocked while an Agent still references the connection: "The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it," with the referencing Agents listed by name.
 
-<UnderConstruction />
+## Health
+
+Every connection carries one of five health states, shown as a dot plus label:
+
+| State | Label | Meaning |
+|---|---|---|
+| `unknown` | Not checked | No probe has run yet |
+| `ok` | Healthy | The last probe reached the server and listed its tools |
+| `unreachable` | Unreachable | The server itself couldn't be reached |
+| `auth_required` | Auth required | No credentials are configured yet |
+| `auth_error` | Auth error | Credentials are configured, but the server rejected them |
+
+`auth_required` and `auth_error` are easy to conflate but mean opposite things — one is missing credentials, the other is credentials that didn't work. Probes run automatically after you create or install a connection, after OAuth consent completes, and again whenever you open a connection's detail view and its last check is more than 15 minutes old, plus on demand via **Test connection**. A degraded or unhealthy connection never blocks publishing on its own — only a connection you've explicitly disabled, while still attached to an Agent, does that.
+
+## The tool filter and approval policy
+
+A successful probe caches the server's tool list, and that cache drives two separate controls on the connection. The **tool filter** is a three-way switch — All tools, an allow-list, or a block-list — with checkboxes over the cached names plus free-text entry for anything the cache doesn't know; without a cache, it's free-text only, with a hint to run **Test connection** first. The filter belongs to the connection, not the Agent, so every Agent equipped with it sees the same filtered set.
+
+**Approval policy** is a separate, additional control: a default decision — `Never — auto-allow`, `Once per session`, or `Always ask` — plus per-tool overrides from the same cached list. The filter decides what an Agent can even see; approval policy decides whether a visible tool's call needs your sign-off before it runs.
+
+## Equipping an Agent
+
+Attaching a connection in the agent editor's Context section pulls it, credentials and all, into what gets compiled when the Agent publishes — the compiled artifact carries the connection's identity and its tool filter, not a live reference back to this page. An OAuth connection's access token is the exception: it is never baked into the artifact, and is fetched fresh from the platform only at the moment a tool call needs it. See [Security](/docs/platform/security) for the full trust model, and [Equip an Agent](/docs/guides/equip-an-agent) for the walkthrough.
+
+If a connection stops resolving — deleted, or disabled while still attached — see [Troubleshooting](/docs/reference/troubleshooting).

@@ -1,0 +1,48 @@
+---
+title: Skills
+section: Building
+order: 36
+---
+
+# Skills
+
+A skill is authored knowledge — markdown plus attachments — that lives in a workspace's or a member's personal [Context library](/docs/building/context-mcp) and gets packaged into an [Agent](/docs/concepts/agents)'s compiled artifact when equipped, the same way an MCP connection is. Where a connection gives an Agent tools, a skill gives it something to know — attach one from the Context section of the [agent editor](/docs/building/agent-editor).
+
+## The skill editor
+
+A skill has a **Name**, a **Description** ("A one-liner the agent uses to decide when to reach for this skill"), and an **Instructions** body — the same rich-text/markdown-toggle editor used for Persona, with the placeholder "# How to… Write the skill in Markdown." An attachments sidebar sits alongside the body.
+
+Saving is explicit, not autosaved — a real behavioral break from the agent and workflow editors, both of which save every keystroke to the draft. The header tracks dirty state instead: "Unsaved changes" while you're editing, a green "✓ Saved" once a save lands. Nothing you write persists until you press **Save**.
+
+A read-only member — anyone without manage rights on a workspace-scope skill — sees the identical layout with every mutating control removed.
+
+### Attachments
+
+Drop files onto the sidebar, or click "browse." Accepted formats are text: `.md .markdown .txt .json .jsonc .yaml .yml .toml .csv .tsv .xml .html .css .js .jsx .ts .tsx .py .sh .rb .go .rs .java .sql .env .ini .log`, plus anything the browser reports as `text/*`. The server enforces this independently — a binary upload is rejected with a 415 regardless of what the client sent. Re-uploading a name that's already attached replaces the existing file.
+
+## Limits
+
+| What | Limit | On exceeding it |
+|---|---|---|
+| Instructions body | 256 KiB of markdown | The save is rejected |
+| Each attachment | 5 MiB | Rejected client-side per file with a toast — "*filename* is larger than 5 MiB" — the rest of the batch still attempts to upload |
+
+See [limits & defaults](/docs/reference/limits-and-defaults) for the platform's other ceilings.
+
+## Skills, personas, and connections
+
+Three different things equip an Agent, and it's easy to reach for the wrong one:
+
+| | What it's for | Where it lives | Changing it |
+|---|---|---|---|
+| **Persona** | One Agent's identity and working style | On the Agent itself | Autosaves to that Agent's draft only |
+| **Skill** | Reusable knowledge, shared across any Agent that equips it | The workspace or personal Context library | Explicit save; affects every Agent that has it equipped, on their next publish |
+| **Connection** | Tools — an MCP server's capabilities | The workspace or personal Context library | Managed in [Context & MCP](/docs/building/context-mcp); affects every Agent that has it equipped, on their next publish |
+
+## Deleting a skill
+
+Deleting a skill removes it and its attachments outright — unlike a connection, it isn't blocked while something still references it. Nothing fails immediately, and the two kinds of dependent degrade differently. An Agent that still has it attached reports it as missing in the agent editor's Context section, and can't publish again until the reference is removed or replaced. A Workflow whose instructions name it with `@skill.` keeps an amber warning that doesn't block publish, and still dispatches — the reference just resolves to nothing, the same degradation [Agents](/docs/concepts/agents#renaming-deleting-and-dependents) describes for any stale reference.
+
+## Changes land on the next publish
+
+Editing a skill doesn't retroactively touch an Agent that's already published — a published version is an immutable, content-hash-pinned artifact, and the skill's content at publish time is what got baked in. Edit the skill, and every Agent equipped with it picks up the change the next time each one publishes, not before.

@@ -1,0 +1,31 @@
+---
+title: Settings
+section: Building
+order: 38
+---
+
+# Settings
+
+Settings is workspace-level configuration, split across five panels: Models, Allowlist, Integrations, Members, and Workspace. What you can change depends on your role — owners and admins manage every panel, while members see the same layout with the mutating controls removed rather than a page they can't reach. MCP connections and skills live under their own surface, not here — see [Context & MCP](/docs/building/context-mcp).
+
+## Models
+
+"Point each preset at a provider, model and reasoning effort. Presets are what agents and workflows pick from." Three fixed cards — Powerful, Balanced, Quick — each show a provider·model chip, a reasoning-effort chip, and a hint line; see [Models](/docs/building/models) for what those hints mean and how the resolution works. Owners and admins get a Provider select, a Model select filtered to enabled allowlist entries for that provider, and a Reasoning effort select on each card.
+
+The footer note here is worth quoting exactly, since it's the thing people get wrong: "Preset changes apply on the next publish. Agents already published keep running the model and effort baked into their current version until you publish them again."
+
+## Allowlist
+
+"The provider and model pairs workflows are allowed to use." Each row shows a provider chip, the model id in monospace, an "In use" chip when a preset references it, an enable/disable switch, and a delete control. A model referenced by a preset can't be removed — its delete button is disabled with the tooltip "In use by a preset." Adding one is a Provider select plus a model-id text input (placeholder `e.g. anthropic/claude-sonnet-5`) and an **Add** button; duplicates are rejected client-side before they reach the server.
+
+## Integrations
+
+"Connect Slack so workflows can be triggered by mentions and reply in-thread." Owners and admins get a **Connect Slack** button that navigates away entirely — not a popup — to the platform's install flow, so the session cookie rides along, and returns with a status banner covering connected, canceled, must-be-admin, and already-connected-elsewhere outcomes. Connected teams list with a team name, a scope count, and, for managers, a **Disconnect** button behind a confirmation: "Workflows bound to {team} will stop receiving Slack events." The empty state reads "Connect Slack to route mentions and DMs to your workflows. We store an encrypted bot token — never your Slack password." For the full walkthrough, see [Connect Slack](/docs/guides/connect-slack).
+
+## Members
+
+"Who can access this workspace and what they can do." Each row shows a name and email plus a role control — an editable Admin/Member select for managers, a read-only chip otherwise, and always read-only for your own row and the owner's. The "Invite a teammate" box, visible to owners and admins, takes an email and a role (Member or Admin) and an **Invite** button; since there's no mailer, inviting generates a copyable link rather than sending anything. See [Workspaces](/docs/concepts/workspaces) for how invites and roles fit into the bigger picture.
+
+## Workspace
+
+A workspace-name field, editable by owners and admins with **Save** disabled until the name is actually dirty — members see it read-only. Below that, an Account card offers **Sign out**, and a Danger Zone card names workspace deletion honestly: it isn't available yet, and its button is permanently disabled rather than implying a feature that doesn't exist.

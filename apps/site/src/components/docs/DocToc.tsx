@@ -29,7 +29,7 @@ export function DocToc({ entries, activeId }: DocTocProps) {
                 href={`#${entry.id}`}
                 aria-current={active ? "location" : undefined}
                 className={cn(
-                  "lift -ml-px block border-l-2 py-0.5 text-[13px] leading-snug",
+                  "lift -ml-px block border-l-2 py-0.5 pl-2.5 text-[13px] leading-snug",
                   active
                     ? "border-ink font-medium text-ink"
                     : "border-transparent text-ink-3 hover:text-ink",

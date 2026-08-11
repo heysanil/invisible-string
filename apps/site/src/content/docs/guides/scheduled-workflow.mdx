@@ -1,0 +1,47 @@
+---
+title: Build a scheduled Workflow
+section: Guides
+order: 48
+---
+
+# Build a scheduled Workflow
+
+Say you want a standup digest to run every weekday at 09:00 UTC. This guide builds that as a scheduled Workflow — cron expression, bound Agent, and where the digest actually ends up once it's generated.
+
+## Before you start
+
+- A published Agent already equipped with whatever it needs to produce the digest — a connector to pull data from, or nothing at all if it's just summarizing its own context. See [Equip an Agent with a connector](/docs/guides/equip-an-agent) if it needs one.
+- Familiarity with how a Workflow's trigger, Agent, and instructions fit together — see [Workflows](/docs/concepts/workflows).
+
+## Steps
+
+1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor).
+2. In the Trigger section, pick **Schedule**.
+3. Enter the cron expression `0 9 * * 1-5` — five numeric fields: minute, hour, day-of-month, month, day-of-week. The field's live preview reads back what it understood underneath it, and a status chip beside it reads "Valid" once the expression parses; an expression it can't parse reads "Unrecognized" instead.
+4. Bind the Agent you equipped in the prerequisite step.
+5. Write instructions naming the exact shape you want the output in — for a standup digest, something like "list open items grouped by owner, one line each, ending with a one-sentence summary."
+6. Click **Publish**.
+
+## UTC only
+
+Schedules run on the platform clock, which is UTC — always, with no per-workspace timezone setting. If you actually want 09:00 in US/Eastern, you have to do the conversion yourself and write the UTC-equivalent expression: `0 14 * * 1-5` in winter (UTC-5) or `0 13 * * 1-5` once daylight saving starts (UTC-4). UTC itself never shifts across the DST boundary, so a schedule that's correct in January silently fires an hour off in July unless you edit the expression — the platform has no way to know you meant "9am wherever I am" instead of "9am UTC."
+
+## No backfill
+
+Ticks missed while the platform is down are skipped, not queued up and replayed. A digest that misses Monday's 09:00 firing because of downtime runs once on Tuesday at its normal time — not twice back to back to make up for it. That's the right default for something like a digest: a digest that arrives twice, once stale and once current, is worse than one that's simply late by a day.
+
+## Test without waiting
+
+You don't need to wait for the next tick to see what the Workflow does. Open the header's **Run** popover and press **Fire now** to dispatch the instructions immediately, exactly as the ticker would when it fires — with no payload, since a schedule trigger carries none. Read the result the same way you would a real firing: in the run itself.
+
+## Where the output goes
+
+Nowhere, on its own — worth knowing before you wait a day to find out. A schedule firing doesn't publish or send anything by itself; the digest only reaches somewhere if the Agent's own equipped tools put it there — posting to Slack, sending an email through a connector, writing a row somewhere. Otherwise, the only place to read the result is the run itself, in the Workflow's run history.
+
+## If it doesn't work
+
+- **The status chip reads "Unrecognized"** — the cron syntax is wrong. It needs exactly five numeric fields; month and day-of-week names aren't accepted, only numbers.
+- **Nothing fired at the expected time** — check the UTC conversion first, then confirm the Workflow is actually published. A draft schedule doesn't tick.
+- **Firing it by hand works but the real schedule didn't** — give it a full tick interval before assuming something's broken; a schedule that was just published won't necessarily catch a tick that's already in progress.
+
+See [Triggers](/docs/building/triggers) for how the other trigger kinds compare, [Sessions & runs](/docs/concepts/sessions-and-runs) for how a scheduled dispatch shows up as a run, and [troubleshooting](/docs/reference/troubleshooting) for anything not covered above.

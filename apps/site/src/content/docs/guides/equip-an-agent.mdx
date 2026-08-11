@@ -1,0 +1,38 @@
+---
+title: Equip an Agent with a connector
+section: Guides
+order: 45
+---
+
+# Equip an Agent with a connector
+
+Say a support-triage Agent needs to read and file issues in Linear. This guide connects Linear through the catalog's OAuth connector, narrows what the Agent can do with it, and proves the whole path works from chat.
+
+## Before you start
+
+- An Agent to equip — see [the agent editor](/docs/building/agent-editor) if you haven't created one yet.
+- Familiarity with the Context library's three connection lanes — see [Context & MCP](/docs/building/context-mcp).
+- A Linear account you can consent with (the OAuth popup authenticates as you, not as invisible-string).
+
+## Steps
+
+1. Open the workspace's Context library and click **Add connection**.
+2. In the Catalog lane, find the Linear tile and click it. Linear is a one-click OAuth connector, so clicking opens a consent popup immediately — no URL or credentials to type in.
+3. Complete consent on Linear's own page. The popup closes on its own once you approve, and the connection lands with a health state of "Healthy."
+4. Open the new connection's detail view and find its **tool filter**. A successful probe already cached the server's full tool list — switch the filter to an allow list and check only the 2-3 tools this Agent actually needs (for example, listing issues and creating a comment), rather than leaving every Linear tool exposed.
+5. Open the Agent in the agent editor and go to its Context section.
+6. Click **Browse**, find the Linear connection, and attach it.
+7. Click **Publish** and wait for the build to finish — attaching a connection changes what gets compiled into the Agent, so it doesn't take effect until the next successful publish.
+
+## What you should see
+
+Open a chat session against the Agent and send a literal prompt like "List my open Linear issues." The run timeline shows a tool-call step inside the work box — status running, then succeeded — followed by the Agent's prose answer summarizing what it found. If you narrowed the tool filter to only a list-issues tool, that's the one the rail should show being called.
+
+## If it doesn't work
+
+- **Connection health shows "Auth required" or "Auth error"** — the OAuth grant never completed or has since gone bad. Re-run the consent flow from the connection's detail view.
+- **A tool call in the run fails asking you to reconnect** — the OAuth grant died after the fact (expired or was revoked at Linear's end). Same fix: reconnect the connection.
+- **The tool you wanted isn't offered** — the connection's tool filter excludes it. Open the connection and widen the allow list to include it.
+- **Nothing changed after you adjusted the connection** — model, effort, and context are all pinned at publish time, so editing a connection's filter or reattaching it does nothing to an Agent's already-published version. Republish the Agent.
+
+See [troubleshooting](/docs/reference/troubleshooting) for anything not covered above, and [Security](/docs/platform/security) for how credentials and tokens are handled behind this flow. Once the connection works, chat directly against the Agent as described in [Chat](/docs/building/chat) to keep exercising it.

@@ -4,20 +4,25 @@ section: Concepts
 order: 22
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Sessions & runs
 
-A **session** is a conversation with a published Agent; a **run** is a single
-execution within it. Whether you open it from chat or a workflow trigger starts
-it, a session pins the agent version it began with, and each run streams its
+A session is a conversation with a published Agent; a run is a single
+execution within it. Whether it starts from chat or from a Workflow's trigger,
+a session pins the agent version it began with, and each run streams its
 progress back to the browser live — an ordered timeline of what the Agent said
-and what it did, with any human-in-the-loop pauses inline. How that renders is
-covered in [Chat](/docs/building/chat).
+and what it did, with any human-in-the-loop pauses inline.
 
-Runs stream over **resumable SSE** — reconnecting with a `Last-Event-ID` replays
+Runs stream over resumable SSE — reconnecting with a Last-Event-ID replays
 missed events rather than restarting — so a dropped connection never loses run
 history.
+
+## What a run contains
+
+A run is the ordered stream itself: everything the Agent said, everything it
+thought through, every tool it called, and every point where it stopped and
+waited. Every run belongs to exactly one session and runs against exactly one
+agent version — the version its session pinned when it began, never a later
+one. How that stream renders is covered in [Chat](/docs/building/chat).
 
 ## One run per session
 
@@ -27,19 +32,49 @@ run requests against a busy session are refused rather than interleaved. In
 chat that rule is invisible: messages you send during a run are queued and
 delivered when the session frees.
 
+## Waiting
+
+Three things park a run on a person before it can continue:
+
+- **Tool approval** — a gated tool call needs a yes before it runs.
+- **A direct question** — the Agent is asking you something and needs an
+  answer to proceed.
+- **A session limit** — the session has crossed its input-token budget, and
+  continuing needs your say-so.
+
+A waiting run still holds the session exactly like an actively streaming one
+does — see [One run per session](#one-run-per-session) above. Nothing about
+"waiting" is a lesser state than "running": it's still the one execution the
+session is allowed to have in flight.
+
 ## How a run ends
 
-A run finishes in one of three states. It **succeeds**, it **fails**, or it is
-**canceled** — the state a run lands in when you stop it. Cancellation is a
-decision rather than an error, and the platform keeps the two apart: a stopped
-run is never reported as a failure, and a workflow's outbound reply is never
-delivered from a run someone cut short.
+A run finishes in one of three states: succeeds, fails, or is canceled — the
+state a run lands in when you stop it. Cancellation is a decision rather than
+an error: a stopped run is never reported as a failure, and a Workflow's
+outbound reply is never delivered from a run someone cut short — deliberately,
+not as an incidental side effect of how cancellation happens to be
+implemented, because a reply from a run nobody let finish isn't one the
+platform should send on your behalf.
+
+A `failed` run doesn't take the session down with it. The session is still
+there and still usable afterward — sending another message starts a new run
+against the same session, same pinned agent version.
 
 ## Sessions end, too
 
-A session is not forever. Resetting one retires it permanently — a retired
-session can never accept another message, and a new one takes its place. Long
-sessions also age out on their own; when that happens, the next message starts
-a fresh session against the Agent's current published version.
+Resetting a session retires it permanently — a retired session can never
+accept another message. Long sessions also age out on their own; when that
+happens, the next message starts a fresh session against the Agent's current
+published version.
 
-<UnderConstruction />
+## Where runs are visible
+
+A run is visible wherever its session is visible: in the chat thread for a
+conversational session, and in a Workflow's run history for one a trigger
+started. Both views show the same underlying timeline — chat just keeps it
+open live, while run history is where you go back and check what a triggered
+Workflow actually did. See [Durability](/docs/platform/durability) for what
+keeps that history intact across a worker failure, and
+[Troubleshooting](/docs/reference/troubleshooting) if a run's state doesn't
+match what you expected.

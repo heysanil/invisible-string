@@ -4,22 +4,50 @@ section: Building
 order: 33
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Copilot
 
-Both editors dock an AI copilot on the right. It reads the current draft plus
-the workspace inventory — MCP connections, skills, published Agents, model
-presets, and the allowlist — and proposes edits as **typed mutations**, streamed
-over a WebSocket. In the agent editor those are `setPersona`, `setModel`,
-`addContext`, and `removeContext`; in the workflow editor, `setTrigger`,
-`setAgent`, and `setInstructions`.
+Both editors dock an AI copilot on the right. It reads the current draft plus the workspace inventory — MCP connections, skills, published Agents, model presets, and the allowlist — and proposes edits as typed mutations, streamed over a WebSocket. It runs on the platform's own credentials by default, so using it costs you nothing extra and needs no API key of your own.
 
-Every proposal renders as a structured **Apply / Dismiss** card with a preview
-— an inline diff for text, before-and-after otherwise. The server never mutates
-your draft directly: accepted mutations are applied client-side through the
-same controller manual edits use, so autosave and diagnostics all just work.
-Invalid tool calls — unknown ids, non-allowlisted models, dangling references —
-bounce back to the model server-side and never reach the UI.
+The panel opens as a glass dock headed "Copilot" with a collapse chevron, or collapses to a narrow pill; either state persists per workspace across sessions. At 1179px of viewport width or narrower it auto-collapses on its own — the copilot must never out-size the editor it's meant to help you edit.
 
-<UnderConstruction />
+## Using it well
+
+Copilot works from plain instructions, not a command syntax. In the agent editor:
+
+- "Tighten this persona so it refuses work outside code review."
+- "Switch this Agent to the quick preset."
+
+In the workflow editor:
+
+- "Add a Slack trigger for the #support channel."
+- "Reference the submitted email in the instructions."
+
+## What it can change
+
+| Editor | Mutation | What it changes |
+|---|---|---|
+| agent editor | `setPersona` | The persona text |
+| agent editor | `setModel` | The preset, model override, or reasoning effort |
+| agent editor | `addContext` | Attaches a connection or skill |
+| agent editor | `removeContext` | Detaches a connection or skill |
+| workflow editor | `setTrigger` | The trigger type and its configuration |
+| workflow editor | `setAgent` | Which Agent the Workflow delegates to |
+| workflow editor | `setInstructions` | The workflow instructions text |
+
+`setModel` picks from the same presets and allowlist described in [Models](/docs/building/models) — copilot can't propose a model the workspace hasn't sanctioned any more than the Model section can.
+
+## Working with a proposal
+
+Every proposal renders as a structured card: an icon, a title, an optional rationale, a preview — an inline diff for text, a compact before-and-after row otherwise — and **Apply** / **Dismiss** buttons. The card is focusable; Enter applies it, Delete or Backspace dismisses it. Either decision collapses the card to a one-line receipt — a check and "Applied — *title*," or a muted "Dismissed — *title*" — and applying flashes the section of the editor it touched, so you can see exactly what moved.
+
+The server never mutates your draft directly: accepted mutations are applied client-side through the same controller manual edits use, so autosave and diagnostics all just work.
+
+## Connection
+
+The dock talks to the server over a WebSocket. While it's opening, a small "Connecting…" status line appears below the thread — it's deliberately not the composer's placeholder, since changing that would tear down and re-create the editor mid-draft. If the socket drops, a banner reads "Reconnecting — your draft will resync automatically." While copilot is generating, a pulsing "Thinking…" indicator shows, or "More suggestions may follow — respond to the card above." if a proposal is already waiting on you. Errors render inline as red-bordered alert text; an empty thread shows clickable prompt-starter chips to get you going. Enter sends your message and Shift+Enter starts a new line, as in chat — though unlike chat's composer, there's no Escape shortcut here, because there's no run to stop. See [keyboard & accessibility](/docs/reference/keyboard-and-accessibility) for the full shortcut list.
+
+## What it will not do
+
+- **It never edits your draft directly.** Every change arrives as a proposal you apply or dismiss — nothing lands until you accept it.
+- **It never publishes on its own.** Publishing is always a deliberate action you take from the [agent editor](/docs/building/agent-editor) or [workflow editor](/docs/building/workflow-editor).
+- **It can't select a model the workspace hasn't allowlisted**, and it can't reference a connection, skill, or Agent that doesn't exist. Invalid tool calls — unknown ids, non-allowlisted models, dangling references — bounce back to the model server-side and never reach you as a proposal.

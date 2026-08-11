@@ -4,14 +4,12 @@ section: Concepts
 order: 20
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Agents
 
 An Agent is a role you define. Like a capable assistant, it's fully described by who it
 is, how it thinks, and what it's equipped with — three decisions, each a
 focused section of the agent editor. You chat with a published Agent directly,
-or put it on standing duty with a [workflow](/docs/concepts/workflows).
+or put it on standing duty with a [Workflow](/docs/concepts/workflows).
 
 ## Persona
 
@@ -34,7 +32,29 @@ What the Agent is equipped with: MCP connections (workspace or personal) and
 authored skills, drawn from the workspace's
 [Context library](/docs/building/context-mcp). Equipment is packaged straight
 into the compiled agent, so a published Agent carries its tools and knowledge
-with it.
+with it. See [Skills](/docs/building/skills) for how authored skills are built.
+
+## Draft and published
+
+An Agent has a draft and, once you've published at least once, a current
+published version. The draft is what the [agent editor](/docs/building/agent-editor)
+shows you — persona, model, and context edits autosave to it continuously. A
+published version is immutable and never changes underneath you; an Agent has
+at most one current published version at a time, and unpublished draft edits
+change nothing at runtime until you publish again.
+
+This is the load-bearing mental model for everything downstream: chat sessions
+and workflow dispatches always run the current published version, never the
+draft, no matter how far the draft has since drifted.
+
+## Who the Agent runs as
+
+Every dispatch — chat, a webhook, a schedule, a Slack event — runs the Agent
+with one workspace member's connected credentials. This "Run as" control lives
+on the Agent itself, not per-workflow, because a Workflow attaches no context
+of its own; the Agent's own equipment, including whose credentials it acts
+with, is the only context there is. See [sessions & runs](/docs/concepts/sessions-and-runs)
+for how a run uses that identity once it's underway.
 
 ## Publishing and versions
 
@@ -42,13 +62,37 @@ Publishing an Agent compiles its definition — persona, model, context — into
 real [eve](https://eve.dev) agent project, runs the build, and uploads the
 resulting artifact to object storage. The artifact is cached by a **content
 hash** — a digest of the definition, the resolved model and reasoning effort,
-the compiler version, the pinned eve version, and the build environment — so an
-identical definition never rebuilds.
+the compiler version, the pinned eve version, and the build environment.
+
+That hash has two practical consequences. An identical definition never
+rebuilds — republishing an Agent whose draft hasn't meaningfully changed reuses
+the existing artifact. And a workspace preset edit changes nothing already
+running: it only takes effect the next time the Agent publishes, because the
+resolved model and effort are baked into the hash at publish time, not read
+live.
 
 Each published **agent version** is immutable and independently addressable on
 the worker pool. Versions matter because runs are bound to them: a session pins
 the exact agent version it started with, so editing and re-publishing an Agent
-never changes the behaviour of conversations already in flight — new versions
-apply to new sessions.
+never changes the behavior of conversations already in flight — new versions
+apply to new sessions. See [sessions & runs](/docs/concepts/sessions-and-runs).
 
-<UnderConstruction />
+## Renaming, deleting, and dependents
+
+Renaming is the safe case. Because Workflows delegate to an Agent by reference
+rather than by name, editing the name in the agent editor's header renames it
+everywhere at once and breaks no binding.
+
+Context is where dependents get interesting. A Workflow's instructions may
+name the Agent's connections and skills with `@` references. If an Agent is
+republished missing something a bound Workflow referenced, that reference
+stops resolving — the [workflow editor](/docs/building/workflow-editor) surfaces
+a staleness warning rather than blocking the save. This is a warning, not a
+hard failure: it doesn't block publishing the Workflow, and it doesn't block
+dispatch either — a Workflow whose instructions carry a dangling reference
+still fires, it just runs without that reference resolving to anything.
+
+Deleting an Agent is the stricter case: it removes the Agent and every
+published version, so it's blocked outright while any Workflow or chat
+session still references it — there's no dangling-reference state to degrade
+into, because the delete itself doesn't go through.

@@ -1,10 +1,8 @@
 ---
 title: Durability
 section: Platform
-order: 41
+order: 51
 ---
-
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Durability
 
@@ -18,10 +16,63 @@ per version is enforced by fencing and scheduler
 reservations — so two workers never write the same version's state at once. The
 control plane's dead-worker sweep detects a lost worker and reroutes its runs.
 
+## What durable means here
+
+State lives in Postgres, not in worker memory, and work resumes at durable
+step boundaries. A crash replays a run from the last completed boundary, never
+from the very beginning — the further into a run the crash lands, the less
+gets redone.
+
+## What survives, and what doesn't
+
+Durability is real, but it isn't magic, and the honest boundary matters more
+than the guarantee:
+
+- A tool call already in flight when a worker dies can still complete, or
+  repeat — cancellation and crash recovery are both cooperative at step
+  boundaries, not mid-call, so a side effect from that call can land even
+  though the run itself gets replayed.
+- A canceled run stays canceled. Durability resumes interrupted work; it
+  doesn't retry a decision you made.
+- Messages queued in the chat composer live only in your browser until they
+  actually send — closing the tab before that loses them. See
+  [Chat](/docs/building/chat) for how the composer queues a follow-up while a
+  run is busy.
+
+## A failover, narrated
+
+A worker stops heartbeating. The control plane's dead-worker sweep notices,
+and per-version write fencing ensures no second worker was already writing
+that version's state while the first one looked alive. The affected runs are
+reserved onto a live worker, which resumes each one from its last durable
+step. Your browser, still holding its SSE connection open, reconnects with
+`Last-Event-ID` and replays exactly what it missed before continuing live —
+from where you sat, the run picks back up rather than restarting.
+
+## One writer per version
+
+Because a single agent version can only be written by one worker at a time, an
+Agent's entire live traffic — every chat session against it, and every
+Workflow delegating to it — concentrates onto its one current published
+version. That's a known, accepted trade-off in the platform's current
+single-worker-friendly deployment shape, not a hidden limitation: publishing a
+new version moves traffic to a new version's world database rather than
+spreading load across workers within one version.
+
+## Idle and cold starts
+
+Idle agent processes and idle sandboxes get reaped after a period of
+inactivity, and cold or unused build artifacts are evicted from a worker's
+local cache under an LRU policy. The first run after a quiet stretch pays a
+boot cost to re-fetch the artifact and start the process back up — see
+[Limits and defaults](/docs/reference/limits-and-defaults) for the actual
+timeouts and cache sizes rather than guessing at them here.
+
 ## Streaming through failure
 
 Runs stream to the browser over resumable SSE, so even a client that reconnects
 across a worker failover replays the events it missed and continues from where
-it left off.
-
-<UnderConstruction />
+it left off. See [Architecture](/docs/platform/architecture) for how a chat
+message reaches a worker in the first place, and
+[Sessions & runs](/docs/concepts/sessions-and-runs) for what the resulting
+stream contains.

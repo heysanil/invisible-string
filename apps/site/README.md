@@ -120,9 +120,10 @@ owns.
 - **MDX code-splitting is a deliberate no-op**: `src/lib/docs.ts` eagerly
   globs frontmatter from the same modules it lazy-imports, so Rollup keeps
   every doc body in one chunk (`INEFFECTIVE_DYNAMIC_IMPORT` warnings at
-  build). At ~14 short pages the single chunk is smaller than the plumbing
-  to split it; revisit (frontmatter as a separate virtual module) if the
-  docs grow into long-form content.
+  build). At ~28 pages — most now long-form rather than short stubs — the
+  single chunk is materially larger than when this was weighed; revisit
+  (frontmatter as a separate virtual module) now that the docs have grown
+  into long-form content.
 
 ## Testing constraint: no MDX in tests
 

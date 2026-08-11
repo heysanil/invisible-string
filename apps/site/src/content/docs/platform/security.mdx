@@ -1,10 +1,8 @@
 ---
 title: Security
 section: Platform
-order: 42
+order: 52
 ---
-
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
 
 # Security
 
@@ -33,7 +31,9 @@ time and response size are capped.
 Credentials decrypted to probe a server exist only for the length of the call:
 they are never logged, never persisted in the clear, and never returned in an
 API response. Error text from a failed probe is scrubbed against the
-credentials it was given before it is stored.
+credentials it was given before it is stored. See
+[Context & MCP](/docs/building/context-mcp) for how a connection is set up in
+the first place.
 
 ## OAuth tokens
 
@@ -55,4 +55,43 @@ provider keys never enter the build environment (builds run allowlisted and with
 install scripts ignored). Compiled agents are reached with per-version derived
 JWTs, and workers dispatch with single-use tokens.
 
-<UnderConstruction />
+## What is stored, and where
+
+Agent definitions, sessions, run events, and encrypted credentials live in
+Postgres. Compiled artifacts and skill attachments live in the object store.
+The search index holds only a disposable mirror of the MCP registry — no user
+data ever reaches it. See [Architecture](/docs/platform/architecture) for the
+full data map.
+
+Run transcripts persist for the life of the workspace — there is no automatic
+transcript expiry today.
+
+## Your data and the model provider
+
+Prompts and run content are sent to whichever model provider the resolved
+Agent uses — OpenRouter or Anthropic, the only two providers the platform
+speaks to, depending on the workspace's configuration. That's inherent to how
+an Agent produces an answer, not an incidental detail: the platform cannot
+generate a response without sending the conversation to a provider. The key it
+authenticates with is never the build's — see
+[Compiled agents](#compiled-agents) above.
+
+## Protecting public ingress
+
+Slack requests are verified against their signature within a replay window
+before anything else happens with them. Webhook and other trigger ingress
+enforce per-token and per-IP rate limits, plus a cap on request body size — see
+[Limits and defaults](/docs/reference/limits-and-defaults) for the exact
+numbers rather than repeating them here.
+
+## If you self-host
+
+Running your own [deployment](/docs/getting-started/deploy-your-own) puts you
+in control of your own provider key, your own database, and your own backups —
+none of that runs through invisible-string's infrastructure.
+
+One switch is a development convenience, not a production setting:
+`MCP_PROBE_ALLOW_PRIVATE` relaxes the health-probe egress guard to allow
+private addresses. Leave it off on any deployment reachable from the internet
+— turning it on in production reopens exactly the class of request the guarded
+egress path exists to block.

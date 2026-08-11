@@ -4,26 +4,50 @@ section: Building
 order: 30
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # The agent editor
 
-The agent editor is where an Agent takes shape. A section rail — Persona,
-Model, Context, Access — sits alongside focused editors for each, with the AI
-copilot docked on the right. Edits autosave to the draft as you work, and
-problems surface directly on the section that owns them.
+The agent editor is where an [Agent](/docs/concepts/agents) takes shape. A section rail — Persona, Model, Context, Access — sits alongside focused editors for each, with the [AI copilot](/docs/building/copilot) docked on the right. Edits autosave to the draft as you work, and problems surface directly on the section that owns them.
 
-Persona is a rich-text editor over plain markdown, with a toggle to edit the
-markdown directly — what you write is what gets compiled, either way. Model
-picks the preset, an optional specific model, and how hard it thinks
-([Models](/docs/building/models)); Context equips it from the workspace
-library ([Context & MCP](/docs/building/context-mcp)).
+Each rail card carries a one-line summary of its section, a ✓ once it's valid, and an amber issue count when it isn't. Clicking a card scrolls the center column to that section rather than navigating away, so the rail doubles as both a map and a status board.
 
-The rail carries the Agent's lifecycle: **Chat with agent** opens a
-conversation against the latest published version, and **Publish** compiles
-and builds the draft with live build progress — an Agent is the thing that
-builds, so publishing is where the draft becomes a real, version-pinned
-artifact. The Access section sets the run-as user whose credentials the Agent
-uses on every dispatch.
+## Persona — "Who this agent is"
 
-<UnderConstruction />
+Two fields: a plain-text **Description** (a one-liner used in list views and routing, not compiled into the persona), and **Persona** itself — a rich-text editor over markdown, with a toggle to edit the markdown directly. What you write is what gets compiled either way. The toolbar covers bold, italic, inline code, headings, bullet and numbered lists, quotes, and code blocks.
+
+An empty persona shows an advisory footer: "The persona prepended to every run. Aim for under 1,500 characters." That figure is advice, not a limit — the hard cap is 50,000 characters, and once you've written anything the footer switches to a running `characters / 50,000` count.
+
+## Model — "How it thinks"
+
+A **Model preset** segmented control (Powerful / Balanced / Quick) sits above a line showing what it resolves to in this workspace. Below it, a **Model override** select lets you pin a specific allowlisted model instead of following the preset — picking one outside the workspace allowlist is a hard block, shown as "…it will be rejected at publish," not just a warning. A **Reasoning effort** select defaults to "Inherit from preset" (or "Inherit (model default)" once you've set a model override, since an override no longer follows the preset's effort).
+
+Reasoning effort carries two non-blocking advisories instead: one when the effective model advertises no reasoning support at all, another when it doesn't advertise the specific effort you chose. Both read "Publishing still works" — an off-catalog effort is honest guesswork, not a rejection. See [Models](/docs/building/models) for how presets, the allowlist, and reasoning effort resolve at publish time.
+
+## Context — "Tools and knowledge"
+
+Two columns, Connections and Skills, each with an **Add** button that opens a **Browse** popover over the unattached items in the workspace and personal libraries. Every attached row carries a Workspace or Personal scope tag, a "Disabled" chip if the underlying connection or skill is disabled, and a remove (×) control. See [Skills](/docs/building/skills) for how a skill itself gets written.
+
+Each connection also has a **Settings** popover with a tool picker (allow or block individual tools) and an **Approval policy** — Never — auto-allow, Once per session, or Always ask — for how the Agent should handle that connection's gated tool calls. If the draft references a connection or skill that's since been deleted, the section surfaces "*n* attached connection(s)/skill(s) could not be found" rather than failing silently. A "Manage the full registry in Context" link routes to the full [Context & MCP](/docs/building/context-mcp) library.
+
+## Access — "Whose credentials it uses"
+
+One control: **Run-as member**, a select over the workspace's members. The card spells out the consequence directly: "This agent runs with this member's connected credentials — in chat and in every workflow that delegates to it." There's no per-workflow override — the Agent is the only place this identity lives.
+
+## Diagnostics
+
+Diagnostics are two-tier. Instant, client-side checks run as you type — an empty persona is a warning, an off-allowlist model override is an error. A second pass runs server-side as a dry-run compile at publish time and routes any resulting errors back onto the section that owns them by error code — a missing connection or skill routes to Context, a stale run-as user routes to Access.
+
+Errors block **Publish**; warnings don't — with one exception worth knowing, because it looks like a contradiction: an empty persona surfaces as a warning while you type, but Publish stays disabled until you write one. Below the Publish button, unresolved diagnostics show as "*n* issue(s) to resolve before publishing," and each section's own diagnostics list carries a "✦ *n* issue(s) — ask copilot to fix" affordance that pre-fills the copilot composer with the exact issue text.
+
+## Publishing
+
+Publish moves through `idle → compiling → building → ready`, with an error branch at any step. The button's label tracks the phase — Publish, Compiling…, Building…, then Published or Published (cached) — and on success the rail shows an inline result: "Published — build served from cache." or "Published and built." A failure replaces that with the build error text in a red-bordered box instead of navigating anywhere. See [troubleshooting](/docs/reference/troubleshooting) if a build keeps failing.
+
+## Header actions
+
+The Agent's name is inline-editable in the header: click in, type, and Enter commits (or click away to blur-commit); Escape reverts to the last saved name. Owners and admins also see a **Delete** action, which removes the Agent and every published version — blocked while any Workflow or chat session still references it.
+
+**Chat with agent** always publishes first, even if the Agent is already published — for an unchanged draft that's a cache hit, not a rebuild. This is worth knowing precisely because it's easy to misread: clicking it chats against the Agent's latest **published** version, republishing the draft first if needed, never your unpublished draft directly. If the publish doesn't succeed cleanly, you get an error toast instead of a navigation. See [Chat](/docs/building/chat) for what happens once the session opens.
+
+## Keyboard
+
+The name field commits on Enter and reverts on Escape, matching the pattern used across the editors. For the full shortcut and accessibility reference, see [keyboard & accessibility](/docs/reference/keyboard-and-accessibility).

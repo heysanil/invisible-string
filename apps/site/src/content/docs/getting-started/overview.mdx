@@ -4,59 +4,79 @@ section: Getting started
 order: 10
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Overview
 
-invisible-string puts agents to work for you: give an agent a role, a
-model, and the tools it needs, then chat with it like a teammate — or put it on
-standing duty from Slack, forms, webhooks, or a schedule. Runs stream live,
-pause for your approval, and are yours to run wherever you host them.
-
-invisible-string is a multi-tenant cloud platform for AI agents. You build an
-**Agent** — a persona, a model, and the context it's equipped with — and every
-published Agent compiles into a real, self-hosted [eve](https://eve.dev) agent
-that runs on a durable, Postgres-backed worker pool.
+invisible-string is a multi-tenant cloud platform for AI agents. You give an
+**Agent** a role, a model, and the tools it needs, then chat with it like a
+teammate — or put it on standing duty from Slack, forms, webhooks, or a
+schedule. Runs stream live, pause for your approval, and are yours to run
+wherever you host them: every published Agent compiles into a real,
+self-hosted [eve](https://eve.dev) agent on a durable, Postgres-backed worker
+pool.
 
 ## Agents
 
-An Agent is a role you define, fully described by three decisions:
-
-### Persona
-
-Who it is and how it works — the natural-language description of its role,
-judgment, and working style.
-
-### Model
-
-How it thinks: `powerful`, `balanced`, or `quick`, resolved within the
-workspace's model allowlist. Each preset carries a reasoning effort as well as
-a model, so the same model can serve two tiers at different depths of thought.
-
-### Context
-
-What it's equipped with: MCP connections and authored skills, packaged straight
-into the compiled agent.
-
-An Agent isn't a prompt template. Publishing compiles its definition into a
-standalone, version-pinned artifact — built once, cached by content hash, and
-run on a stateless worker pool where runs survive a worker dying mid-flight and
-resume on any live worker. You chat with published Agents directly.
+An Agent is a role you define, fully described by three decisions: Persona (who
+it is and how it works), Model (`powerful`/`balanced`/`quick`, resolved within
+the workspace's model allowlist — each preset carries a reasoning effort as
+well as a model), Context (MCP connections and authored skills, packaged into
+the compiled agent). An Agent isn't a prompt template: publishing it produces a
+standalone, version-pinned build, and that build is what you chat with.
 
 ## Workflows
 
-For standing work, delegate with a **workflow**: a trigger (webhook, form,
-Slack event, or schedule), the published Agent that handles it, and
-instructions for what to do when it fires, with `@trigger` references into the
-event's data.
-
-A workflow builds nothing — publishing is instant, and when the trigger fires
+For standing work, delegate with a Workflow: a trigger (webhook, form, Slack
+event, or schedule), the published Agent that handles it, and instructions for
+what to do when it fires, with `@trigger` references into the event's data. A
+Workflow builds nothing — publishing is instant — and when the trigger fires
 the platform delivers the event *and the instructions* to the bound Agent as
 its task.
 
+## How it fits together
+
+An Agent starts as a draft in the agent editor — a persona, a model preset,
+and whatever connections or skills it needs — and nothing runs until you
+publish it. See [Agents](/docs/concepts/agents).
+
+Publishing compiles that draft into a real [eve](https://eve.dev) agent
+project, runs the build, and stores the resulting artifact by content hash —
+an unchanged definition never rebuilds, so republishing after an unrelated
+edit is often instant too.
+
+Once published, an Agent is something you can chat with directly or delegate
+to. Chat starts a session and streams every run live; a Workflow instead binds
+the published Agent to a trigger and hands it a task whenever that trigger
+fires — no chat window required. See
+[Workflows](/docs/concepts/workflows).
+
+Every run — chat or delegated — lands on a stateless worker pool backed by
+Postgres, so a worker dying mid-run doesn't lose the run: it resumes on
+whichever live worker picks it up next. See
+[Durability](/docs/platform/durability).
+
+## Chat or a Workflow?
+
+| | Chat | Workflow |
+|---|---|---|
+| Shape | Interactive — a back-and-forth conversation | Standing — fires on its own trigger |
+| Who starts it | You, by typing | A webhook, form submission, Slack event, or schedule |
+| Where output lands | The chat thread you're reading | Wherever the Workflow delivers it (for example, back to a Slack thread) |
+| Does publishing build anything | Yes — compiles and builds the Agent | No — publishing a Workflow is instant |
+
+## What a Workflow is not
+
+A Workflow carries no persona, no model, and no context of its own — it binds
+to one published Agent and uses that Agent's equipment as-is. You don't chat
+with a Workflow directly; you chat with the Agent it delegates to, or you let
+its trigger fire it.
+
 ## Where to go next
 
-Head to the [Quickstart](/docs/getting-started/quickstart) to build, publish,
-and delegate to your first agent end to end.
+- **Build one** — follow the [Quickstart](/docs/getting-started/quickstart) to
+  build, publish, and delegate to your first Agent end to end.
+- **Understand the model** — read [Agents](/docs/concepts/agents) for how
+  persona, model, and context become a published version.
+- **Run it yourself** — [Deploy your own](/docs/getting-started/deploy-your-own)
+  covers self-hosting the whole platform.
 
-<UnderConstruction />
+Unfamiliar term along the way? Check the [Glossary](/docs/reference/glossary).

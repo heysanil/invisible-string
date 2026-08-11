@@ -4,46 +4,105 @@ section: Building
 order: 34
 ---
 
-import { UnderConstruction } from "../../../components/docs/UnderConstruction";
-
 # Triggers
 
-A trigger decides when a workflow fires. invisible-string supports five kinds,
-and every kind lands the same way: the platform authenticates the event,
-normalises it, and dispatches the run — delivering the event's data and the
-workflow's instructions to the bound agent version as its task. Compiled agents
-carry no per-trigger channels; the trigger surface lives entirely in the
-platform.
+A trigger decides when a [Workflow](/docs/concepts/workflows) fires.
+invisible-string supports five kinds, and every kind lands the same way: the
+platform authenticates the event, normalizes it, and dispatches the run —
+delivering the event's data and the Workflow's instructions to the bound agent
+version as its task. Compiled agents carry no per-trigger channels; the
+trigger surface lives entirely in the platform.
 
-## Chat
+| Kind | What fires it | What lands in the event | Where the reply goes | How it authenticates |
+|---|---|---|---|---|
+| Manual | The [workflow editor](/docs/building/workflow-editor)'s **Run** popover | No structured data — the instructions carry the whole task | Streams live in Chat | Your authenticated session in the app |
+| Webhook | An HTTP `POST` to the ingress URL | The raw JSON body, verbatim, as `data` | Nowhere automatic — read the run's history | The `whk_` ingress token in the URL |
+| Form | A submission of the rendered form | Each declared field, type-coerced and validated | Nowhere automatic — read the run's history | The same per-workflow ingress token, embedded in the form's submit URL |
+| Slack | An `@mention` or DM the connected app receives | `{eventType, channel, ts, thread_ts, text, user, team, channelType}` | Posted back into the originating thread | Slack's request signature, verified within a replay window |
+| Schedule | The platform's cron ticker, on tick | `data.scheduledFor`; message is empty | Nowhere automatic — read the run's history | N/A — the platform fires it, nothing external calls in |
 
-The default `manual` trigger: fire the workflow by hand — **Run now** in the
-workflow editor — and follow the run in chat. (For conversational work you
-don't need a workflow at all; chat targets your published Agents directly.)
+## Manual
+
+Manual is the default trigger: fire the Workflow by hand from the
+[workflow editor](/docs/building/workflow-editor)'s **Run** popover and follow the run live
+in Chat. It carries no structured trigger data — the instructions alone
+describe the whole task, the same as any other manually started run.
 
 ## Webhook
 
-A per-workflow ingress token accepts an HTTP `POST`; the entire JSON body
-becomes the trigger event's data. Tokens are minted once and shown a single
-time.
+A per-Workflow ingress token accepts an HTTP `POST`, and the entire JSON body
+becomes the trigger event's `data` — no schema, no coercion. Tokens are
+minted as `whk_` plus 43 URL-safe base64 characters (256 bits of entropy),
+shown once at mint time, and never retrievable again: the platform stores
+only their SHA-256 hash, and `POST /t/:token` hashes the presented token to
+look it up.
+
+Before any JSON parsing happens, the ingress caps a request body at 256 KiB
+and rejects anything larger with `payload_too_large`, then checks per-token
+and per-IP rate limits, both returning `Retry-After` when exceeded — see
+[Limits and defaults](/docs/reference/limits-and-defaults) for the exact
+numbers. The HTTP response to that `POST` is only an acknowledgement that the
+trigger was accepted — it is never the Agent's answer. Read the actual result
+in the Workflow's run history; see
+[Build a webhook Workflow](/docs/guides/webhook-workflow) for a worked
+example.
 
 ## Form
 
-A bound field schema renders a submittable form; the submission is normalised
-into the trigger event's data. Malformed submissions are rejected so the event
-data is always well-formed.
+A bound field schema renders a submittable form, and each field is one of
+`text`, `textarea` (Long text), `number`, `select`, `checkbox`, or `date`.
+Every field has a `key` — which must start with a letter — plus a `label` and
+a `required` flag, with optional `placeholder`/`helpText`; a `select` field
+additionally carries its `options` list, which every other type disallows.
+
+Submitting the form runs through the same `POST /t/:token` ingress as
+Webhook, just with the token embedded in the form's own submit URL rather
+than typed by hand. Each value is coerced to its declared type — numbers
+parsed, checkboxes normalized to booleans — and a submission is rejected
+outright, rather than passed through malformed, if it's missing a required
+field or a `select` value falls outside its declared options. Unknown
+submitted keys are silently dropped, since the form schema is authoritative.
+Duplicate field keys are caught earlier, when the Workflow itself is saved.
 
 ## Slack
 
-Slack events route through the connected platform Slack app. Incoming requests
-are verified by signature within a replay window, and the workspace and
-workflow are resolved from the team id and the trigger's binding. Replies post
-back into the originating thread.
+Slack events route through the connected platform Slack app. Every incoming
+request is verified by signature within a five-minute replay window before
+anything else happens, and the workspace and Workflow are resolved from the
+team id and the trigger's binding — see
+[Connect Slack](/docs/guides/connect-slack) for how that connection is set
+up.
+
+The bot only receives events from channels it has been invited to —
+inviting it to each channel that should fire the trigger isn't optional. Two
+toggles on the binding decide what counts as a new run: `mentionOnly`
+(default true) means only `@mentions` start one, while thread replies always
+continue that run's existing session regardless of the mention setting;
+`includeDirectMessages` (default false) lets DMs start runs too, and a DM's
+session key is the channel itself rather than a thread, so a 1:1 conversation
+stays one ongoing session.
+
+Replies post back into the originating thread via `chat.postMessage`, using
+the connected team's encrypted bot token. Delivery is at-least-once — a crash
+between posting the reply and recording that delivery can cause a rare
+duplicate post, which is expected behavior, not a bug. Slack's own event
+retries are separately deduplicated by `event_id`, so a flaky delivery on
+Slack's side doesn't compound the problem.
 
 ## Schedule
 
-A cron expression fires the workflow on a schedule, evaluated in UTC by the
-platform. Ticks missed while the platform is down are skipped, not backfilled —
-a schedule never queues a burst of stale runs on recovery.
+A cron expression fires the Workflow on a schedule, evaluated in UTC at
+minute precision by a five-field evaluator — minute, hour, day-of-month,
+month, and day-of-week, numeric only, with no month or day names. It supports
+`*`, `*/n` steps, single values, and `a-b` ranges (including stepped ranges
+like `a-b/n`); when both day-of-month and day-of-week are restricted, a date
+matches if either one does, the standard cron convention. See
+[Build a scheduled Workflow](/docs/guides/scheduled-workflow) for worked
+examples.
 
-<UnderConstruction />
+The schedule ticker checks every 30 seconds by default and always advances
+the next fire time from now, never backfilling. Ticks missed while the
+platform is down are skipped, not queued — a control plane that's been down
+across several windows fires once on recovery and resumes its normal
+cadence, rather than bursting out every missed run at once. That's the safer
+default for anything that isn't idempotent.

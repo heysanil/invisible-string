@@ -119,6 +119,38 @@ export interface RuntimeConfig {
    * (local dev/CI, where worker ids are random per boot).
    */
   workerAllowedIds?: string[];
+  /**
+   * Meilisearch registry-search mirror (MEILISEARCH_URL +
+   * MEILISEARCH_MASTER_KEY). BOTH optional and never validated as required:
+   * absent means registry search is degraded, not a boot failure (connectors
+   * redesign spec §5 — the index is a disposable mirror).
+   */
+  meilisearchUrl?: string;
+  meilisearchMasterKey?: string;
+  /**
+   * Registry→Meilisearch sync cadence (REGISTRY_SYNC_INTERVAL_MS, default
+   * 6 h): how often the ETL mirrors the official MCP registry into the
+   * search index. Only consulted when the Meilisearch client exists.
+   */
+  registrySyncIntervalMs: number;
+  /**
+   * MCP_PROBE_ALLOW_PRIVATE=1 — DEV/E2E/SELF-HOSTED ONLY: the guarded egress
+   * helper (net/guarded-fetch.ts) stops rejecting private/loopback targets
+   * AND allows plain http://, so probes can reach stubs on 127.0.0.1. Never
+   * set in production: it disables the SSRF containment.
+   */
+  mcpProbeAllowPrivate: boolean;
+  /**
+   * PLATFORM_API_URL — the control-plane base URL as reachable from the
+   * WORKER network (prod compose: `http://control-plane:3000`; dev:
+   * `http://localhost:3000`). Injected into every agent env under the same
+   * name (compiler PLATFORM_API_URL_ENV): compiled agents with broker-
+   * delivered OAuth connections call `POST /internal/connections/token` on
+   * it. Optional: absent, agents boot fine but any oauth connection's tool
+   * calls fail with a missing-env error — a degraded state, not a boot
+   * failure.
+   */
+  platformApiUrl?: string;
 }
 
 /** Env vars that, when any is present, mean "the runtime is configured". */
@@ -208,6 +240,13 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     120_000,
     problems,
   );
+  const registrySyncIntervalMs = parsePositiveInt(
+    env.REGISTRY_SYNC_INTERVAL_MS,
+    "REGISTRY_SYNC_INTERVAL_MS",
+    // Keep in sync with search/registry-sync.ts DEFAULT_REGISTRY_SYNC_INTERVAL_MS.
+    21_600_000,
+    problems,
+  );
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -246,7 +285,18 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
         ? "worker-token"
         : "shared-secret",
     workerAllowedIds: parseWorkerAllowedIds(env.WORKER_ALLOWED_IDS),
+    meilisearchUrl: env.MEILISEARCH_URL?.trim() || undefined,
+    meilisearchMasterKey: env.MEILISEARCH_MASTER_KEY?.trim() || undefined,
+    registrySyncIntervalMs,
+    mcpProbeAllowPrivate: env.MCP_PROBE_ALLOW_PRIVATE?.trim() === "1",
+    platformApiUrl: normalizeBaseUrl(env.PLATFORM_API_URL),
   };
+}
+
+/** Trim + drop a trailing slash so path joins never double up. */
+function normalizeBaseUrl(raw: string | undefined): string | undefined {
+  const value = raw?.trim().replace(/\/+$/, "");
+  return value || undefined;
 }
 
 function parseWorkerAllowedIds(raw: string | undefined): string[] | undefined {

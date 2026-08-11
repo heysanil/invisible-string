@@ -50,6 +50,7 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
     userMessage: "Summarize the issues",
     segments: [],
     pendingInputs: [],
+    authorizations: [],
     error: null,
     modelId: "deepseek/deepseek-v4-pro",
     canceled: false,

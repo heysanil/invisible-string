@@ -65,5 +65,21 @@
  * entries stay so older versions keep recompiling to identical bytes.
  * BUILD_ENV_EPOCH is deliberately NOT bumped — the byte change is inside
  * compile(), which this version already re-keys.
+ *
+ * 4.1.0 — MINOR: new emitted file + new optional behavior for broker-
+ * delivered OAuth connections (connectors redesign spec §6). Connections
+ * with `auth.kind === "oauth"` emit an `auth.getToken` that calls the new
+ * `agent/lib/platform-token.ts`: an in-process-cached (60 s expiry margin)
+ * fetch of a short-lived access token from the control plane's
+ * `POST /internal/connections/token`, authenticated with a self-minted
+ * HS256 platform JWT (hand-rolled on node:crypto — generated projects take
+ * no new runtime deps) under the version-bound audience platform-auth.ts
+ * already bakes. The generated project reads TWO env vars for this —
+ * PLATFORM_API_URL (new; injected by the dispatcher's env assembly) and the
+ * existing PLATFORM_JWT_SECRET — both lazily inside the call, so keyless
+ * `eve build` still never crashes. No OAuth material (tokens, client
+ * secrets, refresh tokens) ever appears in generated files or agent env.
+ * Existing bearer/headers/none emissions are byte-identical; hashes still
+ * shift for every version because COMPILER_VERSION participates.
  */
-export const COMPILER_VERSION = "4.0.0";
+export const COMPILER_VERSION = "4.1.0";

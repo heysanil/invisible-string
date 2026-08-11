@@ -3,7 +3,7 @@
  * that block the action. For MCP connections the blocking entities are
  * AGENTS (the server's `connection_in_use` details carry the agent names
  * whose draft or published context references the connection — see
- * apps/control-plane/src/resources/mcp-connections.ts connectionReferences).
+ * apps/control-plane/src/resources/connections.ts connectionReferences).
  * The server sends a bare name array; we also read a couple of legacy keyed
  * shapes defensively so a small contract drift degrades to an empty list,
  * never a crash.

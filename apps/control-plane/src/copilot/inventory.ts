@@ -13,11 +13,15 @@
  * effort and each allowlisted model's catalog-advertised efforts. The copilot
  * proposes efforts through setModel, so the prompt has to state which ones the
  * model actually accepts; the catalog reaches the copilot only through here.
+ *
+ * Connection rows carry their probe-derived HEALTH and cached bare tool names
+ * (spec §11) so proposals can reference tools the server really exposes.
  */
 import { and, eq, inArray, or } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   agentDefinitionSchema,
+  type ConnectionHealth,
   type ReasoningEffort,
 } from "@invisible-string/shared";
 
@@ -28,6 +32,13 @@ import {
   type OpenRouterCatalog,
 } from "../resources/openrouter-catalog";
 
+/**
+ * Prompt-size cap on tool names per connection entry. The probe already caps
+ * the cache at 200; `toolCount` keeps the full cached total so the prompt can
+ * render a truncation marker.
+ */
+export const INVENTORY_TOOL_NAME_CAP = 40;
+
 export interface InventoryConnection {
   id: string;
   name: string;
@@ -35,6 +46,17 @@ export interface InventoryConnection {
   slug: string;
   description: string | null;
   enabled: boolean;
+  /** Probe-classified health (spec §7); `unknown` until the first probe. */
+  health: ConnectionHealth;
+  /**
+   * Bare tool names from the cached `tools/list` of the last successful
+   * probe, capped at {@link INVENTORY_TOOL_NAME_CAP}; empty when nothing is
+   * cached. Bare names only — the compiler qualifies `<slug>__<tool>`
+   * internally and the copilot must never see qualified names.
+   */
+  tools: string[];
+  /** Full cached tool count — exceeds `tools.length` when the cap truncated. */
+  toolCount: number;
 }
 
 export interface InventorySkill {
@@ -134,8 +156,8 @@ export function createInventoryLoader(
     const [connections, skills, agents, presets, allowlist, catalog] = await Promise.all([
       db
         .select()
-        .from(schema.mcpConnections)
-        .where(scopeFilter(schema.mcpConnections)),
+        .from(schema.connections)
+        .where(scopeFilter(schema.connections)),
       db.select().from(schema.skills).where(scopeFilter(schema.skills)),
       db
         .select({
@@ -198,9 +220,9 @@ export function createInventoryLoader(
     const [extraConnections, extraSkills] = await Promise.all([
       missingConnectionIds.size > 0
         ? db
-            .select({ id: schema.mcpConnections.id, name: schema.mcpConnections.name })
-            .from(schema.mcpConnections)
-            .where(inArray(schema.mcpConnections.id, [...missingConnectionIds]))
+            .select({ id: schema.connections.id, name: schema.connections.name })
+            .from(schema.connections)
+            .where(inArray(schema.connections.id, [...missingConnectionIds]))
         : Promise.resolve([]),
       missingSkillIds.size > 0
         ? db
@@ -224,13 +246,21 @@ export function createInventoryLoader(
       });
 
     return {
-      connections: connections.map((row) => ({
-        id: row.id,
-        name: row.name,
-        slug: slugifyName(row.name),
-        description: row.description,
-        enabled: row.enabled,
-      })),
+      connections: connections.map((row) => {
+        const cached = row.toolsCache ?? [];
+        return {
+          id: row.id,
+          name: row.name,
+          slug: slugifyName(row.name),
+          description: row.description,
+          enabled: row.enabled,
+          health: row.health,
+          tools: cached
+            .slice(0, INVENTORY_TOOL_NAME_CAP)
+            .map((tool) => tool.name),
+          toolCount: cached.length,
+        };
+      }),
       skills: skills.map((row) => ({
         id: row.id,
         name: row.name,

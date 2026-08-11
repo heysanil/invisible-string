@@ -7,7 +7,7 @@ export { queryKeys, scopeBasePath, type ScopeRef, type SessionListFilters } from
 export * from "./workflows";
 export * from "./sessions";
 export * from "./runs";
-export * from "./mcp-connections";
+export * from "./connections";
 export * from "./registry";
 export * from "./skills";
 export * from "./models";

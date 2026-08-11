@@ -68,6 +68,15 @@ services:
       SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
       SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      # Registry search (docs/DEPLOY.md — Meilisearch). Absent/unreachable
+      # degrades search only; the control plane never hard-requires it.
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:?}
+      # Control-plane base URL as reachable from the WORKER network: compiled
+      # agents with OAuth connections call POST /internal/connections/token on
+      # it (version-bound platform JWT; tokens never enter agent env). Agents
+      # run on the worker container, which shares the internal bridge.
+      PLATFORM_API_URL: http://control-plane:3000
     volumes:
       - agent-build:/var/lib/agents
       - npm-cache:/var/lib/npm-cache
@@ -163,6 +172,25 @@ services:
       timeout: 3s
       retries: 12
 
+  meilisearch:
+    # Registry search mirror. The index is DISPOSABLE: no backups — an empty
+    # index is rebuilt by a full resync from the official MCP registry. Same
+    # pinned tag as the dev compose (docker-compose.yml).
+    image: getmeili/meilisearch:v1.52.0
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:?}
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili-data:/meili_data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:7700/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   # Optional Cloudflare Tunnel ingress: docker compose --profile cloudflared up.
   # Map the tunnel's public hostname to http://web:80 in the Cloudflare
   # dashboard. TUNNEL_TOKEN is required only when the profile is enabled
@@ -218,6 +246,7 @@ networks:
 volumes:
   postgres-data:
   garage-data:
+  meili-data:
   agent-build:
   agent-cache:
   npm-cache:

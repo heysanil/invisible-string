@@ -1,0 +1,122 @@
+[
+  {
+    "slug": "deepwiki",
+    "title": "DeepWiki",
+    "category": "dev-tools",
+    "description": "Ask questions about any public GitHub repo.",
+    "modelDescription": "DeepWiki: look up documentation and answer questions about public GitHub repositories.",
+    "url": "https://mcp.deepwiki.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "none" },
+    "websiteUrl": "https://deepwiki.com",
+    "featured": true
+  },
+  {
+    "slug": "context7",
+    "title": "Context7",
+    "category": "dev-tools",
+    "description": "Up-to-date docs for any library or framework.",
+    "modelDescription": "Context7: fetch current documentation and code examples for libraries, frameworks, SDKs, and APIs.",
+    "url": "https://mcp.context7.com/mcp",
+    "transport": "streamable-http",
+    "auth": {
+      "type": "headers",
+      "headers": [
+        { "name": "CONTEXT7_API_KEY", "description": "Context7 API key (context7.com/dashboard)", "isSecret": true }
+      ]
+    },
+    "websiteUrl": "https://context7.com",
+    "featured": true
+  },
+  {
+    "slug": "hugging-face",
+    "title": "Hugging Face",
+    "category": "data",
+    "description": "Search models, datasets, papers, and Spaces.",
+    "modelDescription": "Hugging Face Hub: search and inspect models, datasets, papers, and Spaces.",
+    "url": "https://huggingface.co/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "bearer", "tokenLabel": "HF access token", "tokenHint": "hf.co/settings/tokens" },
+    "websiteUrl": "https://huggingface.co"
+  },
+  {
+    "slug": "stripe",
+    "title": "Stripe",
+    "category": "commerce",
+    "description": "Query and act on your Stripe account.",
+    "modelDescription": "Stripe: customers, payments, invoices, subscriptions, and docs search.",
+    "url": "https://mcp.stripe.com",
+    "transport": "streamable-http",
+    "auth": { "type": "bearer", "tokenLabel": "Stripe secret or restricted key", "tokenHint": "dashboard.stripe.com/apikeys" },
+    "websiteUrl": "https://stripe.com"
+  },
+  {
+    "slug": "linear",
+    "title": "Linear",
+    "category": "project-management",
+    "description": "Issues, projects, and cycles in your Linear workspace.",
+    "modelDescription": "Linear: search, create, and update issues, projects, cycles, and comments in the connected Linear workspace.",
+    "url": "https://mcp.linear.app/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://linear.app",
+    "featured": true
+  },
+  {
+    "slug": "notion",
+    "title": "Notion",
+    "category": "productivity",
+    "description": "Search and edit pages and databases in your workspace.",
+    "modelDescription": "Notion: search, read, create, and update pages, databases, and comments in the connected Notion workspace.",
+    "url": "https://mcp.notion.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://www.notion.com",
+    "featured": true
+  },
+  {
+    "slug": "sentry",
+    "title": "Sentry",
+    "category": "dev-tools",
+    "description": "Errors, issues, and performance data from Sentry.",
+    "modelDescription": "Sentry: look up projects, issues, stack traces, and performance data in the connected Sentry organization.",
+    "url": "https://mcp.sentry.dev/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://sentry.io",
+    "featured": true
+  },
+  {
+    "slug": "neon",
+    "title": "Neon",
+    "category": "data",
+    "description": "Manage Neon Postgres projects, branches, and queries.",
+    "modelDescription": "Neon: manage Postgres projects, branches, and databases, and run SQL against the connected Neon account.",
+    "url": "https://mcp.neon.tech/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://neon.tech"
+  },
+  {
+    "slug": "paypal",
+    "title": "PayPal",
+    "category": "commerce",
+    "description": "Invoices, payments, and transaction reporting.",
+    "modelDescription": "PayPal: create and manage invoices, payments, and transaction reports for the connected PayPal account.",
+    "url": "https://mcp.paypal.com/mcp",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://www.paypal.com"
+  },
+  {
+    "slug": "vercel",
+    "title": "Vercel",
+    "category": "dev-tools",
+    "description": "Projects, deployments, and logs on Vercel.",
+    "modelDescription": "Vercel: inspect projects, deployments, domains, and logs for the connected Vercel account.",
+    "url": "https://mcp.vercel.com",
+    "transport": "streamable-http",
+    "auth": { "type": "oauth" },
+    "websiteUrl": "https://vercel.com"
+  }
+]

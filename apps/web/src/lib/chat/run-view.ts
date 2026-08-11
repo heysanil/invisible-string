@@ -124,6 +124,37 @@ export interface PendingInputView {
   display: "confirmation" | "select" | "text";
 }
 
+/**
+ * One mid-run MCP consent challenge (`authorization.required`), pending until
+ * its `authorization.completed` sets an outcome. DORMANT on eve 0.31.3 for
+ * platform connections (spike REPORT finding 34: a getToken-only connection
+ * surfaces a mid-run 401 as a plain failed tool call) — reduced defensively
+ * against eve's declared wire types so an eve that starts emitting them
+ * renders a consent card instead of dropping the event on the floor.
+ */
+export interface AuthorizationView {
+  /** eve's connection name (the compiled per-version slug) — card identity. */
+  name: string;
+  /** Server-supplied connection description. */
+  description: string | null;
+  /** Consent URL — SERVER-SUPPLIED content rendered in trusted chrome. */
+  url: string | null;
+  /**
+   * Host of {@link url}, extracted for prominent display (spec §13): the user
+   * must see where the consent link goes before clicking it.
+   */
+  host: string | null;
+  instructions: string | null;
+  /** Device-flow style user code, rendered prominently when present. */
+  userCode: string | null;
+  /** ISO expiry driving the card's countdown. */
+  expiresAt: string | null;
+  /** Null while awaiting consent; the `authorization.completed` outcome after. */
+  outcome: "authorized" | "declined" | "failed" | "timed-out" | null;
+  /** Completion reason, when eve supplies one (failures mostly). */
+  reason: string | null;
+}
+
 export interface ThoughtItem {
   kind: "thought";
   /** `${turnId}:${stepIndex}`, plus `#2`, `#3`… once that key has sealed. */
@@ -181,6 +212,12 @@ export interface RunView {
   segments: readonly RunSegment[];
   /** Unanswered `input.requested` entries (approval cards / questions). */
   pendingInputs: readonly PendingInputView[];
+  /**
+   * Mid-run consent challenges: unresolved ones only while the run is parked
+   * or active (mirroring {@link pendingInputs}); resolved ones always — a
+   * settled consent is a historical fact of the transcript.
+   */
+  authorizations: readonly AuthorizationView[];
   error: string | null;
   /** Resolved model id from session.started (thread header chip). */
   modelId: string | null;
@@ -246,6 +283,34 @@ export function inputRequestKindOf(
   return request.action?.toolName === "ask_question"
     ? "question"
     : "tool-approval";
+}
+
+/** The four completion outcomes eve declares; anything else reads `failed`. */
+const AUTHORIZATION_OUTCOMES: ReadonlySet<string> = new Set([
+  "authorized",
+  "declined",
+  "failed",
+  "timed-out",
+]);
+
+/** Defensive string read from eve's loosely-typed `authorization` payload. */
+function authorizationField(
+  payload: unknown,
+  key: string,
+): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Host of a server-supplied consent URL; null when unparseable. */
+function hostOf(url: string | null): string | null {
+  if (url === null) return null;
+  try {
+    return new URL(url).host || null;
+  } catch {
+    return null;
+  }
 }
 
 function pendingInputFromRequest(request: EveInputRequest): PendingInputView {
@@ -333,6 +398,8 @@ export function reduceRunView(
     string,
     { view: PendingInputView; callId: string | null }
   >();
+  // Consent challenges keyed by eve's connection name (insertion-ordered).
+  const authorizationsByName = new Map<string, AuthorizationView>();
 
   let userMessage = run.triggerEvent.message;
   let error: string | null = run.error;
@@ -444,10 +511,15 @@ export function reduceRunView(
   /**
    * Every unanswered request is stale once the turn is cancelled or the
    * context is cleared — answering one would post a dead requestId that eve
-   * replays to the model as an ordinary user message.
+   * replays to the model as an ordinary user message. Unresolved consent
+   * challenges are stale for the same reason (their turn is over); RESOLVED
+   * ones stay — a settled consent is transcript history.
    */
   const retirePendingInputs = () => {
     pendingByRequest.clear();
+    for (const [name, auth] of authorizationsByName) {
+      if (auth.outcome === null) authorizationsByName.delete(name);
+    }
   };
 
   for (const frame of store.frames) {
@@ -528,6 +600,63 @@ export function reduceRunView(
             : (resultError?.message ?? previewValue(result.output) ?? "Failed");
         upsertTool(result.callId, result.toolName, state, preview, frame.at);
         resolveInputsForCall(result.callId);
+        break;
+      }
+      // Mid-run MCP consent challenge (DORMANT on eve 0.31.3 for platform
+      // connections — finding 34; reduced defensively). A re-challenge for
+      // the same connection replaces the pending card wholesale.
+      case "authorization.required": {
+        const payload = event.data.authorization;
+        const url = authorizationField(payload, "url");
+        authorizationsByName.set(event.data.name, {
+          name: event.data.name,
+          description:
+            typeof event.data.description === "string" &&
+            event.data.description.length > 0
+              ? event.data.description
+              : null,
+          url,
+          host: hostOf(url),
+          instructions: authorizationField(payload, "instructions"),
+          userCode: authorizationField(payload, "userCode"),
+          expiresAt: authorizationField(payload, "expiresAt"),
+          outcome: null,
+          reason: null,
+        });
+        break;
+      }
+      case "authorization.completed": {
+        const raw: unknown = event.data.outcome;
+        // Unknown outcome strings read `failed` — defensively pessimistic;
+        // the reason (when present) carries the specifics either way.
+        const outcome = (
+          typeof raw === "string" && AUTHORIZATION_OUTCOMES.has(raw)
+            ? raw
+            : "failed"
+        ) as Exclude<AuthorizationView["outcome"], null>;
+        const reason =
+          typeof event.data.reason === "string" && event.data.reason.length > 0
+            ? event.data.reason
+            : null;
+        const existing = authorizationsByName.get(event.data.name);
+        authorizationsByName.set(
+          event.data.name,
+          existing !== undefined
+            ? { ...existing, outcome, reason }
+            : {
+                // A bare completion with no observed challenge (dropped
+                // frame, resumed tail): still surface the outcome.
+                name: event.data.name,
+                description: null,
+                url: null,
+                host: null,
+                instructions: null,
+                userCode: null,
+                expiresAt: null,
+                outcome,
+                reason,
+              },
+        );
         break;
       }
       case "reasoning.appended": {
@@ -655,6 +784,14 @@ export function reduceRunView(
       ? [...pendingByRequest.values()].map((entry) => entry.view)
       : [];
 
+  // Same gating for UNRESOLVED consent challenges: only a parked/active run
+  // can still resolve one (a dangling pending card on a settled run has
+  // nothing left to answer it). Resolved cards are history and always stay.
+  const authorizations = [...authorizationsByName.values()].filter(
+    (auth) =>
+      auth.outcome !== null || (!canceled && (status === "waiting" || runLive)),
+  );
+
   const lastIndex = segments.length - 1;
   const outSegments: RunSegment[] = segments.map((seg, index) => {
     if (seg.kind === "speech") {
@@ -705,6 +842,7 @@ export function reduceRunView(
     userMessage,
     segments: outSegments,
     pendingInputs,
+    authorizations,
     // Error surfaces only when the run actually failed — a step that failed
     // mid-run but recovered must not leave a stale banner, and a CANCELLED
     // run is not a failure at all (it emits no failure event to read).

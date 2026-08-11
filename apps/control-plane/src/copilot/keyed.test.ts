@@ -46,6 +46,9 @@ const inventory: WorkspaceInventory = {
       slug: "gmail",
       description: "reads the support inbox and sends drafts",
       enabled: true,
+      health: "ok",
+      tools: ["search_threads", "create_draft"],
+      toolCount: 2,
     },
   ],
   skills: [

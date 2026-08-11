@@ -145,3 +145,32 @@ describe("agentDefinitionSchema", () => {
     ).toBe(false);
   });
 });
+
+describe("agentContextSchema mcpConnectionIds id shapes", () => {
+  test("accepts historical uuid ids", () => {
+    const r = agentContextSchema.safeParse({
+      mcpConnectionIds: ["7f6c2d9e-2b7a-4f6e-9c1d-3a5b7c9d1e2f"],
+      skillIds: [],
+    });
+    expect(r.success).toBe(true);
+  });
+  test("accepts cn_ nanoid ids", () => {
+    const r = agentContextSchema.safeParse({
+      mcpConnectionIds: ["cn_a1b2c3d4e5f6g7h8"],
+      skillIds: [],
+    });
+    expect(r.success).toBe(true);
+  });
+  test("rejects other shapes and duplicates", () => {
+    expect(
+      agentContextSchema.safeParse({ mcpConnectionIds: ["nope"], skillIds: [] })
+        .success,
+    ).toBe(false);
+    expect(
+      agentContextSchema.safeParse({
+        mcpConnectionIds: ["cn_a1b2c3d4e5f6g7h8", "cn_a1b2c3d4e5f6g7h8"],
+        skillIds: [],
+      }).success,
+    ).toBe(false);
+  });
+});

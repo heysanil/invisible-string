@@ -63,8 +63,8 @@ jobs:
         with:
           path: ~/.npm
 
-      - name: Compose up (postgres, garage, dex)
-        run: docker compose up -d --wait postgres garage dex
+      - name: Compose up (postgres, garage, dex, meilisearch)
+        run: docker compose up -d --wait postgres garage dex meilisearch
 
       # The world-isolation proof and the spike suites need the spike
       # project's pinned @workflow/world-postgres install.
@@ -78,6 +78,10 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://dev:dev@localhost:5432/product
           TEST_S3_ENDPOINT: http://localhost:3900
+          # Meilisearch-gated search suites (index client, registry sync ETL,
+          # community search) — dev compose master key from docker-compose.yml.
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_MASTER_KEY: dev-meili-master-key
         run: bun test apps packages spike
 
       - name: Compose down
@@ -203,6 +207,7 @@ jobs:
           PLATFORM_JWT_SECRET=lint
           BETTER_AUTH_SECRET=lint
           WORKER_SHARED_SECRET=lint
+          MEILISEARCH_MASTER_KEY=lint
           WORKER_ID=00000000-0000-0000-0000-000000000000
           DATABASE_URL=postgres://lint:lint@db.example.com:5432/product
           WORLD_DATABASE_URL=postgres://lint:lint@db.example.com:5432/world

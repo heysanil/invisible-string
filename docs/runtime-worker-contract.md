@@ -159,7 +159,8 @@ eve world package's contract — never rename them to match platform nouns.)
 | `PLATFORM_JWT_SECRET` | channel-auth secret, **derived per version** (`derivePlatformJwtSecret(master, contentHash)`) — never the platform master |
 | `OPENROUTER_API_KEY` **or** `ANTHROPIC_API_KEY` | exactly ONE, matching the version's resolved provider (`agent_versions.model_provider`) |
 | `OPENROUTER_BASE_URL` | passthrough when set (test harnesses) |
-| `MCP_<NAME>_TOKEN` | decrypted MCP connection bearer tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time. Header-auth connections get one `MCP_<NAME>_HEADER_<H>` per header instead (`mcpHeaderEnvName`, same drift guard) |
+| `MCP_<NAME>_TOKEN` | decrypted MCP connection bearer tokens; `<NAME>` = connection name upper-snaked (`src/runtime/agent-env.ts` `mcpTokenEnvName`). The compiler-emitted `connections/*.ts` reads `MCP_<SLUG>_TOKEN` (`connectionTokenEnvVar(slugifyName(name))`) — the adapter (`src/build/compiler-adapter.ts`) asserts both sides agree at compile time. Header-auth connections get one `MCP_<NAME>_HEADER_<H>` per header instead (`mcpHeaderEnvName`, same drift guard). **OAuth connections get NO `MCP_*` env at all** — their generated `getToken` calls the token broker (below) at tool-call time |
+| `PLATFORM_API_URL` | control-plane base URL as reachable from the worker network (present only when configured — absent, oauth connections' tool calls fail with a missing-env error, nothing else breaks). Read by the compiler-emitted `lib/platform-token.ts` (same env-name constant on both sides, `PLATFORM_API_URL_ENV`) to POST `/internal/connections/token` |
 | `EVE_MOCK_AUTHORED_MODELS` | TEST HARNESS ONLY passthrough (set on the control plane → forwarded per agent); eve serves turns with its built-in mock model |
 
 The supervisor adds `PORT`, `NODE_ENV=production` (REPORT finding 5) and
@@ -168,6 +169,48 @@ REPORT finding 9; caller env may override) itself, plus the ambient
 PATH/HOME/LANG/TMPDIR. Worker registration:
 `POST /internal/workers/{register,heartbeat,deregister}` on the control
 plane, `x-worker-secret`-guarded (`src/runtime/workers.ts`).
+
+## Agent-facing token broker (control plane)
+
+`POST /internal/connections/token` — the runtime half of the MCP OAuth broker
+(connectors redesign spec §6). Callers are COMPILED AGENTS: the generated
+`getToken` helper mints a short-lived HS256 platform JWT with the version's
+in-env `PLATFORM_JWT_SECRET` (audience `agent-version:<contentHash>`) and
+posts here to obtain a live access token for one of its OAuth connections.
+The route shares the `/internal/*` prefix with the worker plane but NOT its
+auth model: a version-bound platform JWT, never `x-worker-secret`.
+
+- **Request:** `Authorization: Bearer <agent-minted JWT>` +
+  `{"connectionId": "cn_…"}`. Any other body field is ignored — in
+  particular, a `versionHash` in the body can never steer version
+  resolution.
+- **Verification order (exact, security-relevant** —
+  `src/runtime/routes.ts` `serveConnectionToken`**):** read the UNVERIFIED
+  `aud` claim and require the strict shape `agent-version:<64-hex>` (this
+  rejects the bare `agent-version` audience channel dispatch uses) → verify
+  signature/`exp`/issuer against the audience-derived per-version secret
+  (`derivePlatformJwtSecret(master, hash)`) — a JWT minted in a different
+  version's env fails here → resolve the agent version by the VERIFIED
+  audience hash — never from the request body → authorize by membership: the
+  connection id must be in that version's compiled definition.
+- **Response:** `{token, expiresAt}` only. Refresh tokens and client secrets
+  NEVER leave the control plane — refresh happens centrally inside this call
+  (single-flight `SELECT … FOR UPDATE`, `src/oauth/tokens.ts`) when the
+  stored access token is stale.
+- **Errors:** one opaque 401 for every credential failure (missing/
+  malformed/expired/cross-version JWT, unknown version hash), 403
+  `connection_not_in_version`, 409 `oauth_not_connected` (grant absent/
+  expired/revoked — re-consent is the only recovery; the agent surfaces it
+  as a failed tool call, never a hang).
+
+Blast radius (spec §13): a leaked agent env can mint valid JWTs only for its
+OWN version — the audience and the derived signing secret both bind the
+content hash — so the route serves exactly the connections named in that one
+version's definition. Agents reach the route at the control-plane base URL
+on the worker network (injected as agent env by the oauth codegen slice);
+like the rest of `/internal/*` it is not proxied by the public web gateway
+(`infra/nginx/web.conf`) and must never be internet-reachable (deployment
+constraints below).
 
 ## Trigger ingress + dispatch (control-plane public surface)
 
@@ -602,10 +645,12 @@ in-flight proxied requests, stops its agents, then deregisters.
   per-trigger advisory locks — but nothing else is.) HA needs leader
   election / shared state first — do not scale this process horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface
-  (register/heartbeat/deregister, `/internal/metrics`) is mounted on the same
-  listener as the tenant API and guarded only by worker credentials; restrict
-  it at the ingress/L7 layer (or bind a separate interface) so a leaked
-  secret alone cannot be exercised from the internet.
+  (register/heartbeat/deregister, `/internal/metrics`) and the agent-facing
+  token broker (`/internal/connections/token`, platform-JWT-authed — see its
+  section above) are mounted on the same listener as the tenant API and
+  guarded only by bearer credentials; restrict the prefix at the ingress/L7
+  layer (or bind a separate interface) so a leaked secret alone cannot be
+  exercised from the internet.
 - **NTP on every host** (see clock-skew note above).
 - **Per-IP rate limiting and proxies:** set `TRUST_PROXY_HOPS=<n>` to the
   number of reverse proxies in front of the control plane. With 0 (default)

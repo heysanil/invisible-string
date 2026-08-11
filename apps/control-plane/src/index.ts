@@ -14,7 +14,7 @@ import { cors } from "@elysiajs/cors";
 import { eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { schema } from "@invisible-string/db";
-import type { Logger } from "@invisible-string/shared";
+import type { ConnectorCatalogEntry, Logger } from "@invisible-string/shared";
 
 import { createAuth, type Auth } from "./auth";
 import { loadConfig, type Config } from "./config";
@@ -47,13 +47,26 @@ import {
 } from "./runs/delivery";
 import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
+import { createGuardedFetch } from "./net/guarded-fetch";
+import type { OauthBrokerDeps } from "./oauth/broker";
+import { probeAndPersist } from "./probe/service";
 import { resourcesPlugin } from "./resources/plugin";
 import {
   createOpenRouterCatalog,
   type OpenRouterCatalog,
 } from "./resources/openrouter-catalog";
-import { createRegistryClient, type RegistryClient } from "./resources/registry";
+import {
+  createRegistryClient,
+  REGISTRY_HOST,
+  type RegistryClient,
+} from "./resources/registry";
 import type { ResourceDeps } from "./resources/common";
+import {
+  createMeiliClient,
+  ensureRegistryIndex,
+  type MeiliClient,
+} from "./search/meili";
+import { createRegistrySync, type RegistrySync } from "./search/registry-sync";
 import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
@@ -65,7 +78,7 @@ import {
   type WorkerClient,
 } from "./runtime/worker-client";
 import { mintDispatchToken } from "@invisible-string/shared";
-import { loadIntegrationsConfig } from "./integrations/config";
+import { loadIntegrationsConfig, publicAppUrlFromEnv } from "./integrations/config";
 import { FixedWindowRateLimiter } from "./integrations/rate-limit";
 import { integrationsPlugin, type IntegrationDeps } from "./integrations/routes";
 import { createSlackClient, type SlackClient } from "./integrations/slack-client";
@@ -98,6 +111,12 @@ export interface AppStack {
   runtime: RuntimeDeps | null;
   /** Present when the runtime API is configured (triggers/integrations). */
   integrations: IntegrationDeps | null;
+  /**
+   * Meilisearch client for the registry-search mirror — present only when
+   * MEILISEARCH_URL + MEILISEARCH_MASTER_KEY are configured alongside the
+   * runtime. Null = registry search degraded, never fatal (spec §5).
+   */
+  meili: MeiliClient | null;
   close(): Promise<void>;
 }
 
@@ -110,6 +129,11 @@ export interface RuntimeOverrides {
   workerClient?: WorkerClient;
   /** MCP registry proxy client (stubbed in tests). */
   registry?: RegistryClient;
+  /**
+   * Connector catalog override (gated suites install synthetic recipes);
+   * production always uses the checked-in, boot-validated JSON.
+   */
+  catalog?: ReadonlyMap<string, ConnectorCatalogEntry>;
   /** Slack Web API client (stubbed against a fake Slack server in tests). */
   slackClient?: SlackClient;
   /**
@@ -195,6 +219,8 @@ export function createIntegrationDeps(opts: {
   env: Record<string, string | undefined>;
   runtimeDeps: RuntimeDeps | null;
   slackClient?: SlackClient;
+  /** MCP OAuth consent broker — the mcp-oauth callback route runs on it. */
+  oauthBroker: OauthBrokerDeps;
 }): IntegrationDeps | null {
   const { env, runtimeDeps } = opts;
   if (!runtimeDeps) return null;
@@ -219,6 +245,7 @@ export function createIntegrationDeps(opts: {
       windowMs: 60_000,
     }),
     slackDedup: new SlackEventDedup(),
+    oauthBroker: opts.oauthBroker,
   };
 }
 
@@ -414,10 +441,55 @@ export function createAppStack(
     overrides: runtimeOverrides,
   });
   runtimeSlot.current = runtimeDeps;
+  // Meilisearch registry-search mirror: constructed only when BOTH vars are
+  // configured, and NEVER fatal — an unreachable Meilisearch degrades registry
+  // search, nothing else (connectors redesign spec §5). The index bootstrap is
+  // fire-and-forget; consumers find the index ready or degrade.
+  let meili: MeiliClient | null = null;
+  if (
+    runtimeDeps?.runtime.meilisearchUrl &&
+    runtimeDeps.runtime.meilisearchMasterKey
+  ) {
+    meili = createMeiliClient({
+      url: runtimeDeps.runtime.meilisearchUrl,
+      apiKey: runtimeDeps.runtime.meilisearchMasterKey,
+    });
+    void ensureRegistryIndex(meili).catch((error) => {
+      logger.warn("search.meili_index_bootstrap_failed", {
+        msg: "meilisearch registry index bootstrap failed — registry search degraded",
+        err: error,
+      });
+    });
+  }
+  // ONE guarded egress fetch for every caller-influenced URL leaving the
+  // control plane: MCP probes AND the whole OAuth broker (discovery, DCR,
+  // token exchange) — a single egress policy, a single allow-private switch.
+  const mcpEgressFetch = createGuardedFetch({
+    allowPrivate: runtimeDeps?.runtime.mcpProbeAllowPrivate ?? false,
+  });
+  // MCP OAuth consent broker (oauth/broker.ts): the start routes ride the
+  // resources plugin, the callback rides the integrations plugin — both run
+  // on this one deps object. `probeConnection` closes over `resourceDeps`
+  // (declared below) — it only runs after assembly, on post-connect probes.
+  const oauthBroker: OauthBrokerDeps = {
+    db: dbHandle.db,
+    masterKey: config.encryptionMasterKey,
+    publicAppUrl: publicAppUrlFromEnv(env),
+    fetchImpl: mcpEgressFetch,
+    logger,
+    workspaceDeps,
+    probeConnection: (connection) => probeAndPersist(resourceDeps, connection),
+  };
+  // The runtime plugin's agent-facing token route (POST /internal/connections/
+  // token) refreshes through the SAME lifecycle deps the broker runs on — one
+  // egress policy, one master key. Late-bound onto the runtime deps because
+  // the broker assembles after createRuntimeDeps has returned.
+  if (runtimeDeps) runtimeDeps.oauthTokens = oauthBroker;
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,
     slackClient: runtimeOverrides?.slackClient,
+    oauthBroker,
   });
   const resourceDeps: ResourceDeps = {
     db: dbHandle.db,
@@ -430,11 +502,23 @@ export function createAppStack(
     registry:
       runtimeOverrides?.registry ??
       createRegistryClient({ baseUrl: env.MCP_REGISTRY_BASE_URL }),
+    // Community search rides the Meilisearch mirror; null keeps the route on
+    // its typed 503 degradation (connectors spec §5).
+    meili,
     // Advisory allowlist-add validation + reasoning/context capabilities from
     // OpenRouter's public model catalog (fail-open when unreachable — see
     // resources/openrouter-catalog.ts).
     openRouterCatalog:
       runtimeOverrides?.openRouterCatalog ?? createOpenRouterCatalog(),
+    // Guarded egress for MCP probes — the ONLY fetch caller-influenced URLs
+    // ride (SSRF containment: DNS-validated, IP-pinned, redirect-re-validated).
+    // MCP_PROBE_ALLOW_PRIVATE (dev/e2e/self-hosted) admits private targets and
+    // plain http; a runtime-less boot keeps the hardened default. The same
+    // instance backs the OAuth broker above.
+    probeFetch: mcpEgressFetch,
+    oauthBroker,
+    ...(runtimeOverrides?.catalog ? { catalog: runtimeOverrides.catalog } : {}),
+    logger,
   };
   // Copilot socket: mounted whenever a transport is available — a scripted
   // fake (COPILOT_FAKE_SCRIPT / test override; dev/test ONLY — loadCopilotConfig
@@ -504,6 +588,7 @@ export function createAppStack(
     logger,
     runtime: runtimeDeps,
     integrations: integrationDeps,
+    meili,
     close: async () => {
       await runtimeDeps?.tailers.stopAll();
       await dbHandle.close();
@@ -551,6 +636,7 @@ if (import.meta.main) {
   });
 
   let scheduleTicker: ScheduleTicker | null = null;
+  let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
     // they hold cap slots and hang SSE streams forever otherwise. The
@@ -593,6 +679,23 @@ if (import.meta.main) {
       tickMs: stack.runtime.runtime.scheduleTickMs,
     });
     scheduleTicker.start();
+    // Registry→Meilisearch sync ETL: mirrors the official MCP registry into
+    // the disposable search index (immediate full/incremental run, then
+    // REGISTRY_SYNC_INTERVAL_MS cadence). Only when the meili client exists —
+    // without it registry search is degraded and there is nothing to feed.
+    // Multi-instance safe via a single advisory try-lock.
+    if (stack.meili) {
+      registrySync = createRegistrySync({
+        db: stack.dbHandle.db,
+        meili: stack.meili,
+        // Same dev/CI-only override seam as the registry proxy client.
+        registryBaseUrl:
+          process.env.MCP_REGISTRY_BASE_URL?.trim() || REGISTRY_HOST,
+        logger: logger.child({ fields: { component: "registry-sync" } }),
+        intervalMs: stack.runtime.runtime.registrySyncIntervalMs,
+      });
+      registrySync.start();
+    }
   }
 
   // Graceful shutdown (SIGTERM/SIGINT): stop accepting new connections, drain
@@ -606,7 +709,7 @@ if (import.meta.main) {
       fields: { signal },
     });
     stack.app.server?.stop();
-    void Promise.resolve(scheduleTicker?.stop())
+    void Promise.all([scheduleTicker?.stop(), registrySync?.stop()])
       .then(() => stack.close())
       .catch((error) => {
         logger.error("control-plane.shutdown_failed", { err: error });

@@ -15,6 +15,7 @@ export { compile } from "./compile";
 export { CompileError, type CompileErrorCode } from "./errors";
 export { canonicalJson, computeAgentHash } from "./hash";
 export {
+  PLATFORM_API_URL_ENV,
   PLATFORM_JWT_AUDIENCE,
   PLATFORM_JWT_ISSUER,
   platformJwtAudienceForHash,

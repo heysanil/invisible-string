@@ -76,6 +76,44 @@ describe("compileAgent — MCP auth wiring", () => {
     // No secret value is ever present in generated code.
     expect(file!).not.toContain("Bearer");
   });
+
+  test("oauth rows map to broker-delivered getToken by connection id (spec §6)", () => {
+    const oauthRow: CompileConnection = {
+      id: "cn_ab12cd34ef56gh78",
+      name: "Linear",
+      description: "Issues",
+      url: "https://mcp.linear.app/mcp",
+      envTokenVar: null,
+      authHeaders: null,
+      oauth: true,
+      toolAllow: null,
+      toolBlock: null,
+      approvalPolicy: null,
+    };
+    const result = compileAgent(baseRequest(oauthRow));
+    const file = result.files.get("agent/connections/linear.ts");
+    expect(file).toBeDefined();
+    expect(file!).toContain(
+      'platformConnectionToken("cn_ab12cd34ef56gh78")',
+    );
+    // No static-credential env reads on the oauth branch…
+    expect(file!).not.toContain("requireEnv");
+    // …and the platform-token lib rides along.
+    expect(result.files.get("agent/lib/platform-token.ts")).toContain(
+      'requireEnv("PLATFORM_API_URL")',
+    );
+
+    // The auth SHAPE is hashed (spec §8): the same row with bearer auth
+    // must produce a different content hash.
+    const bearer = compileAgent(
+      baseRequest({
+        ...oauthRow,
+        oauth: false,
+        envTokenVar: "MCP_LINEAR_TOKEN",
+      }),
+    );
+    expect(bearer.hash).not.toBe(result.hash);
+  });
 });
 
 describe("compileAgent — build-env epoch in the content hash", () => {

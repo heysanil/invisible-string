@@ -38,6 +38,14 @@ export interface CompileConnection {
    * decrypted values under the same names (agent-env `mcpHeaderEnvName`).
    */
   authHeaders: { header: string; envVar: string }[] | null;
+  /**
+   * True for `auth_type = "oauth"` rows (connectors redesign spec §6): the
+   * adapter maps them to the compiler's `{kind:"oauth", connectionId}` auth,
+   * whose generated `getToken` fetches short-lived access tokens from the
+   * platform token broker. Mutually exclusive with envTokenVar/authHeaders —
+   * OAuth rows carry NO static credentials.
+   */
+  oauth?: boolean;
   toolAllow: string[] | null;
   toolBlock: string[] | null;
   approvalPolicy: Record<string, unknown> | null;

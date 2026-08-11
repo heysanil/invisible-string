@@ -4,8 +4,9 @@
  * unit now, workflows are a standing delegation):
  *
  *   sign in → author a skill (with a file attachment) in /context → install a
- *   registry MCP connection (registry browser, network-stubbed) + add a
- *   custom-URL MCP connection (→ the local stub server) → BUILD an agent in
+ *   community MCP connection (add-connection dialog search lane, backed by
+ *   the Meilisearch mirror of the stubbed registry) + add a custom-URL MCP
+ *   connection (→ the local stub server) → BUILD an agent in
  *   /agents: persona, balanced model preset, both connections + the skill
  *   attached → Publish (real eve build; wait for the ready chip) → CHAT with
  *   it via the "New chat" agent picker: the WORKING BLOCK streams live steps
@@ -43,8 +44,11 @@ import {
   RUN_TIMEOUT_MS,
 } from "../support/builder.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
+import { REGISTRY_SERVER_TITLE } from "../config.ts";
 
-const REGISTRY_CONNECTION = "Registry notes";
+// Community installs are named after the server title (no name field in the
+// add dialog), so the attached connection carries the stub server's title.
+const REGISTRY_CONNECTION = REGISTRY_SERVER_TITLE;
 const CUSTOM_CONNECTION = "notes";
 // Deliberately unrelated to the run message so the mock model's skill matcher
 // never intercepts the tool call we want to exercise.
@@ -68,7 +72,7 @@ test("build an agent in the UI, publish + chat, then delegate a form workflow to
     content: "# Brand voice\n\nWarm, concise, plain language.",
     fileName: "template.md",
   });
-  await installRegistryConnection(page, { name: REGISTRY_CONNECTION, query: "notes" });
+  await installRegistryConnection(page, { query: "notes" });
   await addCustomConnection(page, { name: CUSTOM_CONNECTION });
 
   // ── build the agent: persona · model · context ──────────────────────────────
@@ -86,13 +90,13 @@ test("build an agent in the UI, publish + chat, then delegate a form workflow to
   await publishAgentAndWaitReady(page);
 
   // ── chat with it via the agent picker ──────────────────────────────────────
-  // The published agent really connects to both MCP servers at session start
-  // (the stub logs the initialize + tools/list handshakes). We drive the run
-  // with a tool the eve MOCK model can invoke directly: eve exposes its
-  // built-in tools (todo, read_file, …) to the top-level model, while MCP
-  // connection tools sit behind eve's `connection_search` sub-agent — which
-  // the deterministic mock never delegates to. `todo` yields a real streamed
-  // tool step + a prose reply, exactly exercising the working-block UI.
+  // Under the mock model the published agent never even opens an MCP session
+  // to the stub: MCP connections attach lazily through eve's
+  // `connection_search` sub-agent, which the deterministic mock never
+  // delegates to. So we drive the run with a tool the mock CAN invoke
+  // directly — eve exposes its built-in tools (todo, read_file, …) to the
+  // top-level model. `todo` yields a real streamed tool step + a prose
+  // reply, exactly exercising the working-block UI.
   await startChatAndSend(
     page,
     AGENT_NAME,

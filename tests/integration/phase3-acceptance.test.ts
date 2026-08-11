@@ -63,7 +63,7 @@ import { and, eq } from "drizzle-orm";
 import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
-  encryptSecret,
+  newId,
   parseMasterKey,
   generateMasterKeyBase64,
   SLACK_SIGNATURE_HEADER,
@@ -81,7 +81,7 @@ import {
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
 import { runMigrations } from "../../apps/control-plane/src/migrate";
-import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-env";
+import { encryptConnectionAuthConfig } from "../../apps/control-plane/src/resources/mcp-crypto";
 import {
   createScheduleTicker,
   type ScheduleTicker,
@@ -688,23 +688,22 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
 
     // One MCP connection → the stub server (equipped on agent Alpha; proves
     // agent CONTEXT boots against a real MCP server across trigger surfaces).
-    const conn = await db
-      .insert(schema.mcpConnections)
-      .values({ scope: "workspace", organizationId: orgId, name: "notes", source: "custom", url: mcp.url })
-      .returning({ id: schema.mcpConnections.id });
-    const connectionId = conn[0]!.id;
-    await db
-      .update(schema.mcpConnections)
-      .set({
-        authConfigEncrypted: JSON.stringify(
-          encryptSecret(
-            JSON.stringify({ token: "stub-notes-token" }),
-            parseMasterKey(MASTER_KEY_B64),
-            mcpAuthAadContext(connectionId),
-          ),
-        ),
-      })
-      .where(eq(schema.mcpConnections.id, connectionId));
+    // The auth AAD binds the row id, so the id exists before the insert.
+    const connectionId = newId("cn");
+    await db.insert(schema.connections).values({
+      id: connectionId,
+      scope: "workspace",
+      organizationId: orgId,
+      name: "notes",
+      source: "custom",
+      url: mcp.url,
+      authType: "bearer",
+      authConfigEncrypted: encryptConnectionAuthConfig(
+        { type: "bearer", values: { token: "stub-notes-token" } },
+        parseMasterKey(MASTER_KEY_B64),
+        connectionId,
+      ),
+    });
 
     const persona =
       "You are a helpful assistant. Do exactly what the incoming message asks. " +

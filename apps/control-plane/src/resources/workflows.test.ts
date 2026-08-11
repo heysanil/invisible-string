@@ -21,7 +21,11 @@ import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type { GetWorkflowResponse, SlackTriggerBinding } from "@invisible-string/shared";
+import {
+  newId,
+  type GetWorkflowResponse,
+  type SlackTriggerBinding,
+} from "@invisible-string/shared";
 
 import { createDb, type DbHandle } from "../db";
 import { setSlackBinding, setTriggerToken, upsertTriggerType } from "../integrations/service";
@@ -97,15 +101,16 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     const mcpConnectionIds: string[] = [];
     for (const name of options.connectionNames ?? []) {
       const rows = await handle.db
-        .insert(schema.mcpConnections)
+        .insert(schema.connections)
         .values({
+          id: newId("cn"),
           scope: "workspace",
           organizationId: orgId,
           name,
           source: "custom",
           url: "https://mcp.example.test/mcp",
         })
-        .returning({ id: schema.mcpConnections.id });
+        .returning({ id: schema.connections.id });
       mcpConnectionIds.push(rows[0]!.id);
     }
     const skillIds: string[] = [];

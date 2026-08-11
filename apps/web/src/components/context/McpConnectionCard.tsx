@@ -1,23 +1,24 @@
-import { Blocks, Globe, ShieldCheck, Trash2 } from "lucide-react";
-import type { McpConnectionDto } from "@invisible-string/shared";
+import { Blocks, Globe, ShieldCheck } from "lucide-react";
+import type { ConnectionDto } from "@invisible-string/shared";
 
 import { APPROVAL_LABEL } from "../../lib/labels";
 import { Chip } from "../ui/Chip";
 import { Switch } from "../ui/Switch";
+import { HealthBadge } from "./HealthBadge";
 
 export interface McpConnectionCardProps {
-  connection: McpConnectionDto;
+  connection: ConnectionDto;
   onToggle: (enabled: boolean) => void;
-  onDelete: () => void;
+  /** Open the connection detail slide-over (plan-2 Task 4). */
+  onOpen: () => void;
   /** Members (read-only) get no mutating controls. */
   readOnly?: boolean;
 }
 
 /** Human summary of the tool filter (allow/block/all). */
-function toolsLabel(connection: McpConnectionDto): string {
+function toolsLabel(connection: ConnectionDto): string {
   if (connection.toolAllow && connection.toolAllow.length > 0) {
-    const n = connection.toolAllow.length;
-    return `${n} tool${n === 1 ? "" : "s"}`;
+    return `${connection.toolAllow.length} allowed`;
   }
   if (connection.toolBlock && connection.toolBlock.length > 0) {
     const n = connection.toolBlock.length;
@@ -26,10 +27,15 @@ function toolsLabel(connection: McpConnectionDto): string {
   return "All tools";
 }
 
+/**
+ * Connection card: health dot + identity up top, filter/approval chips below.
+ * The card itself opens the detail (delete now lives in the detail's danger
+ * zone); the enable switch stays inline and never triggers the open.
+ */
 export function McpConnectionCard({
   connection,
   onToggle,
-  onDelete,
+  onOpen,
   readOnly = false,
 }: McpConnectionCardProps) {
   const approval = connection.approvalPolicy?.default ?? "never";
@@ -39,13 +45,26 @@ export function McpConnectionCard({
   const SourceIcon = connection.source === "custom" ? Globe : Blocks;
 
   return (
-    <div className="lift flex flex-col gap-3 rounded-card-lg border border-black/[0.07] bg-white/45 p-4">
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={`${connection.name} details`}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      className="lift flex cursor-pointer flex-col gap-3 rounded-card-lg border border-black/[0.07] bg-white/45 p-4 text-left hover:border-black/15 hover:bg-white/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ink"
+    >
       <div className="flex items-start gap-3">
         <div className="flex size-9 shrink-0 items-center justify-center rounded-[10px] bg-black/[0.05] text-ink-2">
           <SourceIcon size={17} strokeWidth={1.9} aria-hidden="true" />
         </div>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center gap-1.5">
+            <HealthBadge health={connection.health} dotOnly />
             <h3 className="truncate text-[14px] font-semibold text-ink" title={connection.name}>
               {connection.name}
             </h3>
@@ -57,16 +76,21 @@ export function McpConnectionCard({
           </div>
           <p className="truncate text-[12px] text-ink-4">
             {connection.source === "registry"
-              ? (connection.registryId ?? "Registry server")
-              : (connection.url ?? "Custom server")}
+              ? (connection.registryName ?? "Registry server")
+              : connection.url}
           </p>
         </div>
         {readOnly ? null : (
-          <Switch
-            checked={connection.enabled}
-            onChange={onToggle}
-            label={`${connection.enabled ? "Disable" : "Enable"} ${connection.name}`}
-          />
+          <span
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <Switch
+              checked={connection.enabled}
+              onChange={onToggle}
+              label={`${connection.enabled ? "Disable" : "Enable"} ${connection.name}`}
+            />
+          </span>
         )}
       </div>
 
@@ -77,6 +101,11 @@ export function McpConnectionCard({
       ) : null}
 
       <div className="flex flex-wrap items-center gap-1.5">
+        {connection.tools ? (
+          <Chip tone="neutral">
+            {connection.tools.length} tool{connection.tools.length === 1 ? "" : "s"}
+          </Chip>
+        ) : null}
         <Chip tone="neutral">{toolsLabel(connection)}</Chip>
         <Chip tone={approval === "never" ? "neutral" : "warn"} dot={approval !== "never"}>
           {APPROVAL_LABEL[approval]}
@@ -84,19 +113,6 @@ export function McpConnectionCard({
         </Chip>
         {connection.enabled ? null : <Chip tone="neutral">Disabled</Chip>}
       </div>
-
-      {readOnly ? null : (
-        <div className="mt-0.5 flex items-center justify-end border-t border-black/[0.05] pt-2.5">
-          <button
-            type="button"
-            onClick={onDelete}
-            className="lift inline-flex items-center gap-1.5 rounded-capsule px-2.5 py-1.5 text-[12.5px] font-medium text-ink-3 hover:bg-err/10 hover:text-err"
-          >
-            <Trash2 size={13} aria-hidden="true" />
-            Remove
-          </button>
-        </div>
-      )}
     </div>
   );
 }

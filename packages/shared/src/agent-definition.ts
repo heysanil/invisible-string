@@ -73,9 +73,15 @@ export type AgentModel = z.infer<typeof agentModelSchema>;
 
 // ── CONTEXT ─────────────────────────────────────────────────────────────────
 
-const uuidArray = (what: string) =>
+/** Historical uuid rows AND connectors-redesign `cn_` nanoid rows (spec §3). */
+const connectionIdShape = z.union([
+  z.uuid(),
+  z.string().regex(/^cn_[0-9a-z]{16}$/),
+]);
+
+const idArray = (shape: z.ZodType<string>, what: string) =>
   z
-    .array(z.uuid())
+    .array(shape)
     .superRefine((ids, ctx) => {
       if (new Set(ids).size !== ids.length) {
         ctx.addIssue({
@@ -87,13 +93,14 @@ const uuidArray = (what: string) =>
     .default([]);
 
 /**
- * What the agent is equipped with. Ids point at `mcp_connections` / `skills`
+ * What the agent is equipped with. Ids point at `connections` (uuid ids in
+ * immutable published definitions predate the nanoid convention) / `skills`
  * rows; the control plane resolves them to concrete connection/skill
  * definitions before compiling.
  */
 export const agentContextSchema = z.object({
-  mcpConnectionIds: uuidArray("MCP connection"),
-  skillIds: uuidArray("skill"),
+  mcpConnectionIds: idArray(connectionIdShape, "MCP connection"),
+  skillIds: idArray(z.uuid(), "skill"),
 });
 
 export type AgentContext = z.infer<typeof agentContextSchema>;

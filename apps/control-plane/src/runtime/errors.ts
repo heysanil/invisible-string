@@ -158,6 +158,17 @@ export const errors = {
       "registry_unavailable",
       `the MCP registry is unavailable: ${detail}`,
     ),
+  /**
+   * Community search degradation (connectors spec §5): Meilisearch is
+   * unconfigured or unreachable. The catalog and custom-URL lanes are
+   * unaffected — the SPA keys off this code to show its degraded state.
+   */
+  searchUnavailable: () =>
+    new RuntimeApiError(
+      503,
+      "search_unavailable",
+      "community search is unavailable — the search index is not configured or not reachable",
+    ),
   registryServerNotFound: (name: string) =>
     new RuntimeApiError(404, "registry_server_not_found", `registry server "${name}" not found`),
   registryServerNotInstallable: (name: string) =>
@@ -171,6 +182,97 @@ export const errors = {
       422,
       "registry_remote_mismatch",
       `the requested remote URL is not one advertised by registry server "${name}"`,
+    ),
+  // ── Connections (connectors redesign, spec §3/§4) ─────────────────────────
+  catalogEntryNotFound: (slug: string) =>
+    new RuntimeApiError(
+      404,
+      "catalog_entry_not_found",
+      `no connector catalog entry with slug "${slug}"`,
+    ),
+  duplicateConnectionName: (name: string) =>
+    new RuntimeApiError(
+      409,
+      "duplicate_connection_name",
+      `a connection named "${name}" already exists in this scope`,
+    ),
+  /**
+   * Two distinct names that slugify to the SAME identifier would collide in
+   * the compiler's per-agent connection namespace (filenames, env vars,
+   * `@ref` slugs) — rejected at create/rename, not at publish.
+   */
+  duplicateConnectionSlug: (name: string, clashingName: string) =>
+    new RuntimeApiError(
+      409,
+      "duplicate_connection_slug",
+      `connection name "${name}" collides with existing connection "${clashingName}" — both produce the same identifier; pick a more distinct name`,
+      { clashingName },
+    ),
+  /**
+   * Infrastructure failure of the probe machinery ITSELF (unexpected throw,
+   * DB write failure) — never an unhealthy probe result: an unreachable or
+   * unauthorized MCP server is a 200 whose DTO carries the classified health
+   * (connectors redesign spec §7/§9).
+   */
+  probeFailed: (detail: string) =>
+    new RuntimeApiError(502, "probe_failed", `connection probe failed: ${detail}`),
+  /**
+   * RFC 7591 dynamic client registration with the connection's authorization
+   * server failed (no registration endpoint, unreachable, egress-refused, or
+   * rejected). `detail` carries the HTTP status and the RFC 7591 `error` code
+   * at most — NEVER a response body or any OAuth value (oauth/client-identity.ts).
+   */
+  oauthRegistrationFailed: (detail: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_registration_failed",
+      `OAuth client registration failed: ${detail}`,
+    ),
+  /**
+   * OAuth discovery against the connection's MCP server failed — no usable
+   * OAuth metadata (this server is not an OAuth resource; use header auth
+   * instead), or its advertised authorization server was unreachable /
+   * egress-refused. `reason` is the discovery module's typed vocabulary
+   * (oauth/discovery.ts); messages carry URLs only, never OAuth values.
+   */
+  oauthDiscoveryFailed: (reason: string, detail?: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_discovery_failed",
+      detail ?? `OAuth discovery failed (${reason})`,
+      { reason },
+    ),
+  /** Consent-callback `state` unknown, expired, superseded, or already used. */
+  oauthStateInvalid: () =>
+    new RuntimeApiError(
+      400,
+      "oauth_state_invalid",
+      "OAuth state is missing, expired, or already used",
+    ),
+  /**
+   * The authorization server rejected the code/token exchange. `detail`
+   * carries the HTTP status and the RFC 6749 `error` code at most — NEVER a
+   * response body, authorization code, verifier, or token value
+   * (oauth/broker.ts).
+   */
+  oauthExchangeFailed: (detail: string) =>
+    new RuntimeApiError(
+      502,
+      "oauth_exchange_failed",
+      `OAuth token exchange failed: ${detail}`,
+    ),
+  /**
+   * The connection's OAuth grant is not in a usable `connected` state — never
+   * connected, expired (refresh rejected with `invalid_grant`), revoked, or
+   * errored. Re-running the consent flow is the only recovery; thrown by the
+   * token lifecycle (oauth/tokens.ts) and surfaced as 409 on the agent-facing
+   * token route.
+   */
+  oauthNotConnected: () =>
+    new RuntimeApiError(
+      409,
+      "oauth_not_connected",
+      "connection is not OAuth-connected — run the consent flow first",
     ),
   noPendingInput: () =>
     new RuntimeApiError(

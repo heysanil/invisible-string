@@ -50,6 +50,14 @@ export interface CompileInputs {
   model: ResolvedModel;
   connections: CompileConnection[];
   skills: CompileSkill[];
+  /**
+   * Slug → connection id for the definition's context connections — the same
+   * slugs the compiler's unique-slug pass bakes into the generated files
+   * (compile validates uniqueness/non-emptiness before anything persists).
+   * Publish persists this on the version row (`agent_versions.connection_slugs`)
+   * so runtime consumers can resolve an emitted slug back to its `cn_` row.
+   */
+  connectionSlugs: Record<string, string>;
   /** Slugified organization slug — baked into the generated project. */
   workspaceSlug: string;
 }
@@ -92,11 +100,12 @@ export async function resolveCompileInputs(
   const workspaceSlug = slugifyName(orgRows[0]?.slug ?? "") || "workspace";
 
   const connections: CompileConnection[] = [];
+  const connectionSlugs: Record<string, string> = {};
   for (const id of definition.context.mcpConnectionIds) {
     const rows = await db
       .select()
-      .from(schema.mcpConnections)
-      .where(eq(schema.mcpConnections.id, id))
+      .from(schema.connections)
+      .where(eq(schema.connections.id, id))
       .limit(1);
     const row = rows[0];
     const owned =
@@ -107,8 +116,14 @@ export async function resolveCompileInputs(
     if (!owned) throw errors.contextResourceNotFound("mcp_connection", id);
 
     // Learn the auth shape (bearer vs headers) + header NAMES without ever
-    // baking a secret value into the generated files.
-    const shape = mcpAuthShape(row.authConfigEncrypted, deps.masterKey, row.id);
+    // baking a secret value into the generated files. OAuth rows carry no
+    // static credentials at all (their grant lives on `connection_oauth`):
+    // the adapter maps the flag to the compiler's broker-delivered
+    // `{kind:"oauth", connectionId}` auth.
+    const oauth = row.authType === "oauth";
+    const shape = oauth
+      ? ({ kind: "none" } as const)
+      : mcpAuthShape(row.authConfigEncrypted, deps.masterKey, row.id);
     connections.push({
       id: row.id,
       name: row.name,
@@ -122,10 +137,18 @@ export async function resolveCompileInputs(
               envVar: mcpHeaderEnvName(row.name, header),
             }))
           : null,
+      oauth,
       toolAllow: row.toolAllow ?? null,
       toolBlock: row.toolBlock ?? null,
-      approvalPolicy: row.approvalPolicy ?? null,
+      approvalPolicy:
+        (row.approvalPolicy as CompileConnection["approvalPolicy"]) ?? null,
     });
+
+    // Mirror the adapter's slug derivation. An empty or clashing slug makes
+    // compileOrThrow fail (422) before anything persists, so the map that
+    // reaches the version row always matches the emitted slugs.
+    const slug = slugifyName(row.name);
+    if (slug !== "") connectionSlugs[slug] = row.id;
   }
 
   const skills: CompileSkill[] = [];
@@ -152,7 +175,7 @@ export async function resolveCompileInputs(
     });
   }
 
-  return { model, connections, skills, workspaceSlug };
+  return { model, connections, connectionSlugs, skills, workspaceSlug };
 }
 
 /**

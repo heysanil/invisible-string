@@ -53,11 +53,15 @@ export const PORTS = {
   postgres: port("E2E_POSTGRES_PORT", 5442),
   garage: port("E2E_GARAGE_PORT", 3910),
   dex: port("E2E_DEX_PORT", 5557),
+  /** Registry-search mirror (offset from the dev stack's :7700). */
+  meilisearch: port("E2E_MEILISEARCH_PORT", 7710),
   controlPlane: port("E2E_CONTROL_PLANE_PORT", 4310),
   worker: port("E2E_WORKER_PORT", 4311),
   preview: port("E2E_PREVIEW_PORT", 5173),
   /** Local stub MCP server the built agent's tools call. */
   stubMcp: port("E2E_STUB_MCP_PORT", 4315),
+  /** Stub OAuth authorization server (the oauth-connection spec's AS). */
+  stubAs: port("E2E_STUB_AS_PORT", 4316),
   /** Pool the worker draws AGENT ports from — see the invariant below. */
   agentMin: port("E2E_AGENT_PORT_MIN", 4320),
   agentMax: port("E2E_AGENT_PORT_MAX", 4399),
@@ -79,6 +83,7 @@ export const PORTS = {
     ["controlPlane", PORTS.controlPlane],
     ["worker", PORTS.worker],
     ["stubMcp", PORTS.stubMcp],
+    ["stubAs", PORTS.stubAs],
     ["preview", PORTS.preview],
   ];
   const clashes = services
@@ -105,11 +110,37 @@ export const S3_ENDPOINT = `http://127.0.0.1:${PORTS.garage}`;
 /** The stub MCP endpoint (bound to 127.0.0.1 so the agent process reaches it). */
 export const STUB_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp`;
 /**
- * The stub server also serves the MCP registry REST API (search + detail) so
- * the control-plane's registry proxy can be redirected here — the registry
- * browser never touches the real registry.
+ * The stub server also serves the MCP registry REST API (list + detail) so
+ * both the control-plane's registry→Meilisearch sync ETL and the server-side
+ * install re-fetch can be redirected here (MCP_REGISTRY_BASE_URL) — the real
+ * registry is never contacted.
  */
 export const REGISTRY_STUB_BASE_URL = `http://127.0.0.1:${PORTS.stubMcp}`;
+/**
+ * The stub server's OAuth-protected MCP endpoint (oauth-connection spec): a
+ * third path on the stub whose `tools/call` demands a bearer token the stub
+ * AS issued — 401 + RFC 9728 `WWW-Authenticate` PRM pointer otherwise.
+ */
+export const STUB_OAUTH_MCP_URL = `http://127.0.0.1:${PORTS.stubMcp}/mcp-oauth`;
+/** The stub OAuth authorization server (scripts/stub-as.ts). */
+export const STUB_AS_URL = `http://127.0.0.1:${PORTS.stubAs}`;
+/** Meilisearch endpoint of the harness compose service (server-side client). */
+export const MEILISEARCH_URL = `http://127.0.0.1:${PORTS.meilisearch}`;
+/** The compose service's hardcoded dev master key (see docker-compose.yml). */
+export const MEILISEARCH_MASTER_KEY = "dev-meili-master-key";
+
+// ── The stub registry server's identity (fixtures + specs share it) ─────────
+/** Reverse-DNS name the stub registry lists (NOT io.github.* ⇒ verified). */
+export const REGISTRY_SERVER_NAME = "io.modelcontextprotocol/e2e-notes";
+/**
+ * The stub server's title — ALSO the installed connection's name: the add
+ * dialog derives registry-install names from the server title (no name field).
+ */
+export const REGISTRY_SERVER_TITLE = "E2E Notes";
+/** Secret header the stub's remote declares; the add dialog must collect it. */
+export const REGISTRY_SECRET_HEADER = "X-Api-Key";
+/** The throwaway credential the specs enter for that header (see banner). */
+export const REGISTRY_SECRET_VALUE = "e2e-notes-api-key";
 
 // ── Databases (compose postgres: user dev / pass dev) ───────────────────────
 const PG_BASE = `postgres://dev:dev@127.0.0.1:${PORTS.postgres}`;
@@ -160,6 +191,22 @@ export function controlPlaneEnv(): Record<string, string> {
     S3_REGION: "us-east-1",
     // Redirect the registry proxy at the local stub (never the real registry).
     MCP_REGISTRY_BASE_URL: REGISTRY_STUB_BASE_URL,
+    // The connection probes (after-create + Test connection) ride the guarded
+    // egress fetch, which rejects private/loopback targets and plain http —
+    // the stub MCP server is both. DEV/E2E ONLY, exactly like the compose
+    // secrets above (never set in production).
+    MCP_PROBE_ALLOW_PRIVATE: "1",
+    // Broker-delivered OAuth (plan-3): compiled agents mint a version-bound
+    // platform JWT and call POST /internal/connections/token here. The agents
+    // run as local Node processes, so the control plane under test IS the
+    // reachable base URL (127.0.0.1 explicitly — see the URL note above).
+    PLATFORM_API_URL: `http://127.0.0.1:${PORTS.controlPlane}`,
+    // Community search rides the harness Meilisearch; the registry→Meilisearch
+    // sync ticks fast so global-setup can await the first successful sync
+    // (a boot-time run can race the stub's listen — 5 s retries it quickly).
+    MEILISEARCH_URL,
+    MEILISEARCH_MASTER_KEY,
+    REGISTRY_SYNC_INTERVAL_MS: "5000",
     // Mock-model harness: the provider key is a dummy and the base URL points
     // at a dead port, so any REAL model call fails loudly (spike finding 5).
     OPENROUTER_API_KEY: "e2e-dummy-openrouter-key",

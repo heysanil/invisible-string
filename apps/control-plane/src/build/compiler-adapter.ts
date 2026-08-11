@@ -92,7 +92,7 @@ function uniqueSlugs<T extends { name: string }>(
 const DB_DECISIONS = new Set(["never", "once", "always"]);
 
 /**
- * db `mcp_connections.approval_policy` → compiler ApprovalSpec.
+ * db `connections.approval_policy` → compiler ApprovalSpec.
  * Stored shape: `{ default: "never"|"once"|"always", tools?: { <tool>: same } }`
  * ("always" = always ask; "never" = auto-allow). null → never (no gating).
  */
@@ -165,7 +165,14 @@ function resolveConnection(
     ]);
   }
   let auth: ResolvedMcpConnection["auth"] = { kind: "none" };
-  if (connection.envTokenVar !== null) {
+  if (connection.oauth === true) {
+    // Broker-delivered OAuth (spec §6): the generated `getToken` calls the
+    // platform token broker by CONNECTION ID — no env var, no static
+    // credential. The env-name agreement guard for this path lives in
+    // runtime/agent-env.ts: it injects PLATFORM_API_URL (the compiler's
+    // PLATFORM_API_URL_ENV) which the emitted platform-token lib reads.
+    auth = { kind: "oauth", connectionId: connection.id };
+  } else if (connection.envTokenVar !== null) {
     const canonical = connectionTokenEnvVar(slug);
     if (connection.envTokenVar !== canonical) {
       // Dispatcher (mcpTokenEnvName) and generated code (connectionTokenEnvVar)

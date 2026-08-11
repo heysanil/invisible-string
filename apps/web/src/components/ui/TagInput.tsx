@@ -3,6 +3,12 @@ import { useId, useState, type KeyboardEvent } from "react";
 
 import { cn } from "../../lib/cn";
 
+// Satisfies React's controlled-input contract; the draft handler rides
+// onInput, matching the shared Input primitive (React's onChange for text
+// inputs never fires under happy-dom — both props ride the same native
+// `input` event in real browsers, so behavior is identical).
+function noopChange() {}
+
 export interface TagInputProps {
   label: string;
   values: readonly string[];
@@ -75,7 +81,8 @@ export function TagInput({
           id={id}
           value={draft}
           placeholder={values.length === 0 ? placeholder : undefined}
-          onChange={(event) => setDraft(event.currentTarget.value)}
+          onChange={noopChange}
+          onInput={(event) => setDraft((event.target as HTMLInputElement).value)}
           onKeyDown={onKeyDown}
           onBlur={() => commit(draft)}
           className="min-w-24 flex-1 bg-transparent px-1 py-0.5 text-[13px] text-ink outline-none placeholder:text-ink-4"

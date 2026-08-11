@@ -1,11 +1,17 @@
 /**
  * Context-section authoring flows: create an authored skill with a file
- * attachment, install an MCP connection from the (stubbed) registry browser,
- * and add a custom-URL connection. All drive the real Context UI.
+ * attachment, install a community server through the add-connection dialog's
+ * search lane (backed by the Meilisearch mirror of the stubbed registry), and
+ * add a custom-URL connection. All drive the real Context UI.
  */
 import { expect, type Page } from "@playwright/test";
 
-import { STUB_MCP_URL } from "../config.ts";
+import {
+  REGISTRY_SECRET_HEADER,
+  REGISTRY_SECRET_VALUE,
+  REGISTRY_SERVER_TITLE,
+  STUB_MCP_URL,
+} from "../config.ts";
 
 /** Click a primary-dock section by its accessible name. */
 export async function gotoSection(
@@ -68,14 +74,18 @@ export async function addCustomConnection(
   await gotoSection(page, "Context");
   await page.getByRole("button", { name: "Add connection" }).first().click();
 
+  // The browse view leads with the curated catalog; the custom lane sits at
+  // the bottom and re-titles the SAME dialog to "Add custom server".
   const modal = page.getByRole("dialog", { name: "Add connection" });
-  await modal.getByRole("tab", { name: "Custom URL" }).click();
-  await modal.getByLabel("Connection name").fill(opts.name);
-  await modal.getByLabel("Server URL").fill(opts.url ?? STUB_MCP_URL);
-  await modal.getByRole("button", { name: "Add connection" }).click();
+  await modal.getByRole("button", { name: "Add a custom server" }).click();
+
+  const custom = page.getByRole("dialog", { name: "Add custom server" });
+  await custom.getByLabel("Connection name").fill(opts.name);
+  await custom.getByLabel("Server URL").fill(opts.url ?? STUB_MCP_URL);
+  await custom.getByRole("button", { name: "Add connection" }).click();
 
   // Modal closes on success; the card appears in the grid.
-  await expect(modal).toBeHidden();
+  await expect(custom).toBeHidden();
   await expect(
     page.getByRole("heading", { name: opts.name, exact: true }),
   ).toBeVisible();
@@ -83,35 +93,43 @@ export async function addCustomConnection(
 }
 
 /**
- * Install a connection from the registry browser. The control-plane's registry
- * proxy is redirected (MCP_REGISTRY_BASE_URL) at the local stub, so both the
- * search and the server-side install re-fetch resolve against the stub — the
- * real registry is never contacted. Returns the installed connection's name.
+ * Install the stub registry server through the add-connection dialog's
+ * community-search lane. The search is served by the control plane's
+ * Meilisearch mirror (fed by the sync ETL from the stubbed registry, awaited
+ * in global-setup); the install re-fetch resolves against the stub via
+ * MCP_REGISTRY_BASE_URL — the real registry is never contacted. The remote
+ * declares a secret header, so the credential form gates the install.
+ *
+ * Returns the connection's name — DERIVED from the server title (the dialog
+ * has no name field for community installs).
  */
 export async function installRegistryConnection(
   page: Page,
-  opts: { name: string; query?: string },
+  opts: { query?: string } = {},
 ): Promise<string> {
   await gotoSection(page, "Context");
   await page.getByRole("button", { name: "Add connection" }).first().click();
 
   const modal = page.getByRole("dialog", { name: "Add connection" });
-  // Registry tab is the default; search, then pick the canned server card.
-  await modal.getByRole("tab", { name: "Registry" }).click();
   await modal
-    .getByRole("textbox", { name: "Search the MCP registry" })
-    .fill(opts.query ?? "notes");
-  await modal.getByRole("button", { name: /E2E Notes \(registry\)/ }).click();
+    .getByRole("textbox", { name: "Search connectors" })
+    .fill(opts.query ?? REGISTRY_SERVER_TITLE);
+  await modal
+    .getByRole("button", { name: new RegExp(REGISTRY_SERVER_TITLE) })
+    .click();
 
-  // Selecting a server re-titles the SAME dialog to "Configure server"
-  // (secret-free canned server) — just name + Install.
+  // The declared secret header re-titles the SAME dialog to "Configure
+  // server" with a one-shot credential form.
   const configure = page.getByRole("dialog", { name: "Configure server" });
-  await configure.getByLabel("Connection name").fill(opts.name);
-  await configure.getByRole("button", { name: "Install" }).click();
+  await configure
+    .getByLabel(REGISTRY_SECRET_HEADER)
+    .fill(REGISTRY_SECRET_VALUE);
+  // exact: the back button "All connectors" substring-matches "Connect".
+  await configure.getByRole("button", { name: "Connect", exact: true }).click();
 
   await expect(configure).toBeHidden();
   await expect(
-    page.getByRole("heading", { name: opts.name, exact: true }),
+    page.getByRole("heading", { name: REGISTRY_SERVER_TITLE, exact: true }),
   ).toBeVisible();
-  return opts.name;
+  return REGISTRY_SERVER_TITLE;
 }

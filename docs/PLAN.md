@@ -78,7 +78,7 @@ apps/worker (stateless, Node 24 image, mounted /var/run/docker.sock)
 
 ## Data model (Drizzle, `packages/db`)
 
-Better Auth-managed: `user, session, account, verification, organization, member, invitation` (+ `session.activeOrganizationId`). Product tables exactly per spec §9: `mcp_connections` (scope, source, url/registry id, encrypted auth, tool allow/block, approval policy), `skills`, `model_presets` (seeded per workspace), `model_allowlist`, `agents` (presets; seed General Purpose / Software Engineer / Product Designer), `workflows` (draft pillar JSON, `run_as_user_id`, `published_version_id`), `workflow_versions` (immutable config + hash incl. compiler+eve versions + build status), `workflow_builds` (hash → artifact key, error log), `agent_sessions`, `runs`, `run_events (run_id, seq, event)`, `integrations` (Slack per `team_id`, encrypted), `triggers` (webhook token **hashes**, form schemas, bindings), `workers` (address, heartbeat, capacity, status live|draining|dead). Encryption: AES-256-GCM envelope (master key env, per-row data keys).
+Better Auth-managed: `user, session, account, verification, organization, member, invitation` (+ `session.activeOrganizationId`). Product tables exactly per spec §9: `connections` (scope, source, url, auth type, health, cached tools, tool allow/block, approval policy) + `connection_oauth` (brokered OAuth grants), `skills`, `model_presets` (seeded per workspace), `model_allowlist`, `agents` (presets; seed General Purpose / Software Engineer / Product Designer), `workflows` (draft pillar JSON, `run_as_user_id`, `published_version_id`), `workflow_versions` (immutable config + hash incl. compiler+eve versions + build status), `workflow_builds` (hash → artifact key, error log), `agent_sessions`, `runs`, `run_events (run_id, seq, event)`, `integrations` (Slack per `team_id`, encrypted), `triggers` (webhook token **hashes**, form schemas, bindings), `workers` (address, heartbeat, capacity, status live|draining|dead). Encryption: AES-256-GCM envelope (master key env, per-row data keys).
 
 ## API surface
 
@@ -184,3 +184,11 @@ The Agent (PERSONA · MODEL · CONTEXT) becomes the first-class entity and the c
 5. **Acceptance + e2e rewrite, then docs/site messaging pivot** (README, MDX docs tree, landing) per the vocabulary standard.
 
 **Acceptance:** the full lane matrix (unit/typecheck, DB-gated integration incl. `SPIKE_EVE_BUILD=1`, phase-1 and phase-3 acceptance re-keyed agent-first + schedule + control-plane Slack delivery proofs, keyed lanes manual, Playwright e2e, prod-compose smoke) green in its documented lanes.
+
+---
+
+## Phase 6 — Connectors redesign (2026-08-09)
+
+**Design record:** `docs/superpowers/specs/2026-08-09-connectors-redesign-design.md`. **Status: COMPLETE (2026-08-10).** Plan 1 (rebuilt `connections` domain, curated catalog, Meilisearch-mirrored community search), Plan 2 (SSRF-guarded egress, MCP health probes, cached tool discovery, connection detail surface + checkbox tool picker), and Plan 3 (MCP OAuth 2.1 broker: path-aware discovery, CIMD-first client identity with DCR fallback, PKCE popup consent with persisted single-use state, envelope-encrypted tokens with single-flight central refresh, the agent-facing token route with audience-derived version binding, oauth `getToken` codegen, verified OAuth catalog entries) all landed.
+
+**Mid-run authorization surface is DORMANT on eve 0.31.3** (Plan 3 Task 9): the tailer's authorization-pending latch (`session.waiting` while latched → run `waiting`, never `succeeded`), the slug→connection `auth_required` health flip, and the chat consent card are implemented and tested against synthetic fixtures — but spike REPORT finding 34 captured that a getToken-only connection (the only auth strategy the platform's compiled agents use) surfaces a mid-run 401 as a plain failed `action.result` and `authorization.required` is never emitted (it is reachable only via interactive auth strategies the platform does not author). The surface activates untouched if a future eve emits the declared `authorization.*` events; until then the live mid-run re-auth UX keys off the failed tool call and connection health.

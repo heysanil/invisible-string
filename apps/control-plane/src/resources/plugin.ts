@@ -1,6 +1,6 @@
 /**
  * Resource CRUD plugin — wires the HTTP surface for agents, workflows,
- * sessions (list), MCP connections (+ registry proxy/install), skills
+ * sessions (list), connections (rebuilt domain + registry proxy), skills
  * (+ attachments), model presets/allowlist, and members onto the pure
  * service functions in this directory. Mounted unconditionally (product CRUD
  * does not require the runtime env); skill uploads that need the object
@@ -12,6 +12,7 @@
 import { Elysia } from "elysia";
 import { SKILL_FILE_MAX_BYTES } from "@invisible-string/shared";
 
+import { startOauth } from "../oauth/broker";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { workspacePlugin } from "../workspace";
 import {
@@ -22,15 +23,15 @@ import {
   updateAgent,
 } from "./agents";
 import type { ResourceDeps, Scope } from "./common";
-import { listWorkspaceMembers } from "./members";
 import {
   createConnection,
   deleteConnection,
   getConnection,
-  installConnection,
   listConnections,
+  probeConnectionRoute,
   updateConnection,
-} from "./mcp-connections";
+} from "./connections";
+import { listWorkspaceMembers } from "./members";
 import {
   addModelAllowlistEntry,
   deleteModelAllowlistEntry,
@@ -40,7 +41,7 @@ import {
   updateModelAllowlistEntry,
   updateModelPreset,
 } from "./presets";
-import { toRegistrySearchResponse } from "./registry";
+import { searchRegistry } from "../search/registry-search";
 import { listSessions } from "./sessions";
 import {
   createSkill,
@@ -77,6 +78,14 @@ function assertUploadWithinLimit(request: Request): void {
   if (Number.isFinite(length) && length > SKILL_UPLOAD_MAX_BODY_BYTES) {
     throw errors.skillFileTooLarge(SKILL_FILE_MAX_BYTES);
   }
+}
+
+/** Optional numeric query param → number | undefined (clamping is the
+ * search module's job; junk simply falls back to its defaults). */
+function numberParam(value: unknown): number | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 /** Pull an uploaded file out of a parsed multipart body. */
@@ -176,57 +185,77 @@ export function resourcesPlugin(deps: ResourceDeps) {
         { requireWorkspace: true },
       )
 
-      // ── MCP connections — workspace scope ─────────────────────────────────
+      // ── Connections — workspace scope (rebuilt domain; one create route
+      // discriminated on source, so no separate /install). Reads are member
+      // ops; mutations are owner/admin-gated (spec §9 authz) ────────────────
       .get(
-        "/workspaces/:workspaceId/mcp-connections",
+        "/workspaces/:workspaceId/connections",
         ({ workspace }) => listConnections(deps, wsScope(workspace.organizationId)),
         { requireWorkspace: true },
       )
       .post(
-        "/workspaces/:workspaceId/mcp-connections",
+        "/workspaces/:workspaceId/connections",
         async ({ workspace, body, set }) => {
           const result = await createConnection(deps, wsScope(workspace.organizationId), body);
           set.status = 201;
           return result;
         },
-        { requireWorkspace: true },
-      )
-      .post(
-        "/workspaces/:workspaceId/mcp-connections/install",
-        async ({ workspace, body, set }) => {
-          const result = await installConnection(deps, wsScope(workspace.organizationId), body);
-          set.status = 201;
-          return result;
-        },
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .get(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params }) =>
           getConnection(deps, wsScope(workspace.organizationId), params.id),
         { requireWorkspace: true },
       )
       .patch(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params, body }) =>
           updateConnection(deps, wsScope(workspace.organizationId), params.id, body),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
       )
       .delete(
-        "/workspaces/:workspaceId/mcp-connections/:id",
+        "/workspaces/:workspaceId/connections/:id",
         ({ workspace, params }) =>
           deleteConnection(deps, wsScope(workspace.organizationId), params.id),
-        { requireWorkspace: true },
+        { requireWorkspace: "admin" },
+      )
+      // Test-connection: probe now, persist, return the fresh DTO. Mutates
+      // the row's probe columns, so it is gated like the other mutations; an
+      // unhealthy server is still a 200 — 502 `probe_failed` means the probe
+      // machinery itself broke (spec §9).
+      .post(
+        "/workspaces/:workspaceId/connections/:id/probe",
+        ({ workspace, params }) =>
+          probeConnectionRoute(deps, wsScope(workspace.organizationId), params.id),
+        { requireWorkspace: "admin" },
+      )
+      // OAuth consent start (spec §6): discovery + client identity + a fresh
+      // PKCE/state pending flow → `{authorizeUrl}` for the popup. Arms a
+      // credential grant, so it is owner/admin-gated like the other mutations;
+      // the callback itself lives on the public integrations prefix
+      // (session-bound — see oauth/broker.ts).
+      .post(
+        "/workspaces/:workspaceId/connections/:id/oauth/start",
+        ({ workspace, params }) =>
+          startOauth(
+            deps.oauthBroker,
+            wsScope(workspace.organizationId),
+            params.id,
+            workspace.userId,
+          ),
+        { requireWorkspace: "admin" },
       )
 
-      // ── MCP connections — user scope (/me) ────────────────────────────────
+      // ── Connections — user scope (/me; the signed-in user owns the rows,
+      // so no role gate applies) ────────────────────────────────────────────
       .get(
-        "/me/mcp-connections",
+        "/me/connections",
         ({ authUser }) => listConnections(deps, userScope(authUser.id)),
         { requireAuth: true },
       )
       .post(
-        "/me/mcp-connections",
+        "/me/connections",
         async ({ authUser, body, set }) => {
           const result = await createConnection(deps, userScope(authUser.id), body);
           set.status = 201;
@@ -234,39 +263,46 @@ export function resourcesPlugin(deps: ResourceDeps) {
         },
         { requireAuth: true },
       )
-      .post(
-        "/me/mcp-connections/install",
-        async ({ authUser, body, set }) => {
-          const result = await installConnection(deps, userScope(authUser.id), body);
-          set.status = 201;
-          return result;
-        },
-        { requireAuth: true },
-      )
       .get(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params }) => getConnection(deps, userScope(authUser.id), params.id),
         { requireAuth: true },
       )
       .patch(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params, body }) =>
           updateConnection(deps, userScope(authUser.id), params.id, body),
         { requireAuth: true },
       )
       .delete(
-        "/me/mcp-connections/:id",
+        "/me/connections/:id",
         ({ authUser, params }) => deleteConnection(deps, userScope(authUser.id), params.id),
         { requireAuth: true },
       )
+      .post(
+        "/me/connections/:id/probe",
+        ({ authUser, params }) =>
+          probeConnectionRoute(deps, userScope(authUser.id), params.id),
+        { requireAuth: true },
+      )
+      .post(
+        "/me/connections/:id/oauth/start",
+        ({ authUser, params }) =>
+          startOauth(deps.oauthBroker, userScope(authUser.id), params.id, authUser.id),
+        { requireAuth: true },
+      )
 
-      // ── MCP registry proxy (SSRF-contained: fixed host only) ──────────────
+      // ── Community registry search (Meilisearch mirror; no client ⇒ typed
+      // 503 degradation — the catalog lane never depends on it) ─────────────
       .get(
         "/mcp-registry/search",
         async ({ query }) => {
           const q = typeof query.q === "string" ? query.q.trim() : "";
-          if (q.length === 0) return toRegistrySearchResponse([]);
-          return toRegistrySearchResponse(await deps.registry.search(q));
+          if (q.length === 0) return { results: [], total: 0 };
+          return searchRegistry(deps.meili, q, {
+            limit: numberParam(query.limit),
+            offset: numberParam(query.offset),
+          });
         },
         { requireAuth: true },
       )

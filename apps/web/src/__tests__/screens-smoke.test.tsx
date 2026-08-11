@@ -28,18 +28,27 @@ const NOW = "2026-07-03T00:00:00.000Z";
 const CONNECTIONS = {
   connections: [
     {
-      id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      id: "cn_cccccccccccccccc",
       scope: "workspace",
       name: "Linear",
       description: "Issue tracking",
       source: "registry",
-      registryId: "io.linear/mcp",
-      url: null,
+      catalogSlug: null,
+      registryName: "io.linear/mcp",
+      url: "https://mcp.linear.app/mcp",
+      transport: "streamable-http",
+      authType: "headers",
+      hasCredentials: true,
+      oauthStatus: null,
       toolAllow: ["create_issue"],
       toolBlock: null,
       approvalPolicy: { default: "once" },
       enabled: true,
-      hasCredentials: true,
+      health: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+      tools: null,
+      toolsCachedAt: null,
       createdAt: NOW,
       updatedAt: NOW,
     },
@@ -100,7 +109,7 @@ afterEach(() => {
 
 test("ContextHome renders connections + skills and opens a skill", async () => {
   fetchMock
-    .on("GET", "/mcp-connections", () => jsonResponse(CONNECTIONS))
+    .on("GET", "/connections", () => jsonResponse(CONNECTIONS))
     .on("GET", "/skills", () => jsonResponse(SKILLS));
 
   const onOpenSkill = mock((_scope: string, _id: string) => {});

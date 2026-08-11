@@ -89,7 +89,12 @@ flowchart LR
   ticker → dispatcher (renders the workflow's instructions + trigger event
   into the task message and delivers it to the bound agent version over
   eve's session API, version-bound JWTs), outbound Slack reply delivery,
-  NDJSON tailer → resumable SSE, and the copilot WebSocket tool loop.
+  NDJSON tailer → resumable SSE, the connections domain (curated connector
+  catalog + a registry→Meilisearch sync job backing community search, MCP
+  health probes over an SSRF-guarded egress path that cache each server's
+  tool list, and an MCP OAuth 2.1 broker — popup consent, envelope-encrypted
+  tokens refreshed centrally, just-in-time token delivery to compiled
+  agents), and the copilot WebSocket tool loop.
 - **Worker** (`apps/worker`) — a stateless Bun supervisor that pulls artifacts,
   boots each compiled agent under Node 24, reverse-proxies traffic to it, and
   reaps idle processes, idle sandboxes, and cold artifacts.
@@ -123,16 +128,16 @@ bun run dev
 
 One command: bootstraps `.env` on first run (generates the four platform
 secrets; provider keys stay blank until you add them), starts Postgres, Garage,
-and Dex and waits for health, applies migrations, then runs the API (:3000),
-worker, and SPA (:5173) with prefixed logs in one terminal. Ctrl-C stops the
+Dex, and Meilisearch and waits for health, applies migrations, then runs the
+API (:3000), worker, and SPA (:5173) with prefixed logs in one terminal. Ctrl-C stops the
 apps and leaves infra running; `bun run dev:down` stops the containers.
 
 <details>
 <summary>Manual, step-by-step equivalent (for debugging individual pieces)</summary>
 
 ```sh
-# local infra: Postgres, Garage, Dex IdP
-docker compose up -d postgres garage dex
+# local infra: Postgres, Garage, Dex IdP, Meilisearch (registry search)
+docker compose up -d postgres garage dex meilisearch
 
 # apply migrations (Better Auth + product tables live in packages/db)
 DATABASE_URL=postgres://dev:dev@localhost:5432/product bun run --cwd packages/db migrate
@@ -222,10 +227,24 @@ trigger-dispatch path.
 ![Workflow editor](docs/screenshots/workflow.png)
 
 ### 🔌 Context — `/context`
-The library your Agents draw from: MCP connections (workspace + personal),
-the MCP registry browser + install (write-once encrypted secrets), and skills
-authoring with drag-drop attachments — equipped onto Agents in the agent
-editor and packaged straight into the compiled agent.
+The library your Agents draw from: MCP connections (workspace + personal)
+and skills authoring with drag-drop attachments — equipped onto Agents in
+the agent editor and packaged straight into the compiled agent. Connections
+are added through a three-lane dialog: a **curated connector catalog**
+(checked into the repo, renders with zero network calls), **community
+search** over a Meilisearch mirror of the official MCP registry
+(typo-tolerant, verified publishers ranked first; installs re-verify the
+remote against the live registry), or a **custom server URL** — with
+write-once encrypted secrets throughout. Connectors that speak MCP OAuth
+(Linear, Notion, Sentry, Neon, PayPal, Vercel) connect in one click: the
+platform brokers the consent popup and keeps the tokens — encrypted at rest,
+refreshed centrally, handed to a running agent only at tool-call time, never
+stored in agent env. Every connection carries a live
+**health state** (probed automatically after install, re-probed when a stale
+detail panel opens or from its **Test connection** button) and a cached list
+of the tools its server actually exposes — the connection detail panel and
+the agent editor turn that cache into a **checkbox tool picker** for
+allow/block filters, with per-tool approval overrides alongside.
 
 ![Context section](docs/screenshots/context.png)
 

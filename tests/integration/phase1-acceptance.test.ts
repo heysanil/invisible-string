@@ -54,7 +54,7 @@ import { count, eq } from "drizzle-orm";
 import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
-  encryptSecret,
+  newId,
   parseMasterKey,
   generateMasterKeyBase64,
   type AgentDefinitionInput,
@@ -72,7 +72,7 @@ import {
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
 import { runMigrations } from "../../apps/control-plane/src/migrate";
-import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-env";
+import { encryptConnectionAuthConfig } from "../../apps/control-plane/src/resources/mcp-crypto";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -530,27 +530,23 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
     });
     await seedWorkspace(db, orgId); // idempotent (afterCreateOrganization already ran)
 
-    // 1 MCP connection → the local stub server, bearer-token auth.
-    const conn = await db
-      .insert(schema.mcpConnections)
-      .values({
-        scope: "workspace",
-        organizationId: orgId,
-        name: "notes",
-        source: "custom",
-        url: mcp.url,
-      })
-      .returning({ id: schema.mcpConnections.id });
-    connectionId = conn[0]!.id;
-    const envelope = encryptSecret(
-      JSON.stringify({ token: "stub-notes-token" }),
-      parseMasterKey(MASTER_KEY_B64),
-      mcpAuthAadContext(connectionId),
-    );
-    await db
-      .update(schema.mcpConnections)
-      .set({ authConfigEncrypted: JSON.stringify(envelope) })
-      .where(eq(schema.mcpConnections.id, connectionId));
+    // 1 MCP connection → the local stub server, bearer-token auth. The auth
+    // AAD binds the row id, so the id exists before the insert.
+    connectionId = newId("cn");
+    await db.insert(schema.connections).values({
+      id: connectionId,
+      scope: "workspace",
+      organizationId: orgId,
+      name: "notes",
+      source: "custom",
+      url: mcp.url,
+      authType: "bearer",
+      authConfigEncrypted: encryptConnectionAuthConfig(
+        { type: "bearer", values: { token: "stub-notes-token" } },
+        parseMasterKey(MASTER_KEY_B64),
+        connectionId,
+      ),
+    });
 
     // 1 authored skill.
     const skill = await db

@@ -7,7 +7,7 @@
 import {
   buildReferenceInventory,
   type AgentSummaryDto,
-  type McpConnectionDto,
+  type ConnectionDto,
   type WorkflowConfig,
 } from "@invisible-string/shared";
 
@@ -116,7 +116,7 @@ export function shortModelId(modelId: string): string {
  * Summarize a connection's approval policy into a short gating phrase (used
  * by the context-attachment rows in the AGENT editor).
  */
-export function connectionGating(connection: McpConnectionDto): string | null {
+export function connectionGating(connection: ConnectionDto): string | null {
   const policy = connection.approvalPolicy;
   if (!policy) return null;
   const toolEntries = Object.entries(policy.tools ?? {});

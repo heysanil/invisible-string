@@ -1,0 +1,24 @@
+{
+  "name": "agent--acme--project-coordinator",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "build": "eve build",
+    "start": "eve start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openrouter/ai-sdk-provider": "3.0.0",
+    "@workflow/world-postgres": "5.0.0-beta.32",
+    "ai": "7.0.58",
+    "eve": "0.31.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.0",
+    "typescript": "7.0.2"
+  }
+}

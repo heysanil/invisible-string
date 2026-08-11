@@ -53,8 +53,8 @@ import { eq } from "drizzle-orm";
 import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
-  encryptSecret,
   isRunStreamTerminalStatus,
+  newId,
   parseMasterKey,
   generateMasterKeyBase64,
   type AgentDefinitionInput,
@@ -68,7 +68,7 @@ import {
 
 import { createAppStack, type AppStack } from "../../apps/control-plane/src/index";
 import { runMigrations } from "../../apps/control-plane/src/migrate";
-import { mcpAuthAadContext } from "../../apps/control-plane/src/runtime/agent-env";
+import { encryptConnectionAuthConfig } from "../../apps/control-plane/src/resources/mcp-crypto";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -561,31 +561,24 @@ describe.skipIf(!GATE)("keyed acceptance — real model through the full stack (
     });
     await seedWorkspace(db, orgId);
 
-    // Approval-gated MCP connection → the stub server (HITL agent).
-    const conn = await db
-      .insert(schema.mcpConnections)
-      .values({
-        scope: "workspace",
-        organizationId: orgId,
-        name: "notes",
-        source: "custom",
-        url: mcp.url,
-        approvalPolicy: { default: "always" },
-      })
-      .returning({ id: schema.mcpConnections.id });
-    connectionId = conn[0]!.id;
-    await db
-      .update(schema.mcpConnections)
-      .set({
-        authConfigEncrypted: JSON.stringify(
-          encryptSecret(
-            JSON.stringify({ token: "stub-notes-token" }),
-            parseMasterKey(MASTER_KEY_B64),
-            mcpAuthAadContext(connectionId),
-          ),
-        ),
-      })
-      .where(eq(schema.mcpConnections.id, connectionId));
+    // Approval-gated MCP connection → the stub server (HITL agent). The auth
+    // AAD binds the row id, so the id exists before the insert.
+    connectionId = newId("cn");
+    await db.insert(schema.connections).values({
+      id: connectionId,
+      scope: "workspace",
+      organizationId: orgId,
+      name: "notes",
+      source: "custom",
+      url: mcp.url,
+      approvalPolicy: { default: "always" },
+      authType: "bearer",
+      authConfigEncrypted: encryptConnectionAuthConfig(
+        { type: "bearer", values: { token: "stub-notes-token" } },
+        parseMasterKey(MASTER_KEY_B64),
+        connectionId,
+      ),
+    });
 
     // quick preset → ~deepseek/deepseek-v4-flash-latest (packages/db seed); reasoning
     // low keeps the (reasoning) model's token spend minimal.

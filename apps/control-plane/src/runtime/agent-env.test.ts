@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { connectionTokenEnvVar } from "@invisible-string/compiler";
+import {
+  connectionTokenEnvVar,
+  PLATFORM_API_URL_ENV,
+} from "@invisible-string/compiler";
 
 import { slugifyName } from "../build/compiler-adapter";
 import { buildAgentEnv, mcpTokenEnvName } from "./agent-env";
@@ -36,6 +39,8 @@ const RUNTIME: RuntimeConfig = {
   workerRequestTimeoutMs: 120_000,
   allowInsecureWorkerTransport: false,
   workerAuthMode: "shared-secret",
+  registrySyncIntervalMs: 21_600_000,
+  mcpProbeAllowPrivate: false,
 };
 
 const HASH = "abcdef0123456789abcdef0123456789";
@@ -145,6 +150,33 @@ describe("buildAgentEnv", () => {
       expect(error).toBeInstanceOf(RuntimeApiError);
       expect((error as RuntimeApiError).code).toBe("provider_key_missing");
     }
+  });
+
+  test("PLATFORM_API_URL rides along when configured — under the compiler's exact env name", () => {
+    // Env-name agreement guard for the broker-delivered OAuth path: the
+    // emitted platform-token lib reads the compiler's PLATFORM_API_URL_ENV;
+    // the dispatcher must inject the SAME name or every oauth tool call
+    // fails with a missing-env error.
+    expect(PLATFORM_API_URL_ENV).toBe("PLATFORM_API_URL");
+    const env = buildAgentEnv({
+      runtime: { ...RUNTIME, platformApiUrl: "http://control-plane:3000" },
+      worldUrl: "postgres://x/y",
+      contentHash: HASH,
+      provider: "openrouter",
+      mcpEnv: {},
+    });
+    expect(env[PLATFORM_API_URL_ENV]).toBe("http://control-plane:3000");
+  });
+
+  test("PLATFORM_API_URL is absent when unconfigured (degraded oauth, clean boot)", () => {
+    const env = buildAgentEnv({
+      runtime: RUNTIME,
+      worldUrl: "postgres://x/y",
+      contentHash: HASH,
+      provider: "openrouter",
+      mcpEnv: {},
+    });
+    expect(env).not.toHaveProperty(PLATFORM_API_URL_ENV);
   });
 
   test("decrypted MCP tokens ride along", () => {

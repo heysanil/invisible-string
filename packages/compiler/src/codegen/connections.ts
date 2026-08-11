@@ -5,7 +5,9 @@
  * - URL and description are literals; SECRETS NEVER ARE. Bearer auth reads
  *   `MCP_<SLUG_UPPER>_TOKEN` via a lazy `getToken`; header auth reads each
  *   named env var inside the lazy `headers` callback (module-scope reads
- *   would crash keyless `eve build`).
+ *   would crash keyless `eve build`); oauth auth defers to the platform
+ *   token broker via the emitted `platformConnectionToken` (no OAuth
+ *   material in agent env or generated files — spec §6).
  * - tools carries exactly one of allow/block (validated at compile).
  * - approval: `never()` / `once()` / `always()` helpers, or a generated
  *   custom policy matching QUALIFIED tool names — eve surfaces connection
@@ -99,6 +101,14 @@ export function emitConnection(connection: ResolvedMcpConnection): string {
   headers: () => ({
 ${entries.join("\n")}
   }),`;
+  } else if (connection.auth.kind === "oauth") {
+    envImport = `\nimport { platformConnectionToken } from "../lib/platform-token.js";\n`;
+    authProperty = `
+  auth: {
+    // Broker-delivered: the platform mints short-lived access tokens; no OAuth
+    // material lives in agent env. Lazy so keyless builds never crash.
+    getToken: async () => ({ token: await platformConnectionToken(${tsString(connection.auth.connectionId)}) }),
+  },`;
   }
 
   let toolsProperty = "";

@@ -2,15 +2,17 @@
  * Context section home: Workspace | Personal tabs over MCP connections +
  * skills. Workspace-scope mutations are gated on `canManage` (members see a
  * read-only view); personal scope is always the signed-in user's own and
- * fully editable.
+ * fully editable. Clicking a connection card opens the connection detail
+ * slide-over (health, auth rotation, test-connection, delete).
  */
 import { useState } from "react";
 
 import type { ScopeRef } from "../../lib/queries/keys";
 import { Panel } from "../ui/Panel";
 import { SegmentedControl } from "../ui/SegmentedControl";
+import { AddConnectionDialog } from "./AddConnectionDialog";
+import { ConnectionDetail } from "./ConnectionDetail";
 import { McpConnectionsGrid } from "./McpConnectionsGrid";
-import { RegistryBrowserModal } from "./RegistryBrowserModal";
 import { SkillList } from "./SkillList";
 
 export type ContextScopeTab = "workspace" | "personal";
@@ -23,9 +25,17 @@ export interface ContextHomeProps {
   onOpenSkill: (scope: ContextScopeTab, skillId: string) => void;
 }
 
+/** Snapshot taken when a detail opens, so a tab switch can't reslot it. */
+interface OpenDetail {
+  scope: ScopeRef;
+  connectionId: string;
+  readOnly: boolean;
+}
+
 export function ContextHome({ workspaceId, canManage, onOpenSkill }: ContextHomeProps) {
   const [tab, setTab] = useState<ContextScopeTab>("workspace");
   const [adding, setAdding] = useState(false);
+  const [detail, setDetail] = useState<OpenDetail | null>(null);
 
   const scope: ScopeRef =
     tab === "workspace"
@@ -63,6 +73,9 @@ export function ContextHome({ workspaceId, canManage, onOpenSkill }: ContextHome
           scope={scope}
           readOnly={readOnly}
           onAdd={() => setAdding(true)}
+          onOpen={(connection) =>
+            setDetail({ scope, connectionId: connection.id, readOnly })
+          }
         />
         <SkillList
           scope={scope}
@@ -71,12 +84,21 @@ export function ContextHome({ workspaceId, canManage, onOpenSkill }: ContextHome
         />
       </div>
 
-      <RegistryBrowserModal
+      <AddConnectionDialog
         open={adding}
         onClose={() => setAdding(false)}
         scope={scope}
         scopeLabel={scopeLabel}
       />
+
+      {detail ? (
+        <ConnectionDetail
+          scope={detail.scope}
+          connectionId={detail.connectionId}
+          readOnly={detail.readOnly}
+          onClose={() => setDetail(null)}
+        />
+      ) : null}
     </Panel>
   );
 }

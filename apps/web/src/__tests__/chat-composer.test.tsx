@@ -299,6 +299,7 @@ function chatRun(userMessage: string): RunView {
     userMessage,
     segments: [],
     pendingInputs: [],
+    authorizations: [],
     error: null,
     modelId: "deepseek/deepseek-v4-pro",
     canceled: false,

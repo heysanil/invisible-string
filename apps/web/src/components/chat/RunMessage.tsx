@@ -18,6 +18,7 @@ import type { RunInputRequest } from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
 import { ApprovalCard } from "./ApprovalCard";
+import { AuthorizationCard } from "./AuthorizationCard";
 import { ContextDivider } from "./ContextDivider";
 import { Markdown } from "./Markdown";
 import { WorkingBlock } from "./WorkingBlock";
@@ -118,6 +119,15 @@ function RunMessageImpl({
           />
         ))}
 
+        {/* Mid-run MCP consent challenges (dormant on eve 0.31.3 for platform
+            connections — spike finding 34; rendered defensively). */}
+        {run.authorizations.map((authorization) => (
+          <AuthorizationCard
+            key={authorization.name}
+            authorization={authorization}
+          />
+        ))}
+
         {run.error !== null ? (
           <div
             role="alert"
@@ -147,7 +157,8 @@ function RunMessageImpl({
         {run.contextCleared ? <ContextDivider kind="cleared" /> : null}
 
         {/* An active run with no output yet still needs a presence cue. */}
-        {run.segments.length === 0 && run.pendingInputs.length === 0 && run.error === null &&
+        {run.segments.length === 0 && run.pendingInputs.length === 0 &&
+        run.authorizations.length === 0 && run.error === null &&
         isActive ? (
           <p className="py-1 text-[12.5px] text-ink-4">Thinking…</p>
         ) : null}

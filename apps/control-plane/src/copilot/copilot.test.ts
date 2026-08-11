@@ -40,6 +40,9 @@ const inventory: WorkspaceInventory = {
       slug: "linear",
       description: "issue tracker",
       enabled: true,
+      health: "ok",
+      tools: ["create_issue", "search_issues"],
+      toolCount: 2,
     },
     {
       id: DISABLED_CONNECTION_ID,
@@ -47,6 +50,9 @@ const inventory: WorkspaceInventory = {
       slug: "old-crm",
       description: null,
       enabled: false,
+      health: "unknown",
+      tools: [],
+      toolCount: 0,
     },
   ],
   skills: [
@@ -1480,5 +1486,48 @@ describe("agent-surface system prompt — reasoning inventory", () => {
     const spec = buildToolSpecs("agent").find((tool) => tool.name === "setModel");
     expect(spec).toBeDefined();
     expect(spec!.description).toContain("null to clear an override");
+  });
+});
+
+describe("agent-surface system prompt — connection tools + health", () => {
+  const draft = { persona: "Be helpful.", model: { preset: "balanced" } };
+
+  test("a connection with cached tools lists its health and bare tool names", () => {
+    const prompt = buildSystemPrompt({ surface: "agent", draft, inventory });
+    expect(prompt).toContain(
+      `- id=${CONNECTION_ID} name="Linear" ref=@linear health=ok tools=[create_issue, search_issues] — issue tracker`,
+    );
+  });
+
+  test("more than 40 cached tools truncate with a count marker", () => {
+    const big: WorkspaceInventory = {
+      ...inventory,
+      connections: [
+        {
+          id: CONNECTION_ID,
+          name: "Big Server",
+          slug: "big-server",
+          description: null,
+          enabled: true,
+          health: "ok",
+          // The loader caps `tools` at 40 while `toolCount` keeps the cache
+          // total (inventory.test.ts proves that mapping against the DB).
+          tools: Array.from({ length: 40 }, (_, i) => `tool_${i + 1}`),
+          toolCount: 45,
+        },
+      ],
+    };
+    const prompt = buildSystemPrompt({ surface: "agent", draft, inventory: big });
+    expect(prompt).toContain("tool_40");
+    expect(prompt).toContain("…+5 more]");
+    expect(prompt).not.toContain("tool_41");
+  });
+
+  test("a connection with no cached tools renders no tools clause", () => {
+    const prompt = buildSystemPrompt({ surface: "agent", draft, inventory });
+    expect(prompt).toContain(
+      `- id=${DISABLED_CONNECTION_ID} name="Old CRM" ref=@old-crm health=unknown (disabled)`,
+    );
+    expect(prompt).not.toContain("health=unknown (disabled) tools=");
   });
 });

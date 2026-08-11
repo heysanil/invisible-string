@@ -10,8 +10,11 @@
 import { and, eq, type SQL } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
+  ConnectionDto,
+  ConnectionOauthStatus,
+  ConnectorCatalogEntry,
+  Logger,
   MasterKey,
-  McpConnectionDto,
   ModelAllowlistEntryDto,
   ModelPresetDto,
   SkillDto,
@@ -21,7 +24,9 @@ import type { ArtifactStore } from "../artifacts";
 import type { Auth } from "../auth";
 import type { CompileAgentFn } from "../build/compiler-contract";
 import type { Db } from "../db";
+import type { OauthBrokerDeps } from "../oauth/broker";
 import { errors } from "../runtime/errors";
+import type { MeiliClient } from "../search/meili";
 import type { WorkspaceDeps } from "../workspace";
 import type { OpenRouterCatalog } from "./openrouter-catalog";
 import type { RegistryClient } from "./registry";
@@ -37,6 +42,12 @@ export interface ResourceDeps {
   artifacts: ArtifactStore | undefined;
   registry: RegistryClient;
   /**
+   * Meilisearch client backing `GET /mcp-registry/search` (the registry
+   * mirror). Null = community search degraded to a typed 503 — the catalog
+   * and custom-URL lanes never depend on it (connectors spec §5).
+   */
+  meili: MeiliClient | null;
+  /**
    * OpenRouter model-catalog lookup: allowlist-add validation AND the model
    * capabilities (supported reasoning efforts, context window) the effort
    * selectors read (advisory, fail-open — see resources/openrouter-catalog.ts).
@@ -44,6 +55,31 @@ export interface ResourceDeps {
    * and report every model's capabilities as unknown.
    */
   openRouterCatalog?: OpenRouterCatalog;
+  /**
+   * Guarded egress fetch for MCP probes (net/guarded-fetch.ts): the ONLY path
+   * a caller-influenced URL may leave the control plane on — DNS-validated,
+   * IP-pinned, redirect-re-validated. Constructed ONCE in index.ts from the
+   * runtime config's `mcpProbeAllowPrivate` (MCP_PROBE_ALLOW_PRIVATE).
+   */
+  probeFetch: typeof fetch;
+  /**
+   * OAuth consent broker dependencies (oauth/broker.ts) — the
+   * `/connections/:id/oauth/start` routes run on them. Shares the guarded
+   * egress fetch with the probe (one egress policy for all
+   * caller-influenced URLs).
+   */
+  oauthBroker: OauthBrokerDeps;
+  /**
+   * Test seam: overrides the checked-in connector catalog
+   * (resources/catalog.ts) so gated suites can install synthetic recipes —
+   * production always uses the module-load-validated JSON.
+   */
+  catalog?: ReadonlyMap<string, ConnectorCatalogEntry>;
+  /**
+   * Structured logger for fire-and-forget resource work (the after-create
+   * connection probe) — request-path failures surface as typed errors instead.
+   */
+  logger: Logger;
 }
 
 /** Resource owner: an organization (workspace scope) or a user (user scope). */
@@ -51,9 +87,9 @@ export type Scope =
   | { kind: "workspace"; organizationId: string }
   | { kind: "user"; userId: string };
 
-/** drizzle WHERE for a scoped table (mcp_connections / skills share columns). */
+/** drizzle WHERE for a scoped table (connections / skills share columns). */
 export function scopeWhere(
-  table: typeof schema.mcpConnections | typeof schema.skills,
+  table: typeof schema.connections | typeof schema.skills,
   scope: Scope,
 ): SQL {
   return scope.kind === "workspace"
@@ -95,27 +131,45 @@ export function parseBody<T>(
 
 // ── DTO mappers ──────────────────────────────────────────────────────────────
 
-type McpConnectionRow = typeof schema.mcpConnections.$inferSelect;
+type ConnectionRow = typeof schema.connections.$inferSelect;
 type SkillRow = typeof schema.skills.$inferSelect;
 type ModelPresetRow = typeof schema.modelPresets.$inferSelect;
 type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
 
-/** Secrets are NEVER echoed — only `hasCredentials`. */
-export function mcpConnectionDto(row: McpConnectionRow): McpConnectionDto {
+/**
+ * Rebuilt `connections` row → wire DTO. Secrets are NEVER echoed — only
+ * `hasCredentials` (an `oauth` row always counts as credentialed).
+ * `oauthStatus` is caller-supplied: create passes the newborn grant's
+ * `pending`; every reader of an oauth row loads its `connection_oauth`
+ * status (resources/connections.ts `oauthStatusOf`) — a null here means
+ * "not an oauth connection", never "status unknown".
+ */
+export function connectionDto(
+  row: ConnectionRow,
+  oauthStatus: ConnectionOauthStatus | null = null,
+): ConnectionDto {
   return {
     id: row.id,
     scope: row.scope,
     name: row.name,
     description: row.description,
     source: row.source,
-    registryId: row.registryId,
+    catalogSlug: row.catalogSlug,
+    registryName: row.registryName,
     url: row.url,
+    transport: row.transport,
+    authType: row.authType,
+    hasCredentials: row.authConfigEncrypted != null || row.authType === "oauth",
+    oauthStatus,
     toolAllow: row.toolAllow ?? null,
     toolBlock: row.toolBlock ?? null,
-    approvalPolicy:
-      (row.approvalPolicy as McpConnectionDto["approvalPolicy"]) ?? null,
+    approvalPolicy: (row.approvalPolicy as ConnectionDto["approvalPolicy"]) ?? null,
     enabled: row.enabled,
-    hasCredentials: row.authConfigEncrypted != null,
+    health: row.health,
+    lastCheckedAt: row.lastCheckedAt?.toISOString() ?? null,
+    lastError: row.lastError,
+    tools: row.toolsCache ?? null,
+    toolsCachedAt: row.toolsCachedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

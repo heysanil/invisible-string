@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  encryptSecret,
   generateMasterKeyBase64,
   parseMasterKey,
   type McpAuthWrite,
@@ -13,21 +14,31 @@ import {
   mcpTokenEnvName,
 } from "../runtime/agent-env";
 import { RuntimeApiError } from "../runtime/errors";
-import { encryptMcpAuthConfig } from "./mcp-crypto";
+import {
+  connectionAuthAad,
+  decryptConnectionAuthHeaders,
+  encryptConnectionAuthConfig,
+} from "./mcp-crypto";
 
 const KEY = parseMasterKey(generateMasterKeyBase64());
-const ID = "11111111-1111-4111-8111-111111111111";
+const ID = "cn_a1b2c3d4e5f6a7b8";
 
-describe("encryptMcpAuthConfig / decrypt round-trip", () => {
+describe("connectionAuthAad", () => {
+  test("binds table+column+row id for the connections table", () => {
+    expect(connectionAuthAad(ID)).toBe(`connections:auth_config:${ID}`);
+  });
+});
+
+describe("encryptConnectionAuthConfig / decrypt round-trip", () => {
   test("none clears credentials (null envelope)", () => {
-    expect(encryptMcpAuthConfig({ type: "none" }, KEY, ID)).toBeNull();
+    expect(encryptConnectionAuthConfig({ type: "none" }, KEY, ID)).toBeNull();
     expect(decryptMcpAuthConfig(null, KEY, ID)).toBeNull();
     expect(mcpAuthShape(null, KEY, ID)).toEqual({ kind: "none" });
   });
 
   test("bearer round-trips and its shape is bearer", () => {
     const write: McpAuthWrite = { type: "bearer", values: { token: "sk-secret" } };
-    const stored = encryptMcpAuthConfig(write, KEY, ID)!;
+    const stored = encryptConnectionAuthConfig(write, KEY, ID)!;
     expect(stored).not.toContain("sk-secret"); // encrypted at rest
     const config = decryptMcpAuthConfig(stored, KEY, ID);
     expect(config).toMatchObject({ type: "bearer", token: "sk-secret" });
@@ -39,7 +50,7 @@ describe("encryptMcpAuthConfig / decrypt round-trip", () => {
       type: "headers",
       values: { "X-Api-Key": "abc", Authorization: "Bearer z" },
     };
-    const stored = encryptMcpAuthConfig(write, KEY, ID)!;
+    const stored = encryptConnectionAuthConfig(write, KEY, ID)!;
     expect(stored).not.toContain("abc");
     const config = decryptMcpAuthConfig(stored, KEY, ID);
     expect(config).toMatchObject({
@@ -55,13 +66,89 @@ describe("encryptMcpAuthConfig / decrypt round-trip", () => {
   });
 
   test("AAD binding: an envelope moved to another row id fails to decrypt", () => {
-    const stored = encryptMcpAuthConfig(
+    const stored = encryptConnectionAuthConfig(
       { type: "bearer", values: { token: "t" } },
       KEY,
       ID,
     )!;
     expect(() =>
-      decryptMcpAuthConfig(stored, KEY, "22222222-2222-4222-8222-222222222222"),
+      decryptMcpAuthConfig(stored, KEY, "cn_zzzzzzzzzzzzzzzz"),
+    ).toThrow(RuntimeApiError);
+  });
+
+  test("AAD binding: an envelope lifted from the dead mcp_connections table fails", () => {
+    // Same row id, but the envelope was minted under the OLD table's AAD —
+    // relocating it onto a `connections` row must fail authentication.
+    const envelope = encryptSecret(
+      JSON.stringify({ type: "bearer", token: "t" }),
+      KEY,
+      `mcp_connections:auth_config:${ID}`,
+    );
+    expect(() =>
+      decryptMcpAuthConfig(JSON.stringify(envelope), KEY, ID),
+    ).toThrow(RuntimeApiError);
+  });
+});
+
+describe("decryptConnectionAuthHeaders (probe read side)", () => {
+  test("none and oauth contribute no headers", () => {
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "none", authConfigEncrypted: null },
+        KEY,
+      ),
+    ).toEqual({});
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "oauth", authConfigEncrypted: null },
+        KEY,
+      ),
+    ).toEqual({});
+  });
+
+  test("bearer becomes an Authorization header", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "bearer", values: { token: "sk-secret" } },
+      KEY,
+      ID,
+    )!;
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "bearer", authConfigEncrypted: stored },
+        KEY,
+      ),
+    ).toEqual({ Authorization: "Bearer sk-secret" });
+  });
+
+  test("headers decrypt as stored", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "headers", values: { "X-Api-Key": "abc" } },
+      KEY,
+      ID,
+    )!;
+    expect(
+      decryptConnectionAuthHeaders(
+        { id: ID, authType: "headers", authConfigEncrypted: stored },
+        KEY,
+      ),
+    ).toEqual({ "X-Api-Key": "abc" });
+  });
+
+  test("an envelope moved to another row fails as a typed error", () => {
+    const stored = encryptConnectionAuthConfig(
+      { type: "bearer", values: { token: "t" } },
+      KEY,
+      ID,
+    )!;
+    expect(() =>
+      decryptConnectionAuthHeaders(
+        {
+          id: "cn_zzzzzzzzzzzzzzzz",
+          authType: "bearer",
+          authConfigEncrypted: stored,
+        },
+        KEY,
+      ),
     ).toThrow(RuntimeApiError);
   });
 });

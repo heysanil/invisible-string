@@ -9,29 +9,83 @@ it all down.
 
 The global setup (in order):
 
-1. `docker compose -p p2e2e up` — postgres, garage, dex (ports offset from the
-   dev `:5432/:3900/:5556` and phase-1 `:5443` stacks, so all three coexist).
+1. `docker compose -p p2e2e up` — postgres, garage, dex, meilisearch (ports
+   offset from the dev `:5432/:3900/:5556/:7700` and phase-1 `:5443` stacks,
+   so all three coexist; meilisearch rides `:7710`).
 2. Fresh product DB + migrations + demo seed (`scripts/db-setup.ts`, under Bun).
 3. Production `vite build` of the SPA with `VITE_API_URL` baked at the
    control-plane origin.
 4. Managed processes with readiness gates: **stub server** (a real MCP server
-   on the official SDK + the MCP-registry REST API), **control-plane**,
-   **worker**, **vite preview**. Node 24 (mise) is pinned first on the
-   control-plane/worker PATH so the real `eve build` and agent boot never fall
-   through to a system Node.
+   on the official SDK + the MCP-registry REST API + an OAuth-protected MCP
+   endpoint at `/mcp-oauth` whose `tools/call` demands a bearer the stub AS
+   issued), **stub OAuth AS** (`scripts/stub-as.ts` — RFC 8414 metadata, an
+   interstitial-Approve `/authorize`, PKCE-validating `/token` with a
+   refresh grant and deliberately short 30 s access tokens, RFC 7591 DCR, and
+   the `__expire`/`__mode`/`__introspect`/`__stats` test hooks),
+   **control-plane**, **worker**, **vite preview**. Node 24 (mise) is pinned
+   first on the control-plane/worker PATH so the real `eve build` and agent
+   boot never fall through to a system Node. The control plane also gets
+   `PLATFORM_API_URL` (its own origin) so compiled agents with
+   broker-delivered OAuth connections can reach
+   `POST /internal/connections/token`.
+5. A gate on the **registry→Meilisearch sync**: the control plane's sync ETL
+   (ticking fast — `REGISTRY_SYNC_INTERVAL_MS=5000`) pages the stub registry
+   into the community-search index; setup polls `GET /mcp-registry/search`
+   (through a throwaway Better Auth session) until the stub server is
+   indexed, so the search-lane specs never race the first sync.
 
 Everything except the LLM is real: Better Auth, the compiler, a real
 `eve build`, the worker + a real compiled agent, and eve's built-in mock model
 (`EVE_MOCK_AUTHORED_MODELS`) so no provider key is ever needed. The copilot
 runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
-`support/copilot-script.ts`).
+`support/copilot-script.ts`). The control plane boots with
+`MCP_PROBE_ALLOW_PRIVATE=1`: the connection health probes (after-create and
+Test connection) ride the guarded egress fetch, which would otherwise reject
+the stub MCP server twice over (loopback address, plain http).
 
 ## Specs (`specs/*.e2e.ts`)
 
 - **auth** — signup → land in the shell; logout; login (+ a bad-password path).
+- **add-connection** — the add-connection dialog's three lanes: the curated
+  catalog renders its seeded tiles with zero network calls; community search
+  (the Meilisearch mirror) surfaces the stub server with its Verified badge
+  and gates the install behind its declared secret header; a custom-URL
+  server is added on a distinct stub path. The community install then rides
+  the full spine — attach → publish (a real eve build compiled from the
+  `cn_`-id, secret-bearing connection row) → chat to a streamed reply —
+  proving compile/dispatch on the rebuilt connections domain end-to-end.
+  Search degradation (`search_unavailable`) is left to unit tests: it would
+  need a second control-plane boot without `MEILISEARCH_URL`.
+- **connection-health** — the probe/tool-picker journey on a custom-URL
+  connection: the fire-and-forget after-create probe lands (green health dot +
+  discovered tool count on the card, asserted through a reload poll), the
+  detail's health panel shows Healthy with a fresh last-checked stamp, the
+  tool picker lists the discovered `save_note` as a checkbox and allow-listing
+  it persists `toolAllow`, Test connection re-probes on demand (the probe POST
+  returns the fresh DTO with `health: "ok"`), and the connection still
+  attaches to an agent. Stops before publish — the build-bearing spine is
+  add-connection's job.
+- **oauth-connection** — the FULL OAuth broker spine: a custom connection on
+  the stub's `/mcp-oauth` is created with `auth:{type:"oauth"}` (via the
+  unified create API — the custom-URL dialog has no OAuth lane; catalog
+  recipes own the UI entry point), then everything else is UI: Connect from
+  the detail runs real discovery (401 → PRM pointer → stub AS metadata) →
+  DCR → PKCE consent in a popup (the spec clicks the stub AS's Approve
+  interstitial) → the callback closes the popup and the panel flips to
+  Connected; the post-connect probe lands `ok` with the discovered tool;
+  attach → publish → chat drives the `connection_search` choreography and a
+  `securenotes__save_note` call whose bearer the stub MCP server validates
+  against the stub AS — proving compiled-agent `getToken` →
+  `POST /internal/connections/token` → central refresh end to end (the AS
+  issues 30 s tokens, below both 60 s expiry margins, so every read
+  refreshes). `POST /__expire` then kills every outstanding token and the
+  next call still succeeds (only a fresh refresh explains it); finally the
+  AS flips to `invalid_grant` — the run surfaces a failed tool call (never a
+  hang) and the connection lands `auth_error` with a Reconnect affordance.
 - **agent-workflow** (THE acceptance, agents-first) — author a skill (with a
-  file attachment) and two MCP connections (one via the registry browser, one
-  custom-URL) in `/context`; **build an agent** in `/agents` (persona typed in
+  file attachment) and two MCP connections (one installed through the
+  dialog's community-search lane, one custom-URL) in `/context`; **build an
+  agent** in `/agents` (persona typed in
   the markdown editor, Balanced preset, both connections + the skill
   attached); **publish** it (the agent is the compile unit — real eve build,
   wait for the ready chip); **chat with it** through the "New chat" agent
@@ -79,13 +133,19 @@ runs on a deterministic scripted fake (`COPILOT_FAKE_SCRIPT` — see
 
 > eve's mock model exposes its **built-in** tools to the top-level model but
 > routes **MCP connection** tools behind a `connection_search` sub-agent it
-> never delegates to. A published agent genuinely connects to its MCP servers
-> (the stub logs the `initialize`/`tools/list` handshakes), but run
-> assertions are driven with mock-reachable tools (`todo` for the
-> working-block step, `ask_question` for the HITL card) — the same
-> streamed-step and `input.requested` code paths, without a real LLM. A
-> `Reply with exactly: …` line in the persona/instructions makes the mock's
-> prose deterministic.
+> never delegates to **on its own** — and MCP connections attach lazily
+> through that sub-agent, so under the mock a published agent never even
+> opens an MCP session to the stub unprompted. Run assertions are therefore
+> driven with mock-reachable tools (`todo` for the working-block step,
+> `ask_question` for the HITL card) — the same streamed-step and
+> `input.requested` code paths, without a real LLM. A `Reply with
+> exactly: …` line in the persona/instructions makes the mock's prose
+> deterministic. When a spec DOES need a real MCP tool call (oauth-connection
+> does), the choreography from `spike/REPORT.md` finding 30 works: an
+> explicit `Call the connection_search tool with connection "<slug>" and
+> keywords "…"` turn performs discovery, after which the discovered
+> `<slug>__<tool>` names are re-advertised to the top-level model on every
+> later turn of the same session and can be called by name.
 
 Note on builds: every fresh workspace also auto-publishes its seeded
 "General Purpose" agent in the background (a real eve build — content hashes
@@ -97,9 +157,11 @@ chip; the others simply ignore it.
 
 - `flows.ts` — signup/login/workspace seeding (Better Auth REST via the
   browser's session cookie).
-- `authoring.ts` — `/context` authoring: skills with attachments, registry +
-  custom-URL MCP connections, and `gotoSection` (Chat · Agents · Workflows ·
-  Context · Settings).
+- `authoring.ts` — `/context` authoring: skills with attachments, the
+  add-connection dialog's community-search install (named after the stub
+  server's title — community installs have no name field) + custom-URL
+  connections, and `gotoSection` (Chat · Agents · Workflows · Context ·
+  Settings).
 - `builder.ts` — the agents-first spine: `openNewAgent` / `writePersona` /
   `setAgentModelPreset` / `attachAgentResource` / `setAgentConnectionApproval`
   / `publishAgentAndWaitReady` (real build) / `waitForAgentPublished` (seeded

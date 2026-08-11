@@ -34,6 +34,7 @@
  */
 import { and, asc, count, eq, inArray, ne } from "drizzle-orm";
 import { Elysia } from "elysia";
+import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
 import { schema } from "@invisible-string/db";
 import {
@@ -81,8 +82,15 @@ import {
 } from "./compile-service";
 import type { RuntimeConfig } from "./config";
 import { dispatchTriggerRun } from "./dispatch";
+import { getAccessToken, type TokenLifecycleDeps } from "../oauth/tokens";
 import { errors, isRuntimeApiError, RuntimeApiError } from "./errors";
-import { agentJwtParams, mintPlatformJwt } from "./jwt";
+import {
+  agentJwtParams,
+  derivePlatformJwtSecret,
+  mintPlatformJwt,
+  PLATFORM_JWT_ISSUER,
+  platformJwtAudienceForHash,
+} from "./jwt";
 import {
   createDrizzleMetricsReader,
   metricsPlugin,
@@ -111,6 +119,14 @@ export interface RuntimeDeps {
    * onFinish hook and boot recovery (reconcileInterruptedRuns) consume it.
    */
   delivery?: DeliveryService;
+  /**
+   * OAuth token lifecycle deps (oauth/tokens.ts) behind the agent-facing
+   * POST /internal/connections/token route. Optional so focused test fixtures
+   * need not wire it; createAppStack always does — the OAuth broker deps
+   * satisfy it structurally, so both surfaces share ONE guarded egress fetch
+   * and ONE master key. Unwired ⇒ the route answers 503.
+   */
+  oauthTokens?: TokenLifecycleDeps;
   /** In-process fleet metrics (GET /internal/metrics). */
   metrics: MetricsRegistry;
   /** Structured, redaction-safe logger (correlation ids threaded per call). */
@@ -317,6 +333,48 @@ export async function ensureAgentOnWorker(
   }
 }
 
+/**
+ * Flip a connection's health to `auth_required` off a mid-run
+ * `authorization.required` event (connectors redesign spec §6). eve names the
+ * connection by its per-version SLUG (the emitted `defineMcpClientConnection`
+ * name), which resolves to a `cn_` row through the agent version's
+ * `connection_slugs` map — persisted at publish from the same unique-slug
+ * pass the compiler bakes into the generated files. Rows published before the
+ * column existed carry null (`?? {}`); an unknown slug is a logged no-op,
+ * never an error (the event is server-influenced content).
+ *
+ * DORMANT on eve 0.31.3 for platform connections (spike REPORT finding 34):
+ * getToken-only strategies surface a mid-run 401 as a plain failed tool call
+ * and this path never fires. It is wired defensively for an eve that starts
+ * emitting the declared `authorization.*` events.
+ */
+export async function flipConnectionAuthRequired(
+  deps: Pick<RuntimeDeps, "db" | "logger">,
+  contentHash: string,
+  connectionName: string,
+): Promise<void> {
+  const versions = await deps.db
+    .select({ connectionSlugs: schema.agentVersions.connectionSlugs })
+    .from(schema.agentVersions)
+    .where(eq(schema.agentVersions.contentHash, contentHash))
+    .limit(1);
+  const slugs = versions[0]?.connectionSlugs ?? {};
+  const connectionId = slugs[connectionName];
+  if (connectionId === undefined) {
+    deps.logger.warn("run.authorization_slug_unresolved", {
+      fields: { contentHash, connectionName },
+    });
+    return;
+  }
+  await deps.db
+    .update(schema.connections)
+    .set({ health: "auth_required" })
+    .where(eq(schema.connections.id, connectionId));
+  deps.logger.info("connection.health_auth_required", {
+    fields: { connectionId, contentHash, connectionName },
+  });
+}
+
 export function startTail(
   deps: RuntimeDeps,
   workerAddress: string,
@@ -332,6 +390,21 @@ export function startTail(
   deps.tailers.start({
     runId,
     agentSessionId,
+    // Mid-run consent challenge → the named connection needs authorization.
+    // Fire-and-forget: a health flip must never stall or fail the tail.
+    onAuthorizationRequired: ({ connectionName }) => {
+      void flipConnectionAuthRequired(deps, contentHash, connectionName).catch(
+        (error: unknown) => {
+          deps.logger.warn("run.authorization_health_flip_failed", {
+            runId,
+            fields: {
+              connectionName,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          });
+        },
+      );
+    },
     // `options` carries the tailer's per-connect stream flags (today:
     // includeTailIndex for the bounded catch-up read). The DECISION is the
     // tailer's — call sites stay ignorant of it.
@@ -606,6 +679,18 @@ export async function publishAgent(
     .limit(1);
 
   let version = existing[0];
+  if (version && version.connectionSlugs === null) {
+    // Republish-to-migrate: a row published before `connection_slugs` existed
+    // adopts the map on the next publish of the same hash. Safe to derive from
+    // THIS publish's inputs — slugs are baked into the hashed files, so an
+    // identical content hash implies identical slugs.
+    const backfilled = await deps.db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: inputs.connectionSlugs })
+      .where(eq(schema.agentVersions.id, version.id))
+      .returning();
+    version = backfilled[0] ?? version;
+  }
   if (!version) {
     const inserted = await deps.db
       .insert(schema.agentVersions)
@@ -617,6 +702,7 @@ export async function publishAgent(
         eveVersion: compiled.eveVersion,
         modelProvider: inputs.model.provider,
         modelId: inputs.model.modelId,
+        connectionSlugs: inputs.connectionSlugs,
         buildStatus: "pending",
       })
       .onConflictDoNothing({
@@ -703,6 +789,136 @@ export async function publishAgentByName(
   return publishAgent(deps, organizationId, agent.id);
 }
 
+// ── agent-facing token broker (POST /internal/connections/token) ────────────
+
+/**
+ * Version-bound audience shape (`agent-version:<64-hex content hash>`). The
+ * strict match is load-bearing: it rejects the bare `agent-version` audience
+ * channel dispatch uses (runtime/jwt.ts), so a channel-scoped token can never
+ * reach the token broker.
+ */
+const AGENT_VERSION_AUDIENCE = /^agent-version:([0-9a-f]{64})$/;
+
+/** Body carries the connection id ONLY — any other field (e.g. a versionHash)
+ * is ignored: the version comes from the verified JWT audience. */
+const connectionTokenRequestSchema = z.object({
+  connectionId: z.string().min(1),
+});
+
+/**
+ * Serve a short-lived OAuth access token to a COMPILED AGENT (connectors
+ * redesign spec §6). Verification order is exact and security-relevant:
+ *
+ *   1. decode the UNVERIFIED `aud` claim — no signature trust yet, it only
+ *      names WHICH per-version derived secret to verify under;
+ *   2. verify signature + `exp` + issuer against that derived secret — a JWT
+ *      minted in a different version's env fails here (its secret differs);
+ *   3. resolve the agent version by the VERIFIED audience hash — never from
+ *      the request body;
+ *   4. authorize by membership: the connection id must be in that version's
+ *      compiled definition;
+ *   5. hand off to the central token lifecycle (oauth/tokens.ts) — refresh
+ *      material NEVER leaves the control plane, the response is
+ *      `{token, expiresAt}` only.
+ */
+async function serveConnectionToken(
+  deps: RuntimeDeps,
+  request: Request,
+  rawBody: unknown,
+): Promise<{ token: string; expiresAt: string }> {
+  // One opaque 401 for every credential failure — the response must not
+  // reveal whether the JWT was absent, malformed, expired, or cross-version.
+  const unauthorized = () =>
+    new RuntimeApiError(401, "unauthorized", "missing or invalid platform JWT");
+
+  const bearer = /^Bearer\s+(.+)$/i.exec(
+    request.headers.get("authorization") ?? "",
+  );
+  if (!bearer) throw unauthorized();
+  const jwt = bearer[1]!;
+
+  let aud: string | undefined;
+  try {
+    const unverified = decodeJwt(jwt);
+    aud = Array.isArray(unverified.aud) ? unverified.aud[0] : unverified.aud;
+  } catch {
+    throw unauthorized();
+  }
+  const matched = AGENT_VERSION_AUDIENCE.exec(aud ?? "");
+  if (!matched) throw unauthorized();
+  const hash = matched[1]!;
+
+  try {
+    await jwtVerify(
+      jwt,
+      new TextEncoder().encode(
+        derivePlatformJwtSecret(deps.runtime.platformJwtSecret, hash),
+      ),
+      {
+        issuer: PLATFORM_JWT_ISSUER,
+        audience: platformJwtAudienceForHash(hash),
+      },
+    );
+  } catch {
+    throw unauthorized();
+  }
+
+  // Version rows sharing a content hash carry identical definitions (the
+  // hash covers the definition), so the first row decides membership.
+  const versions = await deps.db
+    .select()
+    .from(schema.agentVersions)
+    .where(eq(schema.agentVersions.contentHash, hash))
+    .limit(1);
+  const version = versions[0];
+  if (!version) throw unauthorized();
+
+  const parsed = connectionTokenRequestSchema.safeParse(rawBody);
+  if (!parsed.success) throw errors.invalidBody(parsed.error.issues);
+  const { connectionId } = parsed.data;
+
+  const definition = parseAgentDefinition(version.definition);
+  if (!definition.context.mcpConnectionIds.includes(connectionId)) {
+    throw new RuntimeApiError(
+      403,
+      "connection_not_in_version",
+      "connection is not part of this agent version's definition",
+    );
+  }
+
+  if (!deps.oauthTokens) {
+    throw new RuntimeApiError(
+      503,
+      "oauth_broker_unavailable",
+      "the OAuth token broker is not configured on this control plane",
+    );
+  }
+  const { token, expiresAt } = await getAccessToken(
+    deps.oauthTokens,
+    connectionId,
+  );
+  return { token, expiresAt: expiresAt.toISOString() };
+}
+
+function connectionTokenPlugin(deps: RuntimeDeps) {
+  return new Elysia({ name: "connection-token" }).post(
+    "/internal/connections/token",
+    async ({ request, body, set }) => {
+      try {
+        return await serveConnectionToken(deps, request, body);
+      } catch (error) {
+        // Self-contained error translation (like metricsPlugin): this plugin
+        // mounts before the runtime plugin's onError registration.
+        if (isRuntimeApiError(error)) {
+          set.status = error.status;
+          return error.toBody();
+        }
+        throw error;
+      }
+    },
+  );
+}
+
 // ── the plugin ──────────────────────────────────────────────────────────────
 
 export function runtimePlugin(deps: RuntimeDeps) {
@@ -730,6 +946,14 @@ export function runtimePlugin(deps: RuntimeDeps) {
         workerSharedSecret: runtime.workerSharedSecret,
       }),
     )
+    // POST /internal/connections/token — agent-facing OAuth token broker.
+    // Shares the /internal/* prefix with the worker plane above but NOT its
+    // auth model: callers are COMPILED AGENTS presenting a version-bound
+    // platform JWT (audience `agent-version:<hash>`, signed with their
+    // per-version derived PLATFORM_JWT_SECRET) — never x-worker-secret. Like
+    // every /internal/* route it must not be internet-reachable
+    // (docs/runtime-worker-contract.md deployment constraints).
+    .use(connectionTokenPlugin(deps))
     .use(workspacePlugin(deps.workspaceDeps))
     .onError(({ error, set }) => {
       if (isRuntimeApiError(error)) {

@@ -23,18 +23,17 @@ import {
   type AgentDefinitionInput,
   type CreateSessionResponse,
   type GetAgentResponse,
-  type GetMcpConnectionResponse,
+  type GetConnectionResponse,
   type GetModelPresetResponse,
   type GetSkillResponse,
   type GetWorkflowResponse,
-  type ListMcpConnectionsResponse,
+  type ListConnectionsResponse,
   type ListModelCapabilitiesResponse,
   type ListModelPresetsResponse,
   type ListSessionsResponse,
   type ListWorkflowsResponse,
   type ListWorkspaceMembersResponse,
   type PublishAgentResponse,
-  type RegistrySearchResponse,
   type RegistryServerSummary,
   type RunInputResponse,
   type UpdateAgentResponse,
@@ -129,9 +128,6 @@ const REGISTRY_SERVER: RegistryServerSummary = {
 };
 
 const stubRegistry: RegistryClient = {
-  async search(query) {
-    return query.toLowerCase().includes("linear") ? [REGISTRY_SERVER] : [];
-  },
   async getServer(name) {
     return name === REGISTRY_SERVER.name ? REGISTRY_SERVER : null;
   },
@@ -541,49 +537,293 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(anon.status).toBe(401);
   });
 
-  // ── MCP connections + secrets + registry + delete guard ──────────────────
+  // ── connections (rebuilt domain): sources, secrets, guards, authz ────────
 
-  test("mcp connections: bearer secret encrypted + never echoed; CRUD; user scope", async () => {
-    const create = await api("POST", `/workspaces/${orgId}/mcp-connections`, {
+  test("connections: custom create mints cn_ ids, encrypts bearer secrets, never echoes; user scope isolated", async () => {
+    const create = await api("POST", `/workspaces/${orgId}/connections`, {
       cookie: ownerCookie,
       body: {
+        source: "custom",
         name: "Linear",
         url: "https://mcp.linear.app/mcp",
         auth: { type: "bearer", values: { token: "sk-super-secret" } },
-        approvalPolicy: { default: "never", tools: { delete_page: "always" } },
       },
     });
     expect(create.status).toBe(201);
-    const conn = ((await create.json()) as GetMcpConnectionResponse).connection;
+    const conn = ((await create.json()) as GetConnectionResponse).connection;
+    expect(conn.id).toMatch(/^cn_[0-9a-z]{16}$/);
+    expect(conn.source).toBe("custom");
+    expect(conn.transport).toBe("streamable-http");
+    expect(conn.authType).toBe("bearer");
+    expect(conn.health).toBe("unknown");
     expect(conn.hasCredentials).toBeTrue();
     // The secret is NEVER present in any serialized field.
     expect(JSON.stringify(conn)).not.toContain("sk-super-secret");
 
-    const stored = await db.select({ enc: schema.mcpConnections.authConfigEncrypted }).from(schema.mcpConnections).where(eq(schema.mcpConnections.id, conn.id));
+    const stored = await db.select({ enc: schema.connections.authConfigEncrypted }).from(schema.connections).where(eq(schema.connections.id, conn.id));
     expect(stored[0]!.enc).not.toBeNull();
     expect(stored[0]!.enc!).not.toContain("sk-super-secret"); // encrypted at rest
 
-    const get = await api("GET", `/workspaces/${orgId}/mcp-connections/${conn.id}`, { cookie: ownerCookie });
+    const get = await api("GET", `/workspaces/${orgId}/connections/${conn.id}`, { cookie: ownerCookie });
+    expect(get.status).toBe(200);
     expect(JSON.stringify(await get.json())).not.toContain("sk-super-secret");
 
+    // Auth-less custom create stays credential-less.
+    const plain = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Docs", url: "https://mcp.example/docs" },
+    });
+    expect(plain.status).toBe(201);
+    const plainConn = ((await plain.json()) as GetConnectionResponse).connection;
+    expect(plainConn.authType).toBe("none");
+    expect(plainConn.hasCredentials).toBeFalse();
+
     // User-scoped create under /me.
-    const meCreate = await api("POST", `/me/mcp-connections`, { cookie: ownerCookie, body: { name: "Personal", url: "https://mcp.example/mcp" } });
+    const meCreate = await api("POST", `/me/connections`, { cookie: ownerCookie, body: { source: "custom", name: "Personal", url: "https://mcp.example/mcp" } });
     expect(meCreate.status).toBe(201);
-    const meList = await api("GET", `/me/mcp-connections`, { cookie: ownerCookie });
-    const meConns = ((await meList.json()) as ListMcpConnectionsResponse).connections;
+    const meList = await api("GET", `/me/connections`, { cookie: ownerCookie });
+    const meConns = ((await meList.json()) as ListConnectionsResponse).connections;
     expect(meConns.some((c) => c.scope === "user" && c.name === "Personal")).toBeTrue();
     // Workspace list must NOT include the user-scoped connection.
-    const wsList = await api("GET", `/workspaces/${orgId}/mcp-connections`, { cookie: ownerCookie });
-    const wsConns = ((await wsList.json()) as ListMcpConnectionsResponse).connections;
+    const wsList = await api("GET", `/workspaces/${orgId}/connections`, { cookie: ownerCookie });
+    const wsConns = ((await wsList.json()) as ListConnectionsResponse).connections;
     expect(wsConns.some((c) => c.name === "Personal")).toBeFalse();
   });
 
-  test("mcp connections: DELETE blocked (409) while an agent references it", async () => {
-    const create = await api("POST", `/workspaces/${orgId}/mcp-connections`, {
+  test("connections: catalog create seeds from the recipe; unknown slug 404; missing recipe secret 422", async () => {
+    const create = await api("POST", `/workspaces/${orgId}/connections`, {
       cookie: ownerCookie,
-      body: { name: "Referenced", url: "https://mcp.example/ref" },
+      body: { source: "catalog", slug: "deepwiki" },
     });
-    const connId = ((await create.json()) as GetMcpConnectionResponse).connection.id;
+    expect(create.status).toBe(201);
+    const conn = ((await create.json()) as GetConnectionResponse).connection;
+    expect(conn.source).toBe("catalog");
+    expect(conn.catalogSlug).toBe("deepwiki");
+    expect(conn.name).toBe("DeepWiki");
+    expect(conn.url).toBe("https://mcp.deepwiki.com/mcp");
+    expect(conn.transport).toBe("streamable-http");
+    expect(conn.authType).toBe("none");
+
+    const unknown = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "catalog", slug: "not-a-connector" },
+    });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: { code: string } }).error.code).toBe("catalog_entry_not_found");
+
+    // context7's recipe declares a secret header — creating without it is 422.
+    const missingSecret = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "catalog", slug: "context7" },
+    });
+    expect(missingSecret.status).toBe(422);
+
+    const withSecret = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "catalog",
+        slug: "context7",
+        auth: { type: "headers", values: { CONTEXT7_API_KEY: "c7-secret-key" } },
+      },
+    });
+    expect(withSecret.status).toBe(201);
+    const c7 = ((await withSecret.json()) as GetConnectionResponse).connection;
+    expect(c7.authType).toBe("headers");
+    expect(c7.hasCredentials).toBeTrue();
+    expect(JSON.stringify(c7)).not.toContain("c7-secret-key");
+  });
+
+  test("connections: registry create keeps the live remote-provenance check", async () => {
+    // Community search rides the Meilisearch mirror now; this stack has no
+    // meili client configured, so the route degrades to a typed 503 while
+    // install provenance (getServer, below) still works.
+    const search = await api("GET", `/mcp-registry/search?q=linear`, { cookie: ownerCookie });
+    expect(search.status).toBe(503);
+    expect(((await search.json()) as { error: { code: string } }).error.code).toBe(
+      "search_unavailable",
+    );
+
+    // A remote the registry does NOT advertise is rejected (a caller must not
+    // claim registry provenance while pointing credentials at another host).
+    const mismatch = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "registry",
+        registryName: "io.example/linear",
+        remoteUrl: "https://evil.example/mcp",
+      },
+    });
+    expect(mismatch.status).toBe(422);
+    expect(((await mismatch.json()) as { error: { code: string } }).error.code).toBe("registry_remote_mismatch");
+
+    const missing = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "registry", registryName: "io.example/gone", remoteUrl: "https://x.example/y" },
+    });
+    expect(missing.status).toBe(404);
+
+    const install = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "registry",
+        registryName: "io.example/linear",
+        name: "Linear Registry",
+        remoteUrl: "https://mcp.linear.app/mcp",
+        auth: { type: "headers", values: { "X-Api-Key": "key-abc" } },
+      },
+    });
+    expect(install.status).toBe(201);
+    const conn = ((await install.json()) as GetConnectionResponse).connection;
+    expect(conn.source).toBe("registry");
+    expect(conn.registryName).toBe("io.example/linear");
+    expect(conn.url).toBe("https://mcp.linear.app/mcp");
+    expect(conn.transport).toBe("streamable-http");
+    expect(conn.authType).toBe("headers");
+    expect(conn.hasCredentials).toBeTrue();
+    expect(JSON.stringify(conn)).not.toContain("key-abc");
+  });
+
+  test("connections: duplicate names and slug-identical names 409 in-scope; the other scope stays free", async () => {
+    const first = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Notion HQ", url: "https://mcp.example/notion" },
+    });
+    expect(first.status).toBe(201);
+
+    const dupName = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Notion HQ", url: "https://mcp.example/notion2" },
+    });
+    expect(dupName.status).toBe(409);
+    expect(((await dupName.json()) as { error: { code: string } }).error.code).toBe("duplicate_connection_name");
+
+    // Different name, identical slug ("Notion HQ" and "notion-hq" both
+    // slugify to "notion-hq" — the compiler filename/env-var namespace).
+    const dupSlug = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "notion-hq", url: "https://mcp.example/notion3" },
+    });
+    expect(dupSlug.status).toBe(409);
+    expect(((await dupSlug.json()) as { error: { code: string } }).error.code).toBe("duplicate_connection_slug");
+
+    // Same name in the OTHER scope is fine.
+    const otherScope = await api("POST", `/me/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Notion HQ", url: "https://mcp.example/notion" },
+    });
+    expect(otherScope.status).toBe(201);
+  });
+
+  test("connections: PATCH url/transport only for custom; rename re-checks collisions", async () => {
+    // Catalog-sourced rows keep the recipe's endpoint.
+    const hf = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "catalog",
+        slug: "hugging-face",
+        auth: { type: "bearer", values: { token: "hf-token" } },
+      },
+    });
+    expect(hf.status).toBe(201);
+    const hfConn = ((await hf.json()) as GetConnectionResponse).connection;
+    const urlPatch = await api("PATCH", `/workspaces/${orgId}/connections/${hfConn.id}`, {
+      cookie: ownerCookie,
+      body: { url: "https://evil.example/mcp" },
+    });
+    expect(urlPatch.status).toBe(422);
+
+    // Non-endpoint fields stay editable on catalog rows.
+    const rename = await api("PATCH", `/workspaces/${orgId}/connections/${hfConn.id}`, {
+      cookie: ownerCookie,
+      body: { name: "HF Hub", enabled: false },
+    });
+    expect(rename.status).toBe(200);
+    const renamed = ((await rename.json()) as GetConnectionResponse).connection;
+    expect(renamed.name).toBe("HF Hub");
+    expect(renamed.enabled).toBeFalse();
+
+    // Custom rows may re-point url/transport.
+    const custom = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Patchable", url: "https://mcp.example/a" },
+    });
+    const customConn = ((await custom.json()) as GetConnectionResponse).connection;
+    const moved = await api("PATCH", `/workspaces/${orgId}/connections/${customConn.id}`, {
+      cookie: ownerCookie,
+      body: { url: "https://mcp.example/b", transport: "sse" },
+    });
+    expect(moved.status).toBe(200);
+    const movedConn = ((await moved.json()) as GetConnectionResponse).connection;
+    expect(movedConn.url).toBe("https://mcp.example/b");
+    expect(movedConn.transport).toBe("sse");
+
+    // Renaming into an existing sibling's name/slug is the same 409 as create.
+    const clash = await api("PATCH", `/workspaces/${orgId}/connections/${customConn.id}`, {
+      cookie: ownerCookie,
+      body: { name: "HF Hub" },
+    });
+    expect(clash.status).toBe(409);
+    expect(((await clash.json()) as { error: { code: string } }).error.code).toBe("duplicate_connection_name");
+  });
+
+  test("connections: authz matrix — anonymous 401, outsider 403/404, member reads but cannot mutate", async () => {
+    const seeded = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Authz Probe", url: "https://mcp.example/authz" },
+    });
+    expect(seeded.status).toBe(201);
+    const probeId = ((await seeded.json()) as GetConnectionResponse).connection.id;
+
+    const anon = await api("GET", `/workspaces/${orgId}/connections`);
+    expect(anon.status).toBe(401);
+
+    const stranger = await signUpWithOrg("Conn Stranger");
+    // Foreign workspace path → 403.
+    const foreignPath = await api("GET", `/workspaces/${orgId}/connections`, { cookie: stranger.cookie });
+    expect(foreignPath.status).toBe(403);
+    // Foreign row under the stranger's OWN path → 404 (hidden).
+    const foreignRow = await api("GET", `/workspaces/${stranger.orgId}/connections/${probeId}`, { cookie: stranger.cookie });
+    expect(foreignRow.status).toBe(404);
+    const foreignPatch = await api("PATCH", `/workspaces/${stranger.orgId}/connections/${probeId}`, {
+      cookie: stranger.cookie,
+      body: { name: "Stolen" },
+    });
+    expect(foreignPatch.status).toBe(404);
+
+    // Workspace-scoped mutations are owner/admin-gated; reads are member ops.
+    await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    try {
+      const memberRead = await api("GET", `/workspaces/${orgId}/connections`, { cookie: ownerCookie });
+      expect(memberRead.status).toBe(200);
+      const memberGet = await api("GET", `/workspaces/${orgId}/connections/${probeId}`, { cookie: ownerCookie });
+      expect(memberGet.status).toBe(200);
+      const memberCreate = await api("POST", `/workspaces/${orgId}/connections`, {
+        cookie: ownerCookie,
+        body: { source: "custom", name: "Member Made", url: "https://mcp.example/m" },
+      });
+      expect(memberCreate.status).toBe(403);
+      const memberPatch = await api("PATCH", `/workspaces/${orgId}/connections/${probeId}`, {
+        cookie: ownerCookie,
+        body: { name: "Member Renamed" },
+      });
+      expect(memberPatch.status).toBe(403);
+      const memberDelete = await api("DELETE", `/workspaces/${orgId}/connections/${probeId}`, { cookie: ownerCookie });
+      expect(memberDelete.status).toBe(403);
+    } finally {
+      await db.update(schema.member).set({ role: "owner" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    }
+    const ownerDelete = await api("DELETE", `/workspaces/${orgId}/connections/${probeId}`, { cookie: ownerCookie });
+    expect(ownerDelete.status).toBe(200);
+  });
+
+  test("connections: DELETE blocked (409) while an agent draft references the cn_ id", async () => {
+    const create = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Referenced", url: "https://mcp.example/ref" },
+    });
+    expect(create.status).toBe(201);
+    const connId = ((await create.json()) as GetConnectionResponse).connection.id;
+    expect(connId).toMatch(/^cn_/);
     const agent = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
       body: {
@@ -595,43 +835,20 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
       },
     });
     expect(agent.status).toBe(201);
-    const agentName = ((await agent.json()) as GetAgentResponse).agent.name;
+    const agentRow = ((await agent.json()) as GetAgentResponse).agent;
 
-    const del = await api("DELETE", `/workspaces/${orgId}/mcp-connections/${connId}`, { cookie: ownerCookie });
+    const del = await api("DELETE", `/workspaces/${orgId}/connections/${connId}`, { cookie: ownerCookie });
     expect(del.status).toBe(409);
     // details = bare array of referencing AGENT names (the SPA blocker parser
     // reads bare arrays and keyed shapes alike).
     const body = (await del.json()) as { error: { code: string; details?: string[] } };
     expect(body.error.code).toBe("connection_in_use");
-    expect(body.error.details).toContain(agentName);
-  });
+    expect(body.error.details).toContain(agentRow.name);
 
-  test("mcp registry: proxy search + install create a registry-sourced connection", async () => {
-    const search = await api("GET", `/mcp-registry/search?q=linear`, { cookie: ownerCookie });
-    expect(search.status).toBe(200);
-    const servers = ((await search.json()) as RegistrySearchResponse).servers;
-    expect(servers[0]!.name).toBe("io.example/linear");
-
-    const install = await api("POST", `/workspaces/${orgId}/mcp-connections/install`, {
-      cookie: ownerCookie,
-      body: {
-        registryName: "io.example/linear",
-        remoteUrl: "https://mcp.linear.app/mcp",
-        auth: { type: "headers", values: { "X-Api-Key": "key-abc" } },
-      },
-    });
-    expect(install.status).toBe(201);
-    const conn = ((await install.json()) as GetMcpConnectionResponse).connection;
-    expect(conn.source).toBe("registry");
-    expect(conn.registryId).toBe("io.example/linear");
-    expect(conn.url).toBe("https://mcp.linear.app/mcp");
-    expect(conn.hasCredentials).toBeTrue();
-
-    const missing = await api("POST", `/workspaces/${orgId}/mcp-connections/install`, {
-      cookie: ownerCookie,
-      body: { registryName: "io.example/gone", remoteUrl: "https://x/y" },
-    });
-    expect(missing.status).toBe(404);
+    // Unreferencing the connection unblocks the delete.
+    await api("DELETE", `/workspaces/${orgId}/agents/${agentRow.id}`, { cookie: ownerCookie });
+    const freed = await api("DELETE", `/workspaces/${orgId}/connections/${connId}`, { cookie: ownerCookie });
+    expect(freed.status).toBe(200);
   });
 
   // ── skills + attachments → agent publish threads bytes into the compiler ──

@@ -20,7 +20,7 @@ import type {
   AgentDefinition,
   AgentDto,
   AgentSummaryDto,
-  McpConnectionDto,
+  ConnectionDto,
   SkillDto,
   WorkspaceMemberDto,
 } from "@invisible-string/shared";
@@ -60,20 +60,29 @@ function connection(
   id: string,
   name: string,
   description: string,
-): McpConnectionDto {
+): ConnectionDto {
   return {
     id,
     scope: "workspace",
     name,
     description,
     source: "registry",
-    registryId: `io.github.fixtures/${name}`,
+    catalogSlug: null,
+    registryName: `io.github.fixtures/${name}`,
     url: `https://mcp.example.com/${name}`,
+    transport: "streamable-http",
+    authType: "headers",
+    hasCredentials: true,
+    oauthStatus: null,
     toolAllow: null,
     toolBlock: null,
     approvalPolicy: { default: "never" },
     enabled: true,
-    hasCredentials: true,
+    health: "unknown",
+    lastCheckedAt: null,
+    lastError: null,
+    tools: null,
+    toolsCachedAt: null,
     createdAt: EARLIER,
     updatedAt: EARLIER,
   };
@@ -92,7 +101,7 @@ function skill(id: string, name: string, description: string): SkillDto {
   };
 }
 
-export const FIXTURE_AGENT_CONNECTIONS: readonly McpConnectionDto[] = [
+export const FIXTURE_AGENT_CONNECTIONS: readonly ConnectionDto[] = [
   connection(FIXTURE_CONNECTION_IDS.gmail, "gmail", "Read and send email."),
   connection(
     FIXTURE_CONNECTION_IDS.calendar,

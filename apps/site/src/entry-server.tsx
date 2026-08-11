@@ -34,11 +34,10 @@ const MAX_REDIRECTS = 10;
  * (lib/suspense-inline.ts) collapses that markup back into flat,
  * hydration-compatible HTML — see its own doc comment for the full
  * mechanics, including why it splices in `<!--$-->…<!--/$-->` rather than
- * bare content: `main.tsx` mounts via `createRoot` today, but the moment a
- * future task switches it to `hydrateRoot`, those markers are exactly what
- * `hydrateRoot` matches a `<Suspense>` boundary against — bare content would
- * make every routed page fail to hydrate and get silently discarded and
- * re-rendered client-side.
+ * bare content: `main.tsx` mounts via `hydrateRoot`, and those markers are
+ * exactly what `hydrateRoot` matches a `<Suspense>` boundary against — bare
+ * content would make every routed page fail to hydrate and get silently
+ * discarded and re-rendered client-side.
  *
  * `prerender()`'s "waits for everything" guarantee does not, on its own, mean
  * the result is safe to ship: two failure modes still resolve normally rather

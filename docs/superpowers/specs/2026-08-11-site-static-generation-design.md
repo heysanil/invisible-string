@@ -28,11 +28,17 @@ Doc bodies are loaded lazily — `getDocLoader(slug)` returns a dynamic import t
 const MdxDoc = useMemo(() => (loader ? lazy(loader) : null), [loader]);
 ```
 
-`renderToString` throws on a component that suspends ("A component suspended while responding to synchronous input"). React 19's **`prerender()` from `react-dom/static`** exists for exactly this case: it waits for every Suspense boundary to settle and resolves with complete HTML.
+React 19's **`prerender()` from `react-dom/static`** exists for exactly this case: it waits for every Suspense boundary to settle and resolves with complete HTML.
+
+*Corrected during implementation:* this section originally predicted that `renderToString` would **throw** on a suspending component. It does not — and that is worse. Verified directly: neither `renderToString` nor `renderToStaticMarkup` throws, rejects, or waits; both resolve with the boundary's **fallback**. A build on either would have shipped `Loading…` as the body of all 28 docs pages with nothing failing anywhere. `prerender()` is the only API that genuinely waits.
 
 This one API choice is what makes the whole design cheap. The alternative — resolving MDX eagerly for SSR — would mean a second, non-lazy glob in `docs.ts` and a divergence between what the server renders and what the client loads. With `prerender()`, `docs.ts` is untouched.
 
 The mirror-image concern on the client is already handled by React: `hydrateRoot` does **not** discard server HTML inside a Suspense boundary whose lazy component hasn't loaded yet. Selective hydration retains the markup and hydrates when the chunk arrives, so there is no content flash on first paint.
+
+That is true of the *lazy body*, but hydration as a whole was **not** a drop-in — see §3.
+
+`prerender()`'s completeness guarantee also turns out to be about content, not *placement*: a boundary that suspends even once during the render pass is emitted in React's streaming form (`<!--$?-->` + fallback, real content parked in `<div hidden id="S:N">`, a `$RC(...)` swap script), even though it has already resolved. `src/lib/suspense-inline.ts` (`inlineResolvedSuspense`) collapses that back to flat HTML, splicing the segment in as `<!--$-->…<!--/$-->`. Without it every docs page would ship its fallback as its body to any client that does not run JS — the exact failure this design exists to prevent, wearing a passing byte count.
 
 ---
 
@@ -51,11 +57,16 @@ bun scripts/prerender.ts                            # .ssr + dist/index.html →
 
 ### `src/router.tsx` (new)
 
-`createSiteRouter(history?)` becomes the single router factory, imported by both `main.tsx` and `entry-server.tsx`. Client and server cannot drift into different `basepath` or preload settings, which is the usual source of hydration mismatches in a hand-rolled SSG.
+`createSiteRouter(options?)` becomes the single router factory, imported by both `main.tsx` and `entry-server.tsx`. Client and server cannot drift into different `basepath` or preload settings, which is the usual source of hydration mismatches in a hand-rolled SSG.
 
 The server passes `createMemoryHistory({ initialEntries: [path] })` and `defaultPreload: false`; the client keeps `defaultPreload: "intent"`.
 
-`main.tsx` switches `createRoot` → `hydrateRoot`.
+`main.tsx` switches `createRoot` → `hydrateRoot`. **That was not a drop-in**, and the two things that make it work are non-obvious enough to be worth the spec's space:
+
+- **The prerender must emit the root `<Suspense>` boundary the browser renders.** `Matches` picks its root wrapper off `isServer`, which is not a runtime check but a module constant chosen by package export condition (`@tanstack/router-core/isServer`) — `true` under the `node`/`bun` condition `vite build --ssr` resolves with. So the server emitted no boundary, the browser insisted on one, and React refused the hydration outright and threw every prerendered byte away. `createSiteRouter({ prerendering: true })` supplies it through the router's public `InnerWrap` seam (`PrerenderRootSuspense`, `fallback={null}` to match the client's unset `defaultPendingComponent`), and the prerender script asserts every page's markup opens with `<!--$-->`.
+- **`main.tsx` hydrates behind `router.load()`, inside a `Promise.race` with a 10 s timeout.** A fresh router has no matches synchronously and `MatchesInner` reads them off the store during render, so hydrating immediately renders nothing under the root boundary while the HTML holds the whole page. The race exists because a load that never settles would otherwise leave the page permanently un-hydrated and *silent* — inert markup, no error, no fallback. Hydrating regardless degrades at worst to "React discards the markup and client-renders", which is a working site.
+
+**Rejected, verified broken, recorded so nobody retries it:** setting `router.ssr = {...}` — what TanStack Start's `hydrate()` does — makes the *browser* skip the boundary instead. It silences the mismatch and leaves the app dead: the route chunk is never fetched, `DocPage` never renders, and nothing appears in the console. Resolving the SSR build with `browser` conditions (`ssr.noExternal` + `ssr.resolve.conditions`) gets `isServer === false` honestly and then dies in `RouterCore`'s constructor on `window is not defined`.
 
 ---
 
@@ -63,25 +74,35 @@ The server passes `createMemoryHistory({ initialEntries: [path] })` and `default
 
 `src/lib/seo.ts` is **pure TypeScript** — no `import.meta.glob`, no `.mdx` import, no route import. This is deliberate and load-bearing: `apps/site/README.md`'s "no MDX in tests" constraint means anything a test needs to exercise must be glob-free, exactly as `lib/sidebar.ts` and `lib/toc.ts` already are.
 
+As shipped:
+
 ```ts
+interface SeoContext {
+  siteUrl: string;       // absolute origin, no trailing slash
+  indexable: boolean;    // SITE_INDEXABLE === "1"; required, never optional
+}
+
 interface PageSeo {
   path: string;          // "/docs/concepts/agents"
   title: string;         // full <title> text
   description: string;
-  canonical: string;     // absolute
+  canonical: string | null;  // null ⇒ must not be advertised (the 404)
   ogImage: string;       // absolute
   ogType: "website" | "article";
+  robots: "index,follow" | "noindex,nofollow";
   jsonLd: object[];
-  noindex: boolean;
 }
 
-landingSeo(siteUrl): PageSeo
-docSeo(slug, frontmatter, siteUrl): PageSeo
-notFoundSeo(siteUrl): PageSeo
+landingSeo(ctx): PageSeo
+docSeo(slug, frontmatter, ctx): PageSeo
+notFoundSeo(ctx): PageSeo
+seoForPath(pathname, docs, ctx): PageSeo   // → the client, resolving a route
 
 renderHeadHtml(seo): string          // → the prerender script, server side
 applyHead(seo, document): void       // → the client, on route change
 ```
+
+Two shapes differ from this section's original sketch, both deliberately. `canonical` is nullable rather than always-present, because a 404 must not claim to be the canonical version of anything — and `renderSitemap` reuses exactly that null to exclude it (§6). And indexability is a resolved `robots` **string** on the page rather than a `noindex` boolean, so the one place that decides it is `robotsFor(ctx, forceNoindex)`: the 404 is `noindex` on its own account, every page is `noindex` in a non-production build, and no consumer re-derives the rule.
 
 One model, two renderers. The prerender script emits the head as a string; the client mutates `document.head` on SPA navigation.
 
@@ -99,13 +120,18 @@ A side benefit: `applyHead` runs in dev too, so `bun run --cwd apps/site dev` sh
 
 `index.html` is reduced to charset, viewport, theme-color, favicon, the `<noscript>` block from §9, and a `<!--seo-->` marker.
 
-The three `%VITE_SITE_URL%` substitutions are deleted, since `seo.ts` now owns every absolute URL. `VITE_SITE_URL` itself stays — but its local-dev default moves out of `vite.config.ts:29-31` (which mutates `process.env` at config-evaluation time purely to keep the HTML substitution from breaking) and into `seo.ts`:
+The three `%VITE_SITE_URL%` substitutions are deleted, since `seo.ts` now owns every absolute URL. `VITE_SITE_URL` itself stays — but its local-dev default moves out of `vite.config.ts` (which mutated `process.env` at config-evaluation time purely to keep the HTML substitution from breaking) and into `seo.ts`, as **shipped**:
 
 ```ts
-const SITE_URL = import.meta.env.VITE_SITE_URL ?? "http://localhost:5173";
+export const DEFAULT_SITE_URL = "http://localhost:5173";
+
+/** Trim, default, and strip a trailing slash so path joins never double up. */
+export function normalizeSiteUrl(raw: string | undefined): string;
 ```
 
-That matters because `applyHead` runs in the browser and needs the same base URL the prerender script used. Leaving the default in `vite.config.ts` would define it for the HTML-substitution path only, and `import.meta.env.VITE_SITE_URL` would be `undefined` in any build where CI did not set it — producing `undefined/docs/...` canonicals on the client. One default, in the module that consumes it.
+`seo.ts` reads no environment itself — **each entry point passes its own source**: `import.meta.env.VITE_SITE_URL` in `components/HeadSync.tsx`, `process.env.VITE_SITE_URL` in `scripts/prerender.ts`, both through `normalizeSiteUrl`. A bare `import.meta.env` reference inside `seo.ts` would have pinned the module to Vite; keeping it environment-free is exactly what lets the same file run under Vite, under `bun test`, and under a bare Bun script.
+
+The default matters because `applyHead` runs in the browser and needs the same base URL the prerender script used. Leaving it in `vite.config.ts` would define it for the HTML-substitution path only, and `import.meta.env.VITE_SITE_URL` would be `undefined` in any build where CI did not set it — producing `undefined/docs/...` canonicals on the client. One default, in the module that consumes it.
 
 For each page the prerender script takes the **built** `dist/index.html` (which already carries Vite's hashed `<script type="module">` and `<link rel="stylesheet">`) and performs two replacements:
 
@@ -160,7 +186,9 @@ One shared `og.png` for every page. Per-page OG images are out of scope (§11).
 
 ### `sitemap.xml`
 
-One `<url>` per prerendered page, absolute `<loc>`, `noindex` pages excluded.
+One `<url>` per prerendered page that **has a canonical**, absolute `<loc>` — which excludes exactly one page, the 404 (`notFoundSeo` sets `canonical: null`, and `renderSitemap` keys off precisely that null rather than a separate flag, so the two facts cannot diverge).
+
+Keying off the canonical rather than an indexability flag is what keeps the sitemap correct in a `noindex` preview build: there every page is `noindex`, and a flag-driven filter would emit an empty `<urlset>`. The sitemap stays well-formed and complete; `robots.txt`'s `Disallow: /` is what actually holds crawlers off a preview.
 
 **No `<lastmod>`.** `site.yml` uses `actions/checkout@v4` at its default depth of 1, so per-file git dates are unavailable and every entry would report the build timestamp. A uniformly-wrong `lastmod` is worse than an absent one — Google discounts `lastmod` it finds unreliable, across the whole sitemap. Adding it later means setting `fetch-depth: 0` and reading `git log -1 --format=%cI -- <file>`; noted as future work in the README.
 
@@ -199,7 +227,7 @@ Once every route is a real file, the same setting inverts: `/docs/concpets/agent
   Referrer-Policy: no-referrer
 ```
 
-`vite.config.ts:39-42` applies these to the dev server and `vite preview` only, and its comment claims "GitHub Pages fronts the static build with its own headers" — stale since the Cloudflare migration. Workers adds neither. This restores dev/prod parity. No `X-Frame-Options`, matching the existing rationale: this is a public marketing site, framing is fine.
+`vite.config.ts`'s `securityHeaders` applies these to the dev server and `vite preview` only, and its comment still claims "GitHub Pages fronts the static build with its own headers" — stale since the Cloudflare migration, and **not yet corrected in that file**. Workers adds neither header on its own. This restores dev/prod parity. No `X-Frame-Options`, matching the existing rationale: this is a public marketing site, framing is fine.
 
 ---
 
@@ -225,10 +253,12 @@ The flag is fail-safe by default: only the production deploy opts in, so a new w
 Fix: `Reveal` gains `data-reveal`, and `index.html` carries
 
 ```html
-<noscript><style>[data-reveal]{opacity:1!important;transform:none!important}</style></noscript>
+<noscript><style>[data-reveal]{opacity:1!important;transform:none!important;filter:none!important}</style></noscript>
 ```
 
-`!important` beats the inline style. Docs pages are unaffected — `.doc-prose` has no motion wrapper, so the SEO-valuable long-form content was never at risk.
+`!important` beats the inline style. `filter` is in the shipped rule and not optional: the hero headline spans serialize as `opacity:0;filter:blur(7px);transform:translateY(18px)`, so resetting only opacity and transform would leave the largest text on the page blurred.
+
+Measured on the shipped build: `dist/index.html` carries ~35 inline `opacity:0` styles; `dist/docs/**` and `dist/404.html` carry **none**. The residual human cost is that `/` shows nav, wash and footer with a blank middle until hydration runs the reveals — accepted deliberately, since the alternative is dropping the landing entrance animations. Docs pages are unaffected — `.doc-prose` has no motion wrapper, so the SEO-valuable long-form content was never at risk.
 
 ### `ThreadCanvas` hydration mismatch
 
@@ -252,11 +282,17 @@ Prerendering does not fix the `INEFFECTIVE_DYNAMIC_IMPORT` single-chunk problem 
 
 These fail `vite build`, so they run in both `ci.yml`'s `unit` job and `site.yml` with no new CI job:
 
-- every doc frontmatter has a non-empty `title`, `section`, and `description`
+- every doc frontmatter has a non-empty `title`, `section`, and `description` — checked *before* any rendering
 - the emitted page count matches `docEntries.length + 2`
-- every emitted file exceeds a minimum byte length and contains `<h1` — catches a silently-empty render, the characteristic SSG failure
+- every page's `#root` markup exceeds a minimum byte length and the document contains `<h1` — catches a silently-empty render, the characteristic SSG failure. Measured against the **app markup**, not the finished document: the template plus a page's JSON-LD head is 2.2–3.8 kB on its own, so a threshold applied to the whole file is satisfied by a completely empty `#root` and can never fire
+- markup **opens** with `<!--$-->` — the root Suspense boundary is present and not displaced, without which no browser can hydrate the page (§3)
 - no output contains a surviving `%VITE_SITE_URL%` or an unreplaced `<!--seo-->`
 - canonicals are unique across all pages — catches a slug collision
+- **no output contains a React streaming artifact**: `<!--$?-->` (unresolved boundary), `<!--$!-->` (errored boundary — its fallback shipped), `<div hidden id="S:` (the parking div), `$RC("B:` (the swap script), or the docs route's literal `Loading…` fallback markup. This is the guard the byte-length and `<h1>` checks cannot substitute for: a page can carry a perfect shell, a real `<h1>` and 20 kB of markup while its entire `<article>` body is a Suspense fallback. The markers are anchored to React's emitted form rather than matched as loose substrings, so a doc page that legitimately writes *about* `div hidden` or `$RC(` doesn't fail the build
+
+### Not `vite preview`
+
+`vite preview` cannot verify this build's serving behaviour and will mislead anyone who tries. It SPA-falls-back, so `/docs/concepts/agents` — the no-trailing-slash form every canonical, sitemap entry and internal link uses — returns the **landing page** at HTTP 200, and nothing ever returns 404. Only the trailing-slash form works. Cloudflare's `auto-trailing-slash` + `404-page` do the opposite on both counts. Verify serving against a PR preview version or production.
 
 ### Post-merge
 

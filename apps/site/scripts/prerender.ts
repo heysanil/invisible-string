@@ -154,14 +154,23 @@ async function main(): Promise<void> {
   }
   if (problems.length > 0) report();
 
-  // CLOSED list: the landing page, one page per doc entry, and the 404. Never
-  // build it from an arbitrary path — in particular, `/docs` must NEVER appear
-  // here. `renderPage("/docs")` succeeds (it follows the route redirect and
-  // returns markup byte-identical to /docs/getting-started/overview), so
-  // adding it would write dist/docs/index.html — and a Cloudflare assets-only
-  // Worker serves a matching asset BEFORE it evaluates redirect rules, so that
-  // file would shadow the /docs → overview 301 and reintroduce exactly the
-  // duplicate-content problem the redirect exists to prevent.
+  // CLOSED list: the landing page, one page per doc entry, and the 404. It is
+  // built from `docEntries` and accepts no arbitrary path, so what lands in
+  // dist/ is exactly the site's real page set — in particular, `/docs` must
+  // NEVER appear here. `renderPage("/docs")` succeeds (it follows the route
+  // redirect and returns markup byte-identical to /docs/getting-started/
+  // overview), which makes adding it look harmless, but `/docs` has no page of
+  // its own: public/_redirects 301s it to the overview, so no file should
+  // exist at that path.
+  //
+  // To be clear about what the hazard is NOT: the file would not shadow the
+  // redirect. Cloudflare's static-asset redirects take PRECEDENCE over assets
+  // — "Redirects are always followed, regardless of whether or not an asset
+  // matches the incoming request" (developers.cloudflare.com/workers/
+  // static-assets/redirects/). It would be a second copy of the overview's
+  // HTML uploaded on every deploy at a URL the site deliberately does not
+  // serve — dead weight that one `_redirects` or `html_handling` change turns
+  // into the live duplicate the 301 exists to prevent.
   const pages: Page[] = [
     { out: "index.html", route: "/", seo: landingSeo(ctx) },
     ...docEntries.map((entry) => ({

@@ -8,9 +8,16 @@
  * bind to the fixture agents (lib/agents/fixtures.ts); one session is
  * webhook-origin with workflow provenance so the origin + workflow chips
  * render.
+ *
+ * Three 2026-08-11 surfaces are exercised here too, because a preview that
+ * omits them cannot review them: qualified `<slug>__<tool>` tool calls against
+ * {@link FIXTURE_TOOL_DIRECTORY} (D5), a COMPACTED session alongside the
+ * cleared one (D4), and `step.completed` usage so the header's context meter
+ * has a numerator (D6).
  */
 import type {
   AgentSessionSummaryDto,
+  AgentVersionToolDirectory,
   EveStreamEvent,
   RunDto,
   RunEventFrame,
@@ -77,6 +84,14 @@ function sessionSummary(
   status: AgentSessionSummaryDto["status"],
   lastRunStatus: RunStatus | null,
   ageSeconds: number,
+  /**
+   * The generated session title, or null to preview the FALLBACK (the
+   * sidebar truncates the first message instead). Both states are real:
+   * titling runs only for chat-origin sessions and fails silently, so a
+   * fixture set where every row is titled would hide half the design —
+   * which is why the default is the untitled one.
+   */
+  title: string | null = null,
   provenance?: {
     origin: AgentSessionSummaryDto["origin"];
     workflowId: string;
@@ -91,6 +106,7 @@ function sessionSummary(
     workflowId: provenance?.workflowId ?? null,
     origin: provenance?.origin ?? "chat",
     status,
+    title,
     eveSessionId: "eve_fixture",
     createdAt: iso(-ageSeconds - 600),
     updatedAt: iso(-ageSeconds),
@@ -121,7 +137,10 @@ const streamingRun: FixtureRun = {
     { type: "message.appended", data: { messageDelta: "Let me check", messageSoFar: "Let me check the product notes first.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
     { type: "message.completed", data: { finishReason: "tool-calls", message: "Let me check the product notes first.", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
     { type: "actions.requested", data: { actions: [{ callId: "c_notes", kind: "tool-call", toolName: "search_notes", input: { q: "launch" } }], sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(4) } },
+    // Deliberately UNQUALIFIED: one of eve's builtins, which has no connection
+    // prefix and must still render as "Search notes" rather than blank.
     { type: "action.result", data: { result: { callId: "c_notes", kind: "tool-result", toolName: "search_notes", output: "3 notes" }, status: "completed", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(6) } },
+    { type: "step.completed", data: { finishReason: "tool-calls", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 96_500, outputTokens: 210 } }, meta: { at: iso(6) } },
     { type: "reasoning.appended", data: { reasoningDelta: "The notes", reasoningSoFar: "The notes emphasise reliability over novelty — I'll lead with that.", sequence: 0, stepIndex: 2, turnId: "t0" }, meta: { at: iso(7) } },
     { type: "message.appended", data: { messageDelta: "We're excited", messageSoFar: "We're excited to announce", sequence: 0, stepIndex: 2, turnId: "t0" }, meta: { at: iso(9) } },
   ]),
@@ -170,11 +189,15 @@ const completedRun: FixtureRun = {
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "message.received", data: { message: "Summarize the latest issues in the tracker.", sequence: 0, turnId: "t0" }, meta: { at: iso(0) } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(0) } },
-    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear_list_issues", input: { limit: 5 } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
-    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear_list_issues", output: "5 issues: 2 bugs, 3 features" }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
+    // A QUALIFIED MCP tool call: the slug resolves through
+    // FIXTURE_TOOL_DIRECTORY to "Linear · List issues" plus the connector's
+    // own description, and the MCP envelope summarizes to its text part.
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__list_issues", input: { limit: 5 } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(1) } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__list_issues", output: { content: [{ type: "text", text: "5 issues: 2 bugs, 3 features" }], isError: false } }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(3) } },
     { type: "message.appended", data: { messageDelta: "Here", messageSoFar: "Here", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(4) } },
     { type: "message.completed", data: { finishReason: "stop", message: "Here are the **latest issues**:\n\n- Fix login redirect loop (`bug`)\n- Slow dashboard load (`bug`)\n- Add CSV export (`feature`)\n\nWant me to open any of these?", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(5) } },
-    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(5) } },
+    // `usage.inputTokens` is the context meter's numerator (D6).
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 184_320, outputTokens: 640 } }, meta: { at: iso(5) } },
     { type: "turn.completed", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(6) } },
     { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(6) } },
   ]),
@@ -244,9 +267,9 @@ const canceledRun: FixtureRun = {
     { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000002" } },
     { type: "message.received", data: { message: "Crawl every open issue and write a full triage report.", sequence: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000003" } },
     { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-29), id: "evt_01KZFM7A0000000000000004" } },
-    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear_list_issues", input: { limit: 200 } }, { callId: "c2", kind: "tool-call", toolName: "linear_read_issue", input: { id: "ENG-1204" } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-28), id: "evt_01KZFM7A0000000000000005" } },
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__list_issues", input: { limit: 200 } }, { callId: "c2", kind: "tool-call", toolName: "linear__read_issue", input: { id: "ENG-1204" } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-28), id: "evt_01KZFM7A0000000000000005" } },
     // The in-flight call finishes even though the stop already landed.
-    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear_list_issues", output: "142 issues" }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-22), id: "evt_01KZFM7A0000000000000006" } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__list_issues", output: { content: [{ type: "text", text: "142 issues" }] } }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-22), id: "evt_01KZFM7A0000000000000006" } },
     { type: "message.appended", data: { messageDelta: "I pulled 142", messageSoFar: "I pulled 142 open issues and started grouping them by area —", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(-20), id: "evt_01KZFM7A0000000000000007" } },
     { type: "turn.cancelled", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-19), id: "evt_01KZFM7A0000000000000008" } },
     { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-19), id: "evt_01KZFM7A0000000000000009" } },
@@ -279,6 +302,72 @@ const clearedRun: FixtureRun = {
     { type: "turn.completed", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-55), id: "evt_01KZFM7B0000000000000005" } },
     { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-55), id: "evt_01KZFM7B0000000000000006" } },
     { type: "context.cleared", data: { sequence: 1, sessionId: "eve_fixture", turnId: "t0" }, meta: { at: iso(-10), id: "evt_01KZFM7B0000000000000007" } },
+  ]),
+};
+
+// ── Session 8: a COMPACTED session (Support triager) ─────────────────────────
+//
+// The non-empty compaction sequence, exactly as eve documents it and the spike
+// recorded it: `compaction.requested → compaction.completed → session.waiting`.
+// The divider is derived from the COMPLETED event alone (spec D4) — an empty
+// context emits neither event and a failed summarization emits only the
+// request, and in both of those nothing was summarized, so nothing may claim a
+// memory boundary.
+//
+// It runs to TWO runs on purpose, because that is what the falling meter needs:
+// the first measures 903k against a 1M window and is then compacted, the second
+// measures the SUMMARIZED context at 41k. A boundary retires every measurement
+// taken before it (`contextTokensUsed`), so a session that stopped at the first
+// run would show no meter at all — correct, but not the thing this fixture is
+// here to preview.
+
+const compactedRun: FixtureRun = {
+  run: {
+    id: "run_compacted",
+    status: "succeeded",
+    triggerEvent: chatTrigger(
+      FIXTURE_SUPPORT_TRIAGER,
+      "Keep going — what's left in the backlog?",
+    ),
+    taskMessage: null,
+    error: null,
+  },
+  frames: framesFor("run_compacted", [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "~deepseek/deepseek-v4-flash-latest" } }, meta: { at: iso(-300), id: "evt_01KZFM7D0000000000000001" } },
+    { type: "turn.started", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-299), id: "evt_01KZFM7D0000000000000002" } },
+    { type: "message.received", data: { message: "Keep going — what's left in the backlog?", sequence: 0, turnId: "t0" }, meta: { at: iso(-299), id: "evt_01KZFM7D0000000000000003" } },
+    { type: "step.started", data: { sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-299), id: "evt_01KZFM7D0000000000000004" } },
+    { type: "actions.requested", data: { actions: [{ callId: "cb1", kind: "tool-call", toolName: "linear__search_issues", input: { query: "state:backlog" } }], sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-298), id: "evt_01KZFM7D0000000000000005" } },
+    { type: "action.result", data: { result: { callId: "cb1", kind: "tool-result", toolName: "linear__search_issues", output: { content: [{ type: "text", text: "31 issues in Backlog across 4 teams" }] } }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" }, meta: { at: iso(-296), id: "evt_01KZFM7D0000000000000006" } },
+    { type: "message.completed", data: { finishReason: "stop", message: "There are **31 issues** left in the backlog, spread across 4 teams.", sequence: 0, stepIndex: 1, turnId: "t0" }, meta: { at: iso(-294), id: "evt_01KZFM7D0000000000000007" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 903_000, outputTokens: 380 } }, meta: { at: iso(-294), id: "evt_01KZFM7D0000000000000008" } },
+    { type: "turn.completed", data: { sequence: 0, turnId: "t0" }, meta: { at: iso(-293), id: "evt_01KZFM7D0000000000000009" } },
+    { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-293), id: "evt_01KZFM7D0000000000000010" } },
+    { type: "compaction.requested", data: { modelId: "~deepseek/deepseek-v4-flash-latest", sequence: 1, sessionId: "eve_fixture", turnId: "t0", usageInputTokens: 903_000 }, meta: { at: iso(-120), id: "evt_01KZFM7D0000000000000011" } },
+    { type: "compaction.completed", data: { modelId: "~deepseek/deepseek-v4-flash-latest", sequence: 2, sessionId: "eve_fixture", turnId: "t0" }, meta: { at: iso(-118), id: "evt_01KZFM7D0000000000000012" } },
+  ]),
+};
+
+// The exchange AFTER that compaction: same thread, same window, a context that
+// now measures 41k because the summary replaced the history.
+const postCompactionRun: FixtureRun = {
+  run: {
+    id: "run_post_compaction",
+    status: "succeeded",
+    triggerEvent: chatTrigger(
+      FIXTURE_SUPPORT_TRIAGER,
+      "Which team owns the most of them?",
+    ),
+    taskMessage: null,
+    error: null,
+  },
+  frames: framesFor("run_post_compaction", [
+    { type: "turn.started", data: { sequence: 3, turnId: "t1" }, meta: { at: iso(-110), id: "evt_01KZFM7E0000000000000001" } },
+    { type: "message.received", data: { message: "Which team owns the most of them?", sequence: 3, turnId: "t1" }, meta: { at: iso(-110), id: "evt_01KZFM7E0000000000000002" } },
+    { type: "message.completed", data: { finishReason: "stop", message: "**Billing** owns 14 of the 31 — nearly half the backlog.", sequence: 3, stepIndex: 0, turnId: "t1" }, meta: { at: iso(-108), id: "evt_01KZFM7E0000000000000003" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 3, stepIndex: 0, turnId: "t1", usage: { inputTokens: 41_000, outputTokens: 120 } }, meta: { at: iso(-108), id: "evt_01KZFM7E0000000000000004" } },
+    { type: "turn.completed", data: { sequence: 3, turnId: "t1" }, meta: { at: iso(-107), id: "evt_01KZFM7E0000000000000005" } },
+    { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-107), id: "evt_01KZFM7E0000000000000006" } },
   ]),
 };
 
@@ -315,47 +404,148 @@ const sessionLimitRun: FixtureRun = {
 
 export const FIXTURE_SESSIONS: FixtureSession[] = [
   {
-    summary: sessionSummary("s_live", FIXTURE_EXEC_ASSISTANT, "active", "running", 30),
+    summary: sessionSummary(
+      "s_live",
+      FIXTURE_EXEC_ASSISTANT,
+      "active",
+      "running",
+      30,
+      "Launch announcement draft",
+    ),
     versionLabel: "v_a1b2c3",
     runs: [streamingRun],
   },
   {
-    summary: sessionSummary("s_parked", FIXTURE_EXEC_ASSISTANT, "waiting", "waiting", 240),
+    // Untitled on purpose: the sidebar falls back to the first message.
+    summary: sessionSummary(
+      "s_parked",
+      FIXTURE_EXEC_ASSISTANT,
+      "waiting",
+      "waiting",
+      240,
+      null,
+    ),
     versionLabel: "v_a1b2c3",
     runs: [parkedRun],
   },
   {
-    summary: sessionSummary("s_done", FIXTURE_SUPPORT_TRIAGER, "active", "succeeded", 7200),
+    summary: sessionSummary(
+      "s_done",
+      FIXTURE_SUPPORT_TRIAGER,
+      "active",
+      "succeeded",
+      7200,
+      "Issue tracker summary",
+    ),
     versionLabel: "v_9a8b7c",
     runs: [completedRun],
   },
   {
-    summary: sessionSummary("s_failed", FIXTURE_DATA_ANALYST, "error", "failed", 172800, {
-      origin: "webhook",
-      workflowId: FIXTURE_WORKFLOW_ID,
-      workflowName: FIXTURE_WORKFLOW_NAME,
-    }),
+    // Workflow-dispatched sessions are never titled — the titler runs off the
+    // first USER message, and a dispatch has a rendered task message instead.
+    summary: sessionSummary(
+      "s_failed",
+      FIXTURE_DATA_ANALYST,
+      "error",
+      "failed",
+      172800,
+      null,
+      {
+        origin: "webhook",
+        workflowId: FIXTURE_WORKFLOW_ID,
+        workflowName: FIXTURE_WORKFLOW_NAME,
+      },
+    ),
     versionLabel: "v_0f1e2d",
     runs: [failedRun],
   },
   // APPENDED, never spliced: fixture-chat.test.tsx addresses the Executive
   // assistant sessions by list index, so new sessions go on the end.
   {
-    summary: sessionSummary("s_stopped", FIXTURE_SUPPORT_TRIAGER, "active", "canceled", 900),
+    summary: sessionSummary(
+      "s_stopped",
+      FIXTURE_SUPPORT_TRIAGER,
+      "active",
+      "canceled",
+      900,
+      "Full open-issue triage report",
+    ),
     versionLabel: "v_9a8b7c",
     runs: [canceledRun],
   },
   {
-    summary: sessionSummary("s_cleared", FIXTURE_DATA_ANALYST, "active", "succeeded", 3600),
+    summary: sessionSummary(
+      "s_cleared",
+      FIXTURE_DATA_ANALYST,
+      "active",
+      "succeeded",
+      3600,
+      "Top revenue drivers last quarter",
+    ),
     versionLabel: "v_0f1e2d",
     runs: [clearedRun],
   },
   {
-    summary: sessionSummary("s_limit", FIXTURE_EXEC_ASSISTANT, "waiting", "waiting", 5400),
+    summary: sessionSummary(
+      "s_limit",
+      FIXTURE_EXEC_ASSISTANT,
+      "waiting",
+      "waiting",
+      5400,
+      null,
+    ),
     versionLabel: "v_a1b2c3",
     runs: [sessionLimitRun],
   },
+  // Older than every other Support triager session ON PURPOSE: the sidebar
+  // buckets by recency, so this lands below `s_done` and the specs that address
+  // "the idle Support triager row" keep finding the one they mean.
+  {
+    summary: sessionSummary(
+      "s_compacted",
+      FIXTURE_SUPPORT_TRIAGER,
+      "active",
+      "succeeded",
+      90_000,
+      "Backlog check-in",
+    ),
+    versionLabel: "v_9a8b7c",
+    runs: [compactedRun, postCompactionRun],
+  },
 ];
+
+/**
+ * The tool directory the live thread fetches per pinned agent version
+ * (`GET …/agents/:id/versions/:id/tools`), canned so fixture mode renders tool
+ * steps as English (D5) with no backend.
+ *
+ * `linear__read_issue` is deliberately ABSENT from the tools list even though a
+ * fixture run calls it: a connection probed before a server added a tool is the
+ * ordinary case, and the step must still read "Linear · Read issue" — just
+ * without a description.
+ */
+export const FIXTURE_TOOL_DIRECTORY: AgentVersionToolDirectory = {
+  agentVersionId: "dddddddd-0001-4000-8000-000000000001",
+  connections: [
+    {
+      slug: "linear",
+      connectionId: "cn_fixturelinear001",
+      connectionName: "Linear",
+      tools: [
+        {
+          name: "list_issues",
+          description: "List issues in a team, newest first.",
+          params: ["teamId", "limit"],
+        },
+        {
+          name: "search_issues",
+          description: "Search issues by full-text query or filter expression.",
+          params: ["query"],
+        },
+      ],
+    },
+  ],
+};
 
 export const FIXTURE_MODE: boolean =
   import.meta.env.VITE_FIXTURE_MODE === "1" ||

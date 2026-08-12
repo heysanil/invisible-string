@@ -313,6 +313,23 @@ acknowledgement (REPORT finding 24). `reset` is destructive: the eve id is
 retired permanently, so the platform closes the row and mints a NEW
 `agent_sessions` row that the client must switch to.
 
+THE CLEAR/COMPACT DRAIN. Both controls refuse a BUSY session, so by
+construction no tail is attached when one fires and nothing would ever consume
+the frames eve emits for it. An accepted `clear`/`compact` therefore drains
+them itself — it opens the event stream at the session-wide event count, reads
+until `session.waiting` (or the attach-time `x-eve-stream-tail-index` bound, or
+a short timeout), appends what it reads to the session's most recent run, and
+answers `marker: {kind, runId} | null` naming where the boundary landed. Two
+bugs are closed by that one step: the thread's context divider is derived from
+persisted `run_events`, so without the drain none is persisted at all; and the
+session-wide count is the tailer's `startIndex`, so frames left undrained are
+picked up by the NEXT run's tail and rendered under an exchange that happened
+*after* the clear. `marker: null` is a legitimate outcome (an empty or
+already-cleared context emits no `compaction.*`), and a client must not claim a
+boundary on it. The drain is bounded and best-effort: it never blocks on a
+model round-trip, and every failure degrades to "fewer frames drained now, the
+next tail gets the rest" — never to a failed control.
+
 DISPATCH-TIME MODEL ALLOWLIST RE-VALIDATION (spec §7): before running, the
 dispatcher re-checks the version's COMPILED model against the CURRENT workspace
 allowlist; a now-disallowed model FAILS the run (a visible failed run, never
@@ -452,7 +469,7 @@ per-version schema would LOOK isolated while every version still shared
 The control plane resolves preset→model and validates the model allowlist
 BEFORE compiling (typed 422s), then calls an injected
 `compile({definition, model, connections, skills, workspaceSlug,
-agentSlug}) → {files, hash, compilerVersion, eveVersion}` where `definition`
+agentId, agentSlug}) → {files, hash, compilerVersion, eveVersion}` where `definition`
 is a pure `AgentDefinition` — no trigger, no instructions
 (`src/build/compiler-contract.ts`). The production implementation is
 `src/build/compiler-adapter.ts` over `@invisible-string/compiler` (wired as

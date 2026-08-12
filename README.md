@@ -191,10 +191,25 @@ login/signup and land back on the invitation.
 
 ### 💬 Chat — `/chat`
 Pick a published Agent in the "New chat" picker and talk to it: working
-blocks, streamed reply, inline human-in-the-loop approvals. Resumable SSE per
-run with `Last-Event-ID`; one active run per session (`session_busy` handled
-inline). Workflow-fired runs land here too, wearing origin +
-workflow-provenance chips; "Edit agent ↗" deep-links into the agent editor.
+blocks, streamed reply, inline human-in-the-loop approvals. Sending **enters
+the thread immediately** — your message renders while the session is still
+being created, and a failure rolls back to the composer with the text intact.
+Threads name themselves: the control plane generates a short title from the
+first message (falling back to a truncation of it until — or if — that lands),
+so a sidebar full of one agent's chats is readable. Tool calls read as
+English — the connection's display name, a humanized tool name, the server's
+own description of it, and a short result summary rather than raw JSON — and
+the header trades the build hash and raw model slug for a **context-usage
+meter** plus a friendly model label — the meter reads the newest measurement
+taken since the last memory boundary, and simply disappears when there is
+none. Clearing or compacting the context leaves a permanent divider in the
+thread: the control plane drains the events the control emitted onto the run it
+followed, so the divider lands under the right exchange and survives a reload.
+A compaction that had nothing to summarize says so instead of claiming one.
+Resumable SSE per run with `Last-Event-ID`; one active run per session
+(`session_busy` handled inline). Workflow-fired runs land here too, wearing
+origin + workflow-provenance chips; "Edit agent ↗" deep-links into the agent
+editor.
 
 ![Chat surface](docs/screenshots/chat.png)
 
@@ -207,9 +222,15 @@ the options come from what the model actually advertises, always plus "Model
 default", which sends no reasoning field at all), Context (equip MCP
 connections & skills, each with an approval policy), and Access (which member's
 credentials it runs as) — with a
-left rail of live section cards and lifecycle chips. **Publish** compiles the
-Agent (the real `eve build` — Agents are the compile unit), and "Chat with
-agent" drops you straight into `/chat`.
+left rail of live section cards and lifecycle chips that distinguish three
+states, not two: **unsaved changes** (draft ≠ last save), **unpublished
+changes** (saved, but the published version is behind), and **published**.
+**Publish** compiles the Agent (the real `eve build` — Agents are the compile
+unit) but never blocks the page: the build is watched by a workspace-level
+store that outlives the editor, so you can navigate away and still get a toast
+naming the agent when it lands. "Chat with agent" drops you straight into
+`/chat` without waiting for the build. Agent names need not be unique — the
+content hash keys on the agent's stable id, so two agents may share a name.
 
 ![Agent editor](docs/screenshots/agents.png)
 
@@ -263,13 +284,16 @@ All screenshots are captured from the real product by a gated Playwright spec
 ## Copilot (the editor assistant)
 
 Both editors dock the same AI copilot on their right rail — one socket, two
-surfaces. It reads the current draft (the Agent or the workflow) plus the
-workspace inventory (published Agents, MCP connections, skills, model presets,
-allowlist) and proposes edits as **typed mutations** — `setPersona`,
-`setModel`, `addContext`, `removeContext` on the agent surface; `setTrigger`,
-`setAgent`, `setInstructions` on the workflow surface — streamed over
-`WS /workspaces/:workspaceId/copilot` (shared frame protocol in
-`packages/shared/src/copilot.ts`; each turn names its surface).
+surfaces. It reads the current draft (the Agent or the workflow), the agent's
+name and description as the editor currently holds them — unsaved edits
+included — plus the workspace inventory (published Agents, MCP connections,
+skills, model presets, allowlist), and proposes edits as **typed mutations** — `setName`,
+`setDescription`, `setPersona`, `setModel`, `addContext`, `removeContext` on
+the agent surface; `setTrigger`, `setAgent`, `setInstructions` on the workflow
+surface — streamed over `WS /workspaces/:workspaceId/copilot` (shared frame
+protocol in `packages/shared/src/copilot.ts`; each turn names its surface).
+The turn is not a black box: reasoning and tool steps stream as their own
+frames and render in the same rail-in-box grammar the chat thread uses.
 
 ![Copilot dock in the workflow editor — suggestion cards with inline diff preview](docs/screenshots/copilot.png)
 
@@ -278,9 +302,15 @@ Every proposal renders as a structured **Apply / Dismiss** card with a preview
 **never** mutates the draft — accepted mutations are applied client-side
 through the editor controller (the same reducer manual edits use, so
 autosave/dry-run/diagnostics just work), and each accept/reject is fed back
-into the model's tool loop. Invalid tool calls (unknown inventory ids,
-non-allowlisted models, out-of-scope `@` references) bounce back to the model
-server-side and never reach the UI.
+into the model's tool loop — including when applying *fails*, in which case the
+card says so and the model is told the edit was rejected rather than being
+handed a receipt for something that never landed. A session-scoped **allow
+edits** toggle skips the accept gate: mutations apply as they arrive and the
+card still renders, marked applied, so the turn stays an audit trail. It is deliberately not remembered
+across sittings. Invalid tool calls (unknown inventory ids, non-allowlisted
+models, out-of-scope `@` references) bounce back to the model server-side and
+are never offered as a proposal — they surface only as a failed step in the
+rail, so a self-correction loop is visible rather than a stall.
 
 The copilot runs a Claude model via **OpenRouter on the platform key**
 (`COPILOT_PROVIDER=openrouter`, default model `anthropic/claude-sonnet-5`); a

@@ -1,13 +1,18 @@
 /**
  * Agent editor controller: owns the editor reducer, debounced autosave,
- * diagnostics distribution, and the publish state machine (with the
- * post-publish build-status poll). The route renders; this hook holds the
- * behavior. Modeled 1:1 on the workflow builder's controller.
+ * diagnostics distribution, the three-state lifecycle derivation, and the
+ * publish KICK. The route renders; this hook holds the behavior. Modeled 1:1
+ * on the workflow builder's controller.
  *
  * Save → diagnostics chain: publish snapshots the STORED draft and the PATCH
  * response carries dry-run-compile diagnostics for the saved draft, so both
  * must ride a successful PATCH. The debounce collapses keystrokes; a
  * publish/chat flushes any pending save first.
+ *
+ * `publish()` resolves as soon as the POST answers — it no longer waits for
+ * the build (spec D2). The build-status poll belongs to the workspace-level
+ * `AgentPublishStore`, which outlives this hook's unmount; `publishState`
+ * here is just a subscription to that store.
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type {
@@ -25,6 +30,11 @@ import {
   type AgentDiagnostics,
 } from "./diagnostics";
 import {
+  agentLifecycleState,
+  publishedAgentName,
+  type AgentLifecycleState,
+} from "./lifecycle";
+import {
   agentEditorReducer,
   agentEditorStatesEqual,
   agentPatchOf,
@@ -32,24 +42,15 @@ import {
   type AgentEditorAction,
   type AgentEditorState,
 } from "./model";
+import type { PublishState } from "./publish-machine";
+import { agentPublishStore, type AgentPublishStore } from "./publish-store";
+import { useAgentPublishState } from "./use-publish-store";
 import {
-  INITIAL_PUBLISH_STATE,
-  publishReducer,
-  type PublishState,
-} from "./publish-machine";
-import {
-  fetchAgentBuildStatus,
   useDryRunCompileAgent,
   usePublishAgent,
   useUpdateAgent,
 } from "../queries/agents";
 import { ApiError } from "../api-client";
-
-/** Poll cadence + ceiling for the post-publish build-status watch. */
-const BUILD_POLL_INTERVAL_MS = 1500;
-const BUILD_POLL_MAX_ATTEMPTS = 1000; // ~25 min ceiling; a fresh eve build is minutes
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const AUTOSAVE_DELAY_MS = 700;
 
@@ -61,8 +62,8 @@ export interface AgentControllerOptions {
   initialState: AgentEditorState;
   /** Enabled allowlist entries; null while still loading (skip the check). */
   allowlist: readonly ModelAllowlistEntryDto[] | null;
-  /** Test seam — shortens the build-status poll cadence. */
-  buildPollIntervalMs?: number;
+  /** Test seam — an isolated publish store instead of the app singleton. */
+  publishStore?: AgentPublishStore;
 }
 
 export interface AgentController {
@@ -70,8 +71,15 @@ export interface AgentController {
   dispatch: React.Dispatch<AgentEditorAction>;
   saveStatus: SaveStatus;
   isDirty: boolean;
+  /** Draft / Unsaved changes / Unpublished changes / Published (spec D3). */
+  lifecycle: AgentLifecycleState;
   diagnostics: AgentDiagnostics;
   publishState: PublishState;
+  /**
+   * Kick a publish. Resolves when the POST answers — the response's
+   * `buildStatus` is usually still `building`, and the store carries it the
+   * rest of the way. Null means the POST itself failed.
+   */
   publish: () => Promise<PublishAgentResponse | null>;
   resetPublish: () => void;
   canPublish: boolean;
@@ -83,16 +91,13 @@ export function useAgentController(
   options: AgentControllerOptions,
 ): AgentController {
   const { workspaceId, agent, initialState, allowlist } = options;
-  const pollIntervalMs = options.buildPollIntervalMs ?? BUILD_POLL_INTERVAL_MS;
+  const store = options.publishStore ?? agentPublishStore;
 
   const [state, dispatch] = useReducer(agentEditorReducer, initialState);
 
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [dryRun, setDryRun] = useState<AgentDiagnostics>(emptyAgentDiagnostics());
-  const [publishState, publishDispatch] = useReducer(
-    publishReducer,
-    INITIAL_PUBLISH_STATE,
-  );
+  const publishState = useAgentPublishState(agent.id, store);
 
   const updateAgent = useUpdateAgent(workspaceId);
   const dryRunCompile = useDryRunCompileAgent(workspaceId);
@@ -103,16 +108,11 @@ export function useAgentController(
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // A promise that resolves when the in-flight save settles (for flush()).
   const inFlightSave = useRef<Promise<void> | null>(null);
-  // Editor unmount cancels the build-status poll loop (nothing renders the
-  // result anymore — without this, a fresh publish keeps fetching every
-  // 1.5 s for up to ~25 min after navigating away).
-  const disposedRef = useRef(false);
-  useEffect(() => {
-    disposedRef.current = false;
-    return () => {
-      disposedRef.current = true;
-    };
-  }, []);
+  // NOTE: unmount deliberately does NOT cancel the build watch anymore. It
+  // used to (a poll nobody rendered was pure waste), which meant publishing
+  // and then walking away — exactly what "Chat with agent" does — abandoned
+  // the build silently. The store owns the poll now and announces by name.
+  //
   // The in-flight publish (single-flight): a second publish() while one is
   // running — e.g. "Chat with agent" clicked mid-build — joins it instead of
   // POSTing a concurrent /publish and racing a second poll loop into the
@@ -120,6 +120,20 @@ export function useAgentController(
   const inFlightPublish = useRef<Promise<PublishAgentResponse | null> | null>(null);
 
   const isDirty = !agentEditorStatesEqual(state, savedRef.current);
+
+  // The three save states (D3): dirtiness against the last SAVE, plus the
+  // saved draft against `publishedDefinition` — the baseline nothing compared
+  // against before. The NAME is a third input: it is not in the definition but
+  // it is in the content hash (D1 kept `agentSlug` there), so a rename leaves
+  // a published agent genuinely behind. Recomputed each render; all inputs are
+  // cheap.
+  const lifecycle = agentLifecycleState({
+    hasUnsavedChanges: isDirty,
+    savedDefinition: savedRef.current.definition,
+    publishedDefinition: agent.publishedDefinition,
+    currentName: agent.name,
+    publishedName: publishedAgentName(agent),
+  });
 
   // ── save + dry-run ─────────────────────────────────────────────────────────
 
@@ -224,51 +238,21 @@ export function useAgentController(
     // Single-flight: join the running publish rather than starting a twin.
     if (inFlightPublish.current) return inFlightPublish.current;
     const promise = (async (): Promise<PublishAgentResponse | null> => {
-      publishDispatch({ type: "start" });
+      store.begin({ workspaceId, agentId: agent.id, agentName: agent.name });
       try {
         await flush();
         const response = await publishAgent.mutateAsync(agent.id);
-        publishDispatch({ type: "received", response });
-
-        // A fresh build answers "building"/"pending" and finishes in the
-        // background — poll the version's build status until it is terminal
-        // so the rail flips from "Building…" to the ready/error chip. The
-        // loop stops when the editor unmounts (disposedRef): nothing renders
-        // the outcome anymore, and the next mount's publish is a cheap
-        // idempotent re-kick.
-        let current = response;
-        let attempts = 0;
-        while (
-          (current.buildStatus === "building" || current.buildStatus === "pending") &&
-          attempts < BUILD_POLL_MAX_ATTEMPTS &&
-          !disposedRef.current
-        ) {
-          attempts += 1;
-          await sleep(pollIntervalMs);
-          if (disposedRef.current) break;
-          try {
-            const status = await fetchAgentBuildStatus(
-              workspaceId,
-              agent.id,
-              response.versionId,
-            );
-            current = {
-              ...response,
-              buildStatus: status.status,
-              buildError: status.error,
-            };
-            publishDispatch({ type: "received", response: current });
-          } catch {
-            // Transient poll failure — keep waiting for the build to settle.
-          }
-        }
-        return current;
+        // Hand the answer to the store and RETURN. A cache hit settles right
+        // here; a fresh build answers "building"/"pending" and the store polls
+        // it out in the background — past this hook's unmount, deliberately.
+        store.received(agent.id, response);
+        return response;
       } catch (error) {
         const message =
           error instanceof ApiError
             ? error.message
             : "Publish failed. Try again.";
-        publishDispatch({ type: "failed", message });
+        store.failed(agent.id, message);
         return null;
       }
     })();
@@ -278,11 +262,11 @@ export function useAgentController(
     } finally {
       inFlightPublish.current = null;
     }
-  }, [flush, publishAgent, agent.id, workspaceId, pollIntervalMs]);
+  }, [flush, publishAgent, agent.id, agent.name, workspaceId, store]);
 
   const resetPublish = useCallback(() => {
-    publishDispatch({ type: "reset" });
-  }, []);
+    store.reset(agent.id);
+  }, [store, agent.id]);
 
   // Publish is offered whenever there are no blocking errors (warnings ok).
   const canPublish = useMemo(
@@ -297,6 +281,7 @@ export function useAgentController(
     dispatch,
     saveStatus,
     isDirty,
+    lifecycle,
     diagnostics,
     publishState,
     publish,

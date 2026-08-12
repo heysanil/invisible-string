@@ -6,20 +6,31 @@
  * Reconciliation: run ROWS come from the query; run EVENTS come only from the
  * streams (the server replays persisted events on connect). seq is
  * authoritative, so a re-delivered frame after a resume is a no-op.
+ *
+ * The header's two derived facts (2026-08-11 spec D5/D6) are joined here
+ * because this is the only component holding all three inputs: the run views
+ * (context usage + resolved model), the session row (agent + pinned version)
+ * and the reads keyed off it (the agent's definition for the preset label, the
+ * workspace's model capabilities, the version's tool directory).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useBlocker } from "@tanstack/react-router";
 import { MessageSquare } from "lucide-react";
 
-import type {
-  RunDto,
-  RunInputRequest,
-  RunStatus,
+import {
+  getAgentVersionToolsResponseSchema,
+  indexToolDirectory,
+  parseAgentDefinition,
+  type ModelPresetSlug,
+  type RunDto,
+  type RunInputRequest,
+  type RunStatus,
 } from "@invisible-string/shared";
 
-import { isSessionBusy } from "../../lib/api-client";
+import { api, isSessionBusy } from "../../lib/api-client";
 import {
+  contextTokensUsed,
   EMPTY_FRAME_STORE,
   reduceRunView,
   type FrameStore,
@@ -28,13 +39,17 @@ import {
 import { isSessionOver } from "../../lib/chat/session-errors";
 import { useMessageQueue } from "../../lib/chat/use-message-queue";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
-import { titleFromMessage } from "../../lib/chat/time";
+import { sessionRowTitle } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
+import { PRESET_LABEL } from "../../lib/labels";
 import {
+  fetchAgent,
   invalidateSessionLists,
+  queryKeys,
   useCancelRun,
   useClearSessionContext,
   useCompactSessionContext,
+  useModelCapabilities,
   usePostMessage,
   usePostRunInput,
   useResetSession,
@@ -44,10 +59,13 @@ import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { EmptyState } from "../ui/EmptyState";
 import { Spinner } from "../ui/Spinner";
 import { useToast } from "../ui/Toast";
-import type { ContextMarkerKind } from "./ContextDivider";
 import { DiscardQueueDialog } from "./DiscardQueueDialog";
 import { ThreadView } from "./ThreadView";
-import type { SessionContextAction, ThreadHeaderProps } from "./ThreadHeader";
+import type {
+  ContextUsageView,
+  SessionContextAction,
+  ThreadHeaderProps,
+} from "./ThreadHeader";
 
 export interface ThreadContainerProps {
   workspaceId: string;
@@ -114,7 +132,6 @@ export function ThreadContainer({
   const [busyNotice, setBusyNotice] = useState<string | null>(null);
   /** Set once eve reports this session id permanently unusable. */
   const [sessionRetired, setSessionRetired] = useState(false);
-  const [contextMarker, setContextMarker] = useState<ContextMarkerKind | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
 
   const runRows = useMemo(() => data?.runs ?? [], [data?.runs]);
@@ -192,6 +209,114 @@ export function ThreadContainer({
       )?.runId ?? null;
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
+
+  // ── header derivations (2026-08-11 spec D5/D6) ────────────────────────────
+
+  const agentId = data?.session.agentId ?? null;
+  const agentVersionId = data?.session.agentVersionId ?? null;
+
+  // The pinned version's tool directory: slug → connection name + the probe's
+  // cached tool descriptions. A session is bound to ONE immutable agent
+  // version, so this is fetched once per thread and every tool call in it
+  // resolves client-side — no round trip per call, and the response is safe to
+  // cache. Failure is silent by design: the steps fall back to humanized tool
+  // names, which is still strictly better than the raw slug they used to show.
+  const toolsQuery = useQuery({
+    // Spelled inline rather than in `queryKeys`: the factory lives in
+    // `lib/queries/**`, and this read exists only for the chat thread. The
+    // `agents` prefix keeps it inside the agent resource's invalidation scope.
+    queryKey: [
+      "agents",
+      workspaceId,
+      "detail",
+      agentId,
+      "version-tools",
+      agentVersionId,
+    ],
+    enabled: agentId !== null && agentVersionId !== null,
+    staleTime: 5 * 60_000,
+    queryFn: ({ signal }) =>
+      api.get(
+        `/workspaces/${workspaceId}/agents/${agentId}/versions/${agentVersionId}/tools`,
+        getAgentVersionToolsResponseSchema,
+        { signal },
+      ),
+  });
+  // Memoized on the RESPONSE, not on every render: the index is handed to
+  // memoized run rows, which would otherwise repaint on each streamed token.
+  const toolsData = toolsQuery.data;
+  const toolDirectory = useMemo(
+    () => indexToolDirectory(toolsData?.directory),
+    [toolsData],
+  );
+
+  const capabilities = useModelCapabilities(workspaceId);
+
+  // The agent row, read for ONE thing here: the definition behind the version
+  // this session is pinned to. Same query key as `useAgent`, so the editor and
+  // the thread share one cache entry; spelled out only to carry `enabled`
+  // (the id is unknown until the session lands).
+  const agentQuery = useQuery({
+    queryKey: queryKeys.agents.detail(workspaceId, agentId ?? ""),
+    enabled: agentId !== null,
+    staleTime: 30_000,
+    queryFn: ({ signal }) => fetchAgent(workspaceId, agentId ?? "", signal),
+    select: (data) => data.agent,
+  });
+
+  // The preset this session's PINNED VERSION actually runs through, read out
+  // of that version's own definition.
+  //
+  // Matching the resolved model id against the preset list is what this
+  // replaces, and it could not work: `balanced` and `quick` are seeded onto
+  // THE SAME model at different reasoning efforts (packages/db/src/seed.ts
+  // says so in as many words), so an id lookup labels every Quick agent
+  // "Balanced" — and re-pointing a preset later would silently relabel old
+  // sessions on top of that.
+  //
+  // Nothing serves an arbitrary version's definition, so this is readable only
+  // while the pinned version is still the agent's published one; a session
+  // left on an older publish (and any agent carrying a specific-model
+  // override, which wins over the preset at compile time) has no preset to
+  // name and falls through to the model's own short name below.
+  const agent = agentQuery.data;
+  const pinnedPreset: ModelPresetSlug | null = useMemo(() => {
+    if (agent === undefined || agentVersionId === null) return null;
+    if (agent.publishedVersionId !== agentVersionId) return null;
+    const definition = parseAgentDefinition(agent.publishedDefinition);
+    if (definition === null) return null;
+    return definition.model.modelId !== undefined
+      ? null
+      : definition.model.preset;
+  }, [agent, agentVersionId]);
+  // While the agent row is still in flight the label is UNKNOWN, not "no
+  // preset": naming the model first and swapping to "Quick" a beat later would
+  // make the chip flicker between two different words on every open.
+  const agentPending = agentId !== null && agentQuery.isPending;
+  const modelLabel = useMemo(() => {
+    if (pinnedPreset !== null) return PRESET_LABEL[pinnedPreset];
+    if (modelId === null || agentPending) return null;
+    return friendlyModelName(modelId);
+  }, [agentPending, modelId, pinnedPreset]);
+
+  // Numerator: the newest measurement taken SINCE THE NEWEST MEMORY BOUNDARY
+  // (D6). Shared with fixture mode rather than re-scanned here — see
+  // `contextTokensUsed` for why a clear/compact must stop the scan.
+  const usedTokens = useMemo(() => contextTokensUsed(runViews), [runViews]);
+  // Denominator: the catalog's context window for the resolved model. Absent
+  // for a non-OpenRouter provider, an unreachable catalog, or a model that is
+  // no longer on the allowlist — in every one of those the meter must vanish
+  // rather than invent a window.
+  const capabilityRows = capabilities.data;
+  const windowTokens = useMemo(() => {
+    if (modelId === null) return null;
+    const entry = capabilityRows?.find((row) => row.modelId === modelId);
+    return entry?.contextWindowTokens ?? null;
+  }, [capabilityRows, modelId]);
+  const contextUsage: ContextUsageView | null =
+    usedTokens !== null && windowTokens !== null && windowTokens > 0
+      ? { usedTokens, windowTokens }
+      : null;
 
   // `mutateAsync` so the queue can await the outcome of its own flush. The
   // direct `send` path below keeps using `mutate` with callbacks.
@@ -336,7 +461,6 @@ export function ThreadContainer({
 
   const runContextControl = useCallback(
     (action: "clear" | "compact") => {
-      const marker: ContextMarkerKind = action === "clear" ? "cleared" : "compacted";
       const mutate = action === "clear" ? clearMutate : compactMutate;
       mutate(
         { sessionId },
@@ -355,13 +479,43 @@ export function ThreadContainer({
               });
               return;
             }
-            setContextMarker(marker);
+            // No optimistic divider: the marker is DERIVED from the persisted
+            // `context.cleared` / `compaction.completed` frames (D4).
+            //
+            // Both routes refuse a BUSY session, so by construction no tail is
+            // attached when one fires and nothing here would ever see those
+            // frames — which is why the control plane drains them itself and
+            // appends them to the run named by `result.marker`. Re-attach that
+            // run's tail (it resumes from this store's cursor, so nothing
+            // replays twice) and the divider lands under the exchange the
+            // control actually followed, exactly as it will after a reload.
+            const marker = result.marker;
+            if (marker !== null) {
+              if (runRows.some((row) => row.id === marker.runId)) {
+                reopenStream(marker.runId);
+              } else {
+                // The drain landed on a run this thread has never seen (another
+                // tab sent the message that created it). Re-read the session
+                // instead: attaching a tail to a run that is not in the list
+                // would put the frames somewhere nothing renders.
+                void queryClient.invalidateQueries({
+                  queryKey: queryKeys.sessions.detail(sessionId),
+                });
+              }
+            }
             toast({
               variant: "success",
               message:
                 action === "clear"
                   ? "Context cleared — the agent starts fresh from your next message."
-                  : "Context compacted — earlier messages were summarized.",
+                  : result.marker !== null
+                    ? "Context compacted — earlier messages were summarized."
+                    : // A compact with NO marker summarized nothing: an empty
+                      // or already-cleared context emits no `compaction.*` at
+                      // all (D4), and a failed summarization keeps the previous
+                      // history. Claiming a boundary here would be the same lie
+                      // the divider refuses to draw.
+                      "Nothing to compact — there was no earlier context to summarize.",
             });
           },
           onError: (mutationError) => {
@@ -371,7 +525,15 @@ export function ThreadContainer({
         },
       );
     },
-    [clearMutate, compactMutate, sessionId, toast],
+    [
+      clearMutate,
+      compactMutate,
+      queryClient,
+      reopenStream,
+      runRows,
+      sessionId,
+      toast,
+    ],
   );
 
   const performReset = useCallback(() => {
@@ -407,7 +569,6 @@ export function ThreadContainer({
 
   const onContextAction = useCallback(
     (action: SessionContextAction) => {
-      setContextMarker(null);
       // Reset only ASKS here — it retires the eve session id permanently.
       if (action === "reset") {
         setConfirmReset(true);
@@ -437,8 +598,14 @@ export function ThreadContainer({
   }
 
   const { session } = data;
-  const title = titleFromMessage(runRows[0]?.triggerEvent.message ?? "");
-  const versionLabel = shortId(session.agentVersionId);
+  // The sidebar row and this header must name the same conversation the same
+  // way, or a generated title makes one thread read as two. `sessionRowTitle`
+  // is that single source of truth (generated title → first message → agent
+  // name) and is shared with SessionList.
+  const title = sessionRowTitle(
+    { title: session.title, agentName: agentName ?? "Agent" },
+    runRows[0]?.triggerEvent.message ?? null,
+  );
 
   const contextActionPending: SessionContextAction | null = clearContext.isPending
     ? "clear"
@@ -452,8 +619,9 @@ export function ThreadContainer({
     title,
     agentName: agentName ?? "Agent",
     agentId: session.agentId,
-    versionLabel,
+    modelLabel,
     modelId,
+    contextUsage,
     workflowName: workflowName ?? null,
     sessionStatus: session.status,
     lastRunStatus: lastRun?.status ?? null,
@@ -495,15 +663,12 @@ export function ThreadContainer({
         onRespond={respond}
         onStop={stoppableRunId !== null ? onStop : undefined}
         stopping={cancelRun.isPending}
-        // Never two dividers for one clear. The optimistic marker exists for
-        // a clear performed while the session is IDLE, where no run is
-        // tailing and eve's `context.cleared` reaches nobody. If the newest
-        // run did observe that event, it already drew its own divider inline,
-        // so the acknowledged-mutation copy is redundant. The UI blocks
-        // context actions while a run is live, so this only collides on a
-        // narrow race — another tab clearing, or a run starting between the
-        // click and the mutation landing.
-        contextMarker={lastRun?.contextCleared === true ? null : contextMarker}
+        // No `contextMarker`: this surface never draws one from local state.
+        // Both boundaries are derived from persisted frames inside the
+        // RunViews above and drawn inline by RunMessage, which is what makes
+        // them survive a reload (D4). ThreadView's prop exists for fixture
+        // mode, where there is no backend to persist anything.
+        toolDirectory={toolDirectory}
         pendingInput={pendingInput}
         inputError={inputError}
         onSend={onSubmit}
@@ -566,8 +731,15 @@ export function ThreadContainer({
   );
 }
 
-function shortId(id: string): string | null {
-  if (id.length === 0) return null;
-  const tail = id.replace(/^.*[_-]/, "");
-  return tail.length > 8 ? tail.slice(0, 8) : tail;
+/**
+ * Last resort for a model with no preset behind it: `~deepseek/deepseek-v4-pro`
+ * → "Deepseek v4 pro". The vendor prefix and OpenRouter's leading `~` (part of
+ * a `-latest` alias id, not a typo) carry nothing a reader of a chat wants; the
+ * full id stays on the chip's tooltip.
+ */
+function friendlyModelName(modelId: string): string {
+  const tail = modelId.replace(/^~/, "").split("/").pop() ?? modelId;
+  const spaced = tail.replace(/[-_]+/g, " ").trim();
+  if (spaced.length === 0) return modelId;
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }

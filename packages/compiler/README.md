@@ -17,6 +17,7 @@ const { files, hash } = compile(definition, {   // definition: AgentDefinition
     reasoning: "max",                   // required; "provider-default" = omit
   },
   workspaceSlug: "acme",
+  agentId: "b2000000-0000-4000-8000-00000000000a",  // agents.id uuid — identity input (D1)
   agentSlug: "software-engineer",
   connections,                          // resolved `connections` rows
   skills,                               // resolved `skills` rows
@@ -148,10 +149,23 @@ boot — and its first turn would die. With the guard, keyless builds bake
 - **Covers**: the `AgentDefinition`, `COMPILER_VERSION`, the caller's
   build-env epoch, the full `versions.json` content, and every resolved
   input that shapes the emitted files (connections, skills, model,
-  `agentSlug`, `workspaceSlug`, dev flag). This is a superset of the PLAN's
-  "definition + compiler version + eve version" so a cached artifact can
-  never go stale invisibly — e.g. editing a skill's markdown changes the
-  hash even though the definition stores only its UUID.
+  `agentId`, `agentSlug`, `workspaceSlug`, dev flag). This is a superset of
+  the PLAN's "definition + compiler version + eve version" so a cached
+  artifact can never go stale invisibly — e.g. editing a skill's markdown
+  changes the hash even though the definition stores only its UUID.
+- **`agentId` is the IDENTITY input** (2026-08-11 lifecycle spec D1): the
+  `agents.id` uuid, never emitted into a generated file. Two agents in one
+  workspace with the same display name and the same definition must land on
+  different artifacts — before D1 they hashed identically and shared one
+  `ag_v_<hash12>` world database, and the only thing preventing that was the
+  unique index `agents_organization_id_name_uidx` (now dropped). A display
+  string is not identity.
+- **`agentSlug` still participates too**, for a different reason: it is
+  emitted (generated package name, the model-visible identity line in
+  `agent/channels/eve.ts`), and no input that changes emitted bytes may
+  leave the hash unmoved. So renaming an agent still re-keys its artifact,
+  world DB, and JWT audience on the next publish — known churn, out of scope
+  per the spec's §7.
 - **`workspaceSlug` participates deliberately** (tenant isolation):
   identical agent configs in two workspaces must never share an artifact,
   world database, or JWT audience.
@@ -205,6 +219,16 @@ fetches short-lived access tokens from the control plane's
 files). New emitted file → minor; bearer/headers/none emissions are
 byte-identical, though every version hash shifts because `COMPILER_VERSION`
 participates.
+
+**5.0.0 is the agent-identity major**: `CompileDeps` gains a REQUIRED
+`agentId` (the `agents.id` uuid) and the hash keys identity on it rather than
+on the slugified display name alone. No template changed — the only emitted
+bytes that move are the baked audience in `agent/lib/platform-auth.ts` — but
+the compile INPUT gained a required field and **every** existing artifact is
+re-keyed, so the first publish of each agent after deploy runs a real
+`eve build` instead of hitting cache (operational note in `docs/DEPLOY.md`).
+`agentSlug` keeps feeding codegen *and* the hash; `BUILD_ENV_EPOCH` is
+untouched (the build environment is unchanged).
 
 The bump is enforced MECHANICALLY: `fixtures/.golden-digest.json` commits a
 sha256 over every fixture's emitted bytes paired with the `COMPILER_VERSION`

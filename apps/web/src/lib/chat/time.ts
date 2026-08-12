@@ -1,7 +1,8 @@
 /**
- * Time presentation for the chat surface: compact relative timestamps
- * ("now", "5m", "3h", "2d", then a short date) and recency buckets for the
- * session list ("Today" / "Yesterday" / "Previous 7 days" / "Earlier").
+ * Time and title presentation for the chat surface: compact relative
+ * timestamps ("now", "5m", "3h", "2d", then a short date), recency buckets for
+ * the session list ("Today" / "Yesterday" / "Previous 7 days" / "Earlier"),
+ * and how a session row is NAMED.
  */
 
 export function relativeTime(iso: string, now: Date = new Date()): string {
@@ -53,4 +54,46 @@ export function titleFromMessage(message: string, max = 64): string {
   const compact = line.replace(/\s+/g, " ").trim();
   if (compact.length === 0) return "New conversation";
   return compact.length > max ? `${compact.slice(0, max - 1).trimEnd()}…` : compact;
+}
+
+/**
+ * How a session row is NAMED, in falling order of usefulness (2026-08-11
+ * spec, D9). Every row used to read the agent's name, so a workspace that
+ * chats with one agent had a sidebar of identical rows.
+ *
+ *  1. The title the control plane generated after the first user message.
+ *  2. A truncation of that first message — the fallback while the titler is
+ *     still running, and the permanent answer for a session whose titling
+ *     failed (it fails SILENTLY by design), that predates the column, or that
+ *     the titler declined to name.
+ *  3. The agent's name, which is at least true.
+ *
+ * (2) is reachable on a COLD LOAD — nothing opened, any device — because the
+ * session LIST DTO carries `firstMessagePreview`: the thread's opener,
+ * truncated server-side. A caller that holds the WHOLE message (a thread
+ * detail, a fixture's canned runs) may pass it as `firstMessage` and it wins,
+ * since the preview is only the first `SESSION_MESSAGE_PREVIEW_MAX_CHARS` of
+ * the same text. Both are absent only for a thread that never had an inbound
+ * message (a schedule firing), and then (3) is the last honest answer:
+ * `titleFromMessage("")` says "New conversation", a worse row label than the
+ * agent's name — hence the emptiness guards rather than a bare `??` chain.
+ */
+export function sessionRowTitle(
+  session: {
+    title: string | null;
+    agentName: string;
+    /** The list DTO's server-truncated opener — what makes (2) cold-loadable. */
+    firstMessagePreview?: string | null;
+  },
+  firstMessage?: string | null,
+): string {
+  const generated = session.title?.trim() ?? "";
+  if (generated.length > 0) return generated;
+  // Ordered, not `??`-chained: an empty explicit message must fall THROUGH to
+  // the preview rather than shadowing it.
+  for (const candidate of [firstMessage, session.firstMessagePreview]) {
+    const message = candidate?.trim() ?? "";
+    if (message.length > 0) return titleFromMessage(message);
+  }
+  return session.agentName;
 }

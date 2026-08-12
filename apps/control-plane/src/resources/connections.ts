@@ -11,6 +11,11 @@
  * distinctly (`slugifyName` — the exact function the compile path uses for
  * connection filenames/env vars), so a publish can never fail on a slug
  * collision the create quietly allowed.
+ *
+ * Also here: the per-agent-version TOOL DIRECTORY (2026-08-11 spec D5) — the
+ * read-only projection of this domain's probe-cached `tools/list` that lets
+ * the chat thread render a tool call in English. It lives with the data it
+ * projects; see {@link getAgentVersionTools}.
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -19,9 +24,11 @@ import {
   newId,
   updateConnectionRequestSchema,
   type ConnectionOauthStatus,
+  type ConnectionToolDirectoryEntry,
   type ConnectorCatalogEntry,
   type CreateConnectionResponse,
   type DeleteResourceResponse,
+  type GetAgentVersionToolsResponse,
   type GetConnectionResponse,
   type ListConnectionsResponse,
   type McpApprovalPolicy,
@@ -520,4 +527,148 @@ export async function probeConnectionRoute(
       error instanceof Error ? error.message : String(error),
     );
   }
+}
+
+// ── agent-version tool directory (2026-08-11 spec D5) ───────────────────────
+
+/**
+ * `agents.id` / `agent_versions.id` are uuid columns, so a junk path segment
+ * reaches postgres as `invalid input syntax for type uuid` — a 500 for what is
+ * really "no such row". Shape-check first and 404 like any other unknown id.
+ */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Tool directory for ONE agent version — what the chat thread reads so a step
+ * can render as "Linear · Create issue", with the tool's own description as its
+ * subtitle, instead of `linear__create_issue` plus a JSON blob (spec D5).
+ *
+ * Everything served here is data the control plane already holds: the version
+ * row's `connection_slugs` map (slug → `cn_` id, written at publish from the
+ * same unique-slug pass the compiler bakes into the generated files) joined to
+ * each connection's display name and its probe-cached `tools/list`
+ * (`connections.tools_cache`). NOTHING is fetched from an MCP server on this
+ * path — rendering a thread must never dial a third-party server, and a stale
+ * or absent cache is a display degradation, never a probe.
+ *
+ * WHY A VERSION-KEYED ROUTE rather than a field on session detail: a session is
+ * bound to exactly one `agent_version_id` and versions are immutable, so the
+ * thread fetches this ONCE per version and resolves every tool call in the run
+ * stream against it client-side — no round trip per tool call, no N+1, and the
+ * same response serves every session on that version. The echoed
+ * `agentVersionId` is what makes a client-side cache safe to key.
+ *
+ * Degradations, all silent, all still 200 with a well-formed directory:
+ *  - `connection_slugs` null (a row published before that column existed) →
+ *    no entries; republishing backfills it;
+ *  - a slug whose connection row no longer resolves in the agent's scope → the
+ *    entry is DROPPED and the thread falls back to the slug it already has in
+ *    the tool name. Defensive rather than routine: the delete guard
+ *    (`connectionReferences`) refuses to remove a connection any version's
+ *    definition still names, so this is reachable only by a scope change;
+ *  - a connection never probed OK → `tools: []` (empty, never absent), so the
+ *    step shows its humanized name with no description.
+ *
+ * A DISABLED connection is deliberately still resolved: the version was
+ * compiled while it was enabled and its calls are in the run history this
+ * decorates — hiding the name would only make old threads less legible.
+ *
+ * SCOPE: the agent's own — workspace rows of this organization, or user rows of
+ * the agent's run-as user. That is exactly the set `resolveCompileInputs`
+ * accepted at publish, so re-deriving it here means a connection that has since
+ * changed hands cannot be read back through an old version. A workspace member
+ * reading a run-as-someone-else agent does see that user's connection NAMES —
+ * but they already do, because the emitted slug IS `slugifyName(name)` and
+ * rides every tool call in the run stream this directory exists to decorate.
+ * No credential material, URL, or auth config appears in this projection.
+ */
+export async function getAgentVersionTools(
+  deps: ResourceDeps,
+  organizationId: string,
+  agentId: string,
+  versionId: string,
+): Promise<GetAgentVersionToolsResponse> {
+  if (!UUID_RE.test(agentId)) throw errors.notFound("agent");
+  if (!UUID_RE.test(versionId)) throw errors.notFound("agent_version");
+
+  const agents = await deps.db
+    .select({
+      id: schema.agents.id,
+      runAsUserId: schema.agents.runAsUserId,
+    })
+    .from(schema.agents)
+    .where(
+      and(
+        eq(schema.agents.id, agentId),
+        eq(schema.agents.organizationId, organizationId),
+      ),
+    )
+    .limit(1);
+  const agent = agents[0];
+  if (!agent) throw errors.notFound("agent");
+
+  // The version must belong to THIS agent — a version id from another agent
+  // (or another workspace) is 404, not somebody else's tool inventory.
+  const versions = await deps.db
+    .select({
+      id: schema.agentVersions.id,
+      connectionSlugs: schema.agentVersions.connectionSlugs,
+    })
+    .from(schema.agentVersions)
+    .where(
+      and(
+        eq(schema.agentVersions.id, versionId),
+        eq(schema.agentVersions.agentId, agent.id),
+      ),
+    )
+    .limit(1);
+  const version = versions[0];
+  if (!version) throw errors.notFound("agent_version");
+
+  const slugs = version.connectionSlugs ?? {};
+  const entries: ConnectionToolDirectoryEntry[] = [];
+  const connectionIds = [...new Set(Object.values(slugs))];
+  if (connectionIds.length > 0) {
+    // ONE query for every referenced connection (the map is small — a context's
+    // connection list — but a per-slug SELECT here would be an N+1 on a path
+    // the thread hits on every open).
+    const rows = await deps.db
+      .select({
+        id: schema.connections.id,
+        name: schema.connections.name,
+        scope: schema.connections.scope,
+        organizationId: schema.connections.organizationId,
+        userId: schema.connections.userId,
+        toolsCache: schema.connections.toolsCache,
+      })
+      .from(schema.connections)
+      .where(inArray(schema.connections.id, connectionIds));
+    const byId = new Map(
+      rows
+        .filter(
+          (row) =>
+            (row.scope === "workspace" && row.organizationId === organizationId) ||
+            (row.scope === "user" && row.userId === agent.runAsUserId),
+        )
+        .map((row) => [row.id, row]),
+    );
+    for (const [slug, connectionId] of Object.entries(slugs)) {
+      const row = byId.get(connectionId);
+      if (!row) continue;
+      entries.push({
+        slug,
+        connectionId: row.id,
+        connectionName: row.name,
+        tools: row.toolsCache ?? [],
+      });
+    }
+    // Stable order (the map's key order is insertion order from publish, which
+    // is definition order — fine, but sorting makes the response comparable).
+    entries.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  }
+
+  return {
+    directory: { agentVersionId: version.id, connections: entries },
+  };
 }

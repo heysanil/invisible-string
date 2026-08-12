@@ -1,8 +1,19 @@
 /**
- * Session list panel: recency-grouped sessions, each row = agent-name title +
- * live status dot + relative time (+ origin/workflow provenance chips for
- * trigger-started sessions). Client-side search filter and a "New chat"
- * capsule that opens the agent picker.
+ * Session list panel: recency-grouped sessions, each row = live status dot +
+ * the session's own title + relative time, over a quiet identity line naming
+ * the agent (and, for trigger-started sessions, origin/workflow provenance
+ * chips). Client-side search filter and a "New chat" capsule that opens the
+ * agent picker.
+ *
+ * TITLE OVER AGENT, BOTH LEGIBLE (2026-08-11 spec, D9). Rows used to be
+ * titled by the agent's name, which made every thread in a one-agent
+ * workspace look identical. The generated title is now the row's headline —
+ * but a title alone loses WHICH agent a thread belongs to, so the agent keeps
+ * a line of its own, monogram first, in the metadata register. The one case
+ * where it is suppressed is the one where it would be duplicated: a session
+ * with no title and no known first message falls back to the agent's name,
+ * and repeating it underneath would be noise. Resolution itself is
+ * {@link sessionRowTitle}, done by the owner of the data (the shells).
  */
 import { useMemo, useState } from "react";
 import { MessageCircle, Plus, Search } from "lucide-react";
@@ -16,6 +27,7 @@ import {
   relativeTime,
   RECENCY_GROUPS,
 } from "../../lib/chat/time";
+import { AgentMonogram } from "../agents/AgentMonogram";
 import { EmptyState } from "../ui/EmptyState";
 import { ErrorState } from "../ui/ErrorState";
 import { Spinner } from "../ui/Spinner";
@@ -28,8 +40,13 @@ import { livenessOf, StatusDot } from "./StatusDot";
 function noopChange() {}
 
 export interface SessionListItem extends AgentSessionSummaryDto {
-  /** Row title — the agent name (the list DTO carries no first message). */
-  title: string;
+  /**
+   * Resolved row headline from {@link sessionRowTitle} — never empty. Kept
+   * SEPARATE from the DTO's nullable `title` on purpose: the raw column is
+   * still needed to tell "the titler has not answered yet" (fall back) from
+   * "it did" (use it), and collapsing the two would throw that away.
+   */
+  displayTitle: string;
 }
 
 export interface SessionListProps {
@@ -64,7 +81,7 @@ export function SessionList({
     if (q === "") return sessions;
     return sessions.filter(
       (session) =>
-        session.title.toLowerCase().includes(q) ||
+        session.displayTitle.toLowerCase().includes(q) ||
         session.agentName.toLowerCase().includes(q) ||
         (session.workflowName?.toLowerCase().includes(q) ?? false),
     );
@@ -179,6 +196,11 @@ function SessionRow({
   now?: Date;
 }) {
   const liveness = livenessOf(session.status, session.lastRunStatus);
+  // Only redundant when the title IS the agent name — i.e. the last-resort
+  // fallback fired. Any real title, generated or message-derived, keeps the
+  // identity line.
+  const showAgent = session.displayTitle !== session.agentName;
+  const showMeta = showAgent || session.origin !== "chat";
   return (
     <button
       type="button"
@@ -192,17 +214,39 @@ function SessionRow({
       <div className="flex items-center gap-2">
         <StatusDot state={liveness} />
         <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium text-ink">
-          {session.title || session.agentName}
+          {session.displayTitle}
         </span>
         <span className="shrink-0 text-[11px] text-ink-4">
           {relativeTime(session.lastActivityAt, now)}
         </span>
       </div>
-      {session.origin !== "chat" ? (
-        <div className="flex items-center gap-1.5 pl-4">
-          <Chip>{session.origin}</Chip>
-          {session.workflowName !== null ? (
-            <Chip title="Started by workflow">{session.workflowName}</Chip>
+      {/* Metadata register, aligned under the title past the status dot. It
+          WRAPS rather than truncating as a unit: in a 320 px panel an agent
+          name plus a workflow name does not fit on one line, and clipping the
+          provenance would hide the only thing that distinguishes two
+          trigger-started threads. */}
+      {showMeta ? (
+        <div className="flex flex-wrap items-center gap-1.5 pl-4">
+          {showAgent ? (
+            <span className="flex min-w-0 items-center gap-1 text-[11.5px] text-ink-4">
+              {/* Chip-scale monogram: the important overrides win over the
+                  size preset (cn has no tailwind-merge). Decorative — the
+                  name is right beside it. */}
+              <AgentMonogram
+                name={session.agentName}
+                size="sm"
+                className="size-4! text-[8px]!"
+              />
+              <span className="truncate">{session.agentName}</span>
+            </span>
+          ) : null}
+          {session.origin !== "chat" ? (
+            <>
+              <Chip>{session.origin}</Chip>
+              {session.workflowName !== null ? (
+                <Chip title="Started by workflow">{session.workflowName}</Chip>
+              ) : null}
+            </>
           ) : null}
         </div>
       ) : null}

@@ -4,6 +4,12 @@
  *   dedupe, override clearing, lossless PATCH round-trip)
  * - controller behavior over a mocked fetch (debounced autosave PATCH,
  *   piggybacked dry-run diagnostics routing, publish → build-status poll).
+ *
+ * The publish poll no longer belongs to the controller (spec D2) — the probe
+ * injects its own {@link AgentPublishStore} so this file exercises the same
+ * end-to-end path without touching the app singleton. The store's own
+ * behavior (surviving unmount, workspace teardown) lives in
+ * agent-publish-store.test.ts.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -21,6 +27,7 @@ import {
   initAgentEditorState,
   type AgentEditorState,
 } from "../lib/agents/model";
+import { AgentPublishStore } from "../lib/agents/publish-store";
 import { useAgentController } from "../lib/agents/useAgentController";
 
 ensureDomForThisFile();
@@ -245,7 +252,7 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function ControllerProbe() {
+function ControllerProbe({ store }: { store: AgentPublishStore }) {
   const controller = useAgentController({
     workspaceId: WS,
     agent: agentRow(STORED_DRAFT),
@@ -262,12 +269,13 @@ function ControllerProbe() {
         updatedAt: NOW,
       },
     ],
-    buildPollIntervalMs: 10,
+    publishStore: store,
   });
   return (
     <div>
       <p>save:{controller.saveStatus}</p>
       <p>dirty:{String(controller.isDirty)}</p>
+      <p>lifecycle:{controller.lifecycle}</p>
       <p>phase:{controller.publishState.phase}</p>
       <p>model-issues:{controller.diagnostics.sections.model.length}</p>
       <p>persona-issues:{controller.diagnostics.sections.persona.length}</p>
@@ -286,13 +294,13 @@ function ControllerProbe() {
   );
 }
 
-function renderProbe() {
+function renderProbe(store = new AgentPublishStore({ pollIntervalMs: 10 })) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <ControllerProbe />
+      <ControllerProbe store={store} />
     </QueryClientProvider>,
   );
 }
@@ -381,4 +389,176 @@ test("publish flows through the build-status poll to ready", async () => {
   ).toBe(true);
   // No pending edits, so publish must not fire a flush PATCH.
   expect(recordedCalls.some((call) => call.method === "PATCH")).toBe(false);
+});
+
+test("publish() RESOLVES on the POST, without waiting for the build (D2)", async () => {
+  // The regression this guards: awaiting the build here is what made
+  // "Chat with agent" sit on a spinner for the length of an `eve build`.
+  let buildDone = false;
+  respond = (method, url) => {
+    if (method === "POST" && url.includes("/publish")) {
+      return jsonResponse({
+        agentId: AGENT_ID,
+        versionId: VERSION_ID,
+        contentHash: "hash123",
+        buildStatus: "building",
+        cached: false,
+        buildError: null,
+      });
+    }
+    if (method === "GET" && url.includes(`/versions/${VERSION_ID}/build`)) {
+      return jsonResponse(
+        buildDone
+          ? { status: "succeeded", error: null }
+          : { status: "building", error: null },
+      );
+    }
+    return jsonResponse({ agents: [] });
+  };
+
+  let resolved: string | null = null;
+  function ResolveProbe({ store }: { store: AgentPublishStore }) {
+    const controller = useAgentController({
+      workspaceId: WS,
+      agent: agentRow(STORED_DRAFT),
+      initialState: initAgentEditorState(agentRow(STORED_DRAFT)),
+      allowlist: [],
+      publishStore: store,
+    });
+    return (
+      <button
+        type="button"
+        onClick={() =>
+          void controller.publish().then((response) => {
+            resolved = response?.buildStatus ?? "null";
+          })
+        }
+      >
+        publish
+      </button>
+    );
+  }
+
+  const store = new AgentPublishStore({ pollIntervalMs: 10 });
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <ResolveProbe store={store} />
+    </QueryClientProvider>,
+  );
+  fireEvent.click(view.getByRole("button", { name: "publish" }));
+
+  // Resolves with the NON-terminal status while the build is still running…
+  await waitFor(() => expect(resolved).toBe("building"));
+  expect(store.stateOf(AGENT_ID).phase).toBe("building");
+
+  // …and the store finishes the job on its own.
+  buildDone = true;
+  await waitFor(() => expect(store.stateOf(AGENT_ID).phase).toBe("ready"), {
+    timeout: 3000,
+  });
+});
+
+test("lifecycle: saved-but-behind reads 'unpublished', a never-published agent 'draft'", async () => {
+  respond = () => jsonResponse({ agents: [] });
+
+  // Never published → draft (NOT "unpublished changes" — nothing to be behind).
+  const draft = renderProbe();
+  expect(draft.getByText("lifecycle:draft")).toBeTruthy();
+  cleanup();
+
+  // Published, and the saved draft matches it → published.
+  function LifecycleProbe({ published }: { published: unknown }) {
+    const agent: AgentDto = {
+      ...agentRow(STORED_DRAFT),
+      publishedVersionId: VERSION_ID,
+      publishedDefinition: published as AgentDto["publishedDefinition"],
+    };
+    const controller = useAgentController({
+      workspaceId: WS,
+      agent,
+      initialState: initAgentEditorState(agent),
+      allowlist: [],
+      publishStore: new AgentPublishStore({ pollIntervalMs: 10 }),
+    });
+    return <p>lifecycle:{controller.lifecycle}</p>;
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
+  // Key-ORDER differs from the reducer's own output on purpose: the published
+  // definition arrives from postgres jsonb, so a stringify-based comparison
+  // would call this identical draft "unpublished" forever.
+  const reordered = {
+    context: STORED_DRAFT.context,
+    model: {
+      reasoning: STORED_DRAFT.model.reasoning,
+      modelId: STORED_DRAFT.model.modelId,
+      preset: STORED_DRAFT.model.preset,
+    },
+    persona: STORED_DRAFT.persona,
+  };
+  const synced = render(
+    <QueryClientProvider client={queryClient}>
+      <LifecycleProbe published={reordered} />
+    </QueryClientProvider>,
+  );
+  expect(synced.getByText("lifecycle:published")).toBeTruthy();
+  cleanup();
+
+  const behind = render(
+    <QueryClientProvider client={queryClient}>
+      <LifecycleProbe
+        published={{ ...STORED_DRAFT, persona: "An older persona." }}
+      />
+    </QueryClientProvider>,
+  );
+  expect(behind.getByText("lifecycle:unpublished")).toBeTruthy();
+});
+
+test("lifecycle: a rename of a published agent is an UNPUBLISHED change", () => {
+  // The controller must feed the NAME into the lifecycle, not just the two
+  // definitions: `agentSlug` is still a content-hash input (spec D1), so a
+  // rename re-keys the artifact and the running agent keeps introducing
+  // itself by the old name until the next publish.
+  respond = () => jsonResponse({ agents: [] });
+
+  function RenamedProbe({ publishedName }: { publishedName: string }) {
+    const agent = {
+      ...agentRow(STORED_DRAFT),
+      name: "Inbox triage",
+      publishedVersionId: VERSION_ID,
+      publishedDefinition: STORED_DRAFT as AgentDto["publishedDefinition"],
+      publishedName,
+    } as AgentDto;
+    const controller = useAgentController({
+      workspaceId: WS,
+      agent,
+      initialState: initAgentEditorState(agent),
+      allowlist: [],
+      publishStore: new AgentPublishStore({ pollIntervalMs: 10 }),
+    });
+    return <p>lifecycle:{controller.lifecycle}</p>;
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
+  const renamed = render(
+    <QueryClientProvider client={queryClient}>
+      <RenamedProbe publishedName="Untitled agent" />
+    </QueryClientProvider>,
+  );
+  expect(renamed.getByText("lifecycle:unpublished")).toBeTruthy();
+  cleanup();
+
+  const unchanged = render(
+    <QueryClientProvider client={queryClient}>
+      <RenamedProbe publishedName="Inbox triage" />
+    </QueryClientProvider>,
+  );
+  expect(unchanged.getByText("lifecycle:published")).toBeTruthy();
 });

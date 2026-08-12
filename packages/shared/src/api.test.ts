@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   addModelAllowlistEntryRequestSchema,
   agentDtoSchema,
+  agentSessionDtoSchema,
   agentSessionSummaryDtoSchema,
   agentSummaryDtoSchema,
   agentVersionDtoSchema,
@@ -29,6 +30,8 @@ import {
   resetSessionRequestSchema,
   resetSessionResponseSchema,
   RUN_STREAM_EVENT_NAMES,
+  SESSION_MESSAGE_PREVIEW_MAX_CHARS,
+  SESSION_TITLE_MAX_CHARS,
   runDtoSchema,
   runInputRequestSchema,
   runWorkflowRequestSchema,
@@ -195,6 +198,48 @@ describe("workflow CRUD schemas", () => {
   });
 });
 
+describe("session titles (spec D9)", () => {
+  const session = {
+    id: UUID,
+    agentId: UUID_2,
+    agentVersionId: UUID_2,
+    workflowId: null,
+    origin: "chat",
+    status: "active",
+    eveSessionId: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+
+  test("title is a required key with a nullable value", () => {
+    expect(agentSessionDtoSchema.safeParse({ ...session, title: null }).success).toBe(
+      true,
+    );
+    expect(
+      agentSessionDtoSchema.safeParse({ ...session, title: "Ship the notes" }).success,
+    ).toBe(true);
+    // Omitted entirely is a serializer bug — clients must be able to tell
+    // "no title yet" (null → fall back to the message truncation) apart from
+    // a field the server forgot to send.
+    expect(agentSessionDtoSchema.safeParse(session).success).toBe(false);
+  });
+
+  test("a title longer than the column budget is rejected", () => {
+    expect(
+      agentSessionDtoSchema.safeParse({
+        ...session,
+        title: "x".repeat(SESSION_TITLE_MAX_CHARS),
+      }).success,
+    ).toBe(true);
+    expect(
+      agentSessionDtoSchema.safeParse({
+        ...session,
+        title: "x".repeat(SESSION_TITLE_MAX_CHARS + 1),
+      }).success,
+    ).toBe(false);
+  });
+});
+
 describe("sessions list schemas", () => {
   test("query accepts optional agentId + workflowId + status", () => {
     expect(listSessionsQuerySchema.safeParse({}).success).toBe(true);
@@ -217,6 +262,8 @@ describe("sessions list schemas", () => {
         workflowId: null,
         origin: "chat",
         status: "active",
+        // Untitled until the titler lands — the normal early state.
+        title: null,
         eveSessionId: null,
         createdAt: NOW,
         updatedAt: NOW,
@@ -235,6 +282,7 @@ describe("sessions list schemas", () => {
         workflowId: UUID_2,
         origin: "webhook",
         status: "active",
+        title: "Nightly digest",
         eveSessionId: "eve_1",
         createdAt: NOW,
         updatedAt: NOW,
@@ -244,6 +292,52 @@ describe("sessions list schemas", () => {
         lastActivityAt: NOW,
       }).success,
     ).toBe(true);
+  });
+
+  test("the first-message preview is optional, nullable, and length-bounded", () => {
+    const row = {
+      id: UUID,
+      agentId: UUID_2,
+      agentVersionId: UUID,
+      workflowId: null,
+      origin: "chat",
+      status: "active",
+      title: null,
+      eveSessionId: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      agentName: "General Purpose",
+      workflowName: null,
+      lastRunStatus: "running",
+      lastActivityAt: NOW,
+    };
+    // Null = nothing to preview (a schedule-triggered session); absent = a
+    // client/fixture that predates the field. Both must parse — the row still
+    // renders, it just falls through to the agent's name.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({ ...row, firstMessagePreview: null })
+        .success,
+    ).toBe(true);
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "Draft the Q3 board update",
+      }).success,
+    ).toBe(true);
+    // The server truncates; a full message body reaching the list is the bug
+    // the cap exists to catch.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "x".repeat(SESSION_MESSAGE_PREVIEW_MAX_CHARS),
+      }).success,
+    ).toBe(true);
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "x".repeat(SESSION_MESSAGE_PREVIEW_MAX_CHARS + 1),
+      }).success,
+    ).toBe(false);
   });
 });
 
@@ -272,6 +366,7 @@ describe("session context controls (eve 0.31)", () => {
     workflowId: null,
     origin: "chat",
     status: "active",
+    title: "Ship the release notes",
     eveSessionId: "wrun_01KZFM7CCZWQ4SXBPVV0CGA9HN",
     createdAt: NOW,
     updatedAt: NOW,
@@ -293,6 +388,48 @@ describe("session context controls (eve 0.31)", () => {
       sessionContextControlResponseSchema.safeParse({
         session,
         status: "no_active_turn",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("the boundary marker defaults to null and names the run it landed in", () => {
+    // A response with no `marker` key parses to an explicit null rather than
+    // `undefined`: "no divider landed" is a real outcome (a compact over an
+    // empty context emits no `compaction.*` at all, D4), and the client must
+    // not have to tell absent from unknown.
+    const bare = sessionContextControlResponseSchema.parse({
+      session,
+      status: "accepted",
+    });
+    expect(bare.marker).toBeNull();
+
+    const withMarker = sessionContextControlResponseSchema.safeParse({
+      session,
+      status: "accepted",
+      marker: { kind: "cleared", runId: UUID_2 },
+    });
+    expect(withMarker.success).toBe(true);
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "compacted", runId: UUID_2 },
+      }).success,
+    ).toBe(true);
+    // `compaction.requested` proves nothing was summarized yet — there is no
+    // "requested" marker kind, and a run id is not optional.
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "requested", runId: UUID_2 },
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "cleared" },
       }).success,
     ).toBe(false);
   });

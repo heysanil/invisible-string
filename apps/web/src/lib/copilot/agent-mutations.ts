@@ -1,13 +1,30 @@
 /**
  * AGENT-surface copilot adapter (see adapter.ts for the seam).
  *
- * Maps the agent toolset (`setPersona` / `setModel` / `addContext` /
- * `removeContext`) onto the agent editor reducer actions (single writer —
- * the same path manual edits take). `setPersona` previews as a full DiffView
- * diff (persona is a document, like workflow instructions); the rest get the
- * compact before→after row.
+ * Maps the agent toolset (`setName` / `setDescription` / `setPersona` /
+ * `setModel` / `addContext` / `removeContext`) onto the agent editor reducer
+ * actions (single writer — the same path manual edits take). `setPersona`
+ * previews as a full DiffView diff (persona is a document, like workflow
+ * instructions); the rest get the compact before→after row.
+ *
+ * IDENTITY IS NOT IN THE DRAFT (2026-08-11 spec D7.3/D7.4). `agents.name` and
+ * `agents.description` are row columns, not part of the compiled
+ * {@link AgentDefinition}, so:
+ * - the card's "before" side comes from {@link AgentCopilotAdapterOptions.getIdentity},
+ *   not from `getDraft()`;
+ * - the SERVER gets it the same way: `getIdentity` is republished on the
+ *   adapter so `useCopilot` can put it in the `user_message` frame's own
+ *   `identity` field. Without that the model was blind to the agent's name —
+ *   the draft it receives is an `AgentDefinition` and simply has no such key;
+ * - `setDescription` still rides the editor reducer (it owns the column);
+ * - `setName` does NOT — the reducer deliberately excludes the name ("the
+ *   header commits it directly", lib/agents/model.ts), so it rides its own
+ *   {@link AgentCopilotAdapterOptions.setName} seam, which the owning screen
+ *   points at the same commit path its header uses. That seam is a NETWORK
+ *   write, which is why it — alone among the agent tools — reports back
+ *   whether it landed: see {@link ApplyProposalResult}.
  */
-import { Cpu, FileText, Plug } from "lucide-react";
+import { AlignLeft, Cpu, FileText, Plug, Tag } from "lucide-react";
 import {
   AGENT_COPILOT_MUTATION_TOOLS,
   type AgentCopilotMutationTool,
@@ -20,7 +37,11 @@ import {
 import type { AgentEditorAction, AgentSection } from "../agents/model";
 import type { ContextResources } from "../builder/resources";
 import { shortModelId } from "../builder/summary";
-import type { CopilotSurfaceAdapter, ProposalDescription } from "./adapter";
+import type {
+  ApplyProposalResult,
+  CopilotSurfaceAdapter,
+  ProposalDescription,
+} from "./adapter";
 import { unsupportedProposalDescription } from "./mutations";
 
 /** Proposals belonging to the agent surface (any other tool = server bug). */
@@ -37,14 +58,27 @@ export function isAgentProposal(
   );
 }
 
+/** Row-level agent identity — the "before" side of the two identity cards. */
+export interface AgentIdentity {
+  name: string;
+  description: string | null;
+}
+
 /**
  * The editor section a proposal lands on (rail flash + card icon). The
  * copilot never touches "access" — run-as is a human trust decision.
+ *
+ * `null` for the identity tools: name and description live in the editor
+ * HEADER, not in any of the four rail sections, and flashing an unrelated
+ * section would point the user at the wrong thing.
  */
 export function agentSectionOfProposal(
   proposal: AgentCopilotProposal,
-): AgentSection {
+): AgentSection | null {
   switch (proposal.tool) {
+    case "setName":
+    case "setDescription":
+      return null;
     case "setPersona":
       return "persona";
     case "setModel":
@@ -55,11 +89,22 @@ export function agentSectionOfProposal(
   }
 }
 
-/** Map an agent proposal to the editor reducer actions that apply it. */
+/**
+ * Map an agent proposal to the editor reducer actions that apply it.
+ *
+ * `setName` maps to NO action on purpose (see the module header) — the adapter
+ * routes it through its own seam. Everything else is a reducer action.
+ */
 export function agentProposalToActions(
   proposal: AgentCopilotProposal,
 ): AgentEditorAction[] {
   switch (proposal.tool) {
+    case "setName":
+      return [];
+    case "setDescription":
+      return [
+        { type: "setDescription", description: proposal.params.description },
+      ];
     case "setPersona":
       return [{ type: "setPersona", markdown: proposal.params.markdown }];
     case "setModel": {
@@ -131,8 +176,34 @@ export function describeAgentProposal(
   proposal: AgentCopilotProposal,
   definition: AgentDefinition,
   resources: ContextResources,
+  /**
+   * Current row identity. Optional so a caller with no identity source still
+   * gets a usable card — the before side then reads as unknown rather than
+   * as a fabricated empty value.
+   */
+  identity?: AgentIdentity,
 ): ProposalDescription {
   switch (proposal.tool) {
+    case "setName": {
+      const before = identity?.name.trim() ?? "";
+      return {
+        icon: Tag,
+        title: `Rename agent: ${proposal.params.name}`,
+        before: before.length > 0 ? before : null,
+        after: proposal.params.name,
+      };
+    }
+    case "setDescription": {
+      const before = identity?.description?.trim() ?? "";
+      return {
+        icon: AlignLeft,
+        title: before.length > 0 ? "Update description" : "Add description",
+        // An agent that has none is a real state, not missing data — say so
+        // rather than rendering an empty strikethrough.
+        before: before.length > 0 ? before : "No description",
+        after: proposal.params.description,
+      };
+    }
     case "setPersona": {
       const before = definition.persona;
       return {
@@ -191,7 +262,7 @@ export function describeAgentProposal(
 const SCAFFOLD_PROMPTS = [
   "Draft a persona for an executive assistant",
   "Attach the right tools for email and calendar",
-  "Make this agent more cautious with approvals",
+  "Name this agent and write its one-line description",
 ] as const;
 
 const REFINE_PROMPTS = [
@@ -203,8 +274,31 @@ export interface AgentCopilotAdapterOptions {
   agentId: string;
   /** Must read the LIVE draft (a ref-backed closure, never a stale capture). */
   getDraft: () => AgentDefinition;
+  /**
+   * Must read the LIVE row identity (name + description), same discipline as
+   * {@link getDraft}. Only the two identity CARDS need it, so it is optional —
+   * without it they render with an unknown "before" side.
+   */
+  getIdentity?: () => AgentIdentity;
   /** The agent editor controller's dispatch (single writer). */
   dispatch: (action: AgentEditorAction) => void;
+  /**
+   * Commits an accepted `setName` (spec D7.3). Separate from `dispatch`
+   * because the agent NAME is not part of the editor reducer — the screen's
+   * header owns it and PATCHes it directly, and this must take that exact
+   * path so the two writers cannot disagree.
+   *
+   * It therefore RESOLVES FALSE when the PATCH fails, and the adapter passes
+   * that straight through to the card: the rename is the one agent mutation
+   * that can be rejected by the network after the user accepted it, and a
+   * "Applied" receipt over a name that never changed is exactly the lie the
+   * card exists to prevent.
+   *
+   * Optional only so the seam can be added without breaking construction:
+   * when it is absent the copilot's rename cards render but cannot apply, so
+   * a screen that exposes the agent surface MUST wire it.
+   */
+  setName?: (name: string) => boolean | Promise<boolean>;
   /** Merged workspace+user resources (resolves context ids to names). */
   resources: ContextResources;
   /** Fired after an accepted proposal is applied (rail section flash). */
@@ -214,18 +308,33 @@ export interface AgentCopilotAdapterOptions {
 export function agentCopilotAdapter(
   options: AgentCopilotAdapterOptions,
 ): CopilotSurfaceAdapter<AgentDefinition> {
-  const { agentId, getDraft, dispatch, resources, onApplied } = options;
+  const { agentId, getDraft, getIdentity, dispatch, setName, resources, onApplied } =
+    options;
   return {
     entityRef: { surface: "agent", entityId: agentId },
     getDraft,
-    applyProposal: (proposal) => {
+    // Sent with every user message (see the module header) — the copilot is
+    // otherwise blind to what the agent it is editing is called.
+    ...(getIdentity ? { getIdentity } : {}),
+    applyProposal: (proposal): ApplyProposalResult => {
       if (!isAgentProposal(proposal)) return;
+      if (proposal.tool === "setName") {
+        // The rename is a PATCH: hand its verdict back so the card can wait,
+        // and report a failure instead of a receipt. A missing seam is a
+        // wiring bug on the owning screen — never a silent success. (It maps
+        // to no reducer action and no rail section, so there is nothing else
+        // to do here — see agentProposalToActions / agentSectionOfProposal.)
+        if (!setName) return false;
+        return Promise.resolve(setName(proposal.params.name));
+      }
       for (const action of agentProposalToActions(proposal)) dispatch(action);
-      onApplied?.(agentSectionOfProposal(proposal));
+      // Identity proposals have no rail section (see agentSectionOfProposal).
+      const section = agentSectionOfProposal(proposal);
+      if (section !== null) onApplied?.(section);
     },
     describeProposal: (proposal) =>
       isAgentProposal(proposal)
-        ? describeAgentProposal(proposal, getDraft(), resources)
+        ? describeAgentProposal(proposal, getDraft(), resources, getIdentity?.())
         : unsupportedProposalDescription(proposal),
     emptyStateCopy: {
       title: "Shape this agent with copilot",

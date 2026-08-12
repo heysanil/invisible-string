@@ -10,6 +10,18 @@
  * application/presentation, empty-state copy, prompt chips — rides the
  * adapter; this component owns only the surface-agnostic behavior below.
  *
+ * Depth (2026-08-11 spec D7.1): the model's thinking and its tool steps ride
+ * the same rail-in-box grammar as the main chat, one {@link CopilotWorkBlock}
+ * per contiguous stretch of interior work. Steps that already have a
+ * suggestion card are filtered out of the rail — the card is the richer view
+ * of that same tool call.
+ *
+ * Allow-edits (D7.2) is a session-scoped toggle owned HERE, defaulting off and
+ * deliberately NOT persisted: "the copilot may edit my agent without asking"
+ * is a decision to take per sitting, not one to inherit silently from a
+ * previous tab. It is also unmistakable while on — a checked switch, an
+ * explanatory strip above the thread, and the send button's accessible name.
+ *
  * Accessibility/interaction contract:
  * - the thread is a `role="log"`; announcements go through a dedicated
  *   sr-only live region (never per-token);
@@ -17,7 +29,11 @@
  *   next pending card (else composer);
  * - auto-scroll only sticks when the reader is already at the bottom;
  * - the composer never silently drops input: text stays put until the
- *   socket accepts the frame, and sends are blocked mid-turn.
+ *   socket accepts the frame, and sends are blocked mid-turn;
+ * - state NEVER rides the composer's `placeholder` or `ariaLabel` (both are
+ *   `useEditor` construction options — changing either rebuilds the editor and
+ *   destroys the user's draft, see AGENTS.md). Mode and connection state ride
+ *   separate elements and the submit button's accessible name instead.
  */
 import {
   ArrowDown,
@@ -31,11 +47,17 @@ import { useEffect, useRef, useState } from "react";
 
 import type { CopilotSurfaceAdapter } from "../../lib/copilot/adapter";
 import type { WebSocketFactory } from "../../lib/copilot/socket";
-import { useCopilot, type CopilotThreadItem } from "../../lib/copilot/useCopilot";
+import {
+  proposalIdsOf,
+  visibleTimelineItems,
+  type CopilotThreadItem,
+} from "../../lib/copilot/thread";
+import { useCopilot } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
 import { Markdown } from "../chat/Markdown";
 import { LazyComposerEditor } from "../editor/LazyComposerEditor";
 import type { RichTextEditorHandle } from "../editor/RichTextEditor";
+import { CopilotWorkBlock } from "./CopilotWorkBlock";
 import { SuggestionCard } from "./SuggestionCard";
 
 const OPEN_STORAGE_PREFIX = "is.copilot.open";
@@ -81,6 +103,8 @@ export function CopilotDock(props: CopilotDockProps) {
   const { workspaceId, adapter, prefill, createWebSocket, backoffBaseMs } = props;
 
   const [open, setOpen] = useState(() => readStoredOpen(workspaceId));
+  // Session-scoped, default OFF, never persisted — see the module header.
+  const [allowEdits, setAllowEdits] = useState(false);
   const [composer, setComposer] = useState("");
   const [stuckToLatest, setStuckToLatest] = useState(true);
   const [announcement, setAnnouncement] = useState("");
@@ -106,6 +130,7 @@ export function CopilotDock(props: CopilotDockProps) {
     workspaceId,
     adapter,
     enabled: open,
+    allowEdits,
     ...(createWebSocket ? { createWebSocket } : {}),
     ...(backoffBaseMs !== undefined ? { backoffBaseMs } : {}),
   });
@@ -175,6 +200,31 @@ export function CopilotDock(props: CopilotDockProps) {
     }
     prevPendingCount.current = pendingCount;
   }, [pendingCount]);
+  // Auto-applied cards never go through `pending`, so the announcement above
+  // would never fire for them — an edit that lands without a word is exactly
+  // what allow-edits must not become.
+  const autoAppliedCount = copilot.items.filter(
+    (item) => item.kind === "suggestion" && item.autoApplied,
+  ).length;
+  const prevAutoAppliedCount = useRef(0);
+  useEffect(() => {
+    if (autoAppliedCount > prevAutoAppliedCount.current) {
+      setAnnouncement("Copilot applied an edit automatically — review it in the panel");
+    }
+    prevAutoAppliedCount.current = autoAppliedCount;
+  }, [autoAppliedCount]);
+
+  function toggleAllowEdits() {
+    // Computed outside the updater: updaters must stay pure (StrictMode
+    // double-invokes them), and this one announces.
+    const next = !allowEdits;
+    setAllowEdits(next);
+    setAnnouncement(
+      next
+        ? "Auto-apply on — copilot edits the draft without asking"
+        : "Auto-apply off — copilot asks before every edit",
+    );
+  }
 
   function onThreadScroll() {
     const el = threadRef.current;
@@ -268,12 +318,19 @@ export function CopilotDock(props: CopilotDockProps) {
   const connecting = copilot.status === "connecting";
   const canSend = copilot.status === "open" && !copilot.generating;
   const lastItem = copilot.items.at(-1);
+  // Something visible is already moving: streaming prose, or a live work box
+  // with its own spinner. Only when neither is true does the dots line earn
+  // its place — two spinners for one wait reads as two waits.
   const streamingNow =
-    lastItem?.kind === "message" &&
-    lastItem.role === "assistant" &&
-    lastItem.streaming;
+    (lastItem?.kind === "message" &&
+      lastItem.role === "assistant" &&
+      lastItem.streaming) ||
+    (lastItem?.kind === "work" && !lastItem.sealed);
   const promptChips = adapter.promptChips();
   const emptyCopy = adapter.emptyStateCopy;
+  // Every mutation step carries a card; the card is the richer rendering, so
+  // the rail shows only what has none (thinking + self-corrected bad calls).
+  const cardedStepKeys = proposalIdsOf(copilot.items);
 
   return (
     <aside
@@ -305,6 +362,22 @@ export function CopilotDock(props: CopilotDockProps) {
         </button>
       </header>
       <div aria-hidden="true" className="mx-4 h-px bg-black/[0.06]" />
+
+      {/* Mode row. The switch is the control; the strip below it exists so the
+          mode is legible without inspecting a control's state — auto-applying
+          edits to someone's agent is not a preference to hide in a widget. */}
+      <div className="flex items-center px-3 pt-2.5">
+        <AllowEditsSwitch checked={allowEdits} onToggle={toggleAllowEdits} />
+      </div>
+      {allowEdits ? (
+        <p
+          data-testid="copilot-auto-apply-banner"
+          className="mx-3 mt-2 rounded-card border border-ink/15 bg-ink/[0.045] px-3 py-1.5 text-[11.5px] leading-snug text-ink-2"
+        >
+          Copilot edits this draft without asking. Every change still lands as a
+          card below, so you can see exactly what it changed.
+        </p>
+      ) : null}
 
       {reconnecting ? (
         <div
@@ -358,12 +431,25 @@ export function CopilotDock(props: CopilotDockProps) {
           ) : (
             <>
               {copilot.items.map((item) => {
+                if (item.kind === "work") {
+                  const rows = visibleTimelineItems(item.items, cardedStepKeys);
+                  // A box whose every row had a card would be an empty box.
+                  if (rows.length === 0) return null;
+                  return (
+                    <CopilotWorkBlock
+                      key={item.id}
+                      items={rows}
+                      active={!item.sealed && copilot.generating}
+                    />
+                  );
+                }
                 if (item.kind === "suggestion") {
                   return (
                     <SuggestionCard
                       key={item.id}
                       proposal={item.proposal}
                       status={item.status}
+                      autoApplied={item.autoApplied}
                       description={adapter.describeProposal(item.proposal)}
                       onApply={() => decide(item.id, "apply")}
                       onDismiss={() => decide(item.id, "dismiss")}
@@ -489,7 +575,12 @@ export function CopilotDock(props: CopilotDockProps) {
         ) : (
           <button
             type="submit"
-            aria-label="Send to copilot"
+            // The mode rides the BUTTON's accessible name (never the editor's
+            // placeholder/aria-label — those rebuild the editor and eat the
+            // draft; see the module header).
+            aria-label={
+              allowEdits ? "Send to copilot (auto-apply on)" : "Send to copilot"
+            }
             disabled={composer.trim().length === 0 || !canSend}
             className={cn(
               "lift flex size-9 shrink-0 items-center justify-center rounded-full bg-ink text-white",
@@ -501,5 +592,51 @@ export function CopilotDock(props: CopilotDockProps) {
         )}
       </form>
     </aside>
+  );
+}
+
+/**
+ * Allow-edits switch (spec D7.2) — a capsule with a real `role="switch"`, so
+ * the mode is exposed to assistive tech as a mode rather than as a button that
+ * did something. Checked state is carried by BOTH fill and knob position:
+ * position alone fails at a glance, fill alone fails for anyone who cannot
+ * distinguish the two ink tones.
+ */
+function AllowEditsSwitch({
+  checked,
+  onToggle,
+}: {
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={onToggle}
+      className={cn(
+        "lift inline-flex items-center gap-2 rounded-capsule border px-2 py-1 text-[11.5px] font-medium transition-colors duration-150 ease-out",
+        checked
+          ? "border-ink/25 bg-ink/[0.06] text-ink"
+          : "border-black/10 bg-white/50 text-ink-3 hover:text-ink-2",
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          "relative inline-flex h-[13px] w-[22px] shrink-0 items-center rounded-capsule transition-colors duration-150 ease-out",
+          checked ? "bg-ink" : "bg-black/15",
+        )}
+      >
+        <span
+          className={cn(
+            "absolute size-[9px] rounded-full bg-white transition-[left] duration-150 ease-out",
+            checked ? "left-[11px]" : "left-[2px]",
+          )}
+        />
+      </span>
+      Auto-apply edits
+    </button>
   );
 }

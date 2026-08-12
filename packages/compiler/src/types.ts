@@ -163,6 +163,25 @@ export interface CompileDeps {
    * database, or JWT audience.
    */
   readonly workspaceSlug: string;
+  /**
+   * The agent row's STABLE id (`agents.id`) — the agent's identity in the
+   * content hash (2026-08-11 spec D1). It is NOT emitted into any generated
+   * file; it exists so two agents that happen to share a display name and a
+   * definition can never collapse onto one artifact, one `ag_v_<hash12>`
+   * world database, or one JWT audience. Before D1 the hash keyed on
+   * `agentSlug`, which made the `agents_organization_id_name_uidx` unique
+   * index silently load-bearing for world isolation; that index is gone.
+   */
+  readonly agentId: string;
+  /**
+   * Slugified DISPLAY NAME — the generated package name
+   * (`agent--<workspace>--<agent>`) and the model-visible identity line in
+   * `agent/channels/eve.ts`, both deliberately human-readable. It no longer
+   * carries IDENTITY (agentId does), but it still shapes emitted bytes, so
+   * it still participates in the hash: renaming an agent re-keys its
+   * artifact, world DB, and JWT audience on the next publish (accepted;
+   * rename-preserves-world-DB is out of scope per the spec's §7).
+   */
   readonly agentSlug: string;
   readonly connections: readonly ResolvedMcpConnection[];
   readonly skills: readonly ResolvedSkill[];

@@ -4,6 +4,14 @@
  * allowlist visible to the socket user in the socket workspace. Loaded FRESH
  * per turn — the copilot must not propose ids that no longer exist.
  *
+ * NOTHING here is keyed by NAME. Agent names stopped being unique per
+ * workspace when spec D1 moved the content hash onto the agent id and dropped
+ * `agents_organization_id_name_uidx`, so two rows may render identical
+ * `name="…"` text; ids are the addressing mechanism everywhere (the prompt
+ * lists them, every tool takes one, validate.ts matches on them) and the
+ * per-agent maps below are all keyed by `agents.id`. Never introduce a
+ * name→agent lookup here.
+ *
  * Agents carry the context slugs of their published version's definition
  * (not their mutable draft): workflow instructions render at dispatch against
  * the agent's PUBLISHED context, so that is what workflow-surface @reference

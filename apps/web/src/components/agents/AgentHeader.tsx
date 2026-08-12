@@ -3,6 +3,14 @@
  * (commit-on-blur/Enter, Escape restores), save indicator, and the
  * admin-gated Delete affordance. Presentational — the live screen persists
  * renames through the agent PATCH; the fixture editor commits locally.
+ *
+ * The input is stateful but NOT independent of the row: this is not the only
+ * writer of `agents.name`. The copilot's `setName` card commits through the
+ * same PATCH seam (spec D7.3), so the prop can move underneath a mounted
+ * header — and a header that ignored that would go on displaying the old name
+ * and offer it back as the baseline for the next edit. Every observed CHANGE
+ * of the prop is therefore adopted; an unchanged prop (a refetch of the same
+ * row) never disturbs what the user is typing.
  */
 import { Link } from "@tanstack/react-router";
 import { ArrowLeft, Trash2 } from "lucide-react";
@@ -47,6 +55,17 @@ export function AgentHeader({
   // the restored value, so the live value rides a ref updated in the same
   // tick as every setName.
   const liveName = useRef(initialName);
+  // The last prop value we adopted (see the module header). Compared during
+  // render rather than in an effect so the input never paints a stale name
+  // for a frame.
+  const adoptedProp = useRef(initialName);
+
+  if (initialName !== adoptedProp.current) {
+    adoptedProp.current = initialName;
+    committed.current = initialName;
+    liveName.current = initialName;
+    setName(initialName);
+  }
 
   function updateName(next: string) {
     liveName.current = next;

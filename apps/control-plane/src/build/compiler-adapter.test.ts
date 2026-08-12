@@ -31,6 +31,8 @@ function baseRequest(connection: CompileConnection): CompileRequest {
     connections: [connection],
     skills: [],
     workspaceSlug: "acme",
+    // Identity (hashed) vs. display slug (emitted) — spec D1.
+    agentId: "b2000000-0000-4000-8000-00000000000a",
     agentSlug: "lookup",
   };
 }
@@ -114,6 +116,36 @@ describe("compileAgent — MCP auth wiring", () => {
     );
     expect(bearer.hash).not.toBe(result.hash);
   });
+
+  test("agentId reaches the hash — same name, same definition, different agent", () => {
+    // The adapter is the only thing standing between `agents.id` and the
+    // hash; if it dropped the field, two agents a user named the same thing
+    // would compile to one artifact, one JWT audience, and one
+    // `ag_v_<hash12>` world database with two writers (spec D1). The API
+    // used to be protected from this only by a unique index on
+    // (organization_id, name), which this change drops.
+    const row: CompileConnection = {
+      id: "7d3f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6",
+      name: "Linear",
+      description: "Issues",
+      url: "https://mcp.linear.app/mcp",
+      envTokenVar: "MCP_LINEAR_TOKEN",
+      authHeaders: null,
+      toolAllow: null,
+      toolBlock: null,
+      approvalPolicy: null,
+    };
+    const first = compileAgent(baseRequest(row));
+    const twin = compileAgent({
+      ...baseRequest(row),
+      agentId: "b2000000-0000-4000-8000-00000000000b",
+    });
+    expect(twin.hash).not.toBe(first.hash);
+    // …and it is identity only: nothing emits it.
+    for (const content of twin.files.values()) {
+      expect(content).not.toInclude("b2000000-0000-4000-8000-00000000000b");
+    }
+  });
 });
 
 describe("compileAgent — build-env epoch in the content hash", () => {
@@ -138,6 +170,7 @@ describe("compileAgent — build-env epoch in the content hash", () => {
         reasoning: request.model.reasoning,
       },
       workspaceSlug: request.workspaceSlug,
+      agentId: request.agentId,
       agentSlug: request.agentSlug,
       connections: [
         {

@@ -14,7 +14,10 @@
 import { memo, useCallback } from "react";
 import { AlertCircle, Ban } from "lucide-react";
 
-import type { RunInputRequest } from "@invisible-string/shared";
+import type {
+  RunInputRequest,
+  ToolDirectoryIndex,
+} from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
 import { ApprovalCard } from "./ApprovalCard";
@@ -32,6 +35,12 @@ export interface RunMessageProps {
   /** requestId → the response being submitted (optimistic). */
   pendingInput?: { requestId: string; optionId?: string; text?: string } | null;
   inputError?: string | null;
+  /**
+   * Tool display metadata for the session's pinned agent version (D5). Must be
+   * REFERENTIALLY STABLE — this component is memoized, so a freshly built
+   * index every render would repaint every settled row on each streamed token.
+   */
+  toolDirectory?: ToolDirectoryIndex;
 }
 
 function RunMessageImpl({
@@ -40,6 +49,7 @@ function RunMessageImpl({
   onRespond,
   pendingInput,
   inputError,
+  toolDirectory,
 }: RunMessageProps) {
   // `run.canceled` comes off the event stream, so it flips a beat BEFORE the
   // run_status frame — the spinner and caret settle together rather than
@@ -92,7 +102,11 @@ function RunMessageImpl({
           <div className="flex flex-col gap-3.5">
             {run.segments.map((segment) =>
               segment.kind === "work" ? (
-                <WorkingBlock key={segment.key} segment={segment} />
+                <WorkingBlock
+                  key={segment.key}
+                  segment={segment}
+                  toolDirectory={toolDirectory}
+                />
               ) : (
                 <Markdown
                   key={segment.key}
@@ -153,8 +167,16 @@ function RunMessageImpl({
           </div>
         ) : null}
 
-        {/* Clear/compact landed while this run's tail was attached. */}
+        {/* A clear/compact whose frames landed on THIS run — either its tail
+            was attached when they arrived, or (the ordinary case: both control
+            routes refuse a busy session) the control plane drained them and
+            appended them to the session's latest run. Both markers are DERIVED
+            from persisted frames, so they survive a reload — and a compaction
+            that produced nothing (empty context, or a failed summarization)
+            emits no `compaction.completed`, hence draws no divider rather than
+            claiming a boundary that does not exist. */}
         {run.contextCleared ? <ContextDivider kind="cleared" /> : null}
+        {run.contextCompacted ? <ContextDivider kind="compacted" /> : null}
 
         {/* An active run with no output yet still needs a presence cue. */}
         {run.segments.length === 0 && run.pendingInputs.length === 0 &&

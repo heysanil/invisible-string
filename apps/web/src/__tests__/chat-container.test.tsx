@@ -138,7 +138,7 @@ const { ThreadContainer } = await import("../components/chat/ThreadContainer");
 
 // ── fetch mock ───────────────────────────────────────────────────────────────
 
-function sessionResponse(status: RunStatus) {
+function sessionResponse(status: RunStatus, title: string | null = null) {
   return {
     session: {
       id: SESSION_ID,
@@ -147,6 +147,7 @@ function sessionResponse(status: RunStatus) {
       workflowId: null,
       origin: "chat",
       status: "active",
+      title,
       eveSessionId: "eve1",
       createdAt: NOW,
       updatedAt: NOW,
@@ -240,6 +241,7 @@ function sessionDto(id: string) {
     workflowId: null,
     origin: "chat",
     status: "active",
+    title: null,
     eveSessionId: `eve_${id}`,
     createdAt: NOW,
     updatedAt: NOW,
@@ -592,4 +594,458 @@ test("removing a queued row drops it before it is ever sent", async () => {
 
   fireEvent.click(view.getByRole("button", { name: /Remove queued message/ }));
   await waitFor(() => expect(view.queryByText(/scrap this one/)).toBeNull());
+});
+
+// ── the header's derived facts and the tool directory (spec D5/D6) ──────────
+
+/**
+ * The agent row as the header reads it: `publishedDefinition` is where the
+ * PINNED VERSION's preset comes from (the resolved model id cannot name it —
+ * `balanced` and `quick` are seeded onto the same model), and
+ * `publishedVersionId` is what says the definition still describes the version
+ * this session is pinned to.
+ */
+function agentResponse(
+  preset: "powerful" | "balanced" | "quick",
+  options: { publishedVersionId?: string; modelId?: string } = {},
+) {
+  return {
+    agent: {
+      id: AGENT_ID,
+      name: "Report bot",
+      description: null,
+      runAsUserId: "user_1",
+      draft: {},
+      publishedVersionId: options.publishedVersionId ?? AGV_ID,
+      publishedDefinition: {
+        persona: "Be helpful.",
+        model:
+          options.modelId !== undefined
+            ? { preset, modelId: options.modelId }
+            : { preset },
+        context: { mcpConnectionIds: [], skillIds: [] },
+      },
+      createdAt: NOW,
+      updatedAt: NOW,
+    },
+  };
+}
+
+/**
+ * Serve the reads the header joins — the version's tool directory, the agent
+ * row behind the pinned version, the workspace's model presets and its model
+ * capabilities — alongside the session. Everything else 404s, which is itself
+ * part of the contract: each of these is allowed to fail without taking the
+ * thread with it.
+ */
+function headerHandler(title: string | null = null): Handler {
+  return (method, url) => {
+    if (
+      method === "GET" &&
+      url.endsWith(`/workspaces/${WS}/agents/${AGENT_ID}`)
+    ) {
+      return json(agentResponse("balanced"));
+    }
+    if (method === "GET" && url.includes(`/versions/${AGV_ID}/tools`)) {
+      return json({
+        directory: {
+          agentVersionId: AGV_ID,
+          connections: [
+            {
+              slug: "linear",
+              connectionId: "cn_containerlinear1",
+              connectionName: "Linear",
+              tools: [
+                {
+                  name: "list_issues",
+                  description: "List issues in a team, newest first.",
+                  params: ["teamId"],
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
+    if (method === "GET" && url.includes("/model-presets")) {
+      return json({
+        presets: [
+          {
+            id: "55555555-5555-4555-8555-555555555555",
+            slug: "balanced",
+            provider: "openrouter",
+            modelId: "moonshotai/kimi-k3",
+            reasoning: "high",
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ],
+      });
+    }
+    if (method === "GET" && url.includes("/model-capabilities")) {
+      return json({
+        models: [
+          {
+            provider: "openrouter",
+            modelId: "moonshotai/kimi-k3",
+            supportedEfforts: ["high", "low"],
+            contextWindowTokens: 1_048_576,
+          },
+        ],
+        catalogAvailable: true,
+      });
+    }
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("succeeded", title));
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+}
+
+/** One settled run: an MCP tool call, a reply, and a measured step. */
+function toolRunFrames(): RunEventFrame[] {
+  const events: RunEventFrame["event"][] = [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "moonshotai/kimi-k3" } } },
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__list_issues", input: { limit: 5 } }], sequence: 0, stepIndex: 0, turnId: "t0" } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__list_issues", output: { content: [{ type: "text", text: "5 issues: 2 bugs, 3 features" }] } }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 262_144 } } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  return events.map((event, index) => ({
+    runId: RUN_ID,
+    seq: index,
+    event,
+    at: new Date(Date.UTC(2026, 6, 3, 0, 0, index)).toISOString(),
+  }));
+}
+
+test("the thread resolves tool calls through the version's tool directory", async () => {
+  handler = headerHandler();
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  const block = await view.findByRole("button", { name: /Worked/ });
+  fireEvent.click(block);
+  // The description only exists once the DIRECTORY has resolved — the
+  // connection name alone would also appear from the slug fallback, so it is
+  // the wrong thing to wait on.
+  await waitFor(() =>
+    expect(view.getByText("List issues in a team, newest first.")).toBeTruthy(),
+  );
+  expect(view.getByText("Linear ·")).toBeTruthy();
+  expect(view.getByText("List issues")).toBeTruthy();
+  // English, not JSON — and never the wire name.
+  expect(view.getByText("5 issues: 2 bugs, 3 features")).toBeTruthy();
+  expect(view.queryByText("linear__list_issues")).toBeNull();
+});
+
+test("the header meters the context against the catalog's window", async () => {
+  handler = headerHandler();
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  // 262,144 of 1,048,576 = 25%.
+  const meter = await view.findByRole("meter", { name: "Context used" });
+  expect(meter.getAttribute("aria-valuenow")).toBe("25");
+  // The model is named by its PRESET, and its raw id never appears.
+  expect(view.getByText("Balanced")).toBeTruthy();
+  expect(view.queryByText("moonshotai/kimi-k3")).toBeNull();
+});
+
+test("the header names the thread by its generated title, like the sidebar does", async () => {
+  // The sidebar (SessionList) and this header must agree, or one conversation
+  // reads as two different things depending on where you look at it. Both go
+  // through `sessionRowTitle`; this is the header half of that contract.
+  handler = headerHandler("Quarterly revenue breakdown");
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  // Assert on the heading, not on page text: the first message also appears in
+  // the transcript as the user's own bubble, so a bare text query matches both.
+  await waitFor(() =>
+    expect(view.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Quarterly revenue breakdown",
+    ),
+  );
+});
+
+test("the header falls back to the first message before a title is generated", async () => {
+  // Titling is fire-and-forget and can fail silently (spec D9), so the
+  // untitled case is the steady state, not an edge case.
+  handler = headerHandler(null);
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await waitFor(() =>
+    expect(view.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Send the report",
+    ),
+  );
+});
+
+test("no meter when the catalog knows no window for the resolved model", async () => {
+  // The degradation that must never become a zero or a guess.
+  const base = headerHandler();
+  handler = (method, url, body) =>
+    method === "GET" && url.includes("/model-capabilities")
+      ? json({ models: [], catalogAvailable: false })
+      : base(method, url, body);
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await view.findByLabelText("Message");
+  await waitFor(() => expect(view.getByText("Balanced")).toBeTruthy());
+  expect(view.queryByRole("meter")).toBeNull();
+});
+
+// ── the preset label comes from the PINNED VERSION, not the model id ────────
+//
+// `balanced` and `quick` are seeded onto THE SAME model at different reasoning
+// efforts (packages/db/src/seed.ts), so matching the resolved model id against
+// the preset list can only ever return whichever the API listed first — which
+// labelled every Quick session "Balanced".
+
+/** The model `balanced` and `quick` share in a seeded workspace. */
+const SHARED_MODEL_ID = "~deepseek/deepseek-v4-flash-latest";
+
+/** One settled run on the shared model, with a measured step. */
+function sharedModelRunFrames(): RunEventFrame[] {
+  const events: RunEventFrame["event"][] = [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: SHARED_MODEL_ID } } },
+    { type: "message.completed", data: { finishReason: "stop", message: "Done.", sequence: 0, stepIndex: 0, turnId: "t0" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 262_144 } } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  return events.map((event, index) => ({
+    runId: RUN_ID,
+    seq: index,
+    event,
+    at: new Date(Date.UTC(2026, 6, 3, 0, 0, index)).toISOString(),
+  }));
+}
+
+/** headerHandler with both seeded deepseek presets and the shared-model catalog. */
+function sharedModelHandler(agent: ReturnType<typeof agentResponse>): Handler {
+  const base = headerHandler();
+  return (method, url, body) => {
+    if (method === "GET" && url.endsWith(`/workspaces/${WS}/agents/${AGENT_ID}`)) {
+      return json(agent);
+    }
+    if (method === "GET" && url.includes("/model-presets")) {
+      // The API's own order: Balanced before Quick, on ONE model id.
+      return json({
+        presets: [
+          { id: "77777777-7777-4777-8777-777777777771", slug: "balanced", provider: "openrouter", modelId: SHARED_MODEL_ID, reasoning: "max", createdAt: NOW, updatedAt: NOW },
+          { id: "77777777-7777-4777-8777-777777777772", slug: "quick", provider: "openrouter", modelId: SHARED_MODEL_ID, reasoning: "low", createdAt: NOW, updatedAt: NOW },
+        ],
+      });
+    }
+    if (method === "GET" && url.includes("/model-capabilities")) {
+      return json({
+        models: [
+          { provider: "openrouter", modelId: SHARED_MODEL_ID, supportedEfforts: ["max", "low"], contextWindowTokens: 1_048_576 },
+        ],
+        catalogAvailable: true,
+      });
+    }
+    return base(method, url, body);
+  };
+}
+
+test("a Quick session is named Quick, though Balanced shares its model", async () => {
+  handler = sharedModelHandler(agentResponse("quick"));
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, sharedModelRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await waitFor(() => expect(view.getByText("Quick")).toBeTruthy());
+  // The tier the agent does NOT run on must never appear.
+  expect(view.queryAllByText("Balanced")).toHaveLength(0);
+  expect(view.queryAllByText(SHARED_MODEL_ID)).toHaveLength(0);
+});
+
+test("an agent that overrode the model is named by the model, not by a preset", async () => {
+  // A specific-model override wins over the preset at compile time, so there
+  // is no preset to name — but D6 still forbids the raw slug, so the chip
+  // degrades to the model's own short name.
+  handler = sharedModelHandler(
+    agentResponse("balanced", { modelId: SHARED_MODEL_ID }),
+  );
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, sharedModelRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await waitFor(() =>
+    expect(view.getByText("Deepseek v4 flash latest")).toBeTruthy(),
+  );
+  expect(view.queryAllByText("Balanced")).toHaveLength(0);
+  expect(view.queryAllByText(SHARED_MODEL_ID)).toHaveLength(0);
+});
+
+test("a session left on an older publish claims no preset at all", async () => {
+  // Nothing serves an arbitrary version's definition, so the agent row only
+  // describes the CURRENT publish. A session pinned to an older version must
+  // not borrow that label — it names the model it actually resolved instead.
+  handler = sharedModelHandler(
+    agentResponse("quick", {
+      publishedVersionId: "88888888-8888-4888-8888-888888888888",
+    }),
+  );
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, sharedModelRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await waitFor(() =>
+    expect(view.getByText("Deepseek v4 flash latest")).toBeTruthy(),
+  );
+  expect(view.queryAllByText("Quick")).toHaveLength(0);
+});
+
+// ── the memory boundary: the divider, and what it does to the meter ─────────
+
+/** eve's `context.cleared`, as the control plane persists it on a run. */
+function clearedFrame(runId: string, seq: number): RunEventFrame {
+  return {
+    runId,
+    seq,
+    event: {
+      type: "context.cleared",
+      data: { sequence: seq, sessionId: "eve1", turnId: "t0" },
+    },
+    at: new Date(Date.UTC(2026, 6, 3, 0, 1, 0)).toISOString(),
+  };
+}
+
+test("an idle Clear draws its divider by re-attaching the drained run's tail", async () => {
+  // Both control routes refuse a BUSY session, so no tail is attached when one
+  // fires and nothing here would ever see eve's `context.cleared`. The control
+  // plane drains those frames and appends them to the run in `marker`; the
+  // client's whole job is to re-read that run, which is what makes the divider
+  // both appear now and survive a reload (D4).
+  const base = headerHandler();
+  handler = (method, url, body) => {
+    if (method === "POST" && url.endsWith(`/sessions/${SESSION_ID}/clear`)) {
+      return json({
+        session: sessionDto(SESSION_ID),
+        status: "accepted",
+        marker: { kind: "cleared", runId: RUN_ID },
+      });
+    }
+    return base(method, url, body);
+  };
+  const settled = addFrames(EMPTY_FRAME_STORE, toolRunFrames());
+  liveStores.set(RUN_ID, { store: settled, status: "succeeded" });
+
+  const view = renderContainer();
+  await view.findByLabelText("Message");
+  // Counts, not nodes: a failed `toBeNull` on a DOM node serializes the whole
+  // document into the report.
+  expect(view.queryAllByRole("note")).toHaveLength(0);
+
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  fireEvent.click(view.getByText("Clear context"));
+
+  await waitFor(() => expect(reopenCalls).toContain(RUN_ID));
+  // What the re-attached tail replays: the frame the drain persisted.
+  setLiveStore(RUN_ID, {
+    store: addFrames(settled, [clearedFrame(RUN_ID, settled.maxSeq + 1)]),
+    status: "succeeded",
+  });
+  await waitFor(() =>
+    expect(view.getByRole("note").textContent).toContain(
+      "The agent no longer remembers the messages above.",
+    ),
+  );
+});
+
+test("a compact that summarized nothing never claims it did", async () => {
+  // D4's edge case: compacting an empty or already-cleared context emits no
+  // `compaction.*` at all, so the server answers a null marker. No divider —
+  // and no toast saying earlier messages were summarized, because none were.
+  const base = headerHandler();
+  handler = (method, url, body) => {
+    if (method === "POST" && url.endsWith(`/sessions/${SESSION_ID}/compact`)) {
+      return json({
+        session: sessionDto(SESSION_ID),
+        status: "accepted",
+        marker: null,
+      });
+    }
+    return base(method, url, body);
+  };
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+
+  const view = renderContainer();
+  await view.findByLabelText("Message");
+  fireEvent.click(await view.findByRole("button", { name: "Session actions" }));
+  fireEvent.click(view.getByText("Compact context"));
+
+  await waitFor(() => expect(view.getByText(/Nothing to compact/)).toBeTruthy());
+  expect(view.queryAllByText(/were summarized/)).toHaveLength(0);
+  expect(view.queryAllByRole("note")).toHaveLength(0);
+  expect(reopenCalls).not.toContain(RUN_ID);
+});
+
+test("the meter goes quiet at the newest boundary until a step re-measures", async () => {
+  // The measurement lives on the run BEFORE the boundary, so a reverse scan
+  // that crosses it keeps reporting the size of a context that was emptied —
+  // D6's "absent, never a guess" applied to the one case that produces it.
+  const RUN_2_ID = "66666666-6666-4666-8666-666666666666";
+  const base = headerHandler();
+  const twoRuns = (() => {
+    const single = sessionResponse("succeeded");
+    const first = single.runs[0]!;
+    return {
+      session: single.session,
+      runs: [
+        first,
+        {
+          ...first,
+          id: RUN_2_ID,
+          triggerEvent: { ...first.triggerEvent, message: "and again" },
+        },
+      ],
+    };
+  })();
+  handler = (method, url, body) =>
+    method === "GET" && url.includes(`/sessions/${SESSION_ID}`)
+      ? json(twoRuns)
+      : base(method, url, body);
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  // The clear landed on the LATER exchange: nothing has measured the emptied
+  // context, so there is no honest numerator anywhere in the session.
+  liveStores.set(RUN_2_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, [clearedFrame(RUN_2_ID, 0)]),
+    status: "succeeded",
+  });
+
+  const view = renderContainer();
+  await waitFor(() =>
+    expect(view.getByRole("note").textContent).toContain(
+      "The agent no longer remembers the messages above.",
+    ),
+  );
+  expect(view.queryAllByRole("meter")).toHaveLength(0);
+  // The rest of the header is unaffected — this hides the meter, not the chip.
+  expect(view.getByText("Balanced")).toBeTruthy();
 });

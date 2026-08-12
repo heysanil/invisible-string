@@ -97,6 +97,12 @@ export function useSession(sessionId: string) {
   });
 }
 
+// NOTE there is deliberately no per-session "first message" hook here. The
+// sidebar's fallback row title (2026-08-11 spec, D9) reads
+// `firstMessagePreview` straight off the LIST DTO, which is one round trip for
+// the whole page; naming rows from details this tab happens to hold would name
+// only the threads it had already opened — i.e. never on a cold load.
+
 // ── mutations ───────────────────────────────────────────────────────────────
 
 /** Start a chat session on an agent's published version (first run). */

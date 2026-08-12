@@ -162,12 +162,18 @@
       opacity var(--dur-fast) var(--ease-out);
   }
 
+  /* Hover SWELLS, it does not rise (2026-08-11 spec, D10). The old
+     translateY(-1px) read as unusual — a row that floats off the page under
+     the cursor — and 87 call sites inherit this single rule, so the correction
+     lives here and nowhere else. The background-color / border-color
+     transitions declared above already carry most of the affordance; the 1%
+     scale is the accent, not the signal. */
   .lift:hover {
-    transform: translateY(-1px);
+    transform: scale(1.01);
   }
 
   .lift:active {
-    transform: translateY(0);
+    transform: scale(1);
   }
 
   @keyframes panel-in {
@@ -322,11 +328,28 @@
   }
 
   .stream-caret::after {
+    /* Geometry as tokens because the end margin below MUST cancel exactly what
+       these two add — see the note there. */
+    --caret-w: 7px;
+    --caret-gap: 3px;
     content: "";
     display: inline-block;
-    width: 7px;
+    width: var(--caret-w);
     height: 13px;
-    margin-left: 3px;
+    margin-left: var(--caret-gap);
+    /* An inline-block is an ATOMIC INLINE, which UAX #14 treats as U+FFFC with
+       a break opportunity on either side (LB20) — so at the right edge of a
+       full line the caret breaks onto a line of its OWN, blinking under the
+       reply with no text beside it. Chrome reproduces it at 13 of 301 widths
+       for the site's own streaming strings. `white-space: nowrap` here does
+       NOT help: the opportunity belongs to the nearest common ancestor of the
+       text and this box (the .stream-caret element), and making THAT nowrap
+       would stop the sentence wrapping at all. Cancelling the caret's inline
+       advance does: a box that never lengthens the line never forces the break
+       to be taken, and the ink paints into the container's padding instead
+       (≤10px — every call site has more). Keep this in sync with the width and
+       gap above; a stale value re-opens the bug silently. */
+    margin-right: calc(-1 * (var(--caret-w) + var(--caret-gap)));
     vertical-align: -2px;
     border-radius: 2px;
     background: var(--ink);
@@ -850,5 +873,15 @@
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+
+  /* The clamp above only makes a transition INSTANT — it does not remove the
+     end state, so `.lift:hover` would still snap the element to a new size
+     under the cursor. Reduced motion means the hover changes color alone.
+     (Unlayered, so this outranks the `.lift:hover` rule in @layer components
+     regardless of specificity or order.) */
+  .lift:hover,
+  .lift:active {
+    transform: none;
   }
 }

@@ -4,9 +4,14 @@
  * so it gets the rich editor rather than a bare textarea.
  *
  * The description stays a plain `Input` on purpose: it is routing metadata
- * rendered raw in `AgentRail` and the agents grid, so markdown there would
- * leak literal asterisks into list views.
+ * rendered raw in the agents grid and the chat's agent picker, so markdown
+ * there would leak literal asterisks into list views. It is also the field
+ * the copilot's `setDescription` tool writes (spec D7.4) — the ceiling below
+ * is the copilot's, deliberately, so a human and the copilot cannot disagree
+ * about how long "one line" is.
  */
+import { COPILOT_MAX_DESCRIPTION_CHARS } from "@invisible-string/shared";
+
 import { Input } from "../ui/Input";
 import { DOCUMENT_EXTENSIONS } from "../../lib/editor/profiles";
 import { MarkdownDocumentEditor } from "../editor/MarkdownDocumentEditor";
@@ -41,6 +46,7 @@ export function PersonaSection({
       <Input
         label="Description"
         value={description ?? ""}
+        maxLength={COPILOT_MAX_DESCRIPTION_CHARS}
         placeholder="One line about what this agent is for."
         onChange={(event) => onChangeDescription(event.currentTarget.value)}
       />

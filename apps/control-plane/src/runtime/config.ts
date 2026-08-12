@@ -10,6 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError } from "../config";
+import {
+  loadSessionTitleConfig,
+  type SessionTitleConfig,
+} from "../resources/session-title";
 import type { ArtifactStoreConfig } from "../artifacts";
 
 export interface RuntimeConfig {
@@ -35,6 +39,17 @@ export interface RuntimeConfig {
   anthropicApiKey?: string;
   /** Passed through to agents when set (test harnesses point it at a mock). */
   openrouterBaseUrl?: string;
+  /**
+   * Session-titler switch + timeout (SESSION_TITLE_*, spec D9), resolved from
+   * the SAME env record as the platform keys just above and carried beside
+   * them for that reason: the titler reads both off this object
+   * (`TitleRuntimeConfig`, resources/session-title.ts), so an in-process
+   * harness that injects a provider key and `SESSION_TITLE_ENABLED=0` in one
+   * record has both halves of that pair obeyed. Reading `process.env` there
+   * instead would honor the key and ignore the kill switch — a real, billable
+   * provider call the caller explicitly asked not to make.
+   */
+  sessionTitle: SessionTitleConfig;
   /**
    * TEST HARNESS ONLY: propagate `EVE_MOCK_AUTHORED_MODELS=1` to agent
    * processes — eve then serves turns with its built-in mock model (honors
@@ -264,6 +279,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     openrouterApiKey: env.OPENROUTER_API_KEY?.trim() || undefined,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || undefined,
     openrouterBaseUrl: env.OPENROUTER_BASE_URL?.trim() || undefined,
+    sessionTitle: loadSessionTitleConfig(env),
     mockAuthoredModels: env.EVE_MOCK_AUTHORED_MODELS?.trim() === "1",
     maxRunWallClockMs,
     maxConcurrentRunsPerWorkspace,

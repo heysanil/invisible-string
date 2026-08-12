@@ -24,6 +24,9 @@ const RUNTIME: RuntimeConfig = {
   openrouterApiKey: "or-key",
   anthropicApiKey: "an-key",
   openrouterBaseUrl: undefined,
+  // Titling is irrelevant to agent env, but the field is not optional on
+  // RuntimeConfig — the titler must never fall back to ambient process.env.
+  sessionTitle: { enabled: false, timeoutMs: 15_000 },
   mockAuthoredModels: false,
   maxRunWallClockMs: 600_000,
   maxConcurrentRunsPerWorkspace: 5,

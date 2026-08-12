@@ -26,7 +26,11 @@
  * - `setModel.modelId` must be on the enabled workspace allowlist, and an
  *   explicit `setModel.reasoning` must be an effort the EFFECTIVE model
  *   advertises — but only when the catalog answered (fail-open, same rule as
- *   the allowlist-add catalog check).
+ *   the allowlist-add catalog check);
+ * - `setName`/`setDescription` (spec D7.3/D7.4) edit the `agents` ROW rather
+ *   than the definition, so there is no publish rule to mirror: the schemas
+ *   are the PATCH route's own and the only semantic check is "this changes
+ *   nothing", which spares the user a card they would just dismiss.
  */
 import {
   agentCopilotMutationParamSchemas,
@@ -34,6 +38,7 @@ import {
   parseReferences,
   triggerConfigSchema,
   workflowCopilotMutationParamSchemas,
+  type CopilotAgentIdentity,
   type CopilotMutationParams,
   type CopilotMutationTool,
   type CopilotSurface,
@@ -70,6 +75,17 @@ export interface AgentDraftState {
   connectionIds: Set<string>;
   skillIds: Set<string>;
   /**
+   * The agent's IDENTITY for this turn (spec D7.3/D7.4) — the frame's own
+   * `identity` field (the editor's live values), else the persisted `agents`
+   * row the plugin resolved. NOT read off the draft: the draft is an
+   * `AgentDefinition` and carries neither column. Null when nothing resolved —
+   * the no-op checks below then simply do not fire, which is the right failure
+   * direction: a missing baseline must never turn a legitimate rename into an
+   * error.
+   */
+  name: string | null;
+  description: string | null;
+  /**
    * The draft's MODEL selection, needed to know which model an effort-only
    * `setModel` would actually apply to. Loose strings: mid-edit drafts are
    * lenient, and an unrecognized preset simply finds no mapping (no check).
@@ -81,10 +97,17 @@ export interface AgentDraftState {
 
 export type CopilotDraftState = WorkflowDraftState | AgentDraftState;
 
-/** Parse the loose client draft into the state the semantic checks need. */
+/**
+ * Parse the loose client draft into the state the semantic checks need.
+ *
+ * `identity` is the agent surface's row identity (name + description) and
+ * arrives BESIDE the draft, per the frame contract — the workflow surface
+ * passes nothing.
+ */
 export function draftStateFor(
   surface: CopilotSurface,
   draft: Record<string, unknown>,
+  identity: CopilotAgentIdentity | null = null,
 ): CopilotDraftState {
   if (surface === "workflow") {
     const trigger = triggerConfigSchema.safeParse(draft.trigger);
@@ -108,6 +131,10 @@ export function draftStateFor(
     skillIds: ids(context.skillIds),
     preset: typeof model.preset === "string" ? model.preset : null,
     modelId: typeof model.modelId === "string" ? model.modelId : null,
+    // Identity rides ALONGSIDE the definition draft (it lives on the `agents`
+    // row), so it comes from the caller, not from `draft`.
+    name: identity?.name ?? null,
+    description: identity?.description ?? null,
   };
 }
 
@@ -149,6 +176,16 @@ export function applyAcceptedMutation(
       if (model.modelId !== undefined) state.modelId = model.modelId;
       break;
     }
+    case "setName":
+      // Same reason: an accepted rename makes a second identical rename later
+      // in the turn the no-op the check below catches.
+      state.name = (params as CopilotMutationParams["setName"]).name;
+      break;
+    case "setDescription":
+      state.description = (
+        params as CopilotMutationParams["setDescription"]
+      ).description;
+      break;
     default:
       break;
   }
@@ -431,6 +468,29 @@ function agentSemanticProblem(
             supported.join(", ") || "(none — use provider-default)"
           }`;
         }
+      }
+      return null;
+    }
+    case "setName": {
+      // Nothing to check against the inventory: duplicate agent names are
+      // legal since spec D1 dropped `agents_organization_id_name_uidx`, and
+      // the shape is exactly the PATCH route's own `agentNameSchema`. The one
+      // real problem is a proposal that changes nothing — a card the user has
+      // to dismiss for no reason.
+      const { name } = params as CopilotMutationParams["setName"];
+      if (draftState.name !== null && draftState.name.trim() === name.trim()) {
+        return `the agent is already named "${name}" — propose a rename only when it should actually change`;
+      }
+      return null;
+    }
+    case "setDescription": {
+      const { description } =
+        params as CopilotMutationParams["setDescription"];
+      if (
+        draftState.description !== null &&
+        draftState.description.trim() === description.trim()
+      ) {
+        return "the agent already has exactly this description — propose a change only when it should actually change";
       }
       return null;
     }

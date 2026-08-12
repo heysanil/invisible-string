@@ -63,7 +63,9 @@ Publishing an Agent compiles its definition — persona, model, context — into
 real [eve](https://eve.dev) agent project, runs the build, and uploads the
 resulting artifact to object storage. The artifact is cached by a **content
 hash** — a digest of the definition, the resolved model and reasoning effort,
-the compiler version, the pinned eve version, and the build environment.
+the compiler version, the pinned eve version, and the build environment, keyed
+to the Agent's own identity so that two Agents are never confused for one, even
+if you give them the same name and the same definition.
 
 That hash has two practical consequences. An identical definition never
 rebuilds — republishing an Agent whose draft hasn't meaningfully changed reuses

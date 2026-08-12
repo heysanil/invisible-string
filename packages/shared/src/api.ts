@@ -219,6 +219,13 @@ export interface AgentSessionDto {
   origin: SessionOrigin;
   status: AgentSessionStatus;
   /**
+   * Generated thread title (2026-08-11 spec D9). NULL is the normal early
+   * state, not an error: the titler runs asynchronously after the first user
+   * message and stays silent on failure, so clients MUST fall back to
+   * truncating the first message rather than rendering "Untitled".
+   */
+  title: string | null;
+  /**
    * eve's session id. Null until eve acks — `POST /eve/v1/session` is async
    * (202) so creation responses may carry null here.
    */
@@ -227,6 +234,9 @@ export interface AgentSessionDto {
   updatedAt: string;
 }
 
+/** Upper bound on a generated session title (also the DB column's budget). */
+export const SESSION_TITLE_MAX_CHARS = 80;
+
 export const agentSessionDtoSchema = z.object({
   id: productId,
   agentId: productId,
@@ -234,6 +244,7 @@ export const agentSessionDtoSchema = z.object({
   workflowId: productId.nullable(),
   origin: sessionOriginSchema,
   status: agentSessionStatusSchema,
+  title: z.string().max(SESSION_TITLE_MAX_CHARS).nullable(),
   eveSessionId: z.string().nullable(),
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
@@ -465,9 +476,35 @@ export type SessionContextControlRequest = z.infer<
   typeof sessionContextControlRequestSchema
 >;
 
+/**
+ * What a clear/compact actually LEFT BEHIND in the thread.
+ *
+ * The divider a user sees is derived from persisted `run_events` frames (spec
+ * D4), and an IDLE clear/compact — the normal case, since both routes refuse a
+ * busy session — has no run tailing the session, so nothing would consume
+ * eve's `context.cleared` / `compaction.completed`. The control route
+ * therefore drains those frames itself and appends them to the session's most
+ * recent run; this marker names where they landed so the caller can refresh
+ * that run instead of guessing.
+ *
+ * `null` is a REAL outcome, not a failure: compacting an empty or
+ * already-cleared context emits no `compaction.*` events at all (D4), and a
+ * failed summarization emits no `compaction.completed` — in both cases history
+ * was preserved and no boundary may be claimed.
+ */
+export const sessionContextMarkerSchema = z.object({
+  /** `cleared` ← `context.cleared`; `compacted` ← `compaction.completed`. */
+  kind: z.enum(["cleared", "compacted"]),
+  /** Run whose persisted event log now carries the frame. */
+  runId: productId,
+});
+export type SessionContextMarker = z.infer<typeof sessionContextMarkerSchema>;
+
 export const sessionContextControlResponseSchema = z.object({
   session: agentSessionDtoSchema,
   status: sessionContextControlStatusSchema,
+  /** See {@link sessionContextMarkerSchema}; null when no boundary landed. */
+  marker: sessionContextMarkerSchema.nullable().default(null),
 });
 export type SessionContextControlResponse = z.infer<
   typeof sessionContextControlResponseSchema
@@ -753,6 +790,14 @@ export const listSessionsQuerySchema = z.object({
 });
 export type ListSessionsQuery = z.infer<typeof listSessionsQuerySchema>;
 
+/**
+ * Server-side clamp on {@link agentSessionSummaryDtoSchema}'s
+ * `firstMessagePreview`. Comfortably above the client's own title truncation
+ * so the fallback still has a whole first line to work with, and low enough
+ * that a list of long threads stays a small response.
+ */
+export const SESSION_MESSAGE_PREVIEW_MAX_CHARS = 200;
+
 /** Session list item: DTO + the fields the chat list renders. */
 export const agentSessionSummaryDtoSchema = agentSessionDtoSchema.extend({
   agentName: z.string(),
@@ -762,6 +807,25 @@ export const agentSessionSummaryDtoSchema = agentSessionDtoSchema.extend({
   lastRunStatus: runStatusSchema.nullable(),
   /** Max of session/run updatedAt — the list's sort key. */
   lastActivityAt: isoTimestamp,
+  /**
+   * The thread's first user message, truncated server-side to
+   * {@link SESSION_MESSAGE_PREVIEW_MAX_CHARS}. This is what makes D9's
+   * fallback REACHABLE on a cold load: `title` is null while the background
+   * titler runs and permanently null when it fails, and a client that has
+   * never opened the thread holds no message of its own — without this field
+   * every untitled row falls all the way through to the agent's name, which
+   * is exactly the "every thread looks identical" symptom D9 exists to fix.
+   * Null when the session has no message to preview (e.g. a schedule-triggered
+   * workflow run).
+   *
+   * Optional on the wire rather than `.default(null)` so hand-built summaries
+   * (fixtures, tests) stay valid; the list route always sets it.
+   */
+  firstMessagePreview: z
+    .string()
+    .max(SESSION_MESSAGE_PREVIEW_MAX_CHARS)
+    .nullable()
+    .optional(),
 });
 export type AgentSessionSummaryDto = z.infer<
   typeof agentSessionSummaryDtoSchema
@@ -1409,11 +1473,18 @@ export type ListModelCapabilitiesResponse = z.infer<
 // (Lifecycle routes — publish, build status, dry-run-compile, sessions — are
 // documented at their schemas above.) Deleting an agent referenced by
 // workflows or sessions answers 409 `agent_in_use` — the UI warns before
-// deleting. NOTE the agent NAME feeds the content hash via its slug:
-// renaming re-keys the world DB + JWT audience on the next publish, exactly
-// like renaming a workflow used to.
+// deleting. NOTE the content hash keys on the agent's stable `id`, NOT on its
+// name (2026-08-11 spec D1) — duplicate names are legal and renaming does not
+// collide two agents onto one world DB. Renaming still re-keys the world DB +
+// JWT audience on the next publish, because the human name remains in emitted
+// bytes (the generated package name and the model-visible identity line).
 
-const agentNameSchema = z.string().trim().min(1).max(120);
+/**
+ * Agent display name. Exported because the copilot's `setName` mutation must
+ * validate against exactly this schema — a proposal the copilot considers
+ * valid and the PATCH route then rejects is the drift this prevents.
+ */
+export const agentNameSchema = z.string().trim().min(1).max(120);
 
 /**
  * Full agent row. `draft` is served AS STORED (jsonb, draft-lenient); use

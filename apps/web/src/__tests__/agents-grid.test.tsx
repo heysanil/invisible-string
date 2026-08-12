@@ -170,6 +170,35 @@ test("New agent POSTs an untitled draft and navigates into its editor", async ()
   });
 });
 
+test("New agent AUTO-NUMBERS around the untitled drafts already in the list", async () => {
+  // Duplicate names are legal now (spec D1 moved the content hash onto the
+  // agent id and dropped the unique index) — this is readability, not a guard,
+  // so it must never block or warn.
+  fetchMock
+    .on("GET", `/workspaces/${WS}/agents`, () =>
+      jsonResponse({
+        agents: [
+          { ...FIXTURE_EXEC_ASSISTANT.summary, name: "Untitled agent" },
+          { ...FIXTURE_RELEASE_BOT.summary, name: "Untitled agent 2" },
+        ],
+      }),
+    )
+    .on("POST", `/workspaces/${WS}/agents`, () =>
+      jsonResponse({ agent: FIXTURE_RELEASE_BOT.agent }),
+    );
+  const view = renderGrid();
+  await view.findByText("Untitled agent 2");
+
+  fireEvent.click(view.getAllByRole("button", { name: /New agent/ })[0]!);
+
+  const post = await waitFor(() => {
+    const call = fetchMock.calls.find((c) => c.method === "POST");
+    expect(call).toBeTruthy();
+    return call!;
+  });
+  expect(post.body).toEqual({ name: "Untitled agent 3" });
+});
+
 // ── lifecycle chip unit ──────────────────────────────────────────────────────
 
 test("AgentLifecycleChip surfaces the in-flight build state", () => {

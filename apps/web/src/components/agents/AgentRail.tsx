@@ -4,6 +4,11 @@
  * ✓ valid / amber issue badge and a live summary) that anchor-scroll the
  * center column, and "Chat with agent" + Publish capsules at the bottom with
  * inline build progress (builds belong to agents now).
+ *
+ * The chip row carries TWO independent facts, and conflating them is the bug
+ * spec D3 exists to fix: whether the agent has ever been published (Published
+ * · Draft) and whether the editor is ahead of that (Unsaved changes ·
+ * Unpublished changes · nothing). "Saved" never meant "live".
  */
 import {
   AlertTriangle,
@@ -26,6 +31,10 @@ import {
   sectionIssueCount,
   type AgentDiagnostics,
 } from "../../lib/agents/diagnostics";
+import {
+  AGENT_LIFECYCLE_LABELS,
+  type AgentLifecycleState,
+} from "../../lib/agents/lifecycle";
 import {
   AGENT_SECTIONS,
   AGENT_SECTION_LABELS,
@@ -56,7 +65,8 @@ const SECTION_ICONS: Record<AgentSection, ComponentType<{ size?: number }>> = {
 export interface AgentRailProps {
   name: string;
   publishedVersionId: string | null;
-  isDirty: boolean;
+  /** Three save states + Draft (spec D3) — see `lib/agents/lifecycle.ts`. */
+  lifecycle: AgentLifecycleState;
   state: AgentEditorState;
   diagnostics: AgentDiagnostics;
   /** The section the center column currently rests on (aria-current card). */
@@ -79,7 +89,7 @@ export function AgentRail(props: AgentRailProps) {
   const {
     name,
     publishedVersionId,
-    isDirty,
+    lifecycle,
     state,
     diagnostics,
     activeSection,
@@ -113,7 +123,18 @@ export function AgentRail(props: AgentRailProps) {
               Draft
             </StatusChip>
           )}
-          {isDirty ? <StatusChip tone="warning">Unsaved</StatusChip> : null}
+          {lifecycle === "unsaved" || lifecycle === "unpublished" ? (
+            <StatusChip
+              tone="warning"
+              title={
+                lifecycle === "unsaved"
+                  ? "Edits are still being saved."
+                  : "Saved, but the published version is behind — publish to make it live."
+              }
+            >
+              {AGENT_LIFECYCLE_LABELS[lifecycle]}
+            </StatusChip>
+          ) : null}
         </div>
       </header>
 

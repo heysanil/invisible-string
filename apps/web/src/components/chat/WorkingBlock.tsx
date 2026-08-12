@@ -4,9 +4,26 @@
  * cap their body height and tail-follow; a segment auto-folds the moment a
  * later segment exists (`sealed` — i.e. the agent started speaking) or the
  * run stops being live. A manual toggle wins for the life of the mount.
+ *
+ * A TOOL STEP READS AS ENGLISH (2026-08-11 spec D5): "Linear · Create issue",
+ * the connector's own description underneath, and a short summary of what came
+ * back — never `linear__create_issue` plus a serialized-JSON blob. The
+ * resolution is the SHARED one (`resolveToolDisplay`), fed by the version's
+ * tool directory, and every part of it is optional: a builtin has no
+ * connection, a directory that has not loaded (or a connection detached since
+ * the run) has no display name, and an unprobed connection has no description.
+ * Each of those degrades to one fewer line, never to a blank row or an error.
+ * The raw payload stays one disclosure away — never open by default.
  */
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronRight, Circle, Loader2, Minus, Pause, X } from "lucide-react";
+
+import {
+  EMPTY_TOOL_DIRECTORY_INDEX,
+  humanizeToolName,
+  resolveToolDisplay,
+  type ToolDirectoryIndex,
+} from "@invisible-string/shared";
 
 import type { ThoughtItem, ToolItem, WorkSegment } from "../../lib/chat/run-view";
 import { cn } from "../../lib/cn";
@@ -66,25 +83,81 @@ function ThoughtRow({ item }: { item: ThoughtItem }) {
   );
 }
 
-function ToolRow({ item }: { item: ToolItem }) {
+function ToolRow({
+  item,
+  directory,
+}: {
+  item: ToolItem;
+  directory: ToolDirectoryIndex;
+}) {
+  const [rawOpen, setRawOpen] = useState(false);
+  const display = resolveToolDisplay(item.toolName, directory, item.resultSummary);
+  // An unresolvable slug still names its source: humanizing the slug itself
+  // ("github" → "Github") beats dropping the only provenance the step has.
+  const source =
+    display.connectionName ??
+    (display.connectionSlug !== null
+      ? humanizeToolName(display.connectionSlug)
+      : null);
   return (
     <RailRow node={<ToolIcon state={item.state} />}>
-      <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pb-3">
-        <span className="font-mono text-[12px] text-ink">{item.toolName}</span>
-        <span className="sr-only">{STEP_STATE_LABEL[item.state]}</span>
-        {item.resultPreview !== null ? (
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate text-[12px]",
-              item.state === "error" ? "text-err"
-                : item.state === "awaiting" ? "text-warn-ink"
-                  : "text-ink-3",
-            )}
-          >
-            {item.resultPreview}
+      <div className="min-w-0 pb-3">
+        <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span className="text-[12.5px] text-ink">
+            {source !== null ? (
+              <span className="text-ink-3">{source} · </span>
+            ) : null}
+            <span className="font-medium">{display.label}</span>
           </span>
+          <span className="sr-only">{STEP_STATE_LABEL[item.state]}</span>
+          {display.resultSummary !== null ? (
+            <span
+              className={cn(
+                "min-w-0 flex-1 truncate text-[12px]",
+                item.state === "error" ? "text-err"
+                  : item.state === "awaiting" ? "text-warn-ink"
+                    : "text-ink-3",
+              )}
+            >
+              {display.resultSummary}
+            </span>
+          ) : null}
+        </span>
+        {display.description !== null ? (
+          <p className="mt-0.5 line-clamp-2 text-[11.5px] leading-snug text-ink-4">
+            {display.description}
+          </p>
         ) : null}
-      </span>
+        {item.rawResult !== null ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setRawOpen((open) => !open)}
+              aria-expanded={rawOpen}
+              // The row repeats per step, so the accessible name names its
+              // tool — "Raw output" alone would be seven identical buttons.
+              aria-label={`${rawOpen ? "Hide" : "Show"} raw output from ${display.label}`}
+              className="lift mt-1 inline-flex items-center gap-1 rounded-capsule border border-black/[0.07] px-1.5 py-0.5 text-[10.5px] font-medium text-ink-4 hover:bg-black/[0.02] hover:text-ink-2"
+            >
+              <ChevronRight
+                size={10}
+                strokeWidth={2.2}
+                aria-hidden="true"
+                className={cn(
+                  "transition-transform duration-200 ease-out",
+                  rawOpen && "rotate-90",
+                )}
+              />
+              {rawOpen ? "Hide raw output" : "Raw output"}
+            </button>
+            {rawOpen ? (
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-card border border-black/[0.06] bg-black/[0.02] p-2 font-mono text-[11px] leading-relaxed text-ink-3 [overflow-wrap:anywhere]">
+                {item.rawResult}
+              </pre>
+            ) : null}
+          </>
+        ) : null}
+      </div>
     </RailRow>
   );
 }
@@ -106,7 +179,19 @@ function useElapsed(startedAt: string | null, active: boolean): string | null {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
-export function WorkingBlock({ segment }: { segment: WorkSegment }) {
+export function WorkingBlock({
+  segment,
+  toolDirectory = EMPTY_TOOL_DIRECTORY_INDEX,
+}: {
+  segment: WorkSegment;
+  /**
+   * Slug → connection name + probe-cached tool descriptions for the session's
+   * pinned agent version. OPTIONAL by contract: the thread renders before the
+   * directory query resolves, and every fixture/preview surface without one
+   * still shows humanized tool names.
+   */
+  toolDirectory?: ToolDirectoryIndex;
+}) {
   const [open, setOpen] = useState(segment.active);
   const [touched, setTouched] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -193,7 +278,7 @@ export function WorkingBlock({ segment }: { segment: WorkSegment }) {
                 item.kind === "thought" ? (
                   <ThoughtRow key={item.key} item={item} />
                 ) : (
-                  <ToolRow key={item.key} item={item} />
+                  <ToolRow key={item.key} item={item} directory={toolDirectory} />
                 ),
               )}
             </ul>

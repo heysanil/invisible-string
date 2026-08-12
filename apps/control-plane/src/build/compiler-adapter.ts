@@ -245,6 +245,10 @@ export const compileAgent: CompileAgentFn = (
         reasoning: request.model.reasoning,
       },
       workspaceSlug: request.workspaceSlug,
+      // Identity vs. display: agentId keys the hash (two same-named agents
+      // must never share a world DB — spec D1), agentSlug is what the
+      // generated project and the model-visible identity line read.
+      agentId: request.agentId,
       agentSlug: request.agentSlug,
       connections: request.connections.map((connection) =>
         resolveConnection(connection, connectionSlugs.get(connection)!),

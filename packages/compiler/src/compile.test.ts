@@ -380,6 +380,13 @@ describe("typed CompileError cases", () => {
       ...base.deps,
       workspaceSlug: "Acme Inc",
     });
+    // The agent id is never emitted, so it has no slug shape to check — but
+    // an empty one would collapse every agent missing it onto one hash, one
+    // artifact, and one world database.
+    expectCompileError("INVALID_DEPS", base.definition, {
+      ...base.deps,
+      agentId: "   ",
+    });
   });
 
   test("MISSING_CONNECTION / UNEXPECTED_CONNECTION / DUPLICATE_SLUG", () => {

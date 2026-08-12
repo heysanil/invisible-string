@@ -204,11 +204,24 @@ async function fetchSkillFiles(
   return out;
 }
 
+/**
+ * The agent's identity as the compiler needs it: the STABLE row id (what the
+ * content hash keys on — 2026-08-11 spec D1) plus the display NAME (slugified
+ * for the generated package name and the model-visible identity line). Taking
+ * the pair as one argument is deliberate: passing the name alone is exactly
+ * the mistake that let two same-named agents share a world database, and an
+ * `agents` row satisfies this shape structurally, so callers pass the row.
+ */
+export interface CompileAgentIdentity {
+  id: string;
+  name: string;
+}
+
 export function compileOrThrow(
   compile: CompileAgentFn,
   definition: AgentDefinition,
   inputs: CompileInputs,
-  agentName: string,
+  agent: CompileAgentIdentity,
 ): CompileResult {
   try {
     return compile({
@@ -217,7 +230,8 @@ export function compileOrThrow(
       connections: inputs.connections,
       skills: inputs.skills,
       workspaceSlug: inputs.workspaceSlug,
-      agentSlug: slugifyName(agentName) || "agent",
+      agentId: agent.id,
+      agentSlug: slugifyName(agent.name) || "agent",
     });
   } catch (error) {
     if (error instanceof AgentCompileError) {
@@ -241,7 +255,7 @@ export async function dryRunCompile(
   deps: CompileServiceDeps,
   organizationId: string,
   runAsUserId: string,
-  agentName: string,
+  agent: CompileAgentIdentity,
   draft: unknown,
 ): Promise<DryRunResult> {
   try {
@@ -252,7 +266,7 @@ export async function dryRunCompile(
       runAsUserId,
       definition,
     );
-    const compiled = compileOrThrow(deps.compile, definition, inputs, agentName);
+    const compiled = compileOrThrow(deps.compile, definition, inputs, agent);
     return { ok: true, contentHash: compiled.hash };
   } catch (error) {
     if (isRuntimeApiError(error) && error.status === 422) {

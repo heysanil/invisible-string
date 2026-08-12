@@ -26,6 +26,7 @@ import type { ResourceDeps, Scope } from "./common";
 import {
   createConnection,
   deleteConnection,
+  getAgentVersionTools,
   getConnection,
   listConnections,
   probeConnectionRoute,
@@ -511,6 +512,24 @@ export function resourcesPlugin(deps: ResourceDeps) {
         "/workspaces/:workspaceId/agents/:agentId",
         ({ workspace, params }) => deleteAgent(deps, workspace.organizationId, params.agentId),
         { requireWorkspace: "admin" },
+      )
+      // Tool directory for one agent version (2026-08-11 spec D5): the slug →
+      // connection-name + probe-cached tool descriptions the chat thread needs
+      // to render a tool call as English. A pure read of rows we already hold
+      // (never a probe), MEMBER-readable like the rest of the chat surface, and
+      // under the existing /workspaces prefix the prod gateway already routes.
+      // Sibling `.../versions/:versionId/build` lives in the runtime plugin
+      // because it reads the build store; this one needs only the resource db.
+      .get(
+        "/workspaces/:workspaceId/agents/:agentId/versions/:versionId/tools",
+        ({ workspace, params }) =>
+          getAgentVersionTools(
+            deps,
+            workspace.organizationId,
+            params.agentId,
+            params.versionId,
+          ),
+        { requireWorkspace: true },
       )
 
       // ── Members (Better Auth passthrough) ─────────────────────────────────

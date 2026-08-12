@@ -1,9 +1,10 @@
 /**
- * Fixture-mode smoke test: the canned session list mounts (agent-titled rows
- * + trigger provenance chips), every session — streaming / parked / done /
- * failed / STOPPED / CLEARED / session-limit — renders its thread without a
- * backend, and the New chat button opens the agent picker into the
- * first-message composer.
+ * Fixture-mode smoke test: the canned session list mounts (session-titled
+ * rows over an agent identity line + trigger provenance chips), every session
+ * — streaming / parked / done / failed / STOPPED / CLEARED / session-limit —
+ * renders its thread without a backend, and the New chat button opens the
+ * agent picker into the first-message composer, whose send lands in the
+ * thread immediately.
  *
  * The backend-free preview is only useful if it stays honest, so the eve 0.31
  * states are asserted here too: a stopped run must NOT read as an error, and
@@ -40,14 +41,23 @@ afterEach(cleanup);
 
 const { FixtureChatShell } = await import("../components/chat/FixtureChatShell");
 
-test("fixture shell lists every canned session by agent name with provenance chips", async () => {
+test("fixture shell titles rows by session, with the agent still legible", async () => {
   const view = renderWithRouter(<FixtureChatShell />);
   // RouterProvider resolves its initial route asynchronously.
   await view.findAllByText("Executive assistant");
-  // All four fixture sessions appear, titled by their agent.
+  // Every agent stays identifiable — now on the row's identity line rather
+  // than as its headline.
   for (const name of ["Executive assistant", "Support triager", "Data analyst"]) {
     expect(view.getAllByText(name).length).toBeGreaterThan(0);
   }
+  // A titled session leads with the title the control plane generated…
+  expect(view.getAllByText("Launch announcement draft").length).toBeGreaterThan(0);
+  expect(view.getAllByText("Issue tracker summary").length).toBeGreaterThan(0);
+  // …and an untitled one falls back to its first message, so two threads with
+  // the same agent never read identically (the whole point of D9).
+  expect(
+    view.getAllByText("Send the weekly report email to the team.").length,
+  ).toBeGreaterThan(0);
   // The webhook-origin session shows its origin chip + workflow provenance.
   expect(view.getByText("webhook")).toBeTruthy();
   expect(view.getByText("Nightly metrics digest")).toBeTruthy();
@@ -197,3 +207,29 @@ test("New chat opens the agent picker and picking shows the composer", async () 
       ?.getAttribute("data-placeholder"),
   ).toBe("Message Support triager…");
 });
+
+test("sending the first message enters the thread immediately (fixture preview)", async () => {
+  // D8's whole point, previewed backend-free: the pane must not sit on the
+  // composer waiting for a session to exist. A preview that held the composer
+  // would demonstrate the exact behaviour this change removed.
+  const view = renderWithRouter(<FixtureChatShell />);
+  fireEvent.click(await view.findByRole("button", { name: /New chat/ }));
+  const picker = within(view.getByRole("dialog", { name: "Start a new chat" }));
+  fireEvent.click(picker.getByText("Support triager"));
+
+  const box = await view.findByLabelText("Message");
+  pasteInto(box, "Triage today's inbox");
+  pressEnter(box);
+
+  // The typed message is on screen with a starting affordance, and the
+  // new-chat pane is gone.
+  await waitFor(() => expect(view.getByText("Triage today's inbox")).toBeTruthy());
+  expect(view.getByText(/Starting Support triager/)).toBeTruthy();
+  expect(view.queryByText("New chat with Support triager")).toBeNull();
+
+  // The simulated create resolves onto one of that agent's canned threads.
+  await waitFor(
+    () => expect(view.queryByText(/Starting Support triager/)).toBeNull(),
+    { timeout: 4000 },
+  );
+}, 15_000);

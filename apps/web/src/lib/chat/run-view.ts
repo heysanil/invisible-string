@@ -40,10 +40,19 @@
  * it freezes the run's output in place (whatever streamed before the stop
  * stays rendered), retires every unanswered input request, and lets the
  * session accept the next message normally.
+ *
+ * THREE THINGS ARE DERIVED HERE PRECISELY BECAUSE THEY ARE PERSISTED
+ * (2026-08-11 spec D4/D6). `run_events` rows replay forever, so anything read
+ * out of them survives a reload without a migration:
+ *   - `contextCleared` / `contextCompacted` — the memory-boundary markers;
+ *   - `inputTokens` — the context-budget numerator, off `step.completed`;
+ *   - a tool step's `resultSummary` + `rawResult` (D5), so the thread can
+ *     render English with the raw payload one disclosure away.
  */
 import {
   EVE_INPUT_REQUEST_KINDS,
   isRunSettledStatus,
+  summarizeToolResult,
   type EveInputRequest,
   type EveInputRequestKind,
   type EveJsonValue,
@@ -169,9 +178,25 @@ export interface ToolItem {
   kind: "tool";
   /** Tool call id. */
   key: string;
+  /**
+   * The WIRE name — `<connection-slug>__<tool>` for an MCP tool, bare for one
+   * of eve's builtins. Presentation resolves it through the shared
+   * `resolveToolDisplay`; it is never rendered raw (2026-08-11 spec D5).
+   */
   toolName: string;
   state: StepState;
-  resultPreview: string | null;
+  /**
+   * Short English summary of the result (shared `summarizeToolResult`), or the
+   * failure message for a step that did not succeed. NEVER serialized JSON —
+   * a truncated blob is noise, not information.
+   */
+  resultSummary: string | null;
+  /**
+   * The result verbatim (pretty-printed when structured), for the step's
+   * on-demand raw disclosure. Never shown by default; null when the call
+   * produced nothing to show.
+   */
+  rawResult: string | null;
 }
 
 export type TimelineItem = ThoughtItem | ToolItem;
@@ -233,11 +258,109 @@ export interface RunView {
    * transcript above stays readable; the agent simply no longer remembers it.
    */
   contextCleared: boolean;
+  /**
+   * A compaction actually LANDED inside this run's frames (spec D4). Keyed on
+   * `compaction.completed`, never on `compaction.requested`, for two reasons
+   * that both make a `requested`-only latch a lie:
+   *   - compacting an EMPTY or already-cleared context emits no `compaction.*`
+   *     event at all (spike finding 24), so a marker must never be inferred
+   *     from the fact that a compaction was asked for;
+   *   - `compaction.completed` is ABSENT when summarization failed, and the
+   *     session then keeps its previous history — nothing was summarized, so
+   *     there is no memory boundary to draw.
+   */
+  contextCompacted: boolean;
+  /**
+   * `usage.inputTokens` off the newest `step.completed` — how much context the
+   * model was actually sent on its last round-trip, and therefore the
+   * numerator of the thread header's context meter (spec D6). Null when no
+   * step reported usage; the header then renders NO meter rather than a zero
+   * or a guess.
+   *
+   * The LAST value wins, not the maximum: a compaction shrinks the context,
+   * and the meter must fall with it.
+   *
+   * A MEMORY BOUNDARY RESETS IT TO NULL. `context.cleared` /
+   * `compaction.completed` describe a context that no longer exists, so every
+   * measurement taken before one of them stops describing anything — reporting
+   * it would keep the meter pinned at the old percentage over an emptied or
+   * summarized context. Null until a later step measures the NEW context is
+   * the only honest answer, and the session-wide scan stops at the newest
+   * boundary run for the same reason (see {@link contextTokensUsed}).
+   */
+  inputTokens: number | null;
+}
+
+/**
+ * The context meter's NUMERATOR for a whole session (spec D6): the newest
+ * measurement taken since the newest memory boundary, or null when nothing has
+ * been measured since one — in which case the meter must be ABSENT, never zero.
+ *
+ * Runs settle in order, so the last measurement is the session's current
+ * context size — but only while the context it counted is still the one the
+ * agent holds. A clear empties that context and a compaction replaces it with a
+ * summary, so every figure from before the boundary describes a context that no
+ * longer exists; scanning past one would leave the meter pinned at the
+ * pre-boundary percentage for as long as the user sends nothing.
+ *
+ * The boundary run itself is INCLUDED: a run can measure a fresh step after its
+ * own clear/compact frame, and {@link reduceRunView} nulls the pre-boundary
+ * figure within a run for exactly that reason.
+ *
+ * It lives here, beside the reducer whose two halves it completes, because both
+ * the live thread and fixture mode need precisely this number — a second copy
+ * of the scan is how fixture mode came to preview a bug the thread had fixed.
+ */
+export function contextTokensUsed(runs: readonly RunView[]): number | null {
+  let boundary = 0;
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index];
+    if (run !== undefined && (run.contextCleared || run.contextCompacted)) {
+      boundary = index;
+      break;
+    }
+  }
+  for (let index = runs.length - 1; index >= boundary; index -= 1) {
+    const measured = runs[index]?.inputTokens ?? null;
+    if (measured !== null) return measured;
+  }
+  return null;
 }
 
 // ── Reduction ───────────────────────────────────────────────────────────────
 
 const PREVIEW_MAX = 200;
+
+/**
+ * Hard cap on a step's RAW disclosure. A tool can return megabytes; the raw
+ * view exists so a developer can check the payload, not so the thread can host
+ * it, and an unbounded <pre> in a virtualized list wrecks measurement.
+ */
+const RAW_RESULT_MAX = 4000;
+
+/**
+ * The result verbatim for the on-demand raw view: strings as themselves,
+ * structures pretty-printed. Null when there is nothing to disclose, so the
+ * step renders no toggle at all rather than an empty panel.
+ */
+export function rawResultText(
+  value: EveJsonValue | null | undefined,
+): string | null {
+  if (value === undefined || value === null) return null;
+  let text: string;
+  if (typeof value === "string") text = value;
+  else {
+    try {
+      text = JSON.stringify(value, null, 2);
+    } catch {
+      return null;
+    }
+  }
+  if (text.trim().length === 0) return null;
+  return text.length > RAW_RESULT_MAX
+    ? `${text.slice(0, RAW_RESULT_MAX)}\n…`
+    : text;
+}
 
 /** Compact one-line preview of a tool result / args value. */
 export function previewValue(value: EveJsonValue | undefined): string | null {
@@ -406,6 +529,8 @@ export function reduceRunView(
   let modelId: string | null = null;
   let canceled = false;
   let contextCleared = false;
+  let contextCompacted = false;
+  let inputTokens: number | null = null;
 
   /**
    * Keyless append-type frames extend the currently open item of that kind.
@@ -462,7 +587,8 @@ export function reduceRunView(
     callId: string,
     toolName: string,
     state: StepState,
-    resultPreview: string | null,
+    resultSummary: string | null,
+    rawResult: string | null,
     at: string,
   ) => {
     const next: ToolItem = {
@@ -470,7 +596,8 @@ export function reduceRunView(
       key: callId,
       toolName,
       state,
-      resultPreview,
+      resultSummary,
+      rawResult,
     };
     if (!updateItem(callId, next, at)) pushItem(next, at);
   };
@@ -540,7 +667,8 @@ export function reduceRunView(
                 key: action.callId,
                 toolName: action.toolName,
                 state: "pending",
-                resultPreview: null,
+                resultSummary: null,
+                rawResult: null,
               },
               frame.at,
             );
@@ -581,7 +709,8 @@ export function reduceRunView(
           result.callId,
           result.toolName,
           existing?.state ?? "pending",
-          previewValue(result.output),
+          summarizeToolResult(result.output),
+          rawResultText(result.output),
           frame.at,
         );
         break;
@@ -594,11 +723,23 @@ export function reduceRunView(
             : resultStatus === "rejected"
               ? "rejected"
               : "error";
-        const preview =
+        // A failure says WHY in the summary slot: eve's own message first, then
+        // whatever the tool managed to return, and never a bare blank — a step
+        // that failed silently is the one that most needs a line of text.
+        const summary =
           state === "ok"
-            ? previewValue(result.output)
-            : (resultError?.message ?? previewValue(result.output) ?? "Failed");
-        upsertTool(result.callId, result.toolName, state, preview, frame.at);
+            ? summarizeToolResult(result.output)
+            : (resultError?.message ??
+              summarizeToolResult(result.output) ??
+              "Failed");
+        upsertTool(
+          result.callId,
+          result.toolName,
+          state,
+          summary,
+          rawResultText(result.output),
+          frame.at,
+        );
         resolveInputsForCall(result.callId);
         break;
       }
@@ -755,11 +896,36 @@ export function reduceRunView(
         break;
       }
       // Durable model history dropped (the Clear context action). The
-      // transcript stays readable; only the agent's memory of it is gone.
+      // transcript stays readable; only the agent's memory of it is gone —
+      // and so is the meaning of the last usage measurement, which counted
+      // the context that just went away (D6).
       case "context.cleared":
         contextCleared = true;
+        inputTokens = null;
         retirePendingInputs();
         break;
+      // Compaction LANDED — the summary replaced the earlier history. The
+      // matching `compaction.requested` is deliberately NOT reduced: it proves
+      // only that a compaction was attempted, and the two ways it produces
+      // nothing (an empty context emits neither event; a failed summarization
+      // emits `requested` alone and keeps the previous history) would both
+      // draw a divider claiming a boundary that does not exist. See D4.
+      case "compaction.completed":
+        contextCompacted = true;
+        // Same reset as a clear: the summary REPLACED the history the last
+        // measurement counted, so that figure describes nothing now.
+        inputTokens = null;
+        break;
+      // The context-budget numerator (D6). eve carries token usage on
+      // `step.completed`, NOT on `turn.completed` — the turn event's payload is
+      // `{sequence, turnId}` and nothing else.
+      case "step.completed": {
+        const used = event.data.usage?.inputTokens;
+        if (typeof used === "number" && Number.isFinite(used) && used > 0) {
+          inputTokens = used;
+        }
+        break;
+      }
       case "step.failed":
       case "turn.failed":
       case "session.failed":
@@ -850,5 +1016,7 @@ export function reduceRunView(
     modelId,
     canceled: canceled || status === "canceled",
     contextCleared,
+    contextCompacted,
+    inputTokens,
   };
 }

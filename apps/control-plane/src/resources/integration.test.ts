@@ -5,10 +5,14 @@
  * Covers the authz matrix (outsider 403 on paths / 404 on foreign rows; member
  * ok; owner/admin-only ops), secrets-never-echoed, the registry proxy (stubbed
  * registry), delete-referenced-connection 409 (agents reference connections
- * now), the skill attachment upload→agent-publish path (bytes threaded into
- * the compiler), model preset guards, agents CRUD (+ inline dry-run
- * diagnostics, run-as membership, delete guard), member passthrough, and the
- * HITL run-input round trip against a fake eve worker that parks on approval.
+ * now), the per-agent-version tool directory (spec D5: slug → connection name
+ * + probe-cached descriptions, and all three of its degradations), the skill
+ * attachment upload→agent-publish path (bytes threaded into the compiler),
+ * model preset guards, agents CRUD (+ inline dry-run diagnostics, run-as
+ * membership, delete guard), member passthrough, the HITL run-input round
+ * trip against a fake eve worker that parks on approval, the session list's
+ * first-message preview (D9's fallback on a cold load), and the idle
+ * clear/compact drain that makes D4's context divider durable.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -20,9 +24,11 @@ import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
+  SESSION_MESSAGE_PREVIEW_MAX_CHARS,
   type AgentDefinitionInput,
   type CreateSessionResponse,
   type GetAgentResponse,
+  type GetAgentVersionToolsResponse,
   type GetConnectionResponse,
   type GetModelPresetResponse,
   type GetSkillResponse,
@@ -36,6 +42,7 @@ import {
   type PublishAgentResponse,
   type RegistryServerSummary,
   type RunInputResponse,
+  type SessionContextControlResponse,
   type UpdateAgentResponse,
 } from "@invisible-string/shared";
 
@@ -45,6 +52,7 @@ import {
   type CompileRequest,
   type CompileAgentFn,
 } from "../build/compiler-contract";
+import { slugifyName } from "../build/compiler-adapter";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
 import type { OpenRouterModelInfo } from "./openrouter-catalog";
@@ -315,6 +323,32 @@ class FakeWorker {
       }
       return eveAccepted(s.id);
     }
+    // Context controls. Both emit their frames the way eve does — into the
+    // session's durable stream, AFTER answering 202 — which is precisely why
+    // an idle clear/compact has no consumer unless the control route drains
+    // it. `clear` emits `context.cleared`; `compact` over this fake's context
+    // emits NO `compaction.*` at all (eve's real behaviour for an empty or
+    // already-cleared context, spec D4). BOTH settle with `session.waiting`,
+    // which is the only acknowledgement the compact case ever produces.
+    const ctl = sub.match(/^session\/([^/]+)\/(clear|compact)$/);
+    if (ctl && req.method === "POST") {
+      const s = this.sessions.get(ctl[1]!);
+      if (!s) {
+        return Response.json({ ok: true, status: "no_active_session" }, { status: 200 });
+      }
+      if (ctl[2] === "clear") {
+        s.events.push(
+          JSON.stringify({
+            type: "context.cleared",
+            data: { sequence: 0, sessionId: s.id, turnId: "turn_0" },
+          }),
+        );
+      }
+      s.events.push(
+        JSON.stringify({ type: "session.waiting", data: { wait: "next-user-message" } }),
+      );
+      return Response.json({ ok: true, sessionId: s.id, status: "accepted" }, { status: 202 });
+    }
     const str = sub.match(/^session\/([^/]+)\/stream$/);
     if (str && req.method === "GET") {
       const s = this.sessions.get(str[1]!);
@@ -415,6 +449,44 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
 
   async function freshWorker(): Promise<void> {
     await db.update(schema.workers).set({ lastHeartbeatAt: new Date(), status: "live" }).where(eq(schema.workers.address, fixture.url));
+  }
+
+  /**
+   * An immutable `agent_versions` row for `agentId`, written directly and
+   * pointed at by `agents.published_version_id`.
+   *
+   * The tool directory READS that row (its `connection_slugs` map) joined to
+   * `connections`; what PRODUCES it — publish → `resolveCompileInputs` → the
+   * persisted map — is covered by runtime/compile-service.test.ts and the
+   * runtime integration suite. Inserting here keeps the directory cases
+   * independent of a build and lets them state the slug map explicitly, using
+   * the same `slugifyName` the publish path derives it with.
+   */
+  async function publishedVersion(
+    agentId: string,
+    definition: AgentDefinitionInput,
+    connectionSlugs: Record<string, string>,
+  ): Promise<string> {
+    const rows = await db
+      .insert(schema.agentVersions)
+      .values({
+        agentId,
+        definition: definition as unknown as Record<string, unknown>,
+        contentHash: `t6-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
+        compilerVersion: "stub-compiler-1",
+        eveVersion: STUB_EVE_VERSION,
+        modelProvider: "openrouter",
+        modelId: "vendor/test-model",
+        connectionSlugs,
+        buildStatus: "succeeded",
+      })
+      .returning({ id: schema.agentVersions.id });
+    const versionId = rows[0]!.id;
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: versionId })
+      .where(eq(schema.agents.id, agentId));
+    return versionId;
   }
 
   beforeAll(async () => {
@@ -851,6 +923,165 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(freed.status).toBe(200);
   });
 
+  // ── agent-version tool directory (2026-08-11 spec D5) ────────────────────
+
+  test("agent version tools: slug → connection name + probe-cached descriptions; never-probed reads empty, a detached slug drops, a pre-column version degrades", async () => {
+    const linearRes = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Linear D5", url: "https://mcp.example/linear-d5" },
+    });
+    expect(linearRes.status).toBe(201);
+    const linearId = ((await linearRes.json()) as GetConnectionResponse).connection.id;
+
+    const notionRes = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Notion D5", url: "https://mcp.example/notion-d5" },
+    });
+    expect(notionRes.status).toBe(201);
+    const notionId = ((await notionRes.json()) as GetConnectionResponse).connection.id;
+
+    // Only the FIRST connection gets a cache: the probe writes tools_cache
+    // exclusively on `ok`, which no server in this suite ever reaches, so the
+    // second stays the "never probed" case the thread must degrade through.
+    await db
+      .update(schema.connections)
+      .set({
+        toolsCache: [
+          { name: "create_issue", description: "Create a new issue in a team", params: ["team", "title"] },
+          { name: "search_issues", description: "Search issues by query", params: ["query"] },
+        ],
+        toolsCachedAt: new Date(),
+      })
+      .where(eq(schema.connections.id, linearId));
+
+    const draft = agentDraft({
+      persona: "Use the tools.",
+      context: { mcpConnectionIds: [linearId, notionId], skillIds: [] },
+    });
+    const agentRes = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tool Directory Agent", draft },
+    });
+    expect(agentRes.status).toBe(201);
+    const toolAgentId = ((await agentRes.json()) as GetAgentResponse).agent.id;
+    const versionId = await publishedVersion(toolAgentId, draft, {
+      [slugifyName("Linear D5")]: linearId,
+      [slugifyName("Notion D5")]: notionId,
+    });
+
+    const path = `/workspaces/${orgId}/agents/${toolAgentId}/versions/${versionId}/tools`;
+    const res = await api("GET", path, { cookie: ownerCookie });
+    expect(res.status).toBe(200);
+    const { directory } = (await res.json()) as GetAgentVersionToolsResponse;
+    // Echoed version id: a client cache keyed per version cannot mis-attribute.
+    expect(directory.agentVersionId).toBe(versionId);
+    // The slugs are the compiler's own (`slugifyName`) — the `<slug>__` prefix
+    // the run stream's qualified tool names actually carry.
+    expect(directory.connections.map((c) => c.slug)).toEqual(["linear-d5", "notion-d5"]);
+
+    const linear = directory.connections[0]!;
+    expect(linear.connectionId).toBe(linearId);
+    expect(linear.connectionName).toBe("Linear D5");
+    expect(linear.tools.find((t) => t.name === "create_issue")?.description).toBe(
+      "Create a new issue in a team",
+    );
+
+    // Never probed OK → tools EMPTY, never absent: the step renders its
+    // humanized name with no subtitle instead of the request failing.
+    expect(directory.connections[1]!.connectionName).toBe("Notion D5");
+    expect(directory.connections[1]!.tools).toEqual([]);
+
+    // Display projection only — no endpoint, transport, or auth material.
+    const serialized = JSON.stringify(directory);
+    expect(serialized).not.toContain("mcp.example");
+    expect(serialized).not.toContain("authConfig");
+
+    // A slug whose connection is gone (or has left the agent's scope) is
+    // DROPPED — the thread falls back to the slug it already has, and the
+    // surviving entries still resolve.
+    await db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: { "linear-d5": linearId, ghost: "cn_0000000000000000" } })
+      .where(eq(schema.agentVersions.id, versionId));
+    const ghosted = (await (
+      await api("GET", path, { cookie: ownerCookie })
+    ).json()) as GetAgentVersionToolsResponse;
+    expect(ghosted.directory.connections.map((c) => c.slug)).toEqual(["linear-d5"]);
+
+    // A version published before `connection_slugs` existed carries null:
+    // an empty directory, still a 200 (republish backfills the map).
+    await db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: null })
+      .where(eq(schema.agentVersions.id, versionId));
+    const historical = await api("GET", path, { cookie: ownerCookie });
+    expect(historical.status).toBe(200);
+    expect(
+      ((await historical.json()) as GetAgentVersionToolsResponse).directory.connections,
+    ).toEqual([]);
+  });
+
+  test("agent version tools: authz matrix — anonymous 401, outsider 403/404, member reads; another agent's version and junk ids are 404 not 500", async () => {
+    const mineDraft = agentDraft({ persona: "A." });
+    const mine = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tools Authz A", draft: mineDraft },
+    });
+    const mineId = ((await mine.json()) as GetAgentResponse).agent.id;
+    const mineVersionId = await publishedVersion(mineId, mineDraft, {});
+
+    const otherDraft = agentDraft({ persona: "B — a different agent." });
+    const other = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tools Authz B", draft: otherDraft },
+    });
+    const otherId = ((await other.json()) as GetAgentResponse).agent.id;
+    const otherVersionId = await publishedVersion(otherId, otherDraft, {});
+
+    const path = `/workspaces/${orgId}/agents/${mineId}/versions/${mineVersionId}/tools`;
+
+    expect((await api("GET", path)).status).toBe(401);
+
+    const stranger = await signUpWithOrg("Tools Stranger");
+    // Foreign workspace path → 403 (the macro), foreign row under the
+    // stranger's OWN path → 404 (existence-hiding).
+    expect((await api("GET", path, { cookie: stranger.cookie })).status).toBe(403);
+    const foreignRow = await api(
+      "GET",
+      `/workspaces/${stranger.orgId}/agents/${mineId}/versions/${mineVersionId}/tools`,
+      { cookie: stranger.cookie },
+    );
+    expect(foreignRow.status).toBe(404);
+
+    // Another agent's version under this agent's path → 404: a version id is
+    // never enough on its own to read someone else's tool inventory.
+    const crossed = await api(
+      "GET",
+      `/workspaces/${orgId}/agents/${mineId}/versions/${otherVersionId}/tools`,
+      { cookie: ownerCookie },
+    );
+    expect(crossed.status).toBe(404);
+    expect(((await crossed.json()) as { error: { code: string } }).error.code).toBe(
+      "agent_version_not_found",
+    );
+
+    // Junk uuids are 404, not the 500 a raw `= $1` against a uuid column gives.
+    expect(
+      (await api("GET", `/workspaces/${orgId}/agents/${mineId}/versions/nope/tools`, { cookie: ownerCookie })).status,
+    ).toBe(404);
+    expect(
+      (await api("GET", `/workspaces/${orgId}/agents/nope/versions/${mineVersionId}/tools`, { cookie: ownerCookie })).status,
+    ).toBe(404);
+
+    // Reading a thread is a MEMBER operation — the directory is too.
+    await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    try {
+      expect((await api("GET", path, { cookie: ownerCookie })).status).toBe(200);
+    } finally {
+      await db.update(schema.member).set({ role: "owner" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    }
+  });
+
   // ── skills + attachments → agent publish threads bytes into the compiler ──
 
   test("skills: CRUD + attachment upload; agent publish emits the packaged skill", async () => {
@@ -1133,12 +1364,24 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     // run-as defaults to the creator.
     expect(agent.runAsUserId).toBe(ownerUserId);
 
-    // Duplicate name → 409 (names feed the content hash via the slug).
+    // Duplicate names are LEGAL, on create AND on rename (2026-08-11 spec D1:
+    // the content hash keys on the agent's stable id, so two same-named agents
+    // no longer collide onto one world DB, and the unique index on
+    // (organization_id, name) was dropped with migration 0011).
     const dup = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
       body: { name: "Custom" },
     });
-    expect(dup.status).toBe(409);
+    expect(dup.status).toBe(201);
+    const dupAgent = ((await dup.json()) as GetAgentResponse).agent;
+    expect(dupAgent.id).not.toBe(agent.id);
+
+    const renameOnto = await api("PATCH", `/workspaces/${orgId}/agents/${dupAgent.id}`, {
+      cookie: ownerCookie,
+      body: { name: "Custom" },
+    });
+    expect(renameOnto.status).toBe(200);
+    await api("DELETE", `/workspaces/${orgId}/agents/${dupAgent.id}`, { cookie: ownerCookie });
 
     // Draft PATCH returns dry-run diagnostics inline: a non-allowlisted
     // model override is the diagnostics PAYLOAD, not a failed save.
@@ -1249,5 +1492,131 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(listed?.agentName).toBe("General Purpose");
     expect(listed?.workflowName).toBeNull();
     expect(listed?.lastRunStatus).toBe("succeeded");
+  });
+
+  /** Publish the seeded agent and wait for its build (idempotent by hash). */
+  async function readySeededAgent(): Promise<void> {
+    await freshWorker();
+    const pub = (await (
+      await api("POST", `/workspaces/${orgId}/agents/${seededAgentId}/publish`, {
+        cookie: ownerCookie,
+      })
+    ).json()) as PublishAgentResponse;
+    await stack.runtime!.buildService.waitFor(pub.contentHash);
+    await until(
+      async () =>
+        (await stack.runtime!.buildStore.get(pub.contentHash))?.status === "succeeded" ||
+        undefined,
+      "seeded agent build",
+    );
+    await freshWorker();
+  }
+
+  /** Every persisted event type for a run, in seq order. */
+  async function runEventTypes(runId: string): Promise<string[]> {
+    const rows = await db
+      .select({ event: schema.runEvents.event, seq: schema.runEvents.seq })
+      .from(schema.runEvents)
+      .where(eq(schema.runEvents.runId, runId))
+      .orderBy(schema.runEvents.seq);
+    return rows.map((row) => (row.event as { type: string }).type);
+  }
+
+  test("session list carries the first message so an untitled row has a fallback", async () => {
+    // REGRESSION (2026-08-11 spec D9): titling is fire-and-forget and silent
+    // on failure, so `title === null` is the STEADY state, not a blip. A
+    // client that has not opened the thread holds no message of its own —
+    // without a server-side preview every untitled row falls through to the
+    // agent's name and the whole sidebar reads identically.
+    await readySeededAgent();
+    const opener = `Draft the Q3 board update ${"and the appendix ".repeat(40)}`;
+    const created = await api(
+      "POST",
+      `/workspaces/${orgId}/agents/${seededAgentId}/sessions`,
+      { cookie: ownerCookie, body: { message: opener } },
+    );
+    expect(created.status).toBe(201);
+    const { session } = (await created.json()) as CreateSessionResponse;
+
+    const list = await api("GET", `/workspaces/${orgId}/sessions?agentId=${seededAgentId}`, {
+      cookie: ownerCookie,
+    });
+    const listed = ((await list.json()) as ListSessionsResponse).sessions.find(
+      (s) => s.id === session.id,
+    );
+    // Titling is off under `bun test`, which is exactly the state the fallback
+    // exists for.
+    expect(listed?.title).toBeNull();
+    expect(listed?.firstMessagePreview).toBe(
+      opener.slice(0, SESSION_MESSAGE_PREVIEW_MAX_CHARS).trimEnd(),
+    );
+    // Truncated in Postgres, not on the client: a list of long threads must
+    // not ship whole message bodies.
+    expect(listed!.firstMessagePreview!.length).toBeLessThanOrEqual(
+      SESSION_MESSAGE_PREVIEW_MAX_CHARS,
+    );
+    expect(opener.length).toBeGreaterThan(SESSION_MESSAGE_PREVIEW_MAX_CHARS);
+  });
+
+  test("an idle clear persists its divider on the last run and never drains into the next one", async () => {
+    // REGRESSION (2026-08-11 spec D4): clear/compact require a QUIET session,
+    // so no tail is attached when they fire. Nothing consumed eve's
+    // `context.cleared`, so no divider survived a reload — and the next run's
+    // tail drained the frame as a leftover, drawing the boundary under an
+    // exchange that happened AFTER the clear.
+    await readySeededAgent();
+    const created = await api(
+      "POST",
+      `/workspaces/${orgId}/agents/${seededAgentId}/sessions`,
+      { cookie: ownerCookie, body: { message: "before the clear" } },
+    );
+    const { session, run: firstRun } = (await created.json()) as CreateSessionResponse;
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, firstRun.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "first run to succeed");
+
+    const cleared = await api("POST", `/sessions/${session.id}/clear`, {
+      cookie: ownerCookie,
+    });
+    expect(cleared.status).toBe(200);
+    const clearBody = (await cleared.json()) as SessionContextControlResponse;
+    expect(clearBody.status).toBe("accepted");
+    // The boundary landed under the exchange the clear actually followed.
+    expect(clearBody.marker).toEqual({ kind: "cleared", runId: firstRun.id });
+    expect(await runEventTypes(firstRun.id)).toContain("context.cleared");
+
+    // The next exchange must be clean: its tail starts past the drained
+    // frames, so no phantom divider appears under a later reply.
+    await freshWorker();
+    const follow = await api("POST", `/sessions/${session.id}/messages`, {
+      cookie: ownerCookie,
+      body: { message: "after the clear" },
+    });
+    expect(follow.status).toBe(201);
+    const secondRun = ((await follow.json()) as { run: { id: string } }).run;
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, secondRun.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "second run to succeed");
+    expect(await runEventTypes(secondRun.id)).not.toContain("context.cleared");
+
+    // D4's edge case: this fake emits no `compaction.*` at all (an empty or
+    // already-cleared context), so the route must report NO marker rather
+    // than claim a boundary that does not exist.
+    await freshWorker();
+    const compacted = await api("POST", `/sessions/${session.id}/compact`, {
+      cookie: ownerCookie,
+    });
+    expect(compacted.status).toBe(200);
+    const compactBody = (await compacted.json()) as SessionContextControlResponse;
+    expect(compactBody.status).toBe("accepted");
+    expect(compactBody.marker).toBeNull();
   });
 });

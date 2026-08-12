@@ -7,7 +7,10 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
-import type { RunInputRequest } from "@invisible-string/shared";
+import type {
+  RunInputRequest,
+  ToolDirectoryIndex,
+} from "@invisible-string/shared";
 
 import type { RunView } from "../../lib/chat/run-view";
 import type { QueuedMessage } from "../../lib/chat/use-message-queue";
@@ -27,12 +30,22 @@ export interface ThreadViewProps {
   /** True while the stop request is in flight. */
   stopping?: boolean;
   /**
-   * A clear/compact that just landed. eve emits `context.cleared` /
-   * `compaction.*` on the SESSION stream, which nothing is tailing when the
-   * session is idle, so the marker is rendered from the acknowledged
-   * mutation rather than waiting for an event that may never be persisted.
+   * A clear/compact acknowledged by a surface that has no event stream to read
+   * it back from — fixture mode, where there is no backend at all.
+   *
+   * The LIVE thread no longer passes this: both markers are now derived from
+   * persisted frames inside {@link RunView} and drawn inline by `RunMessage`
+   * (2026-08-11 spec D4), which is what makes them survive a reload. Anything
+   * rendered from local state here disappears on the next mount, so this prop
+   * is for previews only.
    */
   contextMarker?: ContextMarkerKind | null;
+  /**
+   * Slug → connection name + probe-cached tool descriptions for the session's
+   * pinned agent version (D5). Referentially stable — it is handed to the
+   * memoized run rows.
+   */
+  toolDirectory?: ToolDirectoryIndex;
   pendingInput?: {
     runId: string;
     requestId: string;
@@ -64,6 +77,7 @@ export function ThreadView({
   onStop,
   stopping,
   contextMarker,
+  toolDirectory,
   pendingInput,
   inputError,
   onSend,
@@ -170,6 +184,7 @@ export function ThreadView({
                     inputError={
                       pendingInput?.runId === run.runId ? inputError : null
                     }
+                    toolDirectory={toolDirectory}
                   />
                 </div>
               </div>

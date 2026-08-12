@@ -18,13 +18,19 @@
  * - Each `user_message` frame re-checks that the surface entity belongs to
  *   the socket's workspace (workflow or agent row per `surface`) and reloads
  *   the workspace inventory fresh, then runs one CopilotSession turn (see
- *   session.ts for the tool loop).
+ *   session.ts for the tool loop) — carrying that frame's own `allowEdits`
+ *   flag, since the toggle is per-turn state the client owns (spec D7.2) and
+ *   the socket deliberately remembers nothing about it.
+ * - On the agent surface it also resolves the agent's row IDENTITY for the
+ *   turn (spec D7.3/D7.4) — the frame's own `identity` first, the persisted
+ *   inventory row as the fallback; see {@link resolveIdentity}.
  */
 import { Elysia } from "elysia";
 import { and, eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   copilotClientFrameSchema,
+  type CopilotAgentIdentity,
   type CopilotServerFrame,
   type CopilotSurface,
 } from "@invisible-string/shared";
@@ -37,7 +43,11 @@ import {
   type WorkspaceDeps,
 } from "../workspace";
 import type { CopilotConfig } from "./config";
-import { createInventoryLoader, type LoadInventoryFn } from "./inventory";
+import {
+  createInventoryLoader,
+  type LoadInventoryFn,
+  type WorkspaceInventory,
+} from "./inventory";
 import { CopilotSession } from "./session";
 import type { CopilotTransport } from "./transport";
 
@@ -304,7 +314,12 @@ export function copilotPlugin(deps: CopilotDeps) {
               surface: frame.surface,
               message: frame.message,
               draft: frame.draft,
+              identity: resolveIdentity(frame, inventory),
               inventory,
+              // Per-turn, straight off the frame — the server holds no
+              // allow-edits state to go stale across turns or reconnects
+              // (spec D7.2).
+              allowEdits: frame.allowEdits ?? false,
             });
             budgetFor(state.workspace.organizationId).tokens += outputTokens;
           })().catch(() => {
@@ -330,6 +345,34 @@ export function copilotPlugin(deps: CopilotDeps) {
       }
     },
   });
+}
+
+/**
+ * The agent identity a turn reasons about (spec D7.3/D7.4), per the frame
+ * contract's precedence rule:
+ *
+ * 1. the frame's `identity` — the EDITOR's live values, which is what the user
+ *    is looking at and may include a description they have not saved yet (the
+ *    editor is the single writer, exactly as for `draft`);
+ * 2. failing that, the persisted `agents` row, taken from the inventory this
+ *    turn already loaded (no extra query) so a client that sends no identity
+ *    still leaves the copilot able to name the agent it is editing instead of
+ *    being blind to it;
+ * 3. null on the workflow surface, and if `entityId` somehow resolves to no
+ *    inventory row — the prompt then states no identity at all.
+ */
+function resolveIdentity(
+  frame: {
+    surface: CopilotSurface;
+    entityId: string;
+    identity?: CopilotAgentIdentity;
+  },
+  inventory: WorkspaceInventory,
+): CopilotAgentIdentity | null {
+  if (frame.surface !== "agent") return null;
+  if (frame.identity) return frame.identity;
+  const row = inventory.agents.find((agent) => agent.id === frame.entityId);
+  return row ? { name: row.name, description: row.description } : null;
 }
 
 function send(

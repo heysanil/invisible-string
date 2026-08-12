@@ -1,14 +1,17 @@
 /**
  * Publish state machine: staged progress (compiling → building → ready),
- * cache-hit fast path, build-failure and network-failure error surfaces, and
- * re-entrancy guards.
+ * cache-hit fast path, build-failure and network-failure error surfaces,
+ * re-entrancy guards, and the settled-publish announcement copy.
  */
 import { expect, test } from "bun:test";
 import type { PublishAgentResponse } from "@invisible-string/shared";
 
 import {
+  chatEntryDecision,
   INITIAL_PUBLISH_STATE,
   isPublishBusy,
+  isPublishTerminal,
+  publishAnnouncement,
   publishPhaseLabel,
   publishReducer,
   type PublishState,
@@ -114,6 +117,85 @@ test("start is ignored while a publish is already in flight", () => {
   const busy = run([{ type: "start" }]);
   const again = publishReducer(busy, { type: "start" });
   expect(again).toBe(busy);
+});
+
+// ── announcements (what a settled build says, wherever the user is) ─────────
+
+test("only TERMINAL phases announce, and they name the agent", () => {
+  const compiling = run([{ type: "start" }]);
+  expect(isPublishTerminal(compiling)).toBe(false);
+  expect(publishAnnouncement("Release bot", compiling)).toBeNull();
+
+  const building = run([
+    { type: "start" },
+    { type: "received", response: response({ buildStatus: "building" }) },
+  ]);
+  expect(publishAnnouncement("Release bot", building)).toBeNull();
+
+  const ready = run([
+    { type: "start" },
+    { type: "received", response: response() },
+  ]);
+  expect(isPublishTerminal(ready)).toBe(true);
+  expect(publishAnnouncement("Release bot", ready)).toEqual({
+    variant: "success",
+    message: "“Release bot” published and built.",
+  });
+
+  const cached = run([
+    { type: "start" },
+    { type: "received", response: response({ cached: true }) },
+  ]);
+  expect(publishAnnouncement("Release bot", cached)?.message).toContain(
+    "served from cache",
+  );
+});
+
+test("a failure announcement carries one clamped line, not a stack dump", () => {
+  const failed = run([
+    { type: "start" },
+    {
+      type: "received",
+      response: response({
+        buildStatus: "failed",
+        buildError: `\n${"x".repeat(400)}\n  at agent.ts:12`,
+      }),
+    },
+  ]);
+  const announcement = publishAnnouncement("Release bot", failed);
+  expect(announcement?.variant).toBe("error");
+  expect(announcement?.message).not.toContain("at agent.ts:12");
+  expect(announcement!.message.length).toBeLessThan(200);
+  expect(announcement!.message.endsWith("…")).toBe(true);
+});
+
+// ── publish → chat ──────────────────────────────────────────────────────────
+
+test("chat entry no longer waits for the build, but never enters on a failure", () => {
+  // The old rule ("enter only on succeeded") is what made "Chat with agent"
+  // block for the length of an eve build.
+  expect(chatEntryDecision(response({ buildStatus: "building" }))).toEqual({
+    enter: true,
+    warnStillBuilding: true,
+  });
+  expect(chatEntryDecision(response({ buildStatus: "pending" }))).toEqual({
+    enter: true,
+    warnStillBuilding: true,
+  });
+  expect(chatEntryDecision(response({ buildStatus: "succeeded" }))).toEqual({
+    enter: true,
+    warnStillBuilding: false,
+  });
+  // A failed build has nothing to chat with — the first message would 409.
+  expect(chatEntryDecision(response({ buildStatus: "failed" }))).toEqual({
+    enter: false,
+    warnStillBuilding: false,
+  });
+  // The POST itself failed; the store already said so.
+  expect(chatEntryDecision(null)).toEqual({
+    enter: false,
+    warnStillBuilding: false,
+  });
 });
 
 test("reset returns to idle from ready or error", () => {

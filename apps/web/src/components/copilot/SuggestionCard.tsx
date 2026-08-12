@@ -5,11 +5,18 @@
  * receipt line; dismissed ones to a muted receipt. Keyboard: the card is
  * focusable and Enter applies, Delete/Backspace dismisses.
  *
+ * Not every apply is instant, and not every apply succeeds: the agent rename
+ * is a PATCH. So the card has two more states than a receipt-or-not binary —
+ * `applying` keeps the card up with its controls locked (one accept, no
+ * premature claim), and `failed` is a receipt that says the change did NOT
+ * land. A card that printed "Applied" over a failed write would be the one
+ * thing a receipt may never do.
+ *
  * Surface-agnostic: presentation arrives as a precomputed
  * {@link ProposalDescription} from the dock's {@link CopilotSurfaceAdapter} —
  * the card never touches workflow or agent draft types.
  */
-import { ArrowRight, Check, X } from "lucide-react";
+import { AlertTriangle, ArrowRight, Check, X } from "lucide-react";
 import { useRef } from "react";
 import type { CopilotProposal } from "@invisible-string/shared";
 
@@ -17,10 +24,17 @@ import type { ProposalDescription } from "../../lib/copilot/adapter";
 import type { SuggestionStatus } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
 import { DiffView } from "../builder/DiffView";
+import { Spinner } from "../ui/Spinner";
 
 export interface SuggestionCardProps {
   proposal: CopilotProposal;
   status: SuggestionStatus;
+  /**
+   * Applied without an accept gate (allow-edits, spec D7.2). The card exists
+   * precisely so an unasked edit still leaves a trace, so the receipt must
+   * SAY it was automatic — "Applied" alone would read as "you applied this".
+   */
+  autoApplied?: boolean;
   /** Presentation computed by the surface adapter against the LIVE draft. */
   description: ProposalDescription;
   onApply: () => void;
@@ -30,35 +44,57 @@ export interface SuggestionCardProps {
 }
 
 export function SuggestionCard(props: SuggestionCardProps) {
-  const { proposal, status, onApply, onDismiss, focusRef } = props;
+  const { proposal, status, autoApplied, onApply, onDismiss, focusRef } = props;
   const live = props.description;
   // Receipts must not drift: the description is recomputed from the LIVE
   // draft (right for a pending preview), but once the card settles the apply
-  // itself changes the draft — freeze the last PENDING description and render
-  // receipts from that copy.
+  // itself changes the draft — freeze the last UNSETTLED description and
+  // render receipts from that copy.
+  const settling = status === "pending" || status === "applying";
   const frozenRef = useRef<ProposalDescription>(live);
-  if (status === "pending") frozenRef.current = live;
-  const description = status === "pending" ? live : frozenRef.current;
+  if (settling) frozenRef.current = live;
+  const description = settling ? live : frozenRef.current;
 
-  if (status !== "pending") {
+  if (!settling) {
     return (
       <div
         data-testid="suggestion-receipt"
-        className="flex items-center gap-1.5 rounded-card border border-black/[0.06] bg-white/30 px-3 py-1.5 text-[12px] text-ink-3"
+        // A failed apply is a real outcome the user must not scroll past —
+        // the other two receipts are quiet by design, this one alerts.
+        {...(status === "failed" ? { role: "alert" as const } : {})}
+        className={cn(
+          "flex items-center gap-1.5 rounded-card border px-3 py-1.5 text-[12px]",
+          status === "failed"
+            ? "border-err/25 bg-err/[0.05] text-ink-2"
+            : "border-black/[0.06] bg-white/30 text-ink-3",
+        )}
       >
         {status === "applied" ? (
           <Check size={13} className="shrink-0 text-ok" aria-hidden="true" />
+        ) : status === "failed" ? (
+          <AlertTriangle size={13} className="shrink-0 text-err" aria-hidden="true" />
         ) : (
           <X size={13} className="shrink-0 text-ink-4" aria-hidden="true" />
         )}
         <span className="truncate">
-          {status === "applied" ? "Applied" : "Dismissed"} — {description.title}
+          {status === "applied"
+            ? autoApplied
+              ? "Applied automatically"
+              : "Applied"
+            : status === "failed"
+              ? "Couldn’t apply"
+              : "Dismissed"}{" "}
+          — {description.title}
         </span>
       </div>
     );
   }
 
   const Icon = description.icon;
+  // While the write is in flight the card stays put, but nothing about it is
+  // actionable: a second accept would double-apply, and Dismiss can no longer
+  // reach the server (the outcome frame for this proposal is already owed).
+  const busy = status === "applying";
 
   return (
     <div
@@ -66,11 +102,13 @@ export function SuggestionCard(props: SuggestionCardProps) {
       data-testid="suggestion-card"
       role="group"
       aria-label={`Suggestion: ${description.title}`}
+      aria-busy={busy || undefined}
       aria-keyshortcuts="Enter Delete"
       aria-description="Press Enter to apply, Delete to dismiss"
       tabIndex={0}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;
+        if (busy) return;
         if (event.key === "Enter") {
           event.preventDefault();
           onApply();
@@ -104,14 +142,27 @@ export function SuggestionCard(props: SuggestionCardProps) {
         <button
           type="button"
           onClick={onApply}
-          className="lift inline-flex h-7 items-center gap-1 rounded-capsule bg-ink px-3 text-[12px] font-medium text-white"
+          disabled={busy}
+          className={cn(
+            "lift inline-flex h-7 items-center gap-1 rounded-capsule bg-ink px-3 text-[12px] font-medium text-white",
+            busy && "opacity-60",
+          )}
         >
-          <Check size={12} aria-hidden="true" /> Apply
+          {busy ? (
+            <Spinner size={12} className="text-white" />
+          ) : (
+            <Check size={12} aria-hidden="true" />
+          )}{" "}
+          {busy ? "Applying…" : "Apply"}
         </button>
         <button
           type="button"
           onClick={onDismiss}
-          className="lift inline-flex h-7 items-center gap-1 rounded-capsule border border-black/10 bg-white/50 px-3 text-[12px] font-medium text-ink-2 hover:text-ink"
+          disabled={busy}
+          className={cn(
+            "lift inline-flex h-7 items-center gap-1 rounded-capsule border border-black/10 bg-white/50 px-3 text-[12px] font-medium text-ink-2 hover:text-ink",
+            busy && "opacity-50",
+          )}
         >
           Dismiss
         </button>

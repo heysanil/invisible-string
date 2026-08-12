@@ -350,8 +350,19 @@ export const agents = pgTable(
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
     /**
-     * Unique per workspace. The slugified name feeds the content hash —
-     * renaming an agent re-keys its world DB + JWT audience on next publish.
+     * Display name. NOT unique per workspace — the unique index that used to
+     * enforce that was dropped (2026-08-11 lifecycle spec D1) once the
+     * content hash stopped keying identity on the slugified name: two agents
+     * sharing a name and a definition previously hashed identically and so
+     * shared one `ag_v_<hash12>` world database, which made a cosmetic UX
+     * rule silently load-bearing for single-writer isolation. `agents.id` is
+     * the identity input now; new agents are still auto-numbered
+     * ("Untitled agent 2") purely so lists stay readable.
+     *
+     * The slugified name DOES still reach the hash — it is emitted into the
+     * generated package name and the model-visible identity line — so
+     * renaming an agent still re-keys its world DB + JWT audience on the
+     * next publish. That churn is known and out of scope (spec §7).
      */
     name: text("name").notNull(),
     description: text("description"),
@@ -378,10 +389,11 @@ export const agents = pgTable(
     updatedAt,
   },
   (table) => [
-    uniqueIndex("agents_organization_id_name_uidx").on(
-      table.organizationId,
-      table.name,
-    ),
+    // Plain, NOT unique (see `name` above). Kept rather than deleted because
+    // it is still the only index for the two org-scoped reads this table
+    // takes: listing a workspace's agents, and the (organization_id, name)
+    // lookup `publishAgentByName` does for the seeded-workspace kick.
+    index("agents_organization_id_name_idx").on(table.organizationId, table.name),
   ],
 );
 
@@ -551,6 +563,16 @@ export const agentSessions = pgTable(
     workflowId: uuid("workflow_id").references(() => workflows.id, {
       onDelete: "set null",
     }),
+    /**
+     * Generated thread title (2026-08-11 spec D9). NULL is the NORMAL state of
+     * a brand-new session and the permanent state whenever titling fails: the
+     * titler (resources/session-title.ts) runs fire-and-forget on the platform
+     * key after the first user message and is silent on every failure. Clients
+     * therefore fall back to truncating that first message, never to
+     * "Untitled". Bounded by shared `SESSION_TITLE_MAX_CHARS` in the titler —
+     * raw model output never reaches this column unclamped.
+     */
+    title: text("title"),
     eveSessionId: text("eve_session_id"),
     continuationToken: text("continuation_token"),
     origin: sessionOrigin("origin").notNull(),

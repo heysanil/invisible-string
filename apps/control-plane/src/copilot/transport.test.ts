@@ -210,6 +210,58 @@ describe("createKeyedScriptedTransport", () => {
   });
 });
 
+describe("scripted reasoning (spec D7.1)", () => {
+  test("a step's reasoning streams as two deltas of ONE block, before its text", async () => {
+    const transport = createFakeTransport(
+      JSON.stringify([{ reasoning: "Thinking hard.", text: "Answer." }]),
+    );
+    const parts = await collect(transport, [{ role: "user", content: "a" }]);
+    const kinds = parts.map((p) => p.type);
+    // Reasoning first, then text, then finish — a real stream's order.
+    expect(kinds).toEqual([
+      "reasoning-delta",
+      "reasoning-delta",
+      "text-delta",
+      "text-delta",
+      "finish",
+    ]);
+    const reasoning = parts.flatMap((p) =>
+      p.type === "reasoning-delta" ? [p] : [],
+    );
+    expect(reasoning.map((p) => p.text).join("")).toBe("Thinking hard.");
+    // One block id: the session joins deltas per block, and a split id here
+    // would insert a paragraph break into a single thought.
+    expect(new Set(reasoning.map((p) => p.id)).size).toBe(1);
+  });
+
+  test("reasoning counts toward the default token estimate", async () => {
+    const transport = createFakeTransport(
+      JSON.stringify([{ reasoning: "x".repeat(40) }]),
+    );
+    const parts = await collect(transport, [{ role: "user", content: "a" }]);
+    const finish = parts.find((p) => p.type === "finish");
+    expect(finish).toMatchObject({ type: "finish", outputTokens: 10 });
+  });
+
+  test("keyed scripts carry reasoning too, with per-replay block ids", async () => {
+    const transport = createKeyedScriptedTransport([
+      { match: "think", steps: [{ reasoning: "Considering.", text: "Ok." }] },
+    ]);
+    const first = await collect(transport, [
+      { role: "user", content: "please think" },
+    ]);
+    const second = await collect(transport, [
+      { role: "user", content: "please think" },
+      { role: "assistant", content: "Ok." },
+      { role: "user", content: "please think" },
+    ]);
+    const ids = (parts: TransportPart[]) =>
+      parts.flatMap((p) => (p.type === "reasoning-delta" ? [p.id] : []));
+    expect(ids(first).length).toBe(2);
+    for (const id of ids(second)) expect(ids(first)).not.toContain(id);
+  });
+});
+
 describe("createFakeTransport format detection", () => {
   test("array of {match, steps} builds the keyed transport", async () => {
     const transport = createFakeTransport(JSON.stringify(SCRIPTS));

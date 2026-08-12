@@ -13,7 +13,8 @@
  *     chat: requires a published agent + ready build → scheduler picks a live
  *     worker → ensure-agent (artifact URL + env) → POST eve session (platform
  *     JWT, 202) → persist agent_sessions + runs → start the NDJSON tailer.
- *     Chat sessions carry `workflowId: null`.
+ *     Chat sessions carry `workflowId: null`, and a fire-and-forget titler
+ *     (resources/session-title.ts) names the thread from that first message.
  * - POST /workspaces/:workspaceId/workflows/:wfId/run {message?, data?}
  *     manual "Run now": dispatch the workflow's published snapshot through
  *     the shared trigger-dispatch path (renders the task message).
@@ -21,7 +22,9 @@
  * - GET  /sessions/:id — session + runs.
  * - POST /runs/:id/input — HITL answer; POST /runs/:id/cancel — Stop (fronts
  *     eve's real `POST /eve/v1/session/:id/cancel`).
- * - POST /sessions/:id/clear | /compact — eve context controls (in place).
+ * - POST /sessions/:id/clear | /compact — eve context controls (in place),
+ *     draining the frames they emit onto the session's latest run so the
+ *     thread's context divider is persisted rather than lost or misplaced.
  * - POST /sessions/:id/reset — DESTRUCTIVE: retires the eve session id and
  *     mints a replacement `agent_sessions` row.
  * - GET  /runs/:id/stream — resumable SSE (Last-Event-ID) over run_events.
@@ -32,7 +35,7 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, count, eq, inArray, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
@@ -52,8 +55,11 @@ import {
   type ResetSessionResponse,
   type RunCancelResponse,
   type RunDto,
+  parseEveStreamTailIndex,
+  EVE_STREAM_TAIL_INDEX_HEADER,
   type SessionContextControlResponse,
   type SessionContextControlStatus,
+  type SessionContextMarker,
   type Logger,
   type TriggerEvent,
   type MasterKey,
@@ -68,7 +74,8 @@ import { RunEventBus } from "../runs/bus";
 import type { DeliveryService } from "../runs/delivery";
 import { createRunSseResponse, parseLastEventId } from "../runs/sse";
 import type { RunStore } from "../runs/store";
-import type { RunTailerManager } from "../runs/tailer";
+import { ndjsonEvents, type RunTailerManager } from "../runs/tailer";
+import { kickSessionTitle } from "../resources/session-title";
 import { loadPublishedWorkflow } from "../resources/workflows";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
 import { buildAgentEnv, decryptMcpEnv } from "./agent-env";
@@ -229,6 +236,10 @@ export function sessionDto(row: SessionRow): AgentSessionDto {
     workflowId: row.workflowId,
     origin: row.origin,
     status: row.status,
+    // Null until the background titler lands one, and permanently null when it
+    // fails (2026-08-11 spec D9) — clients fall back to truncating the first
+    // message, never to "Untitled".
+    title: row.title,
     eveSessionId: row.eveSessionId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -523,12 +534,19 @@ export async function failEveDispatch(
  * 404s at the proxy and the best-effort caller swallows it — the correct
  * outcome, reached immediately.
  */
+interface SessionControlTarget {
+  workerId: string;
+  workerAddress: string;
+  hash: string;
+  token: string;
+}
+
 async function sessionControlTarget(
   deps: RuntimeDeps,
   organizationId: string,
   session: SessionRow,
   options: { ensure?: boolean } = {},
-): Promise<{ workerId: string; workerAddress: string; hash: string; token: string }> {
+): Promise<SessionControlTarget> {
   const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
   const hash = ready.version.contentHash;
   const { worker } = await selectWorker(deps.db, {
@@ -595,6 +613,10 @@ async function cancelEveTurnBestEffort(
  * reading. `session_busy` is the right code here: it is the platform's own
  * transient serialization guard, and the recovery genuinely is "Stop the run
  * (or wait), then try again".
+ *
+ * The flip side of that guarantee is that NO tail is attached when a control
+ * lands, so the frames it emits have no consumer — which is why the accepted
+ * path drains them itself ({@link drainContextControlEvents}).
  */
 async function requireQuietControllableSession(
   deps: RuntimeDeps,
@@ -659,7 +681,7 @@ export async function publishAgent(
     agent.runAsUserId,
     definition,
   );
-  const compiled = compileOrThrow(deps.compile, definition, inputs, agent.name);
+  const compiled = compileOrThrow(deps.compile, definition, inputs, agent);
 
   // Idempotent by content hash: an existing version of this agent with
   // the same hash is re-published, not duplicated. The unique index on
@@ -1021,7 +1043,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           compileServiceDeps(deps),
           workspace.organizationId,
           agent.runAsUserId,
-          agent.name,
+          agent,
           agent.draft,
         );
       },
@@ -1127,6 +1149,18 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
         deps.metrics.recordTrigger("manual", "dispatched");
+
+        // Generated thread title (spec D9) — fire-and-forget on the platform
+        // key against the workspace's `quick` preset. Deliberately AFTER the
+        // dispatch succeeded (a failed dispatch has no thread worth naming)
+        // and never awaited: the create response must not wait on a model
+        // round-trip, and a titling failure leaves `title` null, which the
+        // sidebar renders as the truncated first message.
+        kickSessionTitle(deps, {
+          organizationId: workspace.organizationId,
+          sessionId: session.id,
+          message,
+        });
 
         set.status = 201;
         return { session: sessionDto(session), run: runDto(run) };
@@ -1558,6 +1592,12 @@ export function runtimePlugin(deps: RuntimeDeps) {
     // accepted vs 200 no_active_session), and `no_active_session` is NOT
     // "nothing to do": it is the same dead-session condition a send reports as
     // 409, so it closes the platform row too.
+    //
+    // Both accepted paths then DRAIN what eve emitted (see
+    // drainContextControlEvents): these routes run on a QUIET session, so
+    // nothing else would ever consume `context.cleared` /
+    // `compaction.completed`, and the divider the user is promised is derived
+    // from persisted frames.
     .post(
       "/sessions/:sessionId/clear",
       async ({ workspace, params }) => {
@@ -1578,7 +1618,13 @@ export function runtimePlugin(deps: RuntimeDeps) {
           target.token,
           eveSessionId,
         );
-        return finishContextControl(deps, session, result.status, target.workerId);
+        return finishContextControl(
+          deps,
+          session,
+          result.status,
+          target,
+          eveSessionId,
+        );
       },
       { requireWorkspace: true },
     )
@@ -1597,15 +1643,23 @@ export function runtimePlugin(deps: RuntimeDeps) {
           session,
         );
         // A compact over an EMPTY/already-cleared context emits no
-        // `compaction.*` events at all — the 202 is the only acknowledgement.
-        // Never wait on `compaction.requested` here.
+        // `compaction.*` events at all — the 202 is the only acknowledgement,
+        // and the drain in finishContextControl answers a null `marker`
+        // rather than inventing a boundary. Never wait on
+        // `compaction.requested` here.
         const result = await deps.workerClient.compactEveSession(
           target.workerAddress,
           target.hash,
           target.token,
           eveSessionId,
         );
-        return finishContextControl(deps, session, result.status, target.workerId);
+        return finishContextControl(
+          deps,
+          session,
+          result.status,
+          target,
+          eveSessionId,
+        );
       },
       { requireWorkspace: true },
     )
@@ -1670,6 +1724,11 @@ export function runtimePlugin(deps: RuntimeDeps) {
             // publish.
             agentVersionId: session.agentVersionId,
             workflowId: session.workflowId,
+            // The generated title IS carried over (spec D9): the replacement
+            // row is the same conversation to the user, and it starts with no
+            // messages — so a dropped title would leave the sidebar entry with
+            // nothing to fall back to.
+            title: session.title,
             eveSessionId: null,
             origin: session.origin,
             principal: session.principal,
@@ -1692,29 +1751,203 @@ export function runtimePlugin(deps: RuntimeDeps) {
 }
 
 /**
- * Shared tail of clear/compact: reflect eve's outcome onto the platform row
- * and answer with the (possibly updated) session DTO.
+ * Shared tail of clear/compact: reflect eve's outcome onto the platform row,
+ * DRAIN the frames eve emitted for it, and answer with the (possibly updated)
+ * session DTO plus wherever the boundary marker landed.
  *
  * `no_active_session` is eve telling us the id is dead — the same terminal
  * condition a send answers with 409 `session_not_active` — so the row is
- * closed rather than left looking live.
+ * closed rather than left looking live (and there is nothing to drain).
  */
 async function finishContextControl(
   deps: RuntimeDeps,
   session: SessionRow,
   status: SessionContextControlStatus,
-  workerId: string,
+  target: SessionControlTarget,
+  eveSessionId: string,
 ): Promise<SessionContextControlResponse> {
   if (status === "no_active_session") {
     await deps.runStore.markSession(session.id, "closed");
-    return { session: sessionDto({ ...session, status: "closed" }), status };
+    return {
+      session: sessionDto({ ...session, status: "closed" }),
+      status,
+      marker: null,
+    };
   }
   await deps.db
     .update(schema.agentSessions)
-    .set({ status: "active", affinityWorkerId: workerId })
+    .set({ status: "active", affinityWorkerId: target.workerId })
     .where(eq(schema.agentSessions.id, session.id));
+  const marker = await drainContextControlEvents(deps, session, target, eveSessionId);
   return {
     session: sessionDto({ ...session, status: "active" }),
     status,
+    marker,
   };
+}
+
+/**
+ * Stream opens the drain will attempt, and how long it waits before each.
+ *
+ * eve's clear/compact is 202-ASYNC: the command is queued, so its frames may
+ * not be durable yet when we attach. A couple of very short retries cover that
+ * without ever making a user's click wait on a model round-trip.
+ */
+const CONTEXT_DRAIN_ATTEMPT_DELAYS_MS = [0, 120, 400] as const;
+
+/** Hard bound on one drain, in case eve's tail index is wildly ahead. */
+const CONTEXT_DRAIN_MAX_EVENTS = 64;
+
+/**
+ * How long one open waits for RESPONSE HEADERS, and separately for the body.
+ *
+ * The split matters: a streaming server need not flush headers before it has
+ * a first chunk (Bun's own `serve` does not), so "no headers yet" is how "eve
+ * has emitted nothing at all" actually presents — the ordinary outcome of
+ * compacting an empty context. That case must cost a few hundred ms, not
+ * seconds. Once bytes are flowing the read is bounded logically (see below)
+ * and this longer cap is only a guard against a wedged connection.
+ */
+const CONTEXT_DRAIN_OPEN_TIMEOUT_MS = 400;
+const CONTEXT_DRAIN_READ_TIMEOUT_MS = 1_500;
+
+/**
+ * Consume the frames a clear/compact just emitted and append them to the
+ * session's most recent run.
+ *
+ * WHY THIS EXISTS. The thread's context divider is DERIVED from persisted
+ * `run_events` (spec D4) — but both control routes require a QUIET session
+ * ({@link requireQuietControllableSession}), so by construction no tail is
+ * attached when they fire and nobody would ever consume eve's
+ * `context.cleared` / `compaction.completed`. Left alone those frames have two
+ * effects, both wrong: no divider is persisted (so none survives a reload),
+ * and the NEXT run's tail drains them as leftovers — landing the boundary at
+ * the BOTTOM of an exchange that happened AFTER the clear, i.e. claiming the
+ * context was cleared at a moment it was not.
+ *
+ * Appending them to the latest run fixes both at once: the divider renders
+ * under the exchange the clear actually followed, it is durable, and the
+ * session-wide event count (which IS the tailer's `startIndex`) advances past
+ * them so the next tail never re-drains them.
+ *
+ * BOUNDED, NEVER BLOCKING. Three stop rules, whichever comes first: eve's own
+ * `session.waiting` (every clear/compact settles with one, INCLUDING a compact
+ * that emitted no `compaction.*` at all), the attach-time
+ * `x-eve-stream-tail-index` bound the tailer also uses, and the timeouts
+ * above. Whatever the drain does not reach is left to the next tail exactly as
+ * before — a contiguous prefix is persisted, so the cursor is never wrong,
+ * only sometimes short.
+ *
+ * Every failure is swallowed to whatever marker was already found plus one log
+ * line: a context control that reached eve SUCCEEDED, and a bookkeeping miss
+ * must not turn it into a 502.
+ */
+async function drainContextControlEvents(
+  deps: RuntimeDeps,
+  session: SessionRow,
+  target: SessionControlTarget,
+  eveSessionId: string,
+): Promise<SessionContextMarker | null> {
+  // Held outside the try so a read that dies half-way still reports the
+  // boundary it already persisted.
+  let marker: SessionContextMarker | null = null;
+  let drained = 0;
+  try {
+    // The exchange the boundary belongs under. A session with no runs at all
+    // is not reachable here (a session is born with its first run, and one
+    // without an eve id is refused upstream), but it costs nothing to be sure
+    // — there would be nowhere to put the frames.
+    const runRows = await deps.db
+      .select({ id: schema.runs.id })
+      .from(schema.runs)
+      .where(eq(schema.runs.agentSessionId, session.id))
+      .orderBy(desc(schema.runs.createdAt))
+      .limit(1);
+    const runId = runRows[0]?.id;
+    if (!runId) return null;
+
+    // The same two cursors the tailer resumes on: the session-wide event count
+    // is eve's `startIndex`, the per-run count is our `seq`.
+    let startIndex = await deps.runStore.countSessionEvents(session.id);
+    let seq = await deps.runStore.countRunEvents(runId);
+
+    for (const delayMs of CONTEXT_DRAIN_ATTEMPT_DELAYS_MS) {
+      if (delayMs > 0) await Bun.sleep(delayMs);
+      const abort = new AbortController();
+      let timer = setTimeout(() => abort.abort(), CONTEXT_DRAIN_OPEN_TIMEOUT_MS);
+      try {
+        let response: Response;
+        try {
+          response = await deps.workerClient.openEventStream(
+            target.workerAddress,
+            target.hash,
+            target.token,
+            eveSessionId,
+            startIndex,
+            abort.signal,
+            { includeTailIndex: true },
+          );
+        } catch (openError) {
+          // Headers never came: eve has emitted nothing for this command yet
+          // (or the worker is unreachable). Either way there is nothing to
+          // drain — leave it to the next tail rather than hold the request.
+          if (abort.signal.aborted) return marker;
+          throw openError;
+        }
+        clearTimeout(timer);
+        timer = setTimeout(() => abort.abort(), CONTEXT_DRAIN_READ_TIMEOUT_MS);
+        if (!response.ok || response.body === null) {
+          await response.body?.cancel();
+          return marker;
+        }
+        // `-1` is a REAL value (an empty stream); null means the header was
+        // absent (an older agent, a proxy that drops it) and only the
+        // `session.waiting` rule bounds the read.
+        const tailIndex = parseEveStreamTailIndex(
+          response.headers.get(EVE_STREAM_TAIL_INDEX_HEADER),
+        );
+        if (tailIndex !== null && tailIndex < startIndex) {
+          continue; // eve has not recorded the command's frames yet.
+        }
+
+        for await (const event of ndjsonEvents(response.body)) {
+          // Persist FIRST, advance after — the same ordering the tailer uses,
+          // so a throw here leaves the cursors describing exactly what landed.
+          await deps.runStore.appendEvent(runId, seq, event);
+          seq += 1;
+          startIndex += 1;
+          drained += 1;
+          if (event.type === "context.cleared") marker = { kind: "cleared", runId };
+          if (event.type === "compaction.completed") {
+            marker = { kind: "compacted", runId };
+          }
+          if (event.type === "session.waiting") break; // the command settled
+          if (tailIndex !== null && startIndex > tailIndex) break;
+          if (drained >= CONTEXT_DRAIN_MAX_EVENTS) break;
+        }
+        deps.logger.info("session.context_drained", {
+          sessionId: session.id,
+          runId,
+          fields: { drained, marker: marker?.kind ?? null },
+        });
+        return marker;
+      } finally {
+        clearTimeout(timer);
+        // Closes the connection: the stream itself is still open and
+        // following, and nobody is listening to it now.
+        abort.abort();
+      }
+    }
+    return marker;
+  } catch (error) {
+    // Bookkeeping only — eve already did the work the user asked for.
+    deps.logger.warn("session.context_drain_failed", {
+      sessionId: session.id,
+      fields: {
+        drained,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    });
+    return marker;
+  }
 }

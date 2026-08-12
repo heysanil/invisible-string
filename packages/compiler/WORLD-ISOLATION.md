@@ -8,6 +8,17 @@ world-postgres bootstrap against it once, and passes a URL whose *database
 name* pins the version. `WORKFLOW_POSTGRES_JOB_PREFIX` is set for
 observability only — it does **not** isolate.
 
+⚠️ **The database name is only as distinct as the hash, so the hash must key
+on IDENTITY.** Until the 2026-08-11 lifecycle spec (D1) the hash carried the
+agent's slugified DISPLAY NAME and no stable id, so two agents in one
+workspace named the same thing with the same definition produced the same
+hash — hence one `ag_v_<hash12>` with two writers, precisely the violation
+this document exists to prevent. What was actually holding the line was a
+cosmetic unique index on `(organization_id, name)`. The hash now takes
+`agents.id` (`CompileDeps.agentId`, hash input `resolved.agentId`) and that
+index is dropped. Anything that adds a hash input must preserve this: two
+distinct agent ROWS may never reach one database name.
+
 ## Why not schema-per-version via `search_path`? (verified — it does NOT work)
 
 The plan of record was a schema `ws_v_<hash12>` (the pre-agents-first

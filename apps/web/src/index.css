@@ -43,10 +43,35 @@
   --color-primary-foreground: #ffffff;
 }
 
-/* Streamdown's caret is a static `content:` glyph. E1 signals streaming with
-   a blinking ink caret (see .stream-caret in the design tokens, still used by
-   apps/site) — take streamdown's inline placement, restore our motion.
-   `caret-blink` is defined in @invisible-string/design-tokens/tokens.css. */
+/* Streamdown marks a streaming reply by setting `--streamdown-caret` inline on
+   its wrapper and painting the glyph as `content:` on the last block's
+   ::after. Both rules below are UNLAYERED, so they outrank the Tailwind
+   utilities that place it without needing to out-specify them.
+
+   LAYOUT. The glyph ships as ordinary inline text preceded by a space
+   (`" ▋"`), and that space is a soft wrap opportunity: when a line fills, the
+   caret breaks onto a line of its OWN and blinks under the reply. Chrome does
+   it at 40 of 301 column widths — and `white-space: nowrap` here only fixes
+   the prose case, still orphaning the caret ~6% of the time behind an
+   unbreakable tail (a long URL under `[overflow-wrap:anywhere]`). Taking the
+   caret OUT of inline advance fixes every case: a zero-width inline-block
+   whose margins cancel can never lengthen a line, so the break before it is
+   never taken. The ink paints into the column gutter instead (≤17px at 14px
+   type; the thread column and the copilot dock both leave 20px). The 3px
+   margin replaces the content's leading space, which is trimmed away at the
+   start of the inline-block's own line box — same gap as .stream-caret's.
+
+   MOTION. E1 signals streaming with a BLINKING ink caret (see .stream-caret in
+   the design tokens, still used by apps/site) — take streamdown's inline
+   placement, restore our motion. `caret-blink` is defined in
+   @invisible-string/design-tokens/tokens.css. */
+[style*="--streamdown-caret"] > *:last-child::after {
+  display: inline-block;
+  width: 0;
+  margin-left: 3px;
+  margin-right: -3px;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   [style*="--streamdown-caret"] > *:last-child::after {
     animation: caret-blink 1s steps(1) infinite;

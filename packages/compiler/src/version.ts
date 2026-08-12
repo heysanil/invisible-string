@@ -81,5 +81,25 @@
  * secrets, refresh tokens) ever appears in generated files or agent env.
  * Existing bearer/headers/none emissions are byte-identical; hashes still
  * shift for every version because COMPILER_VERSION participates.
+ *
+ * 5.0.0 — MAJOR: changed HASH INPUT contract (2026-08-11 lifecycle spec D1).
+ * `CompileDeps` gains a required `agentId` — the agent row's stable id — and
+ * the hash keys identity on it instead of on `agentSlug` alone. Before this,
+ * two agents in one workspace with the same display name and the same
+ * definition produced the SAME content hash and therefore shared one
+ * `ag_v_<hash12>` world database, violating single-writer-per-hash; the only
+ * thing preventing it was the unique index `agents_organization_id_name_uidx`
+ * (dropped in the same change), which made a cosmetic UX rule silently
+ * load-bearing. `agentSlug` still feeds codegen (generated package name, the
+ * model-visible identity line) AND still participates in the hash, because it
+ * shapes emitted bytes — renaming an agent therefore still re-keys its
+ * artifact, world DB, and JWT audience, which the spec accepts and leaves out
+ * of scope. No template changed; emitted bytes move only where the baked hash
+ * appears (`agent/lib/platform-auth.ts`). Major rather than minor because the
+ * compile INPUT gained a required field and every existing artifact is
+ * re-keyed: the first publish of each agent after deploy runs a real
+ * `eve build` instead of hitting cache (operational note in docs/DEPLOY.md).
+ * BUILD_ENV_EPOCH is deliberately untouched — the build environment is
+ * unchanged and this version already re-keys every hash.
  */
-export const COMPILER_VERSION = "4.1.0";
+export const COMPILER_VERSION = "5.0.0";

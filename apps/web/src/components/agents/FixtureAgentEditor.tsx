@@ -217,7 +217,11 @@ function FixtureEditor({ fixture }: { fixture: FixtureAgent }) {
         <AgentRail
           name={name}
           publishedVersionId={fixture.agent.publishedVersionId}
-          isDirty={false}
+          // Fixture mode has no server baseline to diff against: an agent
+          // with a published version reads as in-sync, one without as Draft.
+          lifecycle={
+            fixture.agent.publishedVersionId === null ? "draft" : "published"
+          }
           state={state}
           diagnostics={diagnostics}
           activeSection={activeSection}

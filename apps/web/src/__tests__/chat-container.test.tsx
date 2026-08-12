@@ -138,7 +138,7 @@ const { ThreadContainer } = await import("../components/chat/ThreadContainer");
 
 // ── fetch mock ───────────────────────────────────────────────────────────────
 
-function sessionResponse(status: RunStatus) {
+function sessionResponse(status: RunStatus, title: string | null = null) {
   return {
     session: {
       id: SESSION_ID,
@@ -147,7 +147,7 @@ function sessionResponse(status: RunStatus) {
       workflowId: null,
       origin: "chat",
       status: "active",
-      title: null,
+      title,
       eveSessionId: "eve1",
       createdAt: NOW,
       updatedAt: NOW,
@@ -604,7 +604,7 @@ test("removing a queued row drops it before it is ever sent", async () => {
  * Everything else 404s, which is itself part of the contract: each of these is
  * allowed to fail without taking the thread with it.
  */
-function headerHandler(): Handler {
+function headerHandler(title: string | null = null): Handler {
   return (method, url) => {
     if (method === "GET" && url.includes(`/versions/${AGV_ID}/tools`)) {
       return json({
@@ -656,7 +656,7 @@ function headerHandler(): Handler {
       });
     }
     if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
-      return json(sessionResponse("succeeded"));
+      return json(sessionResponse("succeeded", title));
     }
     if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
     return json({}, 404);
@@ -715,6 +715,41 @@ test("the header meters the context against the catalog's window", async () => {
   // The model is named by its PRESET, and its raw id never appears.
   expect(view.getByText("Balanced")).toBeTruthy();
   expect(view.queryByText("moonshotai/kimi-k3")).toBeNull();
+});
+
+test("the header names the thread by its generated title, like the sidebar does", async () => {
+  // The sidebar (SessionList) and this header must agree, or one conversation
+  // reads as two different things depending on where you look at it. Both go
+  // through `sessionRowTitle`; this is the header half of that contract.
+  handler = headerHandler("Quarterly revenue breakdown");
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  // Assert on the heading, not on page text: the first message also appears in
+  // the transcript as the user's own bubble, so a bare text query matches both.
+  await waitFor(() =>
+    expect(view.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Quarterly revenue breakdown",
+    ),
+  );
+});
+
+test("the header falls back to the first message before a title is generated", async () => {
+  // Titling is fire-and-forget and can fail silently (spec D9), so the
+  // untitled case is the steady state, not an edge case.
+  handler = headerHandler(null);
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await waitFor(() =>
+    expect(view.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Send the report",
+    ),
+  );
 });
 
 test("no meter when the catalog knows no window for the resolved model", async () => {

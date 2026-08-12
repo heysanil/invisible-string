@@ -35,7 +35,7 @@ import {
 import { isSessionOver } from "../../lib/chat/session-errors";
 import { useMessageQueue } from "../../lib/chat/use-message-queue";
 import { useThreadStreams } from "../../lib/chat/use-thread-streams";
-import { titleFromMessage } from "../../lib/chat/time";
+import { sessionRowTitle } from "../../lib/chat/time";
 import { errorMessage } from "../../lib/forms";
 import { PRESET_LABEL } from "../../lib/labels";
 import {
@@ -530,7 +530,14 @@ export function ThreadContainer({
   }
 
   const { session } = data;
-  const title = titleFromMessage(runRows[0]?.triggerEvent.message ?? "");
+  // The sidebar row and this header must name the same conversation the same
+  // way, or a generated title makes one thread read as two. `sessionRowTitle`
+  // is that single source of truth (generated title → first message → agent
+  // name) and is shared with SessionList.
+  const title = sessionRowTitle(
+    { title: session.title, agentName: agentName ?? "Agent" },
+    runRows[0]?.triggerEvent.message ?? null,
+  );
 
   const contextActionPending: SessionContextAction | null = clearContext.isPending
     ? "clear"

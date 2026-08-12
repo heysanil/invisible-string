@@ -17,6 +17,7 @@ const { files, hash } = compile(definition, {   // definition: AgentDefinition
     reasoning: "max",                   // required; "provider-default" = omit
   },
   workspaceSlug: "acme",
+  agentId: "b2000000-0000-4000-8000-00000000000a",  // agents.id uuid — identity input (D1)
   agentSlug: "software-engineer",
   connections,                          // resolved `connections` rows
   skills,                               // resolved `skills` rows

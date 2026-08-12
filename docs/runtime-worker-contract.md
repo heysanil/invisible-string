@@ -452,7 +452,7 @@ per-version schema would LOOK isolated while every version still shared
 The control plane resolves preset→model and validates the model allowlist
 BEFORE compiling (typed 422s), then calls an injected
 `compile({definition, model, connections, skills, workspaceSlug,
-agentSlug}) → {files, hash, compilerVersion, eveVersion}` where `definition`
+agentId, agentSlug}) → {files, hash, compilerVersion, eveVersion}` where `definition`
 is a pure `AgentDefinition` — no trigger, no instructions
 (`src/build/compiler-contract.ts`). The production implementation is
 `src/build/compiler-adapter.ts` over `@invisible-string/compiler` (wired as

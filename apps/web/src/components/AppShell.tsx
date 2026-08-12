@@ -2,6 +2,8 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import { Blocks, Bot, MessageCircle, Settings, Zap } from "lucide-react";
 import { useRef, type KeyboardEvent, type ReactNode } from "react";
 
+import { useAgentPublishBinding } from "../lib/agents/use-publish-store";
+import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import { cn } from "../lib/cn";
 import { LogoMark } from "./LogoMark";
 import { Tooltip } from "./ui/Tooltip";
@@ -17,10 +19,33 @@ export const NAV_ITEMS = [
 export function AppShell({ children }: { children: ReactNode }) {
   return (
     <div className="h-dvh">
+      <AgentPublishBinding />
       <Dock />
       <main className="h-full py-5 pl-24 pr-5">{children}</main>
     </div>
   );
+}
+
+/**
+ * The agent publish store (spec D2) is workspace-level and outlives every
+ * screen, so its announcement sink and its active-workspace pin belong to the
+ * shell — not to the agent routes. Mounted here, a build watch is torn down
+ * exactly when the user leaves the workspace that owns it, wherever they
+ * happen to be standing when that happens.
+ *
+ * Its own component, and skipped under `FIXTURE_MODE`, because the binding
+ * resolves the active ORGANIZATION — and the fixture harness is deliberately
+ * backend-free (the `_app` layout skips the whole auth gate there).
+ * `FIXTURE_MODE` is a build-time constant, so this branch never changes at
+ * runtime and no hook order moves.
+ */
+function AgentPublishBinding() {
+  return FIXTURE_MODE ? null : <LivePublishBinding />;
+}
+
+function LivePublishBinding() {
+  useAgentPublishBinding();
+  return null;
 }
 
 /** Floating vertical glass dock: logo mark + primary sections. */

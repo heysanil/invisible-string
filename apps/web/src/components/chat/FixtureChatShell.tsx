@@ -22,7 +22,7 @@ import type { AgentSummaryDto } from "@invisible-string/shared";
 import { indexToolDirectory } from "@invisible-string/shared";
 
 import { FIXTURE_AGENTS } from "../../lib/agents/fixtures";
-import { reduceRunView } from "../../lib/chat/run-view";
+import { contextTokensUsed, reduceRunView } from "../../lib/chat/run-view";
 import {
   FIXTURE_SESSIONS,
   FIXTURE_TOOL_DIRECTORY,
@@ -116,8 +116,11 @@ export function FixtureChatShell({
 
   const sessions: SessionListItem[] = FIXTURE_SESSIONS.map((session) => ({
     ...session.summary,
-    // Untitled fixtures fall back to their first message, exactly as the live
-    // sidebar does for a session the titler has not answered for.
+    // Untitled fixtures fall back to their first message, as the live sidebar
+    // does for a session the titler has not answered for. Fixture mode holds
+    // whole canned runs, so it passes the real opener where the live list
+    // reads the DTO's truncated `firstMessagePreview` — same rung of
+    // `sessionRowTitle`, richer text.
     displayTitle: sessionRowTitle(
       session.summary,
       session.runs[0]?.run.triggerEvent.message,
@@ -239,11 +242,11 @@ function FixtureThread({
   const lastRun = runViews[runViews.length - 1];
   const modelId =
     [...runViews].reverse().find((run) => run.modelId !== null)?.modelId ?? null;
-  // The context meter's numerator, exactly as ThreadContainer derives it: the
-  // newest run that reported `usage.inputTokens` on a `step.completed`.
-  const contextTokens =
-    [...runViews].reverse().find((run) => run.inputTokens !== null)
-      ?.inputTokens ?? null;
+  // The context meter's numerator — the SAME function the live thread calls,
+  // not a lookalike scan: the boundary rule (a clear/compact retires every
+  // earlier measurement) is exactly the sort of detail a second copy loses,
+  // and fixture mode exists to preview shipped behavior.
+  const contextTokens = contextTokensUsed(runViews);
   const { summary } = session;
 
   // The session's one run slot, as the control plane counts it — `waiting`

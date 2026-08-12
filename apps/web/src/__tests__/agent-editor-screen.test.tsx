@@ -16,6 +16,7 @@ import { ensureDomForThisFile } from "../test/setup";
 import { afterEach, expect, mock, test } from "bun:test";
 import type { ModelCapabilityDto } from "@invisible-string/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { AccessSection } from "../components/agents/AccessSection";
@@ -297,6 +298,47 @@ test("header commits a rename on Enter and rolls back when persistence fails", a
   fireEvent.input(input, { target: { value: "Rejected name" } });
   fireEvent.focusOut(input);
   await waitFor(() => expect(input.value).toBe("Chief of staff"));
+});
+
+test("header adopts a rename that lands from ANOTHER writer (the copilot)", async () => {
+  // The copilot's accepted setName card PATCHes `agents.name` through the same
+  // seam (spec D7.3) and the detail query refetches, so the prop moves under a
+  // mounted header. Seeding state once left the input showing the old name —
+  // and offering it back as the baseline for the user's next edit.
+  const onCommitName = mock(async (_name: string) => true);
+  const props = {
+    onCommitName,
+    saveStatus: "saved" as const,
+    issueCount: 0,
+    isDirty: false,
+  };
+  // A harness, not `rerender`: renderWithRouter builds the router around the
+  // element once, so the prop has to move from INSIDE the tree — which is also
+  // how it moves in the app (the detail query refetches).
+  function Harness() {
+    const [name, setName] = useState("Untitled agent");
+    return (
+      <>
+        <button type="button" onClick={() => setName("Inbox triage")}>
+          rename elsewhere
+        </button>
+        <AgentHeader name={name} {...props} />
+      </>
+    );
+  }
+  const view = renderWithRouter(<Harness />);
+  const input = (await view.findByLabelText("Agent name")) as HTMLInputElement;
+  expect(input.value).toBe("Untitled agent");
+
+  fireEvent.click(view.getByRole("button", { name: "rename elsewhere" }));
+  expect(input.value).toBe("Inbox triage");
+
+  // …and the new name is the BASELINE now: blurring untouched must not fire a
+  // rename back to the old one.
+  act(() => input.focus());
+  fireEvent.focusOut(input);
+  await waitFor(() => expect(input.value).toBe("Inbox triage"));
+  expect(onCommitName).not.toHaveBeenCalled();
 });
 
 test("header shows Delete only when the viewer can manage", async () => {

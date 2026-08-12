@@ -279,8 +279,52 @@ export interface RunView {
    *
    * The LAST value wins, not the maximum: a compaction shrinks the context,
    * and the meter must fall with it.
+   *
+   * A MEMORY BOUNDARY RESETS IT TO NULL. `context.cleared` /
+   * `compaction.completed` describe a context that no longer exists, so every
+   * measurement taken before one of them stops describing anything — reporting
+   * it would keep the meter pinned at the old percentage over an emptied or
+   * summarized context. Null until a later step measures the NEW context is
+   * the only honest answer, and the session-wide scan stops at the newest
+   * boundary run for the same reason (see {@link contextTokensUsed}).
    */
   inputTokens: number | null;
+}
+
+/**
+ * The context meter's NUMERATOR for a whole session (spec D6): the newest
+ * measurement taken since the newest memory boundary, or null when nothing has
+ * been measured since one — in which case the meter must be ABSENT, never zero.
+ *
+ * Runs settle in order, so the last measurement is the session's current
+ * context size — but only while the context it counted is still the one the
+ * agent holds. A clear empties that context and a compaction replaces it with a
+ * summary, so every figure from before the boundary describes a context that no
+ * longer exists; scanning past one would leave the meter pinned at the
+ * pre-boundary percentage for as long as the user sends nothing.
+ *
+ * The boundary run itself is INCLUDED: a run can measure a fresh step after its
+ * own clear/compact frame, and {@link reduceRunView} nulls the pre-boundary
+ * figure within a run for exactly that reason.
+ *
+ * It lives here, beside the reducer whose two halves it completes, because both
+ * the live thread and fixture mode need precisely this number — a second copy
+ * of the scan is how fixture mode came to preview a bug the thread had fixed.
+ */
+export function contextTokensUsed(runs: readonly RunView[]): number | null {
+  let boundary = 0;
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index];
+    if (run !== undefined && (run.contextCleared || run.contextCompacted)) {
+      boundary = index;
+      break;
+    }
+  }
+  for (let index = runs.length - 1; index >= boundary; index -= 1) {
+    const measured = runs[index]?.inputTokens ?? null;
+    if (measured !== null) return measured;
+  }
+  return null;
 }
 
 // ── Reduction ───────────────────────────────────────────────────────────────
@@ -852,9 +896,12 @@ export function reduceRunView(
         break;
       }
       // Durable model history dropped (the Clear context action). The
-      // transcript stays readable; only the agent's memory of it is gone.
+      // transcript stays readable; only the agent's memory of it is gone —
+      // and so is the meaning of the last usage measurement, which counted
+      // the context that just went away (D6).
       case "context.cleared":
         contextCleared = true;
+        inputTokens = null;
         retirePendingInputs();
         break;
       // Compaction LANDED — the summary replaced the earlier history. The
@@ -865,6 +912,9 @@ export function reduceRunView(
       // draw a divider claiming a boundary that does not exist. See D4.
       case "compaction.completed":
         contextCompacted = true;
+        // Same reset as a clear: the summary REPLACED the history the last
+        // measurement counted, so that figure describes nothing now.
+        inputTokens = null;
         break;
       // The context-budget numerator (D6). eve carries token usage on
       // `step.completed`, NOT on `turn.completed` — the turn event's payload is

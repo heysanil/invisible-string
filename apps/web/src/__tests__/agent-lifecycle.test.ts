@@ -9,6 +9,8 @@ import {
   agentLifecycleState,
   canonicalJson,
   definitionsEquivalent,
+  publishedAgentName,
+  renamedSincePublish,
 } from "../lib/agents/lifecycle";
 import { nextUntitledAgentName } from "../lib/agents/naming";
 
@@ -129,6 +131,71 @@ test("an UNPARSEABLE published definition never cries 'unpublished'", () => {
       publishedDefinition: { persona: 42 },
     }),
   ).toBe("published");
+});
+
+// ── the name is a publish input too (D1 kept agentSlug in the hash) ─────────
+
+test("a RENAME of a published agent reads Unpublished changes", () => {
+  // The definition did not move, so neither baseline did — but the display
+  // name is still hashed (as its slug) and still lands in the emitted bytes,
+  // so the live artifact introduces itself by the old name until republished.
+  // Reading "Published" over that is exactly the lie D3 exists to end.
+  expect(
+    agentLifecycleState({
+      hasUnsavedChanges: false,
+      savedDefinition: SAVED,
+      publishedDefinition: SAVED,
+      currentName: "Inbox triage",
+      publishedName: "Untitled agent",
+    }),
+  ).toBe("unpublished");
+
+  // Same name ⇒ still Published.
+  expect(
+    agentLifecycleState({
+      hasUnsavedChanges: false,
+      savedDefinition: SAVED,
+      publishedDefinition: SAVED,
+      currentName: "Untitled agent",
+      publishedName: "Untitled agent",
+    }),
+  ).toBe("published");
+});
+
+test("a rename the compiler cannot see is not drift", () => {
+  // The hash carries the SLUG, so casing and punctuation that slugify the
+  // same change no emitted byte — flagging them would nag about nothing.
+  expect(renamedSincePublish("Inbox Triage!", "inbox-triage")).toBe(false);
+  expect(renamedSincePublish("Inbox triage", "Inbox triages")).toBe(true);
+  // Names that slugify to nothing both fall back to the compiler's "agent".
+  expect(renamedSincePublish("!!!", "???")).toBe(false);
+});
+
+test("an UNKNOWN published name never claims drift", () => {
+  // The server does not serve the baseline yet; absence is not evidence, and
+  // an "Unpublished changes" chip that can never be cleared is worse than the
+  // gap it would close.
+  expect(renamedSincePublish("Inbox triage", undefined)).toBe(false);
+  expect(renamedSincePublish("Inbox triage", null)).toBe(false);
+  expect(renamedSincePublish(undefined, "Untitled agent")).toBe(false);
+  expect(
+    agentLifecycleState({
+      hasUnsavedChanges: false,
+      savedDefinition: SAVED,
+      publishedDefinition: SAVED,
+      currentName: "Inbox triage",
+    }),
+  ).toBe("published");
+});
+
+test("publishedAgentName reads the DTO field when it exists, undefined when it does not", () => {
+  const agent = { id: "a1", name: "Inbox triage" } as unknown as Parameters<
+    typeof publishedAgentName
+  >[0];
+  expect(publishedAgentName(agent)).toBeUndefined();
+  expect(
+    publishedAgentName({ ...agent, publishedName: "Untitled agent" } as never),
+  ).toBe("Untitled agent");
 });
 
 test("canonicalJson sorts keys, drops undefined, and keeps arrays ordered", () => {

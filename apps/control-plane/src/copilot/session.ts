@@ -32,6 +32,7 @@
 import type { ModelMessage } from "ai";
 import {
   summarizeToolResult,
+  type CopilotAgentIdentity,
   type CopilotMutationOutcome,
   type CopilotServerFrame,
   type CopilotStepState,
@@ -74,6 +75,13 @@ export class CopilotSession {
    * stale post-done abort can never kill a fresh turn.
    */
   private abortRequested = false;
+  /**
+   * Monotonic turn counter, used ONLY to key thought blocks. The dock upserts
+   * timeline items by key globally, so `step:<index>` alone collides across
+   * turns on one socket (every turn's step loop restarts at zero) and turn 2's
+   * reasoning would replace turn 1's inside its old work block. Never reset.
+   */
+  private turnIndex = 0;
 
   constructor(
     private readonly deps: {
@@ -130,6 +138,15 @@ export class CopilotSession {
     surface: CopilotSurface;
     message: string;
     draft: Record<string, unknown>;
+    /**
+     * The agent's row identity (spec D7.3/D7.4) — the editor's live values,
+     * else the persisted row the plugin resolved for it. Null on the workflow
+     * surface and when nothing could be resolved; the prompt then states no
+     * identity and the no-op checks simply do not fire, which is the right
+     * failure direction (a missing baseline must never turn a legitimate
+     * rename into an error).
+     */
+    identity?: CopilotAgentIdentity | null;
     inventory: WorkspaceInventory;
     /**
      * ALLOW-EDITS for THIS turn (spec D7.2) — carried per turn by the client,
@@ -154,19 +171,26 @@ export class CopilotSession {
       return 0;
     }
     this.turnRunning = true;
+    // Claimed for the whole turn before anything can emit a thought.
+    const turnIndex = this.turnIndex++;
     const abortController = new AbortController();
     this.abortController = abortController;
 
     const system = buildSystemPrompt({
       surface: opts.surface,
       draft: opts.draft,
+      identity: opts.identity ?? null,
       inventory: opts.inventory,
     });
     const tools = buildToolSpecs(opts.surface);
     // Draft state the semantic checks run against (carries the surface) —
     // updated as the user accepts proposals so later calls in the same turn
     // see their effect.
-    const draftState = draftStateFor(opts.surface, opts.draft);
+    const draftState = draftStateFor(
+      opts.surface,
+      opts.draft,
+      opts.identity ?? null,
+    );
     this.messages.push({ role: "user", content: opts.message });
 
     let outputTokens = 0;
@@ -177,18 +201,22 @@ export class CopilotSession {
         type ToolCall = { toolCallId: string; toolName: string; input: unknown };
         const toolCalls: ToolCall[] = [];
         let stepText = "";
-        // One thought block per round-trip, keyed `step:<index>` (the chat
-        // rail's stepIndex convention). Its text is CUMULATIVE on the wire, so
-        // a dropped frame self-heals on the next one; a provider that opens
-        // several reasoning blocks in one step has them joined here rather than
-        // racing for the same key.
+        // One thought block per round-trip, keyed
+        // `turn:<turnIndex>:step:<index>` — the chat rail's stepIndex
+        // convention, PREFIXED by the turn because the dock upserts by key
+        // globally: a bare `step:0` on the socket's second turn would replace
+        // the first turn's thought in its old work block instead of opening a
+        // new one. Its text is CUMULATIVE on the wire, so a dropped frame
+        // self-heals on the next one; a provider that opens several reasoning
+        // blocks in one step has them joined here rather than racing for the
+        // same key.
         //
         // Reasoning is DISPLAY ONLY — it is never pushed back into `messages`.
         // That is correct while nothing asks for reasoning (see transport.ts),
         // but Anthropic's extended thinking + tool use requires the thinking
         // blocks to be echoed in the assistant turn: whoever turns thinking on
         // must round-trip them here as well, or the next request 400s.
-        const thoughtKey = `step:${step}`;
+        const thoughtKey = `turn:${turnIndex}:step:${step}`;
         let stepReasoning = "";
         let reasoningBlockId: string | null = null;
 

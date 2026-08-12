@@ -17,10 +17,17 @@
  * - The dock renders the same rail-in-box grammar as the main chat, fed by
  *   `thought` / `step` frames whose vocabulary deliberately mirrors the chat's
  *   `ThoughtItem` / `ToolItem` (apps/web/src/lib/chat/run-view.ts) rather than
- *   inventing a second one.
+ *   inventing a second one. The dock upserts those items by key GLOBALLY, so
+ *   every `thought`/`step` key must be unique for the whole SOCKET, not merely
+ *   within a turn — see {@link CopilotThoughtFrame}.
  * - Each `user_message` names its `surface` ("workflow" | "agent"); the
  *   server exposes the matching toolset — proposals for the other surface's
  *   tools are a server bug.
+ * - AGENT IDENTITY rides BESIDE the draft, never inside it (spec D7.3/D7.4):
+ *   `agents.name`/`agents.description` are row columns, not part of the
+ *   `AgentDefinition` a client serializes as `draft`, so the frame carries
+ *   them in its own typed {@link copilotAgentIdentitySchema} field — see it
+ *   for the precedence rule against the persisted row.
  * - Mutation param schemas mirror `workflow-config.ts` /
  *   `agent-definition.ts` exactly — a proposal that parses here is directly
  *   applicable to the draft.
@@ -244,6 +251,47 @@ export const copilotProposalSchema = z.discriminatedUnion(
  */
 export const COPILOT_MAX_DRAFT_CHARS = 131_072;
 
+/** Bounds on the identity strings interpolated into the system prompt. */
+export const COPILOT_MAX_IDENTITY_NAME_CHARS = 120;
+export const COPILOT_MAX_IDENTITY_DESCRIPTION_CHARS = 2_000;
+
+/**
+ * The agent's IDENTITY as the EDITOR currently holds it (spec D7.3/D7.4).
+ *
+ * `agents.name` and `agents.description` are columns on the `agents` ROW; the
+ * `draft` a client sends is an `AgentDefinition`, which has neither. Without
+ * this field the copilot is blind to what the agent is called — it cannot
+ * answer "what is this agent named?", and the server's "you already proposed
+ * exactly this name" checks (validate.ts) can never fire because their
+ * baseline is always absent. So identity travels alongside the draft, in its
+ * own typed field, rather than being smuggled into the loose draft record.
+ *
+ * Both bounds are deliberately the ROW's, not the copilot's:
+ * `COPILOT_MAX_DESCRIPTION_CHARS` (200) is what the copilot may PROPOSE, while
+ * an existing description may be up to the DTO's 2000 and must still be
+ * describable to the model.
+ *
+ * Deliberately permissive where the PATCH schemas are strict — an empty name
+ * is a legal MID-EDIT state and must not fail the whole frame; the server
+ * reads a blank name as "no identity to state" rather than as a value.
+ *
+ * PRECEDENCE (server contract): this field WINS over the persisted row. The
+ * editor is the single writer and holds edits the database has not seen yet
+ * (the description is reducer state until the user saves). When it is absent —
+ * the workflow surface, or a client that does not send it — the server falls
+ * back to the `agents` row it already loads with the turn's inventory, so the
+ * copilot is never blind about the agent named by `entityId`.
+ */
+export const copilotAgentIdentitySchema = z.object({
+  name: z.string().max(COPILOT_MAX_IDENTITY_NAME_CHARS),
+  /** `null` = the agent genuinely has no description (a real state). */
+  description: z
+    .string()
+    .max(COPILOT_MAX_IDENTITY_DESCRIPTION_CHARS)
+    .nullable(),
+});
+export type CopilotAgentIdentity = z.infer<typeof copilotAgentIdentitySchema>;
+
 export const copilotUserMessageFrameSchema = z.object({
   type: z.literal("user_message"),
   /** Which editor this turn is about — selects the toolset and prompt. */
@@ -265,6 +313,13 @@ export const copilotUserMessageFrameSchema = z.object({
       message: `draft exceeds ${COPILOT_MAX_DRAFT_CHARS} serialized characters`,
     }),
   message: z.string().min(1).max(8_000),
+  /**
+   * AGENT-SURFACE identity (spec D7.3/D7.4) — see
+   * {@link copilotAgentIdentitySchema} for what it is and why it is not part
+   * of `draft`. Optional: the workflow surface has no identity to send, and an
+   * omission falls back to the persisted row rather than blinding the model.
+   */
+  identity: copilotAgentIdentitySchema.optional(),
   /**
    * ALLOW-EDITS (spec D7). A session-scoped toggle, carried per turn rather
    * than held as server session state on purpose: the server never has to
@@ -351,7 +406,17 @@ export type CopilotStepState = (typeof COPILOT_STEP_STATES)[number];
  */
 export interface CopilotThoughtFrame {
   type: "thought";
-  /** Stable per-block key (server convention: `step:<stepIndex>`). */
+  /**
+   * Stable per-block key — server convention `turn:<turnIndex>:step:<stepIndex>`.
+   *
+   * It MUST be unique for the LIFETIME OF THE SOCKET, not just within a turn:
+   * the dock upserts timeline items by key globally (thread.ts), so a key
+   * reused on the next turn would overwrite the first turn's thought inside
+   * its old work block instead of opening a new one beside the new answer —
+   * silently rewriting history the D7 audit trail exists to keep. The turn
+   * index is what carries that uniqueness; the step index alone restarts at
+   * zero every turn. Opaque to the client: it never parses this.
+   */
   key: string;
   text: string;
   streaming: boolean;

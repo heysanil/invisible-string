@@ -17,12 +17,13 @@
  * SIDEBAR TITLES (D9). `agent_sessions.title` is generated server-side after
  * the first user message; until it lands (and forever, for sessions that
  * predate it or whose titling failed silently) the row falls back to a
- * truncation of that first message. The list DTO carries no message, so this
- * component accumulates the ones it learns — from a chat it started, or from
- * the thread the user has open — and never forgets one for the life of the
- * tab. Resolution order lives in `sessionRowTitle`.
+ * truncation of that first message. That fallback comes off the LIST DTO's
+ * `firstMessagePreview`, so it holds on a cold load with nothing opened —
+ * this component keeps no message store of its own, because a second source
+ * would only be able to name the one thread the tab happened to visit.
+ * Resolution order lives in `sessionRowTitle`.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Cpu, MessageSquare } from "lucide-react";
 
@@ -35,7 +36,6 @@ import {
   queryKeys,
   useAgents,
   useCreateSession,
-  useSessionFirstMessage,
   useSessions,
 } from "../../lib/queries";
 import { AgentMonogram } from "../agents/AgentMonogram";
@@ -107,31 +107,6 @@ export function ChatShell({
    * unequal and only does the work that is safe out of context.
    */
   const pendingTokenRef = useRef(0);
-
-  /**
-   * First messages this tab has learned, by session id — the fallback title
-   * source (D9). Sticky on purpose: read straight off the open thread it
-   * would evaporate the moment the user selects a different row, and a row
-   * that renames itself on blur is worse than one that never renamed.
-   */
-  const [knownFirstMessages, setKnownFirstMessages] = useState<
-    ReadonlyMap<string, string>
-  >(() => new Map());
-  const rememberFirstMessage = useCallback((sessionId: string, message: string) => {
-    setKnownFirstMessages((current) =>
-      current.get(sessionId) === message
-        ? current
-        : new Map(current).set(sessionId, message),
-    );
-  }, []);
-
-  // The open thread's own first message, off the detail ThreadContainer is
-  // already fetching (same cache key, so no second request).
-  const activeFirstMessage = useSessionFirstMessage(activeSessionId);
-  useEffect(() => {
-    if (activeSessionId === null || activeFirstMessage === null) return;
-    rememberFirstMessage(activeSessionId, activeFirstMessage);
-  }, [activeSessionId, activeFirstMessage, rememberFirstMessage]);
 
   function abandonPendingChat() {
     pendingTokenRef.current += 1;
@@ -210,16 +185,17 @@ export function ChatShell({
     return labels;
   }, [agentDetails, publishedAgents]);
 
+  // Rows are named entirely from the list row itself — generated title, else
+  // the DTO's opener preview, else the agent. Nothing here depends on which
+  // threads this tab has opened, which is what makes an untitled row legible
+  // on a cold load and on a second device.
   const sessions: SessionListItem[] = useMemo(
     () =>
       (sessionsQuery.data ?? []).map((session) => ({
         ...session,
-        displayTitle: sessionRowTitle(
-          session,
-          knownFirstMessages.get(session.id) ?? null,
-        ),
+        displayTitle: sessionRowTitle(session),
       })),
-    [sessionsQuery.data, knownFirstMessages],
+    [sessionsQuery.data],
   );
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
@@ -243,9 +219,9 @@ export function ChatShell({
       { agentId: agent.id, message },
       {
         onSuccess: (data) => {
-          // The session exists no matter where the user has wandered to, so
-          // the title fallback is worth keeping either way.
-          rememberFirstMessage(data.session.id, message);
+          // No title bookkeeping to do here: `useCreateSession` refetches the
+          // session list before this fires, and the new row arrives carrying
+          // its own `firstMessagePreview`.
           if (pendingTokenRef.current !== token) return;
           setPendingChat(null);
           setActiveSessionId(data.session.id);

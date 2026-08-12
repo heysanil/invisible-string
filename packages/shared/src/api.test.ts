@@ -30,6 +30,7 @@ import {
   resetSessionRequestSchema,
   resetSessionResponseSchema,
   RUN_STREAM_EVENT_NAMES,
+  SESSION_MESSAGE_PREVIEW_MAX_CHARS,
   SESSION_TITLE_MAX_CHARS,
   runDtoSchema,
   runInputRequestSchema,
@@ -292,6 +293,52 @@ describe("sessions list schemas", () => {
       }).success,
     ).toBe(true);
   });
+
+  test("the first-message preview is optional, nullable, and length-bounded", () => {
+    const row = {
+      id: UUID,
+      agentId: UUID_2,
+      agentVersionId: UUID,
+      workflowId: null,
+      origin: "chat",
+      status: "active",
+      title: null,
+      eveSessionId: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      agentName: "General Purpose",
+      workflowName: null,
+      lastRunStatus: "running",
+      lastActivityAt: NOW,
+    };
+    // Null = nothing to preview (a schedule-triggered session); absent = a
+    // client/fixture that predates the field. Both must parse — the row still
+    // renders, it just falls through to the agent's name.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({ ...row, firstMessagePreview: null })
+        .success,
+    ).toBe(true);
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "Draft the Q3 board update",
+      }).success,
+    ).toBe(true);
+    // The server truncates; a full message body reaching the list is the bug
+    // the cap exists to catch.
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "x".repeat(SESSION_MESSAGE_PREVIEW_MAX_CHARS),
+      }).success,
+    ).toBe(true);
+    expect(
+      agentSessionSummaryDtoSchema.safeParse({
+        ...row,
+        firstMessagePreview: "x".repeat(SESSION_MESSAGE_PREVIEW_MAX_CHARS + 1),
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("run input schema", () => {
@@ -341,6 +388,48 @@ describe("session context controls (eve 0.31)", () => {
       sessionContextControlResponseSchema.safeParse({
         session,
         status: "no_active_turn",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("the boundary marker defaults to null and names the run it landed in", () => {
+    // A response with no `marker` key parses to an explicit null rather than
+    // `undefined`: "no divider landed" is a real outcome (a compact over an
+    // empty context emits no `compaction.*` at all, D4), and the client must
+    // not have to tell absent from unknown.
+    const bare = sessionContextControlResponseSchema.parse({
+      session,
+      status: "accepted",
+    });
+    expect(bare.marker).toBeNull();
+
+    const withMarker = sessionContextControlResponseSchema.safeParse({
+      session,
+      status: "accepted",
+      marker: { kind: "cleared", runId: UUID_2 },
+    });
+    expect(withMarker.success).toBe(true);
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "compacted", runId: UUID_2 },
+      }).success,
+    ).toBe(true);
+    // `compaction.requested` proves nothing was summarized yet — there is no
+    // "requested" marker kind, and a run id is not optional.
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "requested", runId: UUID_2 },
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionContextControlResponseSchema.safeParse({
+        session,
+        status: "accepted",
+        marker: { kind: "cleared" },
       }).success,
     ).toBe(false);
   });

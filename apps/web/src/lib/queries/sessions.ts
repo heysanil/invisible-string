@@ -97,31 +97,11 @@ export function useSession(sessionId: string) {
   });
 }
 
-/**
- * The first user message of a session, for the sidebar's fallback row title
- * (2026-08-11 spec, D9).
- *
- * The session LIST DTO carries no message — only the DETAIL response does —
- * so a row whose generated title has not landed (or never will: titling is
- * best-effort and fails silently) can only be named from a detail this tab
- * already has. This deliberately shares `useSession`'s cache key, so for the
- * OPEN thread it is a second observer on a request `ThreadContainer` is
- * making anyway; `null` disables it entirely. It is NOT an N+1 over the list:
- * fetching every row's detail to improve a label would trade a real cost for
- * a cosmetic one, and the caller remembers what it learns instead.
- */
-export function useSessionFirstMessage(sessionId: string | null): string | null {
-  const query = useQuery({
-    // A stable placeholder key while disabled: react-query still wants a key,
-    // and a per-render one would churn the cache with entries nothing reads.
-    queryKey: queryKeys.sessions.detail(sessionId ?? "__none__"),
-    queryFn: ({ signal }) => fetchSession(sessionId ?? "", signal),
-    enabled: sessionId !== null,
-    staleTime: 5_000,
-    select: (data) => data.runs[0]?.triggerEvent.message ?? null,
-  });
-  return query.data ?? null;
-}
+// NOTE there is deliberately no per-session "first message" hook here. The
+// sidebar's fallback row title (2026-08-11 spec, D9) reads
+// `firstMessagePreview` straight off the LIST DTO, which is one round trip for
+// the whole page; naming rows from details this tab happens to hold would name
+// only the threads it had already opened — i.e. never on a cold load.
 
 // ── mutations ───────────────────────────────────────────────────────────────
 

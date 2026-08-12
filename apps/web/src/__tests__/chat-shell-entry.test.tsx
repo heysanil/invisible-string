@@ -10,10 +10,12 @@
  * error can never eat it, and nothing else in the app would catch a
  * regression there.
  *
- * D9 — session rows are titled by the SESSION, not the agent. The agent has
- * to stay legible underneath (a title alone loses which agent a thread
- * belongs to), except in the one case where the title already IS the agent's
- * name and repeating it would be noise.
+ * D9 — session rows are titled by the SESSION, not the agent, and they are so
+ * titled on a COLD LOAD: the fallback for an untitled row is the opener the
+ * list DTO carries, never a message this tab happened to learn by opening the
+ * thread. The agent has to stay legible underneath (a title alone loses which
+ * agent a thread belongs to), except in the one case where the title already
+ * IS the agent's name and repeating it would be noise.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -179,11 +181,55 @@ test("two sessions of one agent no longer read identically", async () => {
   expect(row(view, /Q3 board deck outline/)).toBeTruthy();
 });
 
-test("an untitled session with no known message falls back to the agent — once", async () => {
-  // The list DTO carries no message and this tab has never opened the thread,
-  // so the only honest label left is the agent's name. It must not then be
-  // repeated underneath itself.
-  sessions = [session(SESSION_A, null)];
+test("untitled rows are named by their own opening message on a COLD load", async () => {
+  // Nothing has been opened, so this tab holds no thread detail and no
+  // message of its own — the label can only come off the list row. It used to
+  // come off a map this component filled as threads were opened, which meant
+  // a fresh page load (or a second device) showed the agent's name on every
+  // untitled row: one repeated string for the whole sidebar, the exact
+  // symptom D9 exists to remove, and permanent whenever titling failed —
+  // which D9 makes a normal, silent outcome.
+  sessions = [
+    session(SESSION_A, null, {
+      firstMessagePreview: "Draft the launch announcement for Tuesday",
+    }),
+    session(SESSION_B, null, {
+      firstMessagePreview: "Summarize the open support tickets",
+    }),
+  ];
+  const view = renderShell();
+
+  const listRow = await waitFor(() =>
+    row(view, /Draft the launch announcement for Tuesday/),
+  );
+  // Two threads of one agent read differently…
+  expect(row(view, /Summarize the open support tickets/)).toBeTruthy();
+  // …and the agent stays legible underneath, as it does under a generated
+  // title: a message alone loses whose thread this is.
+  expect(within(listRow).getByText("Executive assistant")).toBeTruthy();
+});
+
+test("a long preview is truncated in the row, not shown whole", async () => {
+  // The server clamps to SESSION_MESSAGE_PREVIEW_MAX_CHARS (200), which is
+  // still far wider than a 320 px sidebar row — the row's own truncation is
+  // what keeps it a label rather than a paragraph.
+  const opener = `Please review the whole ${"launch ".repeat(20)}checklist`;
+  sessions = [session(SESSION_A, null, { firstMessagePreview: opener })];
+  const view = renderShell();
+
+  const listRow = await waitFor(() => row(view, /Please review the whole/));
+  const headline = within(listRow).getByText(/^Please review the whole/);
+  expect(headline.textContent!.endsWith("…")).toBe(true);
+  expect(headline.textContent!.length).toBeLessThan(opener.length);
+});
+
+test("a session with no message at all falls back to the agent — once", async () => {
+  // Reachable for real: a schedule fires with no inbound message, so the
+  // server has nothing to preview. The agent's name is then the only honest
+  // label left, and it must not be repeated underneath itself.
+  sessions = [
+    session(SESSION_A, null, { origin: "schedule", firstMessagePreview: null }),
+  ];
   const view = renderShell();
 
   const listRow = await waitFor(() => row(view, /Executive assistant/));

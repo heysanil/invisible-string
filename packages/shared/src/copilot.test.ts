@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   AGENT_COPILOT_MUTATION_TOOLS,
   COPILOT_MAX_DESCRIPTION_CHARS,
+  COPILOT_MAX_IDENTITY_NAME_CHARS,
   COPILOT_MUTATION_TOOLS,
   WORKFLOW_COPILOT_MUTATION_TOOLS,
   agentCopilotMutationParamSchemas,
@@ -12,6 +13,7 @@ import {
   copilotServerFrameSchema,
   parseCopilotClientFrame,
   parseCopilotServerFrame,
+  type CopilotAgentIdentity,
   type CopilotServerFrame,
 } from "./copilot";
 
@@ -296,6 +298,84 @@ describe("copilot frames", () => {
     ).toBe(false);
   });
 
+  test("agent identity rides BESIDE the draft, typed and optional", () => {
+    // The draft is an `AgentDefinition` and has no name/description, so the
+    // frame carries the row's identity in its own field — without it the
+    // server has no baseline for the agent it is editing.
+    const withIdentity = copilotClientFrameSchema.safeParse({
+      type: "user_message",
+      surface: "agent",
+      entityId: UUID,
+      draft: { persona: "You are helpful." },
+      identity: { name: "Support Agent", description: "Triages support." },
+      message: "rename it",
+    });
+    expect(withIdentity.success).toBe(true);
+    expect(
+      withIdentity.success &&
+        (withIdentity.data as { identity?: CopilotAgentIdentity }).identity,
+    ).toEqual({ name: "Support Agent", description: "Triages support." });
+
+    // No description is a real state, not missing data.
+    expect(
+      copilotClientFrameSchema.safeParse({
+        type: "user_message",
+        surface: "agent",
+        entityId: UUID,
+        draft: {},
+        identity: { name: "Untitled agent", description: null },
+        message: "describe it",
+      }).success,
+    ).toBe(true);
+
+    // Optional: omitted → undefined (the server falls back to the row).
+    const omitted = copilotClientFrameSchema.parse({
+      type: "user_message",
+      surface: "agent",
+      entityId: UUID,
+      draft: {},
+      message: "hi",
+    });
+    expect((omitted as { identity?: unknown }).identity).toBeUndefined();
+
+    // An EMPTY name is a legal mid-edit state — it must not fail the frame.
+    expect(
+      copilotClientFrameSchema.safeParse({
+        type: "user_message",
+        surface: "agent",
+        entityId: UUID,
+        draft: {},
+        identity: { name: "", description: null },
+        message: "hi",
+      }).success,
+    ).toBe(true);
+
+    // Bounded (it is interpolated into the system prompt) and complete.
+    expect(
+      copilotClientFrameSchema.safeParse({
+        type: "user_message",
+        surface: "agent",
+        entityId: UUID,
+        draft: {},
+        identity: {
+          name: "x".repeat(COPILOT_MAX_IDENTITY_NAME_CHARS + 1),
+          description: null,
+        },
+        message: "hi",
+      }).success,
+    ).toBe(false);
+    expect(
+      copilotClientFrameSchema.safeParse({
+        type: "user_message",
+        surface: "agent",
+        entityId: UUID,
+        draft: {},
+        identity: { name: "Support Agent" },
+        message: "hi",
+      }).success,
+    ).toBe(false);
+  });
+
   test("allow-edits rides the user_message and defaults to the accept gate", () => {
     const gated = copilotClientFrameSchema.parse({
       type: "user_message",
@@ -365,10 +445,12 @@ describe("copilot frames", () => {
   });
 
   test("thought frames carry cumulative text under a stable key", () => {
+    // The key is turn-scoped by convention (`turn:<n>:step:<i>`) because the
+    // dock upserts by key globally — but the wire treats it as opaque.
     expect(
       copilotServerFrameSchema.safeParse({
         type: "thought",
-        key: "step:0",
+        key: "turn:0:step:0",
         text: "The draft has no trigger yet",
         streaming: true,
       }).success,
@@ -377,7 +459,7 @@ describe("copilot frames", () => {
     expect(
       copilotServerFrameSchema.safeParse({
         type: "thought",
-        key: "step:0",
+        key: "turn:1:step:0",
         text: "",
         streaming: false,
       }).success,

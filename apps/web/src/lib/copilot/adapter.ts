@@ -10,7 +10,11 @@
  * `agentCopilotAdapter` (agent-mutations.ts).
  */
 import type { ComponentType } from "react";
-import type { CopilotProposal, CopilotSurface } from "@invisible-string/shared";
+import type {
+  CopilotAgentIdentity,
+  CopilotProposal,
+  CopilotSurface,
+} from "@invisible-string/shared";
 
 /** Frame routing — every `user_message` names the surface + entity it edits. */
 export interface CopilotEntityRef {
@@ -18,6 +22,21 @@ export interface CopilotEntityRef {
   /** Workflow or agent row id (per `surface`). */
   entityId: string;
 }
+
+/**
+ * What applying a proposal produced.
+ *
+ * `void`/`true` — applied. `false` — it FAILED and the card must say so:
+ * some proposals do not land in the editor reducer but in a network write
+ * (the agent rename PATCHes `agents.name`), and a card that prints "Applied"
+ * over a failed write is a receipt for something that never happened.
+ * Promises are awaited before the card settles and before the server is told
+ * the outcome.
+ */
+export type ApplyProposalResult =
+  | void
+  | boolean
+  | Promise<void | boolean>;
 
 /**
  * One suggestion card's presentation, precomputed by the adapter from a
@@ -48,11 +67,25 @@ export interface CopilotSurfaceAdapter<
   /** Read the LIVE draft (sent with every user message) — must never go stale. */
   getDraft: () => TDraft;
   /**
+   * Read the LIVE row identity for surfaces that have one (the agent's name +
+   * description are `agents` COLUMNS, not part of the compiled draft). Sent
+   * alongside the draft on every user message so the copilot can answer "what
+   * is this agent called?" and so the server's "you already proposed exactly
+   * this" guards have a baseline — see `copilotAgentIdentitySchema`
+   * (packages/shared) for the wire contract and its precedence rule.
+   *
+   * Absent on the workflow surface, which has no such columns.
+   */
+  getIdentity?: () => CopilotAgentIdentity | null;
+  /**
    * Apply an accepted proposal through the surface controller's dispatch
    * (the same path manual edits take, so autosave/dirty state just work).
    * Off-surface proposals (a server bug) are ignored.
+   *
+   * See {@link ApplyProposalResult}: an adapter whose application can FAIL
+   * must report it, and may resolve asynchronously.
    */
-  applyProposal: (proposal: CopilotProposal) => void;
+  applyProposal: (proposal: CopilotProposal) => ApplyProposalResult;
   /** Card presentation for a proposal against the CURRENT draft. */
   describeProposal: (proposal: CopilotProposal) => ProposalDescription;
   emptyStateCopy: CopilotEmptyStateCopy;

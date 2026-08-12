@@ -200,8 +200,12 @@ so a sidebar full of one agent's chats is readable. Tool calls read as
 English — the connection's display name, a humanized tool name, the server's
 own description of it, and a short result summary rather than raw JSON — and
 the header trades the build hash and raw model slug for a **context-usage
-meter** plus a friendly model label. Compaction leaves a permanent divider in
-the thread (it is derived from persisted run events, so it survives reload).
+meter** plus a friendly model label — the meter reads the newest measurement
+taken since the last memory boundary, and simply disappears when there is
+none. Clearing or compacting the context leaves a permanent divider in the
+thread: the control plane drains the events the control emitted onto the run it
+followed, so the divider lands under the right exchange and survives a reload.
+A compaction that had nothing to summarize says so instead of claiming one.
 Resumable SSE per run with `Last-Event-ID`; one active run per session
 (`session_busy` handled inline). Workflow-fired runs land here too, wearing
 origin + workflow-provenance chips; "Edit agent ↗" deep-links into the agent
@@ -280,9 +284,10 @@ All screenshots are captured from the real product by a gated Playwright spec
 ## Copilot (the editor assistant)
 
 Both editors dock the same AI copilot on their right rail — one socket, two
-surfaces. It reads the current draft (the Agent or the workflow) plus the
-workspace inventory (published Agents, MCP connections, skills, model presets,
-allowlist) and proposes edits as **typed mutations** — `setName`,
+surfaces. It reads the current draft (the Agent or the workflow), the agent's
+name and description as the editor currently holds them — unsaved edits
+included — plus the workspace inventory (published Agents, MCP connections,
+skills, model presets, allowlist), and proposes edits as **typed mutations** — `setName`,
 `setDescription`, `setPersona`, `setModel`, `addContext`, `removeContext` on
 the agent surface; `setTrigger`, `setAgent`, `setInstructions` on the workflow
 surface — streamed over `WS /workspaces/:workspaceId/copilot` (shared frame
@@ -297,9 +302,11 @@ Every proposal renders as a structured **Apply / Dismiss** card with a preview
 **never** mutates the draft — accepted mutations are applied client-side
 through the editor controller (the same reducer manual edits use, so
 autosave/dry-run/diagnostics just work), and each accept/reject is fed back
-into the model's tool loop. A session-scoped **allow edits** toggle skips the
-accept gate: mutations apply as they arrive and the card still renders, marked
-applied, so the turn stays an audit trail. It is deliberately not remembered
+into the model's tool loop — including when applying *fails*, in which case the
+card says so and the model is told the edit was rejected rather than being
+handed a receipt for something that never landed. A session-scoped **allow
+edits** toggle skips the accept gate: mutations apply as they arrive and the
+card still renders, marked applied, so the turn stays an audit trail. It is deliberately not remembered
 across sittings. Invalid tool calls (unknown inventory ids, non-allowlisted
 models, out-of-scope `@` references) bounce back to the model server-side and
 are never offered as a proposal — they surface only as a failed step in the

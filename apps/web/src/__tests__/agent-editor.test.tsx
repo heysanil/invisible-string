@@ -518,3 +518,47 @@ test("lifecycle: saved-but-behind reads 'unpublished', a never-published agent '
   );
   expect(behind.getByText("lifecycle:unpublished")).toBeTruthy();
 });
+
+test("lifecycle: a rename of a published agent is an UNPUBLISHED change", () => {
+  // The controller must feed the NAME into the lifecycle, not just the two
+  // definitions: `agentSlug` is still a content-hash input (spec D1), so a
+  // rename re-keys the artifact and the running agent keeps introducing
+  // itself by the old name until the next publish.
+  respond = () => jsonResponse({ agents: [] });
+
+  function RenamedProbe({ publishedName }: { publishedName: string }) {
+    const agent = {
+      ...agentRow(STORED_DRAFT),
+      name: "Inbox triage",
+      publishedVersionId: VERSION_ID,
+      publishedDefinition: STORED_DRAFT as AgentDto["publishedDefinition"],
+      publishedName,
+    } as AgentDto;
+    const controller = useAgentController({
+      workspaceId: WS,
+      agent,
+      initialState: initAgentEditorState(agent),
+      allowlist: [],
+      publishStore: new AgentPublishStore({ pollIntervalMs: 10 }),
+    });
+    return <p>lifecycle:{controller.lifecycle}</p>;
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
+  const renamed = render(
+    <QueryClientProvider client={queryClient}>
+      <RenamedProbe publishedName="Untitled agent" />
+    </QueryClientProvider>,
+  );
+  expect(renamed.getByText("lifecycle:unpublished")).toBeTruthy();
+  cleanup();
+
+  const unchanged = render(
+    <QueryClientProvider client={queryClient}>
+      <RenamedProbe publishedName="Inbox triage" />
+    </QueryClientProvider>,
+  );
+  expect(unchanged.getByText("lifecycle:published")).toBeTruthy();
+});

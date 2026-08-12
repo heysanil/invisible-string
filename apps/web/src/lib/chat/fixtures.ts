@@ -312,8 +312,14 @@ const clearedRun: FixtureRun = {
 // The divider is derived from the COMPLETED event alone (spec D4) — an empty
 // context emits neither event and a failed summarization emits only the
 // request, and in both of those nothing was summarized, so nothing may claim a
-// memory boundary. The step's usage is deliberately POST-compaction (small
-// against a 1M window), which is what the falling meter is supposed to show.
+// memory boundary.
+//
+// It runs to TWO runs on purpose, because that is what the falling meter needs:
+// the first measures 903k against a 1M window and is then compacted, the second
+// measures the SUMMARIZED context at 41k. A boundary retires every measurement
+// taken before it (`contextTokensUsed`), so a session that stopped at the first
+// run would show no meter at all — correct, but not the thing this fixture is
+// here to preview.
 
 const compactedRun: FixtureRun = {
   run: {
@@ -339,6 +345,29 @@ const compactedRun: FixtureRun = {
     { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-293), id: "evt_01KZFM7D0000000000000010" } },
     { type: "compaction.requested", data: { modelId: "~deepseek/deepseek-v4-flash-latest", sequence: 1, sessionId: "eve_fixture", turnId: "t0", usageInputTokens: 903_000 }, meta: { at: iso(-120), id: "evt_01KZFM7D0000000000000011" } },
     { type: "compaction.completed", data: { modelId: "~deepseek/deepseek-v4-flash-latest", sequence: 2, sessionId: "eve_fixture", turnId: "t0" }, meta: { at: iso(-118), id: "evt_01KZFM7D0000000000000012" } },
+  ]),
+};
+
+// The exchange AFTER that compaction: same thread, same window, a context that
+// now measures 41k because the summary replaced the history.
+const postCompactionRun: FixtureRun = {
+  run: {
+    id: "run_post_compaction",
+    status: "succeeded",
+    triggerEvent: chatTrigger(
+      FIXTURE_SUPPORT_TRIAGER,
+      "Which team owns the most of them?",
+    ),
+    taskMessage: null,
+    error: null,
+  },
+  frames: framesFor("run_post_compaction", [
+    { type: "turn.started", data: { sequence: 3, turnId: "t1" }, meta: { at: iso(-110), id: "evt_01KZFM7E0000000000000001" } },
+    { type: "message.received", data: { message: "Which team owns the most of them?", sequence: 3, turnId: "t1" }, meta: { at: iso(-110), id: "evt_01KZFM7E0000000000000002" } },
+    { type: "message.completed", data: { finishReason: "stop", message: "**Billing** owns 14 of the 31 — nearly half the backlog.", sequence: 3, stepIndex: 0, turnId: "t1" }, meta: { at: iso(-108), id: "evt_01KZFM7E0000000000000003" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 3, stepIndex: 0, turnId: "t1", usage: { inputTokens: 41_000, outputTokens: 120 } }, meta: { at: iso(-108), id: "evt_01KZFM7E0000000000000004" } },
+    { type: "turn.completed", data: { sequence: 3, turnId: "t1" }, meta: { at: iso(-107), id: "evt_01KZFM7E0000000000000005" } },
+    { type: "session.waiting", data: { wait: "next-user-message" }, meta: { at: iso(-107), id: "evt_01KZFM7E0000000000000006" } },
   ]),
 };
 
@@ -481,7 +510,7 @@ export const FIXTURE_SESSIONS: FixtureSession[] = [
       "Backlog check-in",
     ),
     versionLabel: "v_9a8b7c",
-    runs: [compactedRun],
+    runs: [compactedRun, postCompactionRun],
   },
 ];
 

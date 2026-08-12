@@ -350,8 +350,10 @@ export function createKeyedScriptedTransport(
         yield { type: "finish", outputTokens: 0 };
         return;
       }
-      // Block id salted like the tool-call ids below: stateless replay must
-      // not reuse a thought key across turns on one socket.
+      // Block id salted like the tool-call ids below, so a stateless replay of
+      // the same user message never reuses a REASONING-BLOCK id within a step
+      // (which is what separates joined blocks). It does NOT carry thought-key
+      // uniqueness: the session mints those itself, turn-scoped (session.ts).
       yield* scriptedReasoning(
         step.reasoning,
         `fake_reasoning_${request.messages.length}_${stepIndex}`,

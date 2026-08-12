@@ -41,7 +41,6 @@ import {
   type AgentSection,
 } from "../../lib/agents/model";
 import { chatEntryDecision } from "../../lib/agents/publish-machine";
-import { useAgentPublishSink } from "../../lib/agents/use-publish-store";
 import {
   agentEditorStateFromAgent,
   useAgentController,
@@ -91,9 +90,9 @@ export function AgentEditorScreen({
   const { toast } = useToast();
   const updateAgent = useUpdateAgent(workspaceId);
   const deleteAgent = useDeleteAgent(workspaceId);
-  // Publish completions are announced from the store, not from here — this
-  // just gives it a toast sink and scopes it to the active workspace.
-  useAgentPublishSink(workspaceId);
+  // NOTE: the publish store's sink and workspace pin are mounted by AppShell,
+  // not here. A watch must be torn down when the WORKSPACE changes, and that
+  // can happen from any screen — see lib/agents/use-publish-store.ts.
 
   const initialState = useMemo(
     () => agentEditorStateFromAgent(agent),
@@ -193,10 +192,11 @@ export function AgentEditorScreen({
     dispatch,
     // An accepted rename takes the SAME path the header's inline edit takes —
     // without this seam the card would apply nothing and still print
-    // "Applied", which is the one thing a receipt may never do.
-    setName: (name) => {
-      void commitName(name);
-    },
+    // "Applied", which is the one thing a receipt may never do. The PROMISE is
+    // returned, not fired and forgotten: the card waits on the PATCH, so a
+    // failed rename settles as "Couldn't apply" and the server is told the
+    // mutation was rejected rather than accepted.
+    setName: (name) => commitName(name),
     resources,
     onApplied: onSuggestionApplied,
   });

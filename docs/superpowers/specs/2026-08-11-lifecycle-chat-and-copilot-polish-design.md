@@ -1,6 +1,11 @@
 # 2026-08-11 — Agent lifecycle, chat legibility, and copilot reach
 
-Status: **approved**, not yet implemented.
+Status: **implemented**. Decisions D1–D10 shipped as described, except where a
+decision below carries an **Amended after review** note — those record what the
+mechanism actually turned out to be once the code review found the places where
+this document (and the code's own comments) described something the
+implementation did not do. Read the amendments as part of the decision, not as
+history: each one replaces the sentence above it.
 Supersedes: the agent-identity half of the 2026-07-02 design's compile-hash
 description (§ "Live-doc corrections"); the `.lift` hover motion in that
 spec's §E1 interaction polish.
@@ -91,6 +96,16 @@ No durable queue, no new table, no boot reconcile. A control-plane restart
 mid-build loses that build and re-publishing recovers it — accepted, and
 consistent with the existing single-instance deployment constraint.
 
+**Amended after review — "workspace-level" means the app shell, not the agent
+surfaces.** The store outlives the editor, but the poller that drives it was
+mounted by the agent screens, so navigating to `/chat` (or accepting an
+invitation, which remounts the shell) unmounted the only watcher and the toast
+never came. The watch is split in two: a *sink* that owns the polling and a
+*pin* that binds it to the active workspace, both mounted once by `AppShell`;
+no agent surface mounts either. The pin ignores a NULL (still-resolving)
+workspace — treating "unresolved" as "switched away" cancelled watches nobody
+left.
+
 ### D3 — Three save states, not two
 
 The editor distinguishes:
@@ -106,6 +121,24 @@ comparison — the same structural equality `agentEditorStatesEqual` already
 performs, applied against a second baseline. An agent that has never been
 published reads as **Draft**, not as "unpublished changes".
 
+**Amended after review — a RENAME is unpublished change too.** `agents.name`
+is not part of the definition, so a rename moves neither baseline and the
+editor read "Published" over an agent whose live artifact still introduces
+itself by the old name. That is a direct consequence of D1 keeping `agentSlug`
+in the hash: the display name still shapes emitted bytes, so renaming really
+does leave the published version behind. `agentLifecycleState` therefore also
+compares the current name's SLUG against the published version's — casing and
+punctuation that slugify identically are not drift.
+
+The baseline for that comparison is **not served yet**: `agent_versions` stores
+no name, and nothing else on the DTO records what the published version was
+compiled under. The web side is complete and reads the field defensively — an
+unknown baseline never claims drift, so the chip stays silent rather than
+lying — but closing the loop needs an additive migration adding
+`agent_versions.name` (written at publish from the same `agent.name` the
+compile service slugifies) plus a `publishedName` field on `AgentDto`. No
+backfill: a null baseline reads as "unknown", never as drift.
+
 ### D4 — Compaction persists the way clearing already does
 
 `contextCleared` is not a column; `run-view.ts` derives it by reducing over
@@ -119,6 +152,27 @@ same inline `ContextDivider` treatment in `RunMessage`. The transient
 already-cleared context emits *no* `compaction.*` events at all — only
 `session.waiting`. The UI must therefore not assume a requested compaction
 produced a marker.
+
+**Amended after review — deriving the marker is not enough; someone has to
+DRAIN it.** Both control routes require a QUIET session, so by construction no
+tail is attached when one fires and nothing consumed eve's `context.cleared` /
+`compaction.completed` at all. The result was two failures at once: no divider
+was ever persisted (so none survived a reload — exactly what D4 promised), and
+the frames sat in eve's stream until the NEXT run's tail drained them, drawing
+the boundary under an exchange that happened *after* the clear.
+
+The accepted path now drains those frames itself and appends them to the
+session's most recent run, and the response carries
+`marker: {kind, runId} | null` saying where they landed (contract:
+`docs/runtime-worker-contract.md`, "the clear/compact drain"). The client
+consumes the marker by re-attaching that run's tail — it resumes from the
+store's cursor, so nothing replays — and falls back to refetching the session
+when the named run is one this tab has never seen.
+
+`marker: null` is the D4 edge case made explicit and must be *said*, not
+papered over: a compact that produced no boundary reports "Nothing to compact —
+there was no earlier context to summarize", never "earlier messages were
+summarized".
 
 ### D5 — Tool calls read as English
 
@@ -151,6 +205,30 @@ a context-usage indicator: a small meter plus the actual percentage.
 
 The model remains discoverable — as a friendly preset label, not a raw slug.
 
+**Amended after review, twice.**
+
+*The numerator stops at the newest memory boundary.* "The newest run that
+measured input tokens" keeps the meter pinned at the pre-boundary percentage
+after a clear or compact — it reports a context that no longer exists. Both
+halves of the scan enforce it: `reduceRunView` nulls a run's `inputTokens` when
+that run's own `context.cleared`/`compaction.completed` arrives, and the
+session-wide scan (`contextTokensUsed`) stops at the newest boundary run,
+including that run, since a run can measure a fresh step after its own boundary
+frame. Nothing measured since the boundary ⇒ the meter is ABSENT, per D6's own
+"never zero or guessed" rule.
+
+*The preset label comes from the pinned version's definition, never from the
+model id.* Matching the resolved model id against the preset list cannot work:
+`balanced` and `quick` seed to the SAME model id and differ only by reasoning
+effort, so an id lookup labels every Quick agent "Balanced", and re-pointing a
+preset later would silently relabel old sessions. The label is read from the
+published definition's own `model.preset`, gated on the session still being
+pinned to the published version. A specific-model override (which beats the
+preset at compile time) and a session left on an older publish have no preset
+to name and fall through to the model's friendly short name — never the raw
+slug. Serving an arbitrary version's definition would close that last gap; no
+route does today.
+
 ### D7 — The copilot gets depth and reach
 
 Four changes, one lane:
@@ -165,6 +243,34 @@ Four changes, one lane:
 4. **`setDescription`** — a one-line description. `agents.description` exists
    in the schema and is currently unsurfaced; this lane gives it an editor
    field as well as a copilot tool.
+
+**Amended after review — three things this decision left underspecified.**
+
+*Identity rides the frame, beside the draft.* `agents.name`/`description` are
+ROW columns and the `draft` a client sends is an `AgentDefinition`, which has
+neither — so the copilot could not answer "what is this agent called?", and the
+"you already proposed exactly this name" no-op checks could never fire. The
+`user_message` frame carries an optional typed `identity {name, description}`
+which WINS over the persisted row, because the editor holds edits the database
+has not seen (the description is reducer state until the user saves). Omitted —
+the workflow surface, an older client — the server falls back to the `agents`
+row it already loads with the turn's inventory. Never smuggle these into
+`draft`; the server does not read them there.
+
+*Thought keys must be unique for the SOCKET, not the turn.* The dock upserts
+timeline items by key globally, so the original `step:<stepIndex>` collided on
+every turn after the first (each turn's step loop restarts at zero) and turn 2's
+reasoning overwrote turn 1's inside its old work block — silently rewriting the
+audit trail D7.2 exists to keep. The server mints
+`turn:<turnIndex>:step:<stepIndex>` off a never-reset per-session counter; the
+key stays opaque to the client.
+
+*An "Applied" receipt must mean applied.* Accepting a proposal marked the card
+applied and answered the server `accepted` before the mutation resolved, so a
+failed PATCH left a card claiming a change that had not happened. Apply is now
+result-aware: the card parks in an `applying` state, settles `failed` on
+failure, and the server is told `rejected` with a reason. The allow-edits path
+corrects its own receipt the same way (it has no waiter to answer).
 
 ### D8 — Sending enters the chat immediately
 
@@ -182,6 +288,40 @@ pattern the copilot already establishes — and persists a short title. Until
 it lands, the sidebar falls back to the existing truncation
 (`titleFromMessage`, currently dead code, becomes the fallback rather than
 being deleted). Failure is silent: an untitled session shows the fallback.
+
+**Amended after review — three corrections.**
+
+*The fallback needs a message the list DTO actually carries.* "Falls back to
+truncating the first message" was unreachable on a cold load: the session LIST
+DTO carried no message, so a tab that had never opened a thread fell all the
+way through to the agent's name — the "every thread looks identical" symptom
+D9 exists to remove. `agentSessionSummaryDtoSchema` gains
+`firstMessagePreview`, the thread's opener truncated server-side to
+`SESSION_MESSAGE_PREVIEW_MAX_CHARS` and read inside the list route's existing
+per-page runs query (no N+1, no full bodies on the wire). The resolution order
+is title → a whole message the caller happens to hold → the DTO preview → the
+agent's name, iterated rather than `??`-chained so an EMPTY explicit message
+falls through to the preview instead of shadowing it. No client may keep a
+second source of truth for this — a per-tab map of "messages I have seen" is
+what made the bug invisible in local testing.
+
+*Quick is only cheaper than balanced because of its EFFORT.* Both presets seed
+to the same model id, so a titler that sends the model but not the preset's
+`reasoning` is not asking for the cheap thing at all. The effort travels as
+ai@7's top-level `reasoning` call setting, `max` clamped to `xhigh` (the AI SDK
+effort union has no `max`) and omitted entirely for `provider-default`.
+Honesty about the ceiling: only the Anthropic provider honors it on the control
+plane's current pins — `@openrouter/ai-sdk-provider@6.0.0-alpha.1` builds a
+whitelisted Responses-API body and drops both `reasoning` and `extraBody`, so
+for the seeded (OpenRouter) quick preset the effort cannot reach the wire until
+that pin moves. The code asks correctly and says so; AGENTS.md's `extraBody`
+rule is about the compiled agent's `3.0.0` pin, not this process.
+
+*The kill switch reads the stack's env record.* `SESSION_TITLE_*` is resolved
+into `RuntimeConfig` beside the platform provider keys and consumed from there.
+Reading `process.env` inside the titler honored an injected key while ignoring
+an injected `SESSION_TITLE_ENABLED=0` in the same record — an in-process
+harness would bill a real provider call it had explicitly disabled.
 
 ### D10 — Hover stops rising
 
@@ -255,7 +395,10 @@ Each lane carries its own tests. Beyond that:
 
 `AGENTS.md` (this spec's row; the agent-identity constraint; the `.lift`
 note), `docs/DEPLOY.md` (the one-time rebuild in D1), `README.md` where it
-describes the editor lifecycle, and a changeset.
+describes the editor lifecycle, and a changeset. The review pass added
+`docs/runtime-worker-contract.md` (the clear/compact drain and the response's
+`marker`) and `.env.example` (where the `SESSION_TITLE_*` switch is read
+from).
 
 ## 7. Out of scope
 

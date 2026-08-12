@@ -6,12 +6,27 @@
  * {@link CopilotSurfaceAdapter}.
  *
  * Protocol (packages/shared/src/copilot.ts): each `user_message` names its
- * `surface` + `entityId`, carries the LIVE draft and the ALLOW-EDITS flag for
- * that turn; the server streams `delta` text, `thought`/`step` progress and
- * validated `proposal` frames, pausing its tool loop until the client answers
- * each proposal with a `mutation_result`. Applying routes the proposal through
- * the surface controller's dispatch (single writer) and reports `accepted`;
- * dismissing reports `rejected`. `abort` cuts the in-flight turn short.
+ * `surface` + `entityId`, carries the LIVE draft, the surface's row IDENTITY
+ * where it has one, and the ALLOW-EDITS flag for that turn; the server streams
+ * `delta` text, `thought`/`step` progress and validated `proposal` frames,
+ * pausing its tool loop until the client answers each proposal with a
+ * `mutation_result`. Applying routes the proposal through the surface
+ * controller's dispatch (single writer) and reports `accepted`; dismissing
+ * reports `rejected`. `abort` cuts the in-flight turn short.
+ *
+ * IDENTITY rides its own frame field rather than the draft because it is not
+ * IN the draft: `agents.name`/`agents.description` are row columns and an
+ * `AgentDefinition` has neither, so a server reading them off the draft could
+ * never see anything. Bounded here as well as server-side — an over-long
+ * mid-edit description must degrade to a truncated identity, never to a
+ * rejected frame that silently costs the user their whole turn.
+ *
+ * APPLYING IS NOT ALWAYS INSTANT. Most proposals are reducer dispatches, but
+ * the agent rename is a PATCH, so `applyProposal` may resolve asynchronously
+ * and may FAIL. The card is held in `applying` until it settles, and a failure
+ * marks it `failed` and reports `rejected` (with a reason) rather than
+ * `accepted` — telling the server a mutation landed when it did not would
+ * leave the model editing an agent it cannot see.
  *
  * ALLOW-EDITS (spec D7.2) does not move the writer — the client still applies
  * every mutation. It only removes the ASK: the server marks such proposals
@@ -25,9 +40,14 @@
  * The thread transitions themselves are pure and live in ./thread.ts.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CopilotServerFrame } from "@invisible-string/shared";
+import {
+  COPILOT_MAX_IDENTITY_DESCRIPTION_CHARS,
+  COPILOT_MAX_IDENTITY_NAME_CHARS,
+  type CopilotAgentIdentity,
+  type CopilotServerFrame,
+} from "@invisible-string/shared";
 
-import type { CopilotSurfaceAdapter } from "./adapter";
+import type { ApplyProposalResult, CopilotSurfaceAdapter } from "./adapter";
 import {
   CopilotSocket,
   type CopilotSocketStatus,
@@ -86,6 +106,45 @@ export interface CopilotApi {
   dismissSuggestion: (suggestionId: string) => void;
 }
 
+/**
+ * Clamp a surface's identity to the wire bounds. The server's schema rejects
+ * the WHOLE frame on an over-long string, and a description longer than the
+ * copilot's own cap is a legal row value (the DTO allows 2000), so trimming
+ * here is what keeps a long description from costing the user the turn.
+ */
+function boundedIdentity(
+  identity: CopilotAgentIdentity | null,
+): CopilotAgentIdentity | null {
+  if (!identity) return null;
+  return {
+    name: identity.name.slice(0, COPILOT_MAX_IDENTITY_NAME_CHARS),
+    description:
+      identity.description === null
+        ? null
+        : identity.description.slice(0, COPILOT_MAX_IDENTITY_DESCRIPTION_CHARS),
+  };
+}
+
+/**
+ * What the model is told when an accepted proposal could not be applied. It
+ * rides `mutation_result.reason`, which the server feeds back on rejection —
+ * so the copilot learns the edit did not land and can offer it again, rather
+ * than continuing as though the agent already had the new name.
+ */
+const APPLY_FAILED_REASON =
+  "The editor could not apply this change — it was not saved.";
+
+/** Only an explicit `false` is a failure — `void` means "applied, nothing to say". */
+function appliedOk(result: void | boolean): boolean {
+  return result !== false;
+}
+
+function isThenable(
+  result: ApplyProposalResult,
+): result is Promise<void | boolean> {
+  return typeof (result as { then?: unknown } | undefined)?.then === "function";
+}
+
 export function useCopilot(options: UseCopilotOptions): CopilotApi {
   const {
     workspaceId,
@@ -131,7 +190,20 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
         // double-invokes updaters, and applying twice would double-dispatch
         // into the editor). The server has already moved on.
         if (frame.autoApplied === true) {
-          adapterRef.current.applyProposal(frame.proposal);
+          const result = adapterRef.current.applyProposal(frame.proposal);
+          // An auto-applied card opens as "Applied"; if the application was
+          // async and failed, correct the receipt rather than leaving a
+          // permanent claim about an edit that never landed. Nothing is sent
+          // back — the server is not waiting for this one.
+          if (isThenable(result)) {
+            const proposalId = frame.proposal.id;
+            void result.then((outcome) => {
+              if (appliedOk(outcome)) return;
+              setItems((current) =>
+                decideSuggestion(current, proposalId, "failed"),
+              );
+            });
+          }
         }
         break;
       case "done":
@@ -187,13 +259,17 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
     // One turn at a time: sending mid-turn would orphan the user's bubble
     // (the server answers turn_in_progress and drops the message).
     if (generatingRef.current) return false;
-    const { entityRef, getDraft } = adapterRef.current;
+    const { entityRef, getDraft, getIdentity } = adapterRef.current;
+    const identity = boundedIdentity(getIdentity?.() ?? null);
     const sent = socketRef.current?.send({
       type: "user_message",
       surface: entityRef.surface,
       entityId: entityRef.entityId,
       draft: getDraft() as unknown as Record<string, unknown>,
       message: trimmed,
+      // Omitted where the surface has none (workflows) — the server then
+      // falls back to the persisted row rather than to nothing.
+      ...(identity ? { identity } : {}),
       // Sent only when ON: the field is optional and defaults to the accept
       // gate, which is the safe direction for an omission.
       ...(allowEditsRef.current ? { allowEdits: true } : {}),
@@ -215,6 +291,26 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
     );
   }, []);
 
+  /** Report the outcome to the server and settle the card. Called once. */
+  const settleDecision = useCallback(
+    (
+      suggestionId: string,
+      outcome: "accepted" | "rejected",
+      options: { status: "applied" | "failed" | "dismissed"; reason?: string },
+    ) => {
+      socketRef.current?.send({
+        type: "mutation_result",
+        proposalId: suggestionId,
+        outcome,
+        ...(options.reason ? { reason: options.reason } : {}),
+      });
+      setItems((current) =>
+        decideSuggestion(current, suggestionId, options.status),
+      );
+    },
+    [],
+  );
+
   const decide = useCallback(
     (suggestionId: string, outcome: "accepted" | "rejected") => {
       // Side effects OUTSIDE the state updater (StrictMode-safe): find the
@@ -224,23 +320,49 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
           i.kind === "suggestion" && i.id === suggestionId,
       );
       if (!item || item.status !== "pending") return;
-      if (outcome === "accepted") {
-        adapterRef.current.applyProposal(item.proposal);
+      if (outcome === "rejected") {
+        settleDecision(suggestionId, "rejected", { status: "dismissed" });
+        return;
       }
-      socketRef.current?.send({
-        type: "mutation_result",
-        proposalId: suggestionId,
-        outcome,
-      });
-      setItems((current) =>
-        decideSuggestion(
-          current,
-          suggestionId,
-          outcome === "accepted" ? "applied" : "dismissed",
-        ),
+
+      const result = adapterRef.current.applyProposal(item.proposal);
+      if (!isThenable(result)) {
+        // The common case: a reducer dispatch, done in this tick.
+        if (appliedOk(result)) {
+          settleDecision(suggestionId, "accepted", { status: "applied" });
+        } else {
+          settleDecision(suggestionId, "rejected", {
+            status: "failed",
+            reason: APPLY_FAILED_REASON,
+          });
+        }
+        return;
+      }
+      // Async apply (the agent rename's PATCH): park the card so it neither
+      // claims success nor stays clickable, and answer the server only once
+      // the write has actually landed. The server's tool loop is waiting for
+      // this frame, so every path below must send exactly one.
+      setItems((current) => decideSuggestion(current, suggestionId, "applying"));
+      void result.then(
+        (settled) => {
+          if (appliedOk(settled)) {
+            settleDecision(suggestionId, "accepted", { status: "applied" });
+          } else {
+            settleDecision(suggestionId, "rejected", {
+              status: "failed",
+              reason: APPLY_FAILED_REASON,
+            });
+          }
+        },
+        () => {
+          settleDecision(suggestionId, "rejected", {
+            status: "failed",
+            reason: APPLY_FAILED_REASON,
+          });
+        },
       );
     },
-    [],
+    [settleDecision],
   );
 
   const applySuggestion = useCallback(

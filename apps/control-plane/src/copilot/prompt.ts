@@ -6,15 +6,18 @@
  * CURRENT draft JSON, the workspace inventory (with the exact ids the
  * mutation tools accept), the @reference grammar, and strict instructions to
  * only propose changes via tools. The agent prompt additionally carries the
- * agent's IDENTITY (name + one-line description, spec D7.3/D7.4) when the
- * editor puts it on the draft — those live on the `agents` row rather than in
- * the definition, so they arrive alongside it, not inside it.
+ * agent's IDENTITY (name + one-line description, spec D7.3/D7.4) — those live
+ * on the `agents` row rather than in the definition, so they arrive ALONGSIDE
+ * the draft in the frame's own `identity` field (never inside `draft`, which
+ * is an `AgentDefinition` and has no such keys), resolved by the plugin to the
+ * editor's live values or, failing that, the persisted row.
  */
 import { z } from "zod";
 import {
   AGENT_COPILOT_MUTATION_TOOLS,
   copilotMutationParamSchemas,
   WORKFLOW_COPILOT_MUTATION_TOOLS,
+  type CopilotAgentIdentity,
   type CopilotMutationTool,
   type CopilotSurface,
 } from "@invisible-string/shared";
@@ -90,10 +93,16 @@ export function buildSystemPrompt(opts: {
   surface: CopilotSurface;
   draft: Record<string, unknown>;
   inventory: WorkspaceInventory;
+  /**
+   * Agent-surface row identity (spec D7.3/D7.4). Null/omitted renders NO
+   * identity section — the workflow surface has none, and inventing a blank
+   * one would invite the model to "fix" a name it cannot actually see.
+   */
+  identity?: CopilotAgentIdentity | null;
 }): string {
   return opts.surface === "workflow"
     ? buildWorkflowSystemPrompt(opts.draft, opts.inventory)
-    : buildAgentSystemPrompt(opts.draft, opts.inventory);
+    : buildAgentSystemPrompt(opts.draft, opts.inventory, opts.identity ?? null);
 }
 
 // ── workflow surface ─────────────────────────────────────────────────────────
@@ -145,6 +154,7 @@ References must start with a letter; segments are letters/digits/_/-.
 function buildAgentSystemPrompt(
   draft: Record<string, unknown>,
   inventory: WorkspaceInventory,
+  identityRow: CopilotAgentIdentity | null,
 ): string {
   const connections = inventory.connections
     .map((c) => {
@@ -186,20 +196,20 @@ function buildAgentSystemPrompt(
     .join("\n");
 
   // IDENTITY (name + description) lives on the `agents` row, not in the
-  // definition, so it only reaches the prompt if the editor put it on the
-  // draft. Rendered only when present — inventing a "(unknown)" line would
-  // invite the model to "fix" a name it cannot actually see.
-  const name =
-    typeof draft.name === "string" && draft.name.trim()
-      ? promptSafe(draft.name, 120)
-      : null;
-  const description =
-    typeof draft.description === "string" && draft.description.trim()
-      ? promptSafe(draft.description)
-      : null;
+  // definition, so it reaches this function through its own argument — NEVER
+  // off `draft`, which is an `AgentDefinition` and has no such keys (reading
+  // it there is how the copilot ended up permanently blind to the agent's
+  // name). Rendered only when a name resolved: inventing an "(unknown)" line
+  // would invite the model to "fix" a name it cannot actually see.
+  const name = identityRow?.name.trim()
+    ? promptSafe(identityRow.name, 120)
+    : null;
+  const description = identityRow?.description?.trim()
+    ? promptSafe(identityRow.description)
+    : null;
   // The description line is worth stating as "(none yet)" — that absence is
-  // itself a prompt to write one — but only once the editor has proven it
-  // sends identity at all, which the name does.
+  // itself a prompt to write one — but only once identity resolved at all,
+  // which the name proves.
   const identity =
     name === null
       ? ""

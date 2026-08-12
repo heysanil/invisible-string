@@ -19,9 +19,12 @@
  *    harnesses can point it at a stub. The differences are deliberate and
  *    small: one non-streaming `generateText` round-trip with no tools; the
  *    model is the workspace's **quick** preset (`model_presets.slug =
- *    'quick'`) rather than the copilot's Claude, since a title is the cheapest
- *    possible ask; and the keys come from the RUNTIME CONFIG the stack was
- *    built with, not a fresh `process.env` read (see {@link TitleProviderKeys}).
+ *    'quick'`) **at the preset's own reasoning effort** rather than the
+ *    copilot's Claude, since a title is the cheapest possible ask — and quick
+ *    is only cheaper than balanced BECAUSE of the effort (the two seed to the
+ *    same model id; packages/db seed.ts says so); and both the keys and the
+ *    SESSION_TITLE_* switch come from the RUNTIME CONFIG the stack was built
+ *    with, not a fresh `process.env` read (see {@link TitleRuntimeConfig}).
  * 3. **Raw model output never reaches the column.** `sanitizeSessionTitle`
  *    takes the first line, unwraps the quotes/markdown/`Title:` preambles
  *    models reliably add, drops trailing punctuation, and clamps to shared
@@ -29,18 +32,25 @@
  *    message instead of titling it, or that returns the sentinel `NONE` for a
  *    contentless opener ("hi"), yields null — no title, fallback renders.
  *
- * No reasoning field is sent. The effort-passthrough gotcha documented in
- * AGENTS.md applies to COMPILED AGENTS (eve drops `reasoning:` on the ai@7
- * call option); here we simply ask for none, and `maxOutputTokens` is set well
- * above what a title needs precisely because a reasoning-by-default model
- * spends output tokens thinking before it writes one.
+ * The preset's effort rides ai@7's own top-level `reasoning` call option — the
+ * only route a DIRECT SDK call has, and honored by exactly one of the two
+ * providers on the control plane's pins today ({@link generateTitleWithModel}
+ * spells out which and why). AGENTS.md's `extraBody` rule is about the
+ * COMPILED AGENT's `@openrouter/ai-sdk-provider@3.0.0` pin
+ * (packages/compiler/versions.json), not this process's 6.0.0-alpha.1 one.
+ * `maxOutputTokens` is set well above what a title needs precisely because a
+ * reasoning model spends output tokens thinking before it writes one.
  */
 import { generateText } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { and, eq, isNull } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import { SESSION_TITLE_MAX_CHARS, type Logger } from "@invisible-string/shared";
+import {
+  SESSION_TITLE_MAX_CHARS,
+  type Logger,
+  type ReasoningEffort,
+} from "@invisible-string/shared";
 
 import type { Db } from "../db";
 
@@ -65,6 +75,19 @@ export interface TitleProviderKeys {
   anthropicApiKey?: string;
   /** OPENROUTER_BASE_URL override (harnesses point this at a stub). */
   openrouterBaseUrl?: string;
+}
+
+/**
+ * The slice of the stack's runtime config the titler reads: the platform keys
+ * AND the SESSION_TITLE_* switch, from the ONE env record `createAppStack` was
+ * constructed with. The switch belongs here for the same reason the keys do —
+ * a harness that injects a runtime key and sets `SESSION_TITLE_ENABLED=0` in
+ * the same record must not have the second half of that pair ignored, or it
+ * bills a real provider call it explicitly asked not to make.
+ */
+export interface TitleRuntimeConfig extends TitleProviderKeys {
+  /** `loadSessionTitleConfig(env)` for the stack's env record. */
+  sessionTitle?: SessionTitleConfig;
 }
 
 /**
@@ -111,10 +134,17 @@ export function loadSessionTitleConfig(
 
 // ── deps + parameters ────────────────────────────────────────────────────────
 
-/** The provider + model one title round-trip runs against. */
+/** The provider + model + effort one title round-trip runs against. */
 export interface TitleModelRef {
   provider: "anthropic" | "openrouter";
   modelId: string;
+  /**
+   * The preset's reasoning effort. Load-bearing, not decoration: the seeded
+   * `quick` and `balanced` presets are THE SAME MODEL ID and differ only here
+   * (packages/db/src/seed.ts), so dropping it would run titling at balanced's
+   * cost/latency profile under quick's name.
+   */
+  reasoning: ReasoningEffort;
 }
 
 export interface TitleGeneratorInput {
@@ -139,13 +169,14 @@ export interface SessionTitlerDeps {
   db: Db;
   logger: Logger;
   /**
-   * The runtime config's platform keys (`RuntimeDeps.runtime` satisfies this
-   * as-is). Absent — an unconfigured runtime — means no titles, never an error.
+   * The runtime config's platform keys + titling switch (`RuntimeDeps.runtime`
+   * satisfies this as-is). Absent — an unconfigured runtime — means no titles,
+   * never an error.
    */
-  runtime?: TitleProviderKeys;
+  runtime?: TitleRuntimeConfig;
   /** Test seam: replaces the model round-trip. */
   generateTitle?: TitleGenerator;
-  /** Test seam: replaces the environment-derived config. */
+  /** Test seam: wins over `runtime.sessionTitle` (focused fixtures). */
   sessionTitleConfig?: SessionTitleConfig;
 }
 
@@ -193,7 +224,15 @@ export async function generateAndPersistSessionTitle(
   deps: SessionTitlerDeps,
   params: SessionTitleParams,
 ): Promise<string | null> {
-  const config = deps.sessionTitleConfig ?? loadSessionTitleConfig();
+  // The stack's OWN environment decides, never the ambient one: an injected
+  // env record's kill switch is the only thing standing between an offline
+  // harness that also injects a runtime key and a real, billed provider call.
+  // The `process.env` read is a last resort for focused fixtures that wire
+  // neither (see the wiring note on TitleRuntimeConfig).
+  const config =
+    deps.sessionTitleConfig ??
+    deps.runtime?.sessionTitle ??
+    loadSessionTitleConfig();
   if (!config.enabled) return null;
   if (!params.message.trim()) return null;
 
@@ -263,10 +302,12 @@ export async function generateAndPersistSessionTitle(
 }
 
 /**
- * The workspace's `quick` preset as a model reference. Null when the workspace
- * has no such row — titling is skipped rather than falling back to another
- * preset, because "quick" is the only one D9 authorizes to spend the platform
- * key on background work.
+ * The workspace's `quick` preset as a model reference — provider, model id AND
+ * effort, because the preset's identity is all three (a `quick` row that lost
+ * its `low` is just `balanced`). Null when the workspace has no such row —
+ * titling is skipped rather than falling back to another preset, because
+ * "quick" is the only one D9 authorizes to spend the platform key on
+ * background work.
  */
 export async function resolveQuickPresetModel(
   db: Db,
@@ -276,6 +317,7 @@ export async function resolveQuickPresetModel(
     .select({
       provider: schema.modelPresets.provider,
       modelId: schema.modelPresets.modelId,
+      reasoning: schema.modelPresets.reasoning,
     })
     .from(schema.modelPresets)
     .where(
@@ -286,16 +328,52 @@ export async function resolveQuickPresetModel(
     )
     .limit(1);
   const row = rows[0];
-  return row ? { provider: row.provider, modelId: row.modelId } : null;
+  return row
+    ? {
+        provider: row.provider,
+        modelId: row.modelId,
+        reasoning: row.reasoning,
+      }
+    : null;
 }
 
 // ── the model round-trip ─────────────────────────────────────────────────────
+
+/**
+ * The AI SDK's own effort union (`LanguageModelV4CallOptions["reasoning"]` in
+ * @ai-sdk/provider@4) tops out at `xhigh`, so the platform's `max` clamps
+ * there — the same clamp the compiler's anthropic branch makes, for the same
+ * reason: both mean "spend the most". `provider-default` returns undefined so
+ * the field is omitted entirely (distinct from an explicit `"none"`).
+ */
+export function titleReasoningEffort(
+  effort: ReasoningEffort,
+): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+  if (effort === "provider-default") return undefined;
+  return effort === "max" ? "xhigh" : effort;
+}
 
 /**
  * One non-streaming completion against the resolved model. Returns null when
  * the provider's platform key is absent — a keyless deployment must not throw
  * here, it simply has no titles (same stance the copilot takes by not mounting
  * its socket at all).
+ *
+ * REASONING EFFORT rides ai@7's top-level `reasoning` call setting, which is
+ * the only route a direct SDK call has. Honored per provider, verified against
+ * the pins in apps/control-plane/package.json — do not assume symmetry:
+ * - `@ai-sdk/anthropic@4.0.7` is spec-v4 and its `getArgs()` DOES destructure
+ *   `reasoning`, mapping it onto a thinking budget/effort. It lands.
+ * - `@openrouter/ai-sdk-provider@6.0.0-alpha.1` does NOT. Its chat model
+ *   builds a whitelisted Responses-API body (model/input/stream/
+ *   maxOutputTokens/temperature/topP/tools/toolChoice/text), so this option is
+ *   dropped — and so would `extraBody` be (the provider stores that setting
+ *   and never reads it on this line). copilot/transport.ts documents the same
+ *   ceiling. We still ASK: it costs nothing, it is the SDK-blessed route, and
+ *   it starts landing the day the pin moves. Note AGENTS.md's "effort must
+ *   ride extraBody" rule is about the COMPILED AGENT's 3.0.0 pin
+ *   (packages/compiler/versions.json), where extraBody genuinely is spread
+ *   over the body — that mechanism does not exist here.
  */
 const generateTitleWithModel: TitleGenerator = async ({
   model,
@@ -318,11 +396,13 @@ const generateTitleWithModel: TitleGenerator = async ({
   })();
   if (!languageModel) return null;
 
+  const reasoning = titleReasoningEffort(model.reasoning);
   const result = await generateText({
     model: languageModel,
     system: TITLE_SYSTEM_PROMPT,
     prompt: `First message in the thread:\n\n${message.slice(0, TITLE_INPUT_MAX_CHARS)}`,
     maxOutputTokens: TITLE_MAX_OUTPUT_TOKENS,
+    ...(reasoning ? { reasoning } : {}),
     abortSignal: signal,
   });
   return result.text;

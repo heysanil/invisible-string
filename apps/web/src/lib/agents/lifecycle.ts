@@ -8,11 +8,22 @@
  * client-side comparison.
  *
  *   Unsaved changes   draft ≠ last save          (the existing isDirty)
- *   Unpublished changes   last save ≠ publishedDefinition
+ *   Unpublished changes   last save ≠ publishedDefinition, OR the agent has
+ *                         been RENAMED since it was published
  *   Published         saved and matching the published version
  *
  * An agent that has NEVER been published reads as **Draft**, not "unpublished
  * changes" — there is nothing to be behind.
+ *
+ * THE NAME COUNTS. `agents.name` is not part of the definition, so a rename
+ * moves neither baseline — yet D1 kept `agentSlug` in the content hash on
+ * purpose, because the display name still shapes emitted BYTES (the generated
+ * package name and the model-visible identity line, `packages/compiler`'s
+ * hash.ts). A renamed published agent is therefore genuinely behind: the live
+ * artifact still introduces itself by the old name until it is republished,
+ * and reading "Published" over that is the same lie D3 exists to end. The
+ * comparison is by SLUG, since the slug is what the hash actually carries —
+ * casing and punctuation that slugify identically are not drift.
  *
  * Why not `agentEditorStatesEqual` (JSON.stringify) against the published
  * baseline: it is key-ORDER sensitive, and the two sides are built by
@@ -26,7 +37,10 @@
 import {
   parseAgentDefinition,
   type AgentDefinition,
+  type AgentDto,
 } from "@invisible-string/shared";
+
+import { slugifyName } from "../builder/references";
 
 export const AGENT_LIFECYCLE_STATES = [
   "draft",
@@ -53,6 +67,15 @@ export interface AgentLifecycleInput {
    * agent has never been published.
    */
   publishedDefinition: unknown;
+  /** The agent row's CURRENT display name (`agent.name`). */
+  currentName?: string;
+  /**
+   * The display name the current published version was compiled under, from
+   * {@link publishedAgentName}. `undefined`/`null` means UNKNOWN, and an
+   * unknown baseline never claims drift — the same discipline the
+   * unparseable-definition case follows.
+   */
+  publishedName?: string | null;
 }
 
 /**
@@ -64,6 +87,9 @@ export function agentLifecycleState(
 ): AgentLifecycleState {
   if (input.hasUnsavedChanges) return "unsaved";
   if (input.publishedDefinition == null) return "draft";
+  if (renamedSincePublish(input.currentName, input.publishedName)) {
+    return "unpublished";
+  }
   const published = parseAgentDefinition(input.publishedDefinition);
   // A published definition this client cannot parse (written by a newer
   // server) proves nothing about drift — never cry "unpublished" on it.
@@ -71,6 +97,42 @@ export function agentLifecycleState(
   return definitionsEquivalent(input.savedDefinition, published)
     ? "published"
     : "unpublished";
+}
+
+/**
+ * Has the agent been renamed in a way that re-keys its artifact? Compare the
+ * compiler's slug, not the raw string — `slugifyName` here mirrors
+ * `apps/control-plane/src/build/compiler-adapter.ts`, and the empty-slug
+ * fallback mirrors `compile-service.ts`'s `slugifyName(agent.name) || "agent"`.
+ *
+ * Either side unknown ⇒ false. A baseline the server has not told us is not
+ * evidence of drift, and a false "Unpublished changes" that never clears is
+ * worse than the gap this closes.
+ */
+export function renamedSincePublish(
+  currentName: string | undefined,
+  publishedName: string | null | undefined,
+): boolean {
+  if (currentName === undefined || publishedName == null) return false;
+  return agentSlugOf(currentName) !== agentSlugOf(publishedName);
+}
+
+/** The slug the compiler bakes for a display name (empty ⇒ "agent"). */
+export function agentSlugOf(name: string): string {
+  return slugifyName(name) || "agent";
+}
+
+/**
+ * The display name the agent's CURRENT published version was compiled under.
+ *
+ * The server does not serve it yet — `agent_versions` has no name column and
+ * `AgentDto` has no `publishedName` — so this reads the field defensively and
+ * yields `undefined` until it lands, which {@link renamedSincePublish} treats
+ * as "no evidence", never as "no drift proven". Everything downstream is
+ * already wired; adding the field to the DTO is the only remaining step.
+ */
+export function publishedAgentName(agent: AgentDto): string | null | undefined {
+  return (agent as AgentDto & { publishedName?: string | null }).publishedName;
 }
 
 /**

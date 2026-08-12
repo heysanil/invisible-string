@@ -12,11 +12,17 @@
  * {@link AgentDefinition}, so:
  * - the card's "before" side comes from {@link AgentCopilotAdapterOptions.getIdentity},
  *   not from `getDraft()`;
+ * - the SERVER gets it the same way: `getIdentity` is republished on the
+ *   adapter so `useCopilot` can put it in the `user_message` frame's own
+ *   `identity` field. Without that the model was blind to the agent's name —
+ *   the draft it receives is an `AgentDefinition` and simply has no such key;
  * - `setDescription` still rides the editor reducer (it owns the column);
  * - `setName` does NOT — the reducer deliberately excludes the name ("the
  *   header commits it directly", lib/agents/model.ts), so it rides its own
  *   {@link AgentCopilotAdapterOptions.setName} seam, which the owning screen
- *   points at the same commit path its header uses.
+ *   points at the same commit path its header uses. That seam is a NETWORK
+ *   write, which is why it — alone among the agent tools — reports back
+ *   whether it landed: see {@link ApplyProposalResult}.
  */
 import { AlignLeft, Cpu, FileText, Plug, Tag } from "lucide-react";
 import {
@@ -31,7 +37,11 @@ import {
 import type { AgentEditorAction, AgentSection } from "../agents/model";
 import type { ContextResources } from "../builder/resources";
 import { shortModelId } from "../builder/summary";
-import type { CopilotSurfaceAdapter, ProposalDescription } from "./adapter";
+import type {
+  ApplyProposalResult,
+  CopilotSurfaceAdapter,
+  ProposalDescription,
+} from "./adapter";
 import { unsupportedProposalDescription } from "./mutations";
 
 /** Proposals belonging to the agent surface (any other tool = server bug). */
@@ -278,11 +288,17 @@ export interface AgentCopilotAdapterOptions {
    * header owns it and PATCHes it directly, and this must take that exact
    * path so the two writers cannot disagree.
    *
+   * It therefore RESOLVES FALSE when the PATCH fails, and the adapter passes
+   * that straight through to the card: the rename is the one agent mutation
+   * that can be rejected by the network after the user accepted it, and a
+   * "Applied" receipt over a name that never changed is exactly the lie the
+   * card exists to prevent.
+   *
    * Optional only so the seam can be added without breaking construction:
    * when it is absent the copilot's rename cards render but cannot apply, so
    * a screen that exposes the agent surface MUST wire it.
    */
-  setName?: (name: string) => void;
+  setName?: (name: string) => boolean | Promise<boolean>;
   /** Merged workspace+user resources (resolves context ids to names). */
   resources: ContextResources;
   /** Fired after an accepted proposal is applied (rail section flash). */
@@ -297,9 +313,20 @@ export function agentCopilotAdapter(
   return {
     entityRef: { surface: "agent", entityId: agentId },
     getDraft,
-    applyProposal: (proposal) => {
+    // Sent with every user message (see the module header) — the copilot is
+    // otherwise blind to what the agent it is editing is called.
+    ...(getIdentity ? { getIdentity } : {}),
+    applyProposal: (proposal): ApplyProposalResult => {
       if (!isAgentProposal(proposal)) return;
-      if (proposal.tool === "setName") setName?.(proposal.params.name);
+      if (proposal.tool === "setName") {
+        // The rename is a PATCH: hand its verdict back so the card can wait,
+        // and report a failure instead of a receipt. A missing seam is a
+        // wiring bug on the owning screen — never a silent success. (It maps
+        // to no reducer action and no rail section, so there is nothing else
+        // to do here — see agentProposalToActions / agentSectionOfProposal.)
+        if (!setName) return false;
+        return Promise.resolve(setName(proposal.params.name));
+      }
       for (const action of agentProposalToActions(proposal)) dispatch(action);
       // Identity proposals have no rail section (see agentSectionOfProposal).
       const section = agentSectionOfProposal(proposal);

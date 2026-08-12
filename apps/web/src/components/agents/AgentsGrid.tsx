@@ -14,7 +14,6 @@ import type { AgentSummaryDto } from "@invisible-string/shared";
 
 import { errorMessage } from "../../lib/forms";
 import { nextUntitledAgentName } from "../../lib/agents/naming";
-import { useAgentPublishSink } from "../../lib/agents/use-publish-store";
 import { useAgents, useCreateAgent } from "../../lib/queries/agents";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
@@ -30,7 +29,8 @@ export function AgentsGrid({ workspaceId }: { workspaceId: string }) {
   const { toast } = useToast();
   const agents = useAgents(workspaceId);
   const createAgent = useCreateAgent(workspaceId);
-  useAgentPublishSink(workspaceId);
+  // The publish store's sink + workspace pin live on AppShell (a watch must
+  // outlive every agent screen and die only with the workspace).
 
   async function createNew() {
     try {

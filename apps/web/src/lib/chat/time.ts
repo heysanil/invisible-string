@@ -68,19 +68,32 @@ export function titleFromMessage(message: string, max = 64): string {
  *     the titler declined to name.
  *  3. The agent's name, which is at least true.
  *
- * (2) is only reachable when the caller HAS the first message: the session
- * LIST DTO carries none, so it comes from a detail this tab already holds or
- * from a chat this tab just started (see `ChatShell`). `titleFromMessage`
- * answers "New conversation" for an empty string — a worse row label than the
- * agent's name — hence the emptiness guard rather than a bare `??` chain.
+ * (2) is reachable on a COLD LOAD — nothing opened, any device — because the
+ * session LIST DTO carries `firstMessagePreview`: the thread's opener,
+ * truncated server-side. A caller that holds the WHOLE message (a thread
+ * detail, a fixture's canned runs) may pass it as `firstMessage` and it wins,
+ * since the preview is only the first `SESSION_MESSAGE_PREVIEW_MAX_CHARS` of
+ * the same text. Both are absent only for a thread that never had an inbound
+ * message (a schedule firing), and then (3) is the last honest answer:
+ * `titleFromMessage("")` says "New conversation", a worse row label than the
+ * agent's name — hence the emptiness guards rather than a bare `??` chain.
  */
 export function sessionRowTitle(
-  session: { title: string | null; agentName: string },
+  session: {
+    title: string | null;
+    agentName: string;
+    /** The list DTO's server-truncated opener — what makes (2) cold-loadable. */
+    firstMessagePreview?: string | null;
+  },
   firstMessage?: string | null,
 ): string {
   const generated = session.title?.trim() ?? "";
   if (generated.length > 0) return generated;
-  const message = firstMessage?.trim() ?? "";
-  if (message.length > 0) return titleFromMessage(message);
+  // Ordered, not `??`-chained: an empty explicit message must fall THROUGH to
+  // the preview rather than shadowing it.
+  for (const candidate of [firstMessage, session.firstMessagePreview]) {
+    const message = candidate?.trim() ?? "";
+    if (message.length > 0) return titleFromMessage(message);
+  }
   return session.agentName;
 }

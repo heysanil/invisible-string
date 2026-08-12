@@ -23,6 +23,7 @@ import {
   type AgentPublishSink,
   type AgentPublishWatch,
 } from "../lib/agents/publish-store";
+import { useAgentPublishWorkspace } from "../lib/agents/use-publish-store";
 import type { PublishAnnouncement } from "../lib/agents/publish-machine";
 import { initAgentEditorState } from "../lib/agents/model";
 import { useAgentController } from "../lib/agents/useAgentController";
@@ -347,5 +348,84 @@ test("the build watch OUTLIVES the editor unmount (D2's navigate-away case)", as
     ]);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+// ── who owns the workspace pin ──────────────────────────────────────────────
+
+function WorkspacePin({
+  workspaceId,
+  store,
+}: {
+  workspaceId: string | null;
+  store: AgentPublishStore;
+}) {
+  useAgentPublishWorkspace(workspaceId, store);
+  return null;
+}
+
+test("an UNRESOLVED workspace is not a workspace change", () => {
+  // The pin now lives on the shell, which renders before the active
+  // organization resolves. Treating that null as "you left" would cancel a
+  // watch nobody left — the opposite failure of the one it exists to fix.
+  const store = scriptedStore([]);
+  store.begin({ workspaceId: WS, agentId: AGENT_ID, agentName: "Release bot" });
+  store.received(AGENT_ID, published({ buildStatus: "succeeded", cached: true }));
+
+  const view = render(<WorkspacePin workspaceId={null} store={store} />);
+  expect(store.watchOf(AGENT_ID)).toBeDefined();
+  view.unmount();
+  // Unmounting the pin (navigating away) must not cancel it either.
+  expect(store.watchOf(AGENT_ID)).toBeDefined();
+});
+
+test("activating another workspace from ANYWHERE drops the watch (finding #9)", async () => {
+  // The regression: publish in A, walk to /chat, accept an invitation that
+  // activates B. The pin used to be mounted only by the agent screens, so
+  // nothing told the store the workspace had changed and A's poll kept
+  // running, invalidating A's queries and announcing A's build over B.
+  const calls: string[] = [];
+  const store = scriptedStore([{ status: "building", error: null }], calls);
+  const sink = recorder();
+  store.setSink(sink.sink);
+
+  function Shell({ workspaceId }: { workspaceId: string | null }) {
+    // Stands in for AppShell: mounted on every authenticated screen, agent
+    // route or not.
+    return <WorkspacePin workspaceId={workspaceId} store={store} />;
+  }
+
+  const view = render(<Shell workspaceId={WS} />);
+  store.begin({ workspaceId: WS, agentId: AGENT_ID, agentName: "Release bot" });
+  store.received(AGENT_ID, published());
+  await waitFor(() => expect(calls.length).toBeGreaterThan(0));
+
+  view.rerender(<Shell workspaceId={OTHER_WS} />);
+  expect(store.watchOf(AGENT_ID)).toBeUndefined();
+
+  const seen = calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(calls.length).toBe(seen);
+  expect(sink.announcements).toHaveLength(0);
+});
+
+test("the workspace pin is mounted by the SHELL, not by the agent surfaces", async () => {
+  // The defect was purely one of LOCATION, so no test that renders an agent
+  // screen could have caught it — the hook was there and worked. What has to
+  // be asserted is that it is mounted somewhere every authenticated screen
+  // passes through, and nowhere else (two owners would fight over the pin).
+  const read = async (path: string) =>
+    Bun.file(new URL(path, import.meta.url).pathname).text();
+
+  expect(await read("../components/AppShell.tsx")).toContain(
+    "useAgentPublishBinding()",
+  );
+  for (const surface of [
+    "../components/agents/AgentEditorScreen.tsx",
+    "../components/agents/AgentsGrid.tsx",
+  ]) {
+    const source = await read(surface);
+    expect(source.includes("useAgentPublishBinding(")).toBe(false);
+    expect(source.includes("useAgentPublishSink(")).toBe(false);
   }
 });

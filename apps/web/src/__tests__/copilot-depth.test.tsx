@@ -8,7 +8,13 @@
  *   `user_message` frame, is unmistakable while on, and auto-applied proposals
  *   apply through the surface controller while still leaving a card behind;
  * - D7.3/D7.4 `setName` / `setDescription` cards, where the name takes the
- *   header's commit seam and the description takes the editor reducer.
+ *   header's commit seam and the description takes the editor reducer, and
+ *   the agent's row IDENTITY rides the `user_message` frame so the copilot is
+ *   not blind to what the agent it is editing is called.
+ *
+ * The rename seam is a PATCH, so it also carries the async/failure contract:
+ * a card may not print a receipt before the write lands, and may never print
+ * "Applied" when it did not.
  *
  * The dock's own baseline behavior (thread, focus choreography, persistence,
  * reconnect) lives in copilot-dock.test.tsx on the workflow surface.
@@ -112,15 +118,28 @@ function proposal(overrides: Partial<CopilotProposal> = {}): CopilotProposal {
   } as CopilotProposal;
 }
 
-function renderDock() {
+interface DockOptions {
+  identity?: { name: string; description: string | null };
+  /** Resolves the rename PATCH — a deferred one parks the card in "Applying…". */
+  renameOutcome?: (name: string) => boolean | Promise<boolean>;
+}
+
+function renderDock(options: DockOptions = {}) {
   const dispatched: AgentEditorAction[] = [];
   const names: string[] = [];
+  const identity = options.identity ?? {
+    name: "Untitled agent",
+    description: null,
+  };
   const adapter = agentCopilotAdapter({
     agentId: AGENT_ID,
     getDraft: () => definition,
-    getIdentity: () => ({ name: "Untitled agent", description: null }),
+    getIdentity: () => identity,
     dispatch: (action) => dispatched.push(action),
-    setName: (name) => names.push(name),
+    setName: (name) => {
+      names.push(name);
+      return options.renameOutcome ? options.renameOutcome(name) : true;
+    },
     resources,
     onApplied: mock(() => {}),
   });
@@ -150,6 +169,14 @@ function openSocket(): FakeWebSocket {
 function push(ws: FakeWebSocket, ...frames: CopilotServerFrame[]) {
   act(() => {
     for (const frame of frames) ws.message(frame);
+  });
+}
+
+/** Flush the microtask queue inside act() — used after an async apply. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
   });
 }
 
@@ -184,7 +211,7 @@ test("thinking and self-corrected tool calls render in a rail-in-box; carded ste
   const ws = openSocket();
   push(
     ws,
-    { type: "thought", key: "step:0", text: "The persona is thin.", streaming: true },
+    { type: "thought", key: "turn:0:step:0", text: "The persona is thin.", streaming: true },
     { type: "step", key: "call-9", toolName: "addContext", state: "error", resultPreview: "unknown connection id" },
     { type: "step", key: "call-1", toolName: "setPersona", state: "pending", resultPreview: null },
     { type: "proposal", proposal: proposal() },
@@ -205,7 +232,7 @@ test("thinking and self-corrected tool calls render in a rail-in-box; carded ste
 test("a live box is expanded and folds once the turn settles", () => {
   renderDock();
   const ws = openSocket();
-  push(ws, { type: "thought", key: "step:0", text: "Thinking hard.", streaming: true });
+  push(ws, { type: "thought", key: "turn:0:step:0", text: "Thinking hard.", streaming: true });
   const toggle = () =>
     within(q().getAllByTestId("copilot-work")[0]!).getByRole("button");
   expect(toggle().getAttribute("aria-expanded")).toBe("true");
@@ -274,7 +301,7 @@ test("an auto-applied proposal applies through the controller and still leaves a
 
 // ── D7.3 / D7.4 — name + description ────────────────────────────────────────
 
-test("setName previews the rename and commits through the header's seam, not the reducer", () => {
+test("setName previews the rename and commits through the header's seam, not the reducer", async () => {
   const { dispatched, names } = renderDock();
   const ws = openSocket();
   push(ws, {
@@ -298,6 +325,10 @@ test("setName previews the rename and commits through the header's seam, not the
   // must take the same commit path the header uses.
   expect(names).toEqual(["Inbox triage"]);
   expect(dispatched).toEqual([]);
+
+  // …and only once the PATCH has actually resolved does the receipt appear.
+  await settle();
+  expect(q().getByTestId("suggestion-receipt").textContent).toContain("Applied");
 });
 
 test("setDescription previews against the empty state and dispatches to the reducer", () => {
@@ -326,4 +357,133 @@ test("setDescription previews against the empty state and dispatches to the redu
       description: "Triages the shared inbox every morning.",
     },
   ]);
+});
+
+// ── D7.3 — identity reaches the SERVER, not just the card ───────────────────
+
+test("user_message carries the agent's row identity alongside the draft", async () => {
+  // The regression: `AgentDefinition` has no name/description at all, so a
+  // server reading them off `draft` saw nothing, forever. The card's before
+  // side looked right the whole time because it reads the same identity
+  // locally — which is exactly why this shipped green.
+  renderDock({ identity: { name: "Inbox triage", description: "Triages." } });
+  const ws = openSocket();
+  const box = await waitForComposer();
+  pasteInto(box, "What is this agent called?");
+  pressEnter(box);
+
+  const frame = ws.frames().at(-1)!;
+  expect(frame.type).toBe("user_message");
+  expect(frame.identity).toEqual({
+    name: "Inbox triage",
+    description: "Triages.",
+  });
+  // …and it is NOT smuggled into the loose draft record.
+  expect(frame.draft).toEqual(definition as unknown as Record<string, unknown>);
+}, 30_000);
+
+test("an over-long description is truncated, never allowed to sink the frame", async () => {
+  // The row's description may be up to the DTO's 2000 chars; the copilot's
+  // wire bound is the same, and a mid-edit draft can exceed it. Rejecting the
+  // whole frame would cost the user the turn for a field they did not ask to
+  // send.
+  renderDock({
+    identity: { name: "n".repeat(400), description: "d".repeat(4_000) },
+  });
+  const ws = openSocket();
+  const box = await waitForComposer();
+  pasteInto(box, "Tighten this");
+  pressEnter(box);
+
+  const identity = ws.frames().at(-1)!.identity as {
+    name: string;
+    description: string;
+  };
+  expect(identity.name.length).toBe(120);
+  expect(identity.description.length).toBe(2_000);
+}, 30_000);
+
+// ── D7.3 — a rename that does not land must not print a receipt ─────────────
+
+function pushRename(ws: FakeWebSocket) {
+  push(ws, {
+    type: "proposal",
+    proposal: proposal({
+      id: "call-name",
+      tool: "setName",
+      params: { name: "Inbox triage" },
+      rationale: "It triages the shared inbox.",
+    } as Partial<CopilotProposal>),
+  });
+}
+
+test("a FAILED rename settles as 'Couldn’t apply' and reports rejected, not accepted", async () => {
+  const { names } = renderDock({ renameOutcome: () => Promise.resolve(false) });
+  const ws = openSocket();
+  pushRename(ws);
+
+  fireEvent.click(
+    within(q().getByTestId("suggestion-card")).getByRole("button", {
+      name: "Apply",
+    }),
+  );
+  expect(names).toEqual(["Inbox triage"]);
+  await settle();
+
+  const receipt = q().getByTestId("suggestion-receipt");
+  expect(receipt.textContent).toContain("Couldn’t apply");
+  expect(receipt.textContent).not.toContain("Applied");
+  // The server's tool loop is parked on this frame: it must be answered, and
+  // answered truthfully — "accepted" would leave the model editing an agent
+  // whose name never changed.
+  const result = ws
+    .frames()
+    .find((frame) => frame.type === "mutation_result") as
+    | { outcome: string; reason?: string }
+    | undefined;
+  expect(result?.outcome).toBe("rejected");
+  expect(result?.reason).toContain("could not apply");
+});
+
+test("a slow rename parks the card in Applying… — no receipt, no second accept", async () => {
+  let resolve: ((ok: boolean) => void) | null = null;
+  const { names } = renderDock({
+    renameOutcome: () =>
+      new Promise<boolean>((r) => {
+        resolve = r;
+      }),
+  });
+  const ws = openSocket();
+  pushRename(ws);
+
+  // queryBy, not getBy: without the fix the card is already a receipt here,
+  // and this assertion must report "no card" rather than dump the DOM.
+  const applyButton = (): HTMLElement | null => {
+    const card = q().queryByTestId("suggestion-card");
+    return card
+      ? within(card).queryByRole("button", { name: /Apply/ })
+      : null;
+  };
+  fireEvent.click(applyButton()!);
+  await settle();
+
+  // Still a card, not a receipt — and the server has not been told anything.
+  // Compared as a BOOLEAN: a failing `toBeNull()` on a DOM node serializes the
+  // whole React fiber and turns a 1s failure into a 40s one.
+  expect(q().queryByTestId("suggestion-receipt") === null).toBe(true);
+  expect(applyButton()?.textContent).toContain("Applying…");
+  expect(applyButton()?.hasAttribute("disabled")).toBe(true);
+  expect(ws.frames().some((frame) => frame.type === "mutation_result")).toBe(
+    false,
+  );
+  // A second click cannot double-PATCH.
+  fireEvent.click(applyButton()!);
+  expect(names).toEqual(["Inbox triage"]);
+
+  await act(async () => {
+    resolve!(true);
+    await Promise.resolve();
+  });
+  await settle();
+  expect(q().getByTestId("suggestion-receipt").textContent).toContain("Applied");
 });

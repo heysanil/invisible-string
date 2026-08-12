@@ -31,6 +31,7 @@ import {
 } from "./diagnostics";
 import {
   agentLifecycleState,
+  publishedAgentName,
   type AgentLifecycleState,
 } from "./lifecycle";
 import {
@@ -122,11 +123,16 @@ export function useAgentController(
 
   // The three save states (D3): dirtiness against the last SAVE, plus the
   // saved draft against `publishedDefinition` — the baseline nothing compared
-  // against before. Recomputed each render; both inputs are cheap.
+  // against before. The NAME is a third input: it is not in the definition but
+  // it is in the content hash (D1 kept `agentSlug` there), so a rename leaves
+  // a published agent genuinely behind. Recomputed each render; all inputs are
+  // cheap.
   const lifecycle = agentLifecycleState({
     hasUnsavedChanges: isDirty,
     savedDefinition: savedRef.current.definition,
     publishedDefinition: agent.publishedDefinition,
+    currentName: agent.name,
+    publishedName: publishedAgentName(agent),
   });
 
   // ── save + dry-run ─────────────────────────────────────────────────────────

@@ -543,6 +543,44 @@ test("input tokens come off step.completed usage, last write winning", () => {
   expect(view.inputTokens).toBe(120_000);
 });
 
+test("a memory boundary discards the measurement taken before it", () => {
+  // The header's meter is `inputTokens / contextWindow`. A clear empties the
+  // context the 900k counted, so keeping that figure would leave the meter
+  // pinned at the old percentage over a context that no longer exists — the
+  // exact "no post-boundary measurement" case D6 says renders NOTHING, never a
+  // stale number and never a zero.
+  const events: EveStreamEvent[] = [
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId: "t", usage: { inputTokens: 900_000, outputTokens: 40 } } },
+    { type: "context.cleared", data: { sequence: 1, sessionId: "s1", turnId: "t" } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.contextCleared).toBe(true);
+  expect(view.inputTokens).toBeNull();
+});
+
+test("a completed compaction discards it too, until a step measures the summary", () => {
+  // Same rule for the other boundary — and the re-measure path: a step that
+  // completes AFTER the compaction is describing the new, summarized context,
+  // so it is a legitimate numerator again.
+  const events: EveStreamEvent[] = [
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId: "t", usage: { inputTokens: 903_000, outputTokens: 380 } } },
+    { type: "compaction.completed", data: { modelId: "m", sequence: 1, sessionId: "s1", turnId: "t" } },
+  ];
+  expect(
+    reduceRunView(runRow("succeeded"), storeOf(events), "succeeded").inputTokens,
+  ).toBeNull();
+
+  const remeasured: EveStreamEvent[] = [
+    ...events,
+    { type: "step.completed", data: { finishReason: "stop", sequence: 2, stepIndex: 1, turnId: "t2", usage: { inputTokens: 12_000, outputTokens: 90 } } },
+  ];
+  expect(
+    reduceRunView(runRow("succeeded"), storeOf(remeasured), "succeeded")
+      .inputTokens,
+  ).toBe(12_000);
+});
+
 test("a run whose steps report no usage has NO input-token figure", () => {
   // The header must then render no meter at all — never zero, never a guess.
   const events: EveStreamEvent[] = [
@@ -910,8 +948,14 @@ test("the compacted fixture session reduces to a compaction marker", async () =>
   });
   expect(view.contextCompacted).toBe(true);
   expect(view.contextCleared).toBe(false);
-  // And it carries a numerator for the header's meter.
-  expect(view.inputTokens).toBe(903_000);
+  // And it carries NO numerator: the fixture's one `step.completed` (903k)
+  // lands BEFORE `compaction.completed` — `compaction.requested` echoes the
+  // same 903k as the size it compacted — so nothing in this session has
+  // measured the summarized context yet, and the preview must show no meter
+  // rather than the pre-compaction figure. (The fixture's own comment claims
+  // that usage is post-compaction; the frame order says otherwise. Restoring
+  // the falling-meter preview means adding a run AFTER the boundary.)
+  expect(view.inputTokens).toBeNull();
 });
 
 test("the fixture tool directory resolves the fixture runs' qualified calls", async () => {

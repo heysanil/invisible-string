@@ -38,6 +38,7 @@ import {
   parseReferences,
   triggerConfigSchema,
   workflowCopilotMutationParamSchemas,
+  type CopilotAgentIdentity,
   type CopilotMutationParams,
   type CopilotMutationTool,
   type CopilotSurface,
@@ -74,10 +75,13 @@ export interface AgentDraftState {
   connectionIds: Set<string>;
   skillIds: Set<string>;
   /**
-   * The agent's IDENTITY as the editor last sent it (spec D7.3/D7.4). Null
-   * when the editor sends no identity with the draft — the no-op checks below
-   * then simply do not fire, which is the right failure direction: a missing
-   * baseline must never turn a legitimate rename into an error.
+   * The agent's IDENTITY for this turn (spec D7.3/D7.4) — the frame's own
+   * `identity` field (the editor's live values), else the persisted `agents`
+   * row the plugin resolved. NOT read off the draft: the draft is an
+   * `AgentDefinition` and carries neither column. Null when nothing resolved —
+   * the no-op checks below then simply do not fire, which is the right failure
+   * direction: a missing baseline must never turn a legitimate rename into an
+   * error.
    */
   name: string | null;
   description: string | null;
@@ -93,10 +97,17 @@ export interface AgentDraftState {
 
 export type CopilotDraftState = WorkflowDraftState | AgentDraftState;
 
-/** Parse the loose client draft into the state the semantic checks need. */
+/**
+ * Parse the loose client draft into the state the semantic checks need.
+ *
+ * `identity` is the agent surface's row identity (name + description) and
+ * arrives BESIDE the draft, per the frame contract — the workflow surface
+ * passes nothing.
+ */
 export function draftStateFor(
   surface: CopilotSurface,
   draft: Record<string, unknown>,
+  identity: CopilotAgentIdentity | null = null,
 ): CopilotDraftState {
   if (surface === "workflow") {
     const trigger = triggerConfigSchema.safeParse(draft.trigger);
@@ -121,9 +132,9 @@ export function draftStateFor(
     preset: typeof model.preset === "string" ? model.preset : null,
     modelId: typeof model.modelId === "string" ? model.modelId : null,
     // Identity rides ALONGSIDE the definition draft (it lives on the `agents`
-    // row), so it is read off the top level, not out of `context`/`model`.
-    name: typeof draft.name === "string" ? draft.name : null,
-    description: typeof draft.description === "string" ? draft.description : null,
+    // row), so it comes from the caller, not from `draft`.
+    name: identity?.name ?? null,
+    description: identity?.description ?? null,
   };
 }
 

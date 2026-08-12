@@ -167,11 +167,14 @@ function RunMessageImpl({
           </div>
         ) : null}
 
-        {/* Clear/compact landed while this run's tail was attached. Both are
-            DERIVED from persisted frames, so they survive a reload — and a
-            compaction that produced nothing (empty context, or a failed
-            summarization) emits no `compaction.completed`, hence draws no
-            divider rather than claiming a boundary that does not exist. */}
+        {/* A clear/compact whose frames landed on THIS run — either its tail
+            was attached when they arrived, or (the ordinary case: both control
+            routes refuse a busy session) the control plane drained them and
+            appended them to the session's latest run. Both markers are DERIVED
+            from persisted frames, so they survive a reload — and a compaction
+            that produced nothing (empty context, or a failed summarization)
+            emits no `compaction.completed`, hence draws no divider rather than
+            claiming a boundary that does not exist. */}
         {run.contextCleared ? <ContextDivider kind="cleared" /> : null}
         {run.contextCompacted ? <ContextDivider kind="compacted" /> : null}
 

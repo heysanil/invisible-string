@@ -9,8 +9,10 @@
  * + probe-cached descriptions, and all three of its degradations), the skill
  * attachment upload→agent-publish path (bytes threaded into the compiler),
  * model preset guards, agents CRUD (+ inline dry-run diagnostics, run-as
- * membership, delete guard), member passthrough, and the HITL run-input round
- * trip against a fake eve worker that parks on approval.
+ * membership, delete guard), member passthrough, the HITL run-input round
+ * trip against a fake eve worker that parks on approval, the session list's
+ * first-message preview (D9's fallback on a cold load), and the idle
+ * clear/compact drain that makes D4's context divider durable.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -22,6 +24,7 @@ import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
+  SESSION_MESSAGE_PREVIEW_MAX_CHARS,
   type AgentDefinitionInput,
   type CreateSessionResponse,
   type GetAgentResponse,
@@ -39,6 +42,7 @@ import {
   type PublishAgentResponse,
   type RegistryServerSummary,
   type RunInputResponse,
+  type SessionContextControlResponse,
   type UpdateAgentResponse,
 } from "@invisible-string/shared";
 
@@ -318,6 +322,32 @@ class FakeWorker {
         this.startTurn(s, parsed.message);
       }
       return eveAccepted(s.id);
+    }
+    // Context controls. Both emit their frames the way eve does — into the
+    // session's durable stream, AFTER answering 202 — which is precisely why
+    // an idle clear/compact has no consumer unless the control route drains
+    // it. `clear` emits `context.cleared`; `compact` over this fake's context
+    // emits NO `compaction.*` at all (eve's real behaviour for an empty or
+    // already-cleared context, spec D4). BOTH settle with `session.waiting`,
+    // which is the only acknowledgement the compact case ever produces.
+    const ctl = sub.match(/^session\/([^/]+)\/(clear|compact)$/);
+    if (ctl && req.method === "POST") {
+      const s = this.sessions.get(ctl[1]!);
+      if (!s) {
+        return Response.json({ ok: true, status: "no_active_session" }, { status: 200 });
+      }
+      if (ctl[2] === "clear") {
+        s.events.push(
+          JSON.stringify({
+            type: "context.cleared",
+            data: { sequence: 0, sessionId: s.id, turnId: "turn_0" },
+          }),
+        );
+      }
+      s.events.push(
+        JSON.stringify({ type: "session.waiting", data: { wait: "next-user-message" } }),
+      );
+      return Response.json({ ok: true, sessionId: s.id, status: "accepted" }, { status: 202 });
     }
     const str = sub.match(/^session\/([^/]+)\/stream$/);
     if (str && req.method === "GET") {
@@ -1462,5 +1492,131 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(listed?.agentName).toBe("General Purpose");
     expect(listed?.workflowName).toBeNull();
     expect(listed?.lastRunStatus).toBe("succeeded");
+  });
+
+  /** Publish the seeded agent and wait for its build (idempotent by hash). */
+  async function readySeededAgent(): Promise<void> {
+    await freshWorker();
+    const pub = (await (
+      await api("POST", `/workspaces/${orgId}/agents/${seededAgentId}/publish`, {
+        cookie: ownerCookie,
+      })
+    ).json()) as PublishAgentResponse;
+    await stack.runtime!.buildService.waitFor(pub.contentHash);
+    await until(
+      async () =>
+        (await stack.runtime!.buildStore.get(pub.contentHash))?.status === "succeeded" ||
+        undefined,
+      "seeded agent build",
+    );
+    await freshWorker();
+  }
+
+  /** Every persisted event type for a run, in seq order. */
+  async function runEventTypes(runId: string): Promise<string[]> {
+    const rows = await db
+      .select({ event: schema.runEvents.event, seq: schema.runEvents.seq })
+      .from(schema.runEvents)
+      .where(eq(schema.runEvents.runId, runId))
+      .orderBy(schema.runEvents.seq);
+    return rows.map((row) => (row.event as { type: string }).type);
+  }
+
+  test("session list carries the first message so an untitled row has a fallback", async () => {
+    // REGRESSION (2026-08-11 spec D9): titling is fire-and-forget and silent
+    // on failure, so `title === null` is the STEADY state, not a blip. A
+    // client that has not opened the thread holds no message of its own —
+    // without a server-side preview every untitled row falls through to the
+    // agent's name and the whole sidebar reads identically.
+    await readySeededAgent();
+    const opener = `Draft the Q3 board update ${"and the appendix ".repeat(40)}`;
+    const created = await api(
+      "POST",
+      `/workspaces/${orgId}/agents/${seededAgentId}/sessions`,
+      { cookie: ownerCookie, body: { message: opener } },
+    );
+    expect(created.status).toBe(201);
+    const { session } = (await created.json()) as CreateSessionResponse;
+
+    const list = await api("GET", `/workspaces/${orgId}/sessions?agentId=${seededAgentId}`, {
+      cookie: ownerCookie,
+    });
+    const listed = ((await list.json()) as ListSessionsResponse).sessions.find(
+      (s) => s.id === session.id,
+    );
+    // Titling is off under `bun test`, which is exactly the state the fallback
+    // exists for.
+    expect(listed?.title).toBeNull();
+    expect(listed?.firstMessagePreview).toBe(
+      opener.slice(0, SESSION_MESSAGE_PREVIEW_MAX_CHARS).trimEnd(),
+    );
+    // Truncated in Postgres, not on the client: a list of long threads must
+    // not ship whole message bodies.
+    expect(listed!.firstMessagePreview!.length).toBeLessThanOrEqual(
+      SESSION_MESSAGE_PREVIEW_MAX_CHARS,
+    );
+    expect(opener.length).toBeGreaterThan(SESSION_MESSAGE_PREVIEW_MAX_CHARS);
+  });
+
+  test("an idle clear persists its divider on the last run and never drains into the next one", async () => {
+    // REGRESSION (2026-08-11 spec D4): clear/compact require a QUIET session,
+    // so no tail is attached when they fire. Nothing consumed eve's
+    // `context.cleared`, so no divider survived a reload — and the next run's
+    // tail drained the frame as a leftover, drawing the boundary under an
+    // exchange that happened AFTER the clear.
+    await readySeededAgent();
+    const created = await api(
+      "POST",
+      `/workspaces/${orgId}/agents/${seededAgentId}/sessions`,
+      { cookie: ownerCookie, body: { message: "before the clear" } },
+    );
+    const { session, run: firstRun } = (await created.json()) as CreateSessionResponse;
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, firstRun.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "first run to succeed");
+
+    const cleared = await api("POST", `/sessions/${session.id}/clear`, {
+      cookie: ownerCookie,
+    });
+    expect(cleared.status).toBe(200);
+    const clearBody = (await cleared.json()) as SessionContextControlResponse;
+    expect(clearBody.status).toBe("accepted");
+    // The boundary landed under the exchange the clear actually followed.
+    expect(clearBody.marker).toEqual({ kind: "cleared", runId: firstRun.id });
+    expect(await runEventTypes(firstRun.id)).toContain("context.cleared");
+
+    // The next exchange must be clean: its tail starts past the drained
+    // frames, so no phantom divider appears under a later reply.
+    await freshWorker();
+    const follow = await api("POST", `/sessions/${session.id}/messages`, {
+      cookie: ownerCookie,
+      body: { message: "after the clear" },
+    });
+    expect(follow.status).toBe(201);
+    const secondRun = ((await follow.json()) as { run: { id: string } }).run;
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, secondRun.id));
+      return rows[0]?.status === "succeeded" || undefined;
+    }, "second run to succeed");
+    expect(await runEventTypes(secondRun.id)).not.toContain("context.cleared");
+
+    // D4's edge case: this fake emits no `compaction.*` at all (an empty or
+    // already-cleared context), so the route must report NO marker rather
+    // than claim a boundary that does not exist.
+    await freshWorker();
+    const compacted = await api("POST", `/sessions/${session.id}/compact`, {
+      cookie: ownerCookie,
+    });
+    expect(compacted.status).toBe(200);
+    const compactBody = (await compacted.json()) as SessionContextControlResponse;
+    expect(compactBody.status).toBe("accepted");
+    expect(compactBody.marker).toBeNull();
   });
 });

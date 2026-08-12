@@ -37,12 +37,29 @@ import {
   type CopilotStepState,
 } from "@invisible-string/shared";
 
-export type SuggestionStatus = "pending" | "applied" | "dismissed";
+/**
+ * A card's life. `applying` is not cosmetic: an accepted proposal may be a
+ * NETWORK write (the agent rename PATCHes `agents.name`), so there is a real
+ * window between the click and the verdict in which the card must neither
+ * claim success nor stay clickable — and `failed` is the verdict a receipt
+ * may never round up to "Applied".
+ */
+export type SuggestionStatus =
+  | "pending"
+  | "applying"
+  | "applied"
+  | "failed"
+  | "dismissed";
 
 /** One reasoning block — mirrors the chat's `ThoughtItem`. */
 export interface CopilotThoughtItem {
   kind: "thought";
-  /** Server key (`step:<index>`); the upsert address. */
+  /**
+   * Server key (`turn:<turnIndex>:step:<stepIndex>`); the upsert address.
+   * Unique for the SOCKET's lifetime, not merely within a turn — this map is
+   * global (see the module header), so a per-turn key would have turn 2's
+   * thinking overwrite turn 1's inside its old, sealed box.
+   */
   key: string;
   text: string;
   streaming: boolean;

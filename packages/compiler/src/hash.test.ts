@@ -84,7 +84,14 @@ describe("agent hash properties", () => {
     );
   });
 
-  test("agentSlug and workspaceSlug both change the hash (tenant isolation)", () => {
+  test("agentId, agentSlug and workspaceSlug all change the hash", () => {
+    // IDENTITY (spec D1): the agent's stable id keys the artifact.
+    expect(
+      computeAgentHash(definition, { ...deps, agentId: "a-different-agent" }),
+    ).not.toBe(computeAgentHash(definition, deps));
+    // agentSlug stays hashed because it shapes emitted BYTES (generated
+    // package name, model-visible identity line) — a rename must not
+    // cache-hit an artifact that introduces itself by the old name.
     expect(
       computeAgentHash(definition, { ...deps, agentSlug: "renamed-agent" }),
     ).not.toBe(computeAgentHash(definition, deps));
@@ -93,6 +100,41 @@ describe("agent hash properties", () => {
     expect(
       computeAgentHash(definition, { ...deps, workspaceSlug: "other-tenant" }),
     ).not.toBe(computeAgentHash(definition, deps));
+  });
+
+  test("two agents with IDENTICAL definitions AND identical names hash differently", () => {
+    // The collision spec D1 exists to close. Before the agent id entered the
+    // hash, these two rows produced one content hash — hence one artifact,
+    // one JWT audience, and one `ag_v_<hash12>` world database with two
+    // writers. The unique index on (organization_id, name), now dropped, was
+    // the only thing standing between the platform and that violation.
+    const twin: CompileDeps = { ...deps, agentId: "the-other-untitled-agent" };
+    expect(computeAgentHash(definition, twin)).not.toBe(
+      computeAgentHash(definition, deps),
+    );
+    // And it must hold end-to-end, not just in the pre-computed hash the
+    // build cache looks up: compile() bakes the hash into the emitted
+    // platform-auth audience.
+    expect(compile(definition, twin).hash).not.toBe(
+      compile(definition, deps).hash,
+    );
+    expect(compile(definition, twin).hash).toBe(
+      computeAgentHash(definition, twin),
+    );
+  });
+
+  test("the agent id is IDENTITY, not emitted — a rename keeps it while re-keying", () => {
+    // Renaming changes the slug (and so the hash, and so the world DB) but
+    // not the identity input. Both halves are load-bearing: the first is the
+    // accepted rename churn (spec §7), the second is what keeps two
+    // same-named agents apart.
+    const renamed: CompileDeps = { ...deps, agentSlug: "renamed-agent" };
+    expect(compile(definition, renamed).hash).not.toBe(
+      compile(definition, deps).hash,
+    );
+    for (const content of compile(definition, renamed).files.values()) {
+      expect(content).not.toInclude(deps.agentId);
+    }
   });
 
   test("changing versions.json content changes the hash", () => {

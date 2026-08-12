@@ -14,6 +14,7 @@
  * - the eve session API v2 wire contract (ID-addressed routes, send XOR
  *   respond, cancel/clear/compact/reset, stream query + tail index)
  * - envelope crypto (AES-256-GCM)
+ * - tool-call display resolution (qualified-name split + probe-cached metadata)
  */
 export * from "./agent-definition";
 export * from "./api";
@@ -25,6 +26,7 @@ export * from "./eve-session-api";
 export * from "./id";
 export * from "./observability";
 export * from "./render";
+export * from "./tool-display";
 export * from "./trigger-adapters";
 export * from "./trigger-event";
 export * from "./worker-identity";

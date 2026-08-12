@@ -147,6 +147,7 @@ function sessionResponse(status: RunStatus) {
       workflowId: null,
       origin: "chat",
       status: "active",
+      title: null,
       eveSessionId: "eve1",
       createdAt: NOW,
       updatedAt: NOW,
@@ -240,6 +241,7 @@ function sessionDto(id: string) {
     workflowId: null,
     origin: "chat",
     status: "active",
+    title: null,
     eveSessionId: `eve_${id}`,
     createdAt: NOW,
     updatedAt: NOW,
@@ -592,4 +594,142 @@ test("removing a queued row drops it before it is ever sent", async () => {
 
   fireEvent.click(view.getByRole("button", { name: /Remove queued message/ }));
   await waitFor(() => expect(view.queryByText(/scrap this one/)).toBeNull());
+});
+
+// ── the header's derived facts and the tool directory (spec D5/D6) ──────────
+
+/**
+ * Serve the three reads the header joins — the version's tool directory, the
+ * workspace's model presets and its model capabilities — alongside the session.
+ * Everything else 404s, which is itself part of the contract: each of these is
+ * allowed to fail without taking the thread with it.
+ */
+function headerHandler(): Handler {
+  return (method, url) => {
+    if (method === "GET" && url.includes(`/versions/${AGV_ID}/tools`)) {
+      return json({
+        directory: {
+          agentVersionId: AGV_ID,
+          connections: [
+            {
+              slug: "linear",
+              connectionId: "cn_containerlinear1",
+              connectionName: "Linear",
+              tools: [
+                {
+                  name: "list_issues",
+                  description: "List issues in a team, newest first.",
+                  params: ["teamId"],
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
+    if (method === "GET" && url.includes("/model-presets")) {
+      return json({
+        presets: [
+          {
+            id: "55555555-5555-4555-8555-555555555555",
+            slug: "balanced",
+            provider: "openrouter",
+            modelId: "moonshotai/kimi-k3",
+            reasoning: "high",
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ],
+      });
+    }
+    if (method === "GET" && url.includes("/model-capabilities")) {
+      return json({
+        models: [
+          {
+            provider: "openrouter",
+            modelId: "moonshotai/kimi-k3",
+            supportedEfforts: ["high", "low"],
+            contextWindowTokens: 1_048_576,
+          },
+        ],
+        catalogAvailable: true,
+      });
+    }
+    if (method === "GET" && url.includes(`/sessions/${SESSION_ID}`)) {
+      return json(sessionResponse("succeeded"));
+    }
+    if (method === "GET" && url.includes("/sessions")) return json({ sessions: [] });
+    return json({}, 404);
+  };
+}
+
+/** One settled run: an MCP tool call, a reply, and a measured step. */
+function toolRunFrames(): RunEventFrame[] {
+  const events: RunEventFrame["event"][] = [
+    { type: "session.started", data: { runtime: { agentId: "a", eveVersion: "0.31.3", modelId: "moonshotai/kimi-k3" } } },
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__list_issues", input: { limit: 5 } }], sequence: 0, stepIndex: 0, turnId: "t0" } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__list_issues", output: { content: [{ type: "text", text: "5 issues: 2 bugs, 3 features" }] } }, status: "completed", sequence: 0, stepIndex: 0, turnId: "t0" } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t0", usage: { inputTokens: 262_144 } } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  return events.map((event, index) => ({
+    runId: RUN_ID,
+    seq: index,
+    event,
+    at: new Date(Date.UTC(2026, 6, 3, 0, 0, index)).toISOString(),
+  }));
+}
+
+test("the thread resolves tool calls through the version's tool directory", async () => {
+  handler = headerHandler();
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  const block = await view.findByRole("button", { name: /Worked/ });
+  fireEvent.click(block);
+  // The description only exists once the DIRECTORY has resolved — the
+  // connection name alone would also appear from the slug fallback, so it is
+  // the wrong thing to wait on.
+  await waitFor(() =>
+    expect(view.getByText("List issues in a team, newest first.")).toBeTruthy(),
+  );
+  expect(view.getByText("Linear ·")).toBeTruthy();
+  expect(view.getByText("List issues")).toBeTruthy();
+  // English, not JSON — and never the wire name.
+  expect(view.getByText("5 issues: 2 bugs, 3 features")).toBeTruthy();
+  expect(view.queryByText("linear__list_issues")).toBeNull();
+});
+
+test("the header meters the context against the catalog's window", async () => {
+  handler = headerHandler();
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  // 262,144 of 1,048,576 = 25%.
+  const meter = await view.findByRole("meter", { name: "Context used" });
+  expect(meter.getAttribute("aria-valuenow")).toBe("25");
+  // The model is named by its PRESET, and its raw id never appears.
+  expect(view.getByText("Balanced")).toBeTruthy();
+  expect(view.queryByText("moonshotai/kimi-k3")).toBeNull();
+});
+
+test("no meter when the catalog knows no window for the resolved model", async () => {
+  // The degradation that must never become a zero or a guess.
+  const base = headerHandler();
+  handler = (method, url, body) =>
+    method === "GET" && url.includes("/model-capabilities")
+      ? json({ models: [], catalogAvailable: false })
+      : base(method, url, body);
+  liveStores.set(RUN_ID, {
+    store: addFrames(EMPTY_FRAME_STORE, toolRunFrames()),
+    status: "succeeded",
+  });
+  const view = renderContainer();
+  await view.findByLabelText("Message");
+  await waitFor(() => expect(view.getByText("Balanced")).toBeTruthy());
+  expect(view.queryByRole("meter")).toBeNull();
 });

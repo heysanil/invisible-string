@@ -13,6 +13,10 @@
  *   canonicalized by sorting keys recursively)
  * - any change to the definition, resolved deps, versions.json content, or
  *   COMPILER_VERSION changes the hash
+ * - two DISTINCT agents never collide, however alike they look: the agent's
+ *   stable id is an input (spec D1), so identical definitions under
+ *   identical display names still land on different artifacts and different
+ *   `ag_v_<hash12>` world databases
  */
 import { createHash } from "node:crypto";
 
@@ -72,6 +76,22 @@ export function computeAgentHash(
     compilerVersion,
     definition,
     resolved: {
+      // IDENTITY (2026-08-11 spec D1). Content addressing must key on the
+      // agent's stable id: before D1 the hash carried only agentSlug — a
+      // slugified DISPLAY NAME — so two agents in one workspace with the
+      // same name and the same definition hashed identically and shared one
+      // `ag_v_<hash12>` world database, a direct violation of
+      // single-writer-per-hash that only the (now dropped) unique index on
+      // (organization_id, name) was preventing.
+      agentId: deps.agentId,
+      // agentSlug STAYS, and not for identity: it shapes emitted BYTES (the
+      // generated package name and the model-visible identity line in
+      // agent/channels/eve.ts), and this hash's whole contract is that no
+      // input which changes the emitted files can leave the hash unmoved —
+      // otherwise a rename would cache-hit an artifact that still introduces
+      // itself by the old name. Renaming therefore still re-keys the
+      // artifact, world DB, and JWT audience (spec D1 "explicitly not
+      // fixed"; rename-preserves-world-DB is out of scope).
       agentSlug: deps.agentSlug,
       // Resolved-entry array order is an input artifact, not semantics —
       // normalize by slug so equivalent inputs hash identically.

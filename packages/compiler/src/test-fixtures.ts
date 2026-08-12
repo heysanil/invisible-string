@@ -3,6 +3,11 @@
  * properties, and the gated `eve build` smoke test). Each fixture is a
  * complete (definition, deps) pair; golden outputs live under
  * packages/compiler/fixtures/<name>/.
+ *
+ * Each fixture carries a distinct `agentId` (the `agents.id` uuid the control
+ * plane resolves): it is the hash's IDENTITY input and never reaches a
+ * generated file, so the golden bytes depend on it only through the baked
+ * version hash in `agent/lib/platform-auth.ts`.
  */
 import type { AgentDefinition } from "@invisible-string/shared";
 
@@ -39,6 +44,7 @@ export const basicFixture: CompilerFixture = {
       reasoning: "max",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000001",
     agentSlug: "general-purpose",
     connections: [],
     skills: [],
@@ -68,6 +74,7 @@ export const mcpSkillFixture: CompilerFixture = {
       reasoning: "high",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000002",
     agentSlug: "software-engineer",
     connections: [
       {
@@ -130,6 +137,7 @@ export const customApprovalFixture: CompilerFixture = {
       reasoning: "provider-default",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000003",
     agentSlug: "cms-sync",
     connections: [
       {
@@ -196,6 +204,7 @@ export const flatSkillFixture: CompilerFixture = {
       reasoning: "medium",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000004",
     agentSlug: "incident-writer",
     connections: [],
     skills: [
@@ -237,6 +246,7 @@ export const anthropicModelFixture: CompilerFixture = {
       reasoning: "max",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000005",
     agentSlug: "support-triage",
     connections: [],
     skills: [],
@@ -271,6 +281,7 @@ export const oauthConnectionFixture: CompilerFixture = {
       reasoning: "high",
     },
     workspaceSlug: "acme",
+    agentId: "a1000000-0000-4000-8000-000000000006",
     agentSlug: "project-coordinator",
     connections: [
       {

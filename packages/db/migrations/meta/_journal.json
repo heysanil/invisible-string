@@ -78,6 +78,20 @@
       "when": 1786349818530,
       "tag": "0010_new_joystick",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786497470839,
+      "tag": "0011_shocking_the_call",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786498630892,
+      "tag": "0012_watery_slapstick",
+      "breakpoints": true
     }
   ]
 }

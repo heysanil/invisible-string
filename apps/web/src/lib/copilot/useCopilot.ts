@@ -1,23 +1,31 @@
 /**
- * Copilot panel state — owns the thread (streamed assistant messages +
- * suggestion cards), the socket lifecycle (one per open dock, disposed on
- * unmount), and the Apply/Dismiss flow. Surface-agnostic: everything the
- * workflow and agent editors differ on rides the injected
+ * Copilot panel state — owns the thread (streamed assistant messages, the
+ * thought/step rail and suggestion cards), the socket lifecycle (one per open
+ * dock, disposed on unmount), and the Apply/Dismiss flow. Surface-agnostic:
+ * everything the workflow and agent editors differ on rides the injected
  * {@link CopilotSurfaceAdapter}.
  *
  * Protocol (packages/shared/src/copilot.ts): each `user_message` names its
- * `surface` + `entityId` and carries the LIVE draft; the server streams
- * `delta` text and validated `proposal` frames, pausing its tool loop until
- * the client answers each proposal with a `mutation_result`. Applying routes
- * the proposal through the surface controller's dispatch (single writer) and
- * reports `accepted`; dismissing reports `rejected`. `abort` cuts the
- * in-flight turn short.
+ * `surface` + `entityId`, carries the LIVE draft and the ALLOW-EDITS flag for
+ * that turn; the server streams `delta` text, `thought`/`step` progress and
+ * validated `proposal` frames, pausing its tool loop until the client answers
+ * each proposal with a `mutation_result`. Applying routes the proposal through
+ * the surface controller's dispatch (single writer) and reports `accepted`;
+ * dismissing reports `rejected`. `abort` cuts the in-flight turn short.
+ *
+ * ALLOW-EDITS (spec D7.2) does not move the writer — the client still applies
+ * every mutation. It only removes the ASK: the server marks such proposals
+ * `autoApplied` and continues its loop without parking, so this hook applies
+ * them on arrival and opens their card already settled. It sends no
+ * `mutation_result` for them (there is no waiter to resolve), and it keys off
+ * the FRAME's flag rather than the current toggle, so flipping the toggle
+ * mid-turn can never make the client and the server disagree about who was
+ * waiting for whom.
+ *
+ * The thread transitions themselves are pure and live in ./thread.ts.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type {
-  CopilotProposal,
-  CopilotServerFrame,
-} from "@invisible-string/shared";
+import type { CopilotServerFrame } from "@invisible-string/shared";
 
 import type { CopilotSurfaceAdapter } from "./adapter";
 import {
@@ -25,26 +33,23 @@ import {
   type CopilotSocketStatus,
   type WebSocketFactory,
 } from "./socket";
+import {
+  appendNotice,
+  appendUserMessage,
+  decideSuggestion,
+  reduceCopilotFrame,
+  settleCopilotTurn,
+  type CopilotThreadItem,
+} from "./thread";
 
-export type SuggestionStatus = "pending" | "applied" | "dismissed";
-
-export type CopilotThreadItem =
-  | {
-      kind: "message";
-      id: string;
-      role: "user" | "assistant";
-      text: string;
-      streaming: boolean;
-    }
-  | {
-      kind: "suggestion";
-      id: string;
-      proposal: CopilotProposal;
-      status: SuggestionStatus;
-    }
-  | { kind: "error"; id: string; text: string }
-  /** Muted system line (e.g. a mid-turn connection drop). */
-  | { kind: "notice"; id: string; text: string };
+export type {
+  CopilotStepDisplayState,
+  CopilotStepItem,
+  CopilotThoughtItem,
+  CopilotThreadItem,
+  CopilotTimelineItem,
+  SuggestionStatus,
+} from "./thread";
 
 export interface UseCopilotOptions {
   workspaceId: string;
@@ -56,6 +61,12 @@ export interface UseCopilotOptions {
   adapter: CopilotSurfaceAdapter;
   /** Panel closed ⇒ no socket. */
   enabled: boolean;
+  /**
+   * Allow-edits mode for the NEXT turn (spec D7.2). Read at send time through
+   * a live ref, so it is a property of the turn the user started — not of
+   * whatever the toggle happens to say when a frame lands.
+   */
+  allowEdits?: boolean;
   createWebSocket?: WebSocketFactory;
   backoffBaseMs?: number;
 }
@@ -75,49 +86,15 @@ export interface CopilotApi {
   dismissSuggestion: (suggestionId: string) => void;
 }
 
-let localId = 0;
-const nextLocalId = () => `local-${++localId}`;
-
-/** Append delta text to the trailing streaming assistant message (or open one). */
-function appendDelta(
-  current: CopilotThreadItem[],
-  text: string,
-): CopilotThreadItem[] {
-  const last = current.at(-1);
-  if (last && last.kind === "message" && last.role === "assistant" && last.streaming) {
-    return [...current.slice(0, -1), { ...last, text: last.text + text }];
-  }
-  return [
-    ...current,
-    { kind: "message", id: nextLocalId(), role: "assistant", text, streaming: true },
-  ];
-}
-
-function settleStreaming(current: CopilotThreadItem[]): CopilotThreadItem[] {
-  return current.map((item) =>
-    item.kind === "message" && item.streaming
-      ? { ...item, streaming: false }
-      : item,
-  );
-}
-
-/** Server error copy is protocol-speak — humanize what users may actually see. */
-function humanizeError(code: string, message: string): string {
-  switch (code) {
-    case "turn_in_progress":
-      return "Copilot is still working on the previous request — wait for it to finish (or press Stop).";
-    case "over_budget":
-      return message.includes("window")
-        ? message
-        : "That turn hit the copilot's budget limit — try a smaller request.";
-    default:
-      return message;
-  }
-}
-
 export function useCopilot(options: UseCopilotOptions): CopilotApi {
-  const { workspaceId, adapter, enabled, createWebSocket, backoffBaseMs } =
-    options;
+  const {
+    workspaceId,
+    adapter,
+    enabled,
+    allowEdits,
+    createWebSocket,
+    backoffBaseMs,
+  } = options;
 
   const [items, setItems] = useState<CopilotThreadItem[]>([]);
   const [status, setStatus] = useState<CopilotSocketStatus>("closed");
@@ -131,6 +108,9 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
   // Mirror of `generating` for callbacks that must not capture stale state.
   const generatingRef = useRef(generating);
   generatingRef.current = generating;
+  // Mirror of the allow-edits toggle (see UseCopilotOptions.allowEdits).
+  const allowEditsRef = useRef(allowEdits === true);
+  allowEditsRef.current = allowEdits === true;
 
   const socketRef = useRef<CopilotSocket | null>(null);
   // Live adapter ref so the socket callbacks never capture stale props (the
@@ -140,39 +120,30 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
 
   const handleFrame = useCallback((frame: CopilotServerFrame) => {
     switch (frame.type) {
+      // Text, thinking and step progress all mean the turn is alive.
       case "delta":
+      case "thought":
+      case "step":
         setGenerating(true);
-        setItems((current) => appendDelta(current, frame.text));
         break;
       case "proposal":
-        setItems((current) => [
-          ...settleStreaming(current),
-          {
-            kind: "suggestion",
-            id: frame.proposal.id,
-            proposal: frame.proposal,
-            status: "pending",
-          },
-        ]);
+        // Allow-edits: apply NOW, outside the state updater (StrictMode
+        // double-invokes updaters, and applying twice would double-dispatch
+        // into the editor). The server has already moved on.
+        if (frame.autoApplied === true) {
+          adapterRef.current.applyProposal(frame.proposal);
+        }
         break;
       case "done":
         setGenerating(false);
-        setItems(settleStreaming);
         break;
       case "error":
         // turn_in_progress means the PREVIOUS turn is still streaming — the
         // stop affordance must survive (the real turn is still in flight).
         if (frame.code !== "turn_in_progress") setGenerating(false);
-        setItems((current) => [
-          ...settleStreaming(current),
-          {
-            kind: "error",
-            id: nextLocalId(),
-            text: humanizeError(frame.code, frame.message),
-          },
-        ]);
         break;
     }
+    setItems((current) => reduceCopilotFrame(current, frame));
   }, []);
 
   // ── socket lifecycle: one per open copilot panel ───────────────────────────
@@ -185,19 +156,17 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
         setStatus(next);
         if (next === "reconnecting") {
           // The server session died with the socket — the in-flight turn is
-          // gone. Settle the UI; pending cards stay actionable (Apply is a
-          // pure client-side draft edit). Leave a visible marker so the
-          // prose ("two suggestions…") can't silently disagree with what
-          // actually arrived.
+          // gone. Settle the UI (steps still pending will never resolve);
+          // pending cards stay actionable (Apply is a pure client-side draft
+          // edit). Leave a visible marker so the prose ("two suggestions…")
+          // can't silently disagree with what actually arrived.
           if (generatingRef.current) {
-            setItems((current) => [
-              ...settleStreaming(current),
-              {
-                kind: "notice",
-                id: nextLocalId(),
-                text: "Connection lost — this response was cut short. Ask again to continue.",
-              },
-            ]);
+            setItems((current) =>
+              appendNotice(
+                settleCopilotTurn(current, { cancelPendingSteps: true }),
+                "Connection lost — this response was cut short. Ask again to continue.",
+              ),
+            );
           }
           setGenerating(false);
         }
@@ -225,26 +194,25 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
       entityId: entityRef.entityId,
       draft: getDraft() as unknown as Record<string, unknown>,
       message: trimmed,
+      // Sent only when ON: the field is optional and defaults to the accept
+      // gate, which is the safe direction for an omission.
+      ...(allowEditsRef.current ? { allowEdits: true } : {}),
     });
     if (!sent) return false;
     setGenerating(true);
-    setItems((current) => [
-      ...current,
-      {
-        kind: "message",
-        id: nextLocalId(),
-        role: "user",
-        text: trimmed,
-        streaming: false,
-      },
-    ]);
+    setItems((current) => appendUserMessage(current, trimmed));
     return true;
   }, []);
 
   const stop = useCallback(() => {
     socketRef.current?.send({ type: "abort" });
     setGenerating(false);
-    setItems(settleStreaming);
+    // The server's `done: aborted` would settle these too, but a stop must
+    // land instantly and must not depend on a frame that a dying socket may
+    // never deliver.
+    setItems((current) =>
+      settleCopilotTurn(current, { cancelPendingSteps: true }),
+    );
   }, []);
 
   const decide = useCallback(
@@ -265,10 +233,10 @@ export function useCopilot(options: UseCopilotOptions): CopilotApi {
         outcome,
       });
       setItems((current) =>
-        current.map((i) =>
-          i.kind === "suggestion" && i.id === suggestionId
-            ? { ...i, status: outcome === "accepted" ? "applied" : "dismissed" }
-            : i,
+        decideSuggestion(
+          current,
+          suggestionId,
+          outcome === "accepted" ? "applied" : "dismissed",
         ),
       );
     },

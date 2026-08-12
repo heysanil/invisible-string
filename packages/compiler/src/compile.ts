@@ -79,6 +79,17 @@ function validateDeps(definition: AgentDefinition, deps: CompileDeps): void {
   assertSlug("workspace", deps.workspaceSlug);
   assertSlug("agent", deps.agentSlug);
 
+  // The agent's stable id is what the hash keys identity on (spec D1). It is
+  // never emitted, so no slug shape is imposed — but an EMPTY one would
+  // silently collapse two agents onto one artifact and one world database,
+  // which is exactly the collision D1 exists to close. Fail closed.
+  if (deps.agentId.trim().length === 0) {
+    throw new CompileError(
+      "INVALID_DEPS",
+      "deps.agentId is empty — the agent's stable id is the hash's identity input",
+    );
+  }
+
   // Model resolution happens upstream, but an explicit modelId override in
   // the definition MUST be what the control plane resolved (spec §7: the
   // override wins) — anything else is an internally inconsistent input.

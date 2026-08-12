@@ -18,7 +18,9 @@
  * - Each `user_message` frame re-checks that the surface entity belongs to
  *   the socket's workspace (workflow or agent row per `surface`) and reloads
  *   the workspace inventory fresh, then runs one CopilotSession turn (see
- *   session.ts for the tool loop).
+ *   session.ts for the tool loop) — carrying that frame's own `allowEdits`
+ *   flag, since the toggle is per-turn state the client owns (spec D7.2) and
+ *   the socket deliberately remembers nothing about it.
  */
 import { Elysia } from "elysia";
 import { and, eq } from "drizzle-orm";
@@ -305,6 +307,10 @@ export function copilotPlugin(deps: CopilotDeps) {
               message: frame.message,
               draft: frame.draft,
               inventory,
+              // Per-turn, straight off the frame — the server holds no
+              // allow-edits state to go stale across turns or reconnects
+              // (spec D7.2).
+              allowEdits: frame.allowEdits ?? false,
             });
             budgetFor(state.workspace.organizationId).tokens += outputTokens;
           })().catch(() => {

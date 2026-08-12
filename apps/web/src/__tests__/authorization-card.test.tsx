@@ -126,6 +126,8 @@ test("RunMessage renders authorization cards from the run view", () => {
     modelId: null,
     canceled: false,
     contextCleared: false,
+    contextCompacted: false,
+    inputTokens: null,
   };
   const view = render(
     <RunMessage run={run} isChatOrigin onRespond={() => {}} />,

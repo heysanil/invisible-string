@@ -13,7 +13,8 @@
  *     chat: requires a published agent + ready build → scheduler picks a live
  *     worker → ensure-agent (artifact URL + env) → POST eve session (platform
  *     JWT, 202) → persist agent_sessions + runs → start the NDJSON tailer.
- *     Chat sessions carry `workflowId: null`.
+ *     Chat sessions carry `workflowId: null`, and a fire-and-forget titler
+ *     (resources/session-title.ts) names the thread from that first message.
  * - POST /workspaces/:workspaceId/workflows/:wfId/run {message?, data?}
  *     manual "Run now": dispatch the workflow's published snapshot through
  *     the shared trigger-dispatch path (renders the task message).
@@ -69,6 +70,7 @@ import type { DeliveryService } from "../runs/delivery";
 import { createRunSseResponse, parseLastEventId } from "../runs/sse";
 import type { RunStore } from "../runs/store";
 import type { RunTailerManager } from "../runs/tailer";
+import { kickSessionTitle } from "../resources/session-title";
 import { loadPublishedWorkflow } from "../resources/workflows";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
 import { buildAgentEnv, decryptMcpEnv } from "./agent-env";
@@ -229,6 +231,10 @@ export function sessionDto(row: SessionRow): AgentSessionDto {
     workflowId: row.workflowId,
     origin: row.origin,
     status: row.status,
+    // Null until the background titler lands one, and permanently null when it
+    // fails (2026-08-11 spec D9) — clients fall back to truncating the first
+    // message, never to "Untitled".
+    title: row.title,
     eveSessionId: row.eveSessionId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -659,7 +665,7 @@ export async function publishAgent(
     agent.runAsUserId,
     definition,
   );
-  const compiled = compileOrThrow(deps.compile, definition, inputs, agent.name);
+  const compiled = compileOrThrow(deps.compile, definition, inputs, agent);
 
   // Idempotent by content hash: an existing version of this agent with
   // the same hash is re-published, not duplicated. The unique index on
@@ -1021,7 +1027,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           compileServiceDeps(deps),
           workspace.organizationId,
           agent.runAsUserId,
-          agent.name,
+          agent,
           agent.draft,
         );
       },
@@ -1127,6 +1133,18 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
         deps.metrics.recordTrigger("manual", "dispatched");
+
+        // Generated thread title (spec D9) — fire-and-forget on the platform
+        // key against the workspace's `quick` preset. Deliberately AFTER the
+        // dispatch succeeded (a failed dispatch has no thread worth naming)
+        // and never awaited: the create response must not wait on a model
+        // round-trip, and a titling failure leaves `title` null, which the
+        // sidebar renders as the truncated first message.
+        kickSessionTitle(deps, {
+          organizationId: workspace.organizationId,
+          sessionId: session.id,
+          message,
+        });
 
         set.status = 201;
         return { session: sessionDto(session), run: runDto(run) };
@@ -1670,6 +1688,11 @@ export function runtimePlugin(deps: RuntimeDeps) {
             // publish.
             agentVersionId: session.agentVersionId,
             workflowId: session.workflowId,
+            // The generated title IS carried over (spec D9): the replacement
+            // row is the same conversation to the user, and it starts with no
+            // messages — so a dropped title would leave the sidebar entry with
+            // nothing to fall back to.
+            title: session.title,
             eveSessionId: null,
             origin: session.origin,
             principal: session.principal,

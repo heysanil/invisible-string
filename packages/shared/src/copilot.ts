@@ -10,6 +10,14 @@
  *   client; the client previews it and applies accepted mutations through the
  *   editor controller (single writer), then reports the outcome back with a
  *   `mutation_result` frame so the model's tool loop can continue.
+ * - ALLOW-EDITS MODE (2026-08-11 spec D7) does not move the writer: the client
+ *   still applies, but it stops asking first. The client carries the toggle on
+ *   every `user_message` and the server echoes `autoApplied: true` on the
+ *   proposals it did not wait for — see {@link CopilotProposalFrame}.
+ * - The dock renders the same rail-in-box grammar as the main chat, fed by
+ *   `thought` / `step` frames whose vocabulary deliberately mirrors the chat's
+ *   `ThoughtItem` / `ToolItem` (apps/web/src/lib/chat/run-view.ts) rather than
+ *   inventing a second one.
  * - Each `user_message` names its `surface` ("workflow" | "agent"); the
  *   server exposes the matching toolset — proposals for the other surface's
  *   tools are a server bug.
@@ -23,7 +31,7 @@ import {
   modelPresetSlugSchema,
   reasoningEffortSchema,
 } from "./agent-definition";
-import { connectionIdSchema } from "./api";
+import { agentNameSchema, connectionIdSchema } from "./api";
 import { triggerConfigSchema } from "./workflow-config";
 
 // ── surfaces ─────────────────────────────────────────────────────────────────
@@ -126,8 +134,51 @@ export type AddContextParams = z.infer<typeof addContextParamsSchema>;
 export const removeContextParamsSchema = addContextParamsSchema;
 export type RemoveContextParams = AddContextParams;
 
+/**
+ * `setName` renames the agent (2026-08-11 spec D7).
+ *
+ * NOTE this and {@link setDescriptionParamsSchema} are the only agent-surface
+ * mutations that edit the `agents` ROW rather than the definition draft — the
+ * editor controller applies them to the same in-memory editor state and the
+ * PATCH route persists both, so the copilot sees no difference. The schema is
+ * literally the route's own {@link agentNameSchema}: a proposal that validates
+ * here must be one the PATCH accepts.
+ *
+ * Duplicate names across a workspace are legal (spec D1 dropped the unique
+ * index), so a rename never has to be refused for collision.
+ */
+export const setNameParamsSchema = z.object({
+  name: agentNameSchema,
+});
+export type SetNameParams = z.infer<typeof setNameParamsSchema>;
+
+/**
+ * Max length of a copilot-proposed agent description. DELIBERATELY far below
+ * `updateAgentRequest`'s 2000: this is the ONE-LINE summary rendered on agent
+ * cards and in the editor header, and a model handed a 2000-char budget writes
+ * a paragraph. The stricter bound is the product decision, not a wire limit.
+ */
+export const COPILOT_MAX_DESCRIPTION_CHARS = 200;
+
+/** `setDescription` sets the agent's one-line description (spec D7). */
+export const setDescriptionParamsSchema = z.object({
+  description: z
+    .string()
+    .trim()
+    .min(1)
+    .max(COPILOT_MAX_DESCRIPTION_CHARS)
+    // One LINE, enforced rather than trusted — a model that emits a bulleted
+    // list here would break the single-line layout everywhere it renders.
+    .refine((value) => !/[\r\n]/.test(value), {
+      message: "description must be a single line",
+    }),
+});
+export type SetDescriptionParams = z.infer<typeof setDescriptionParamsSchema>;
+
 /** Agent-surface tool schemas — the validation source for its proposals. */
 export const agentCopilotMutationParamSchemas = {
+  setName: setNameParamsSchema,
+  setDescription: setDescriptionParamsSchema,
   setPersona: setPersonaParamsSchema,
   setModel: setModelParamsSchema,
   addContext: addContextParamsSchema,
@@ -214,6 +265,18 @@ export const copilotUserMessageFrameSchema = z.object({
       message: `draft exceeds ${COPILOT_MAX_DRAFT_CHARS} serialized characters`,
     }),
   message: z.string().min(1).max(8_000),
+  /**
+   * ALLOW-EDITS (spec D7). A session-scoped toggle, carried per turn rather
+   * than held as server session state on purpose: the server never has to
+   * reconcile a toggle the user flipped mid-turn, and a reconnect cannot
+   * silently resume with the wrong mode. When true the server streams each
+   * validated proposal with `autoApplied: true` and CONTINUES ITS TOOL LOOP
+   * IMMEDIATELY instead of parking for a `mutation_result`.
+   *
+   * Default false — a client that omits it gets the accept gate, which is the
+   * safe direction for an omission.
+   */
+  allowEdits: z.boolean().optional(),
 });
 
 export const copilotMutationResultFrameSchema = z.object({
@@ -267,10 +330,66 @@ export interface CopilotDeltaFrame {
   text: string;
 }
 
-/** A validated mutation proposal awaiting client accept/reject. */
+/**
+ * Copilot step lifecycle. The three values the server can emit are exactly the
+ * chat rail's (`StepState` in apps/web/src/lib/chat/run-view.ts) — no parallel
+ * vocabulary. The chat's other states have no copilot analogue:
+ * there is no HITL approval here (`awaiting`/`rejected`), and a step left
+ * `pending` when a `done` frame lands with `reason: "aborted"` is rendered
+ * canceled by the CLIENT, since the server emits nothing further for it.
+ */
+export const COPILOT_STEP_STATES = ["pending", "ok", "error"] as const;
+export type CopilotStepState = (typeof COPILOT_STEP_STATES)[number];
+
+/**
+ * Model reasoning/thinking for one block — mirrors the chat's `ThoughtItem`.
+ *
+ * `text` is CUMULATIVE (eve's `reasoningSoFar` convention), so a dropped frame
+ * self-heals on the next one and the client upserts by {@link key} rather than
+ * appending. `streaming: false` seals the block; a later frame under the same
+ * key is a new block only if the server issues a new key.
+ */
+export interface CopilotThoughtFrame {
+  type: "thought";
+  /** Stable per-block key (server convention: `step:<stepIndex>`). */
+  key: string;
+  text: string;
+  streaming: boolean;
+}
+
+/**
+ * One tool step's progress — mirrors the chat's `ToolItem`. Covers BOTH the
+ * copilot's read tools (inventory lookups) and its mutation tools; a mutation
+ * step's `proposal` frame carries the previewable payload, this carries only
+ * its lifecycle.
+ */
+export interface CopilotStepFrame {
+  type: "step";
+  /** The model tool-call id — the upsert key (matches `CopilotProposal.id`). */
+  key: string;
+  /** Raw tool name; the dock humanizes it for display. */
+  toolName: string;
+  state: CopilotStepState;
+  /** One-line result summary; null while pending and on failures with no body. */
+  resultPreview: string | null;
+}
+
+/**
+ * A validated mutation proposal.
+ *
+ * With the accept gate (the default) the server PARKS here until the client
+ * answers with `mutation_result`. Under allow-edits it does not: `autoApplied`
+ * is true, the loop has already continued, and the client applies the mutation
+ * and renders the card as already-applied — the card still renders, so the
+ * turn remains an audit trail instead of a silent edit. A `mutation_result`
+ * for an auto-applied proposal is ignored by the server (there is nothing left
+ * to unblock), so a client that cannot apply one must surface that locally.
+ */
 export interface CopilotProposalFrame {
   type: "proposal";
   proposal: CopilotProposal;
+  /** True when the server did not wait for an accept (allow-edits mode). */
+  autoApplied?: boolean;
 }
 
 /** Turn finished (model stopped calling tools, or the client aborted). */
@@ -289,6 +408,8 @@ export interface CopilotErrorFrame {
 
 export type CopilotServerFrame =
   | CopilotDeltaFrame
+  | CopilotThoughtFrame
+  | CopilotStepFrame
   | CopilotProposalFrame
   | CopilotDoneFrame
   | CopilotErrorFrame;
@@ -296,8 +417,22 @@ export type CopilotServerFrame =
 export const copilotServerFrameSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("delta"), text: z.string() }),
   z.object({
+    type: z.literal("thought"),
+    key: z.string().min(1),
+    text: z.string(),
+    streaming: z.boolean(),
+  }),
+  z.object({
+    type: z.literal("step"),
+    key: z.string().min(1),
+    toolName: z.string().min(1),
+    state: z.enum(COPILOT_STEP_STATES),
+    resultPreview: z.string().nullable(),
+  }),
+  z.object({
     type: z.literal("proposal"),
     proposal: copilotProposalSchema as z.ZodType<CopilotProposal>,
+    autoApplied: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("done"),

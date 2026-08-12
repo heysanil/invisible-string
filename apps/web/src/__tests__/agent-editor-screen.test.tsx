@@ -25,6 +25,7 @@ import { ModelSection } from "../components/agents/ModelSection";
 import { ContextAttachments } from "../components/context/ContextAttachments";
 import { ToastProvider } from "../components/ui/Toast";
 import { localAgentDiagnostics } from "../lib/agents/diagnostics";
+import type { AgentLifecycleState } from "../lib/agents/lifecycle";
 import {
   FIXTURE_AGENT_CONNECTIONS,
   FIXTURE_AGENT_SKILLS,
@@ -101,7 +102,7 @@ function railProps(fixture = FIXTURE_EXEC_ASSISTANT) {
   return {
     name: fixture.agent.name,
     publishedVersionId: fixture.agent.publishedVersionId,
-    isDirty: false,
+    lifecycle: "published" as AgentLifecycleState,
     state,
     diagnostics: localAgentDiagnostics({
       definition: state.definition,
@@ -166,16 +167,39 @@ test("rail marks the active card aria-current and clicking a card selects its se
   expect(onSelectSection).toHaveBeenCalledWith("model");
 });
 
-test("draft agent: Draft + Unsaved chips, persona issue badge, empty-context summary", () => {
+test("draft agent: Draft + Unsaved-changes chips, persona issue badge, empty-context summary", () => {
   const props = railProps(FIXTURE_RELEASE_BOT);
-  const view = render(<AgentRail {...props} isDirty={true} />);
+  const view = render(<AgentRail {...props} lifecycle="unsaved" />);
 
   expect(view.getByText("Draft")).toBeTruthy();
-  expect(view.getByText("Unsaved")).toBeTruthy();
+  expect(view.getByText("Unsaved changes")).toBeTruthy();
   // Empty persona → warning badge on the card + the publish-gate hint line.
   expect(view.getByText("Empty — required to publish")).toBeTruthy();
   expect(view.getByText("1 issue to resolve before publishing")).toBeTruthy();
   expect(view.getByText("No connections or skills")).toBeTruthy();
+});
+
+test("rail chips separate 'has been published' from 'is ahead of what is published'", () => {
+  // The state that had no surface at all before D3: fully saved, published,
+  // and running older bytes.
+  const behind = render(<AgentRail {...railProps()} lifecycle="unpublished" />);
+  expect(behind.getByText("Published")).toBeTruthy();
+  expect(behind.getByText("Unpublished changes")).toBeTruthy();
+  cleanup();
+
+  // In sync → the publication chip stands alone.
+  const synced = render(<AgentRail {...railProps()} lifecycle="published" />);
+  expect(synced.getByText("Published")).toBeTruthy();
+  expect(synced.queryByText("Unpublished changes")).toBeNull();
+  expect(synced.queryByText("Unsaved changes")).toBeNull();
+  cleanup();
+
+  // Never published → Draft, never "unpublished changes".
+  const fresh = render(
+    <AgentRail {...railProps(FIXTURE_RELEASE_BOT)} lifecycle="draft" />,
+  );
+  expect(fresh.getByText("Draft")).toBeTruthy();
+  expect(fresh.queryByText("Unpublished changes")).toBeNull();
 });
 
 test("rail surfaces publish progress, the build-error card, and the ready card", () => {

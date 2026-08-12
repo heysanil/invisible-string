@@ -81,6 +81,14 @@ export interface CompileRequest {
    */
   workspaceSlug: string;
   agentSlug: string;
+  /**
+   * The agent row's STABLE id (`agents.id`) — the hash's IDENTITY input
+   * (2026-08-11 lifecycle spec D1). Never emitted into a generated file; it
+   * exists so two agents that share a display name and a definition cannot
+   * collapse onto one artifact and one `ag_v_<hash12>` world database. Pass
+   * the row id, never anything derived from the name.
+   */
+  agentId: string;
 }
 
 export interface CompileResult {

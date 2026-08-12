@@ -1,10 +1,12 @@
 /**
  * Session list (chat surface). Workspace-wide, per-agent, or per-workflow,
  * ordered by last activity (max of session/latest-run update time), carrying
- * the latest run's status plus the agent name (identity header) and workflow
- * name (provenance chip; null for direct chat). Session DETAIL, message
- * posting, run input, and SSE stay in the runtime plugin (they dispatch to
- * eve).
+ * the latest run's status plus the agent name (identity header), the workflow
+ * name (provenance chip; null for direct chat), and the generated thread
+ * `title` (null while the background titler in session-title.ts has not landed
+ * one, and permanently null when it fails — the sidebar falls back to
+ * truncating the first message). Session DETAIL, message posting, run input,
+ * and SSE stay in the runtime plugin (they dispatch to eve).
  */
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -106,6 +108,10 @@ function sessionSummaryBase(row: SessionRow) {
     workflowId: row.workflowId,
     origin: row.origin,
     status: row.status,
+    // Null until the background titler lands one — and permanently null when
+    // it fails (2026-08-11 spec D9). The sidebar falls back to truncating the
+    // first message; it must never render "Untitled".
+    title: row.title,
     eveSessionId: row.eveSessionId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

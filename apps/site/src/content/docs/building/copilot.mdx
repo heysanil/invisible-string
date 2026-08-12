@@ -27,6 +27,8 @@ In the workflow editor:
 
 | Editor | Mutation | What it changes |
 |---|---|---|
+| agent editor | `setName` | The Agent's name |
+| agent editor | `setDescription` | The one-line description shown in list views |
 | agent editor | `setPersona` | The persona text |
 | agent editor | `setModel` | The preset, model override, or reasoning effort |
 | agent editor | `addContext` | Attaches a connection or skill |
@@ -42,6 +44,16 @@ In the workflow editor:
 Every proposal renders as a structured card: an icon, a title, an optional rationale, a preview — an inline diff for text, a compact before-and-after row otherwise — and **Apply** / **Dismiss** buttons. The card is focusable; Enter applies it, Delete or Backspace dismisses it. Either decision collapses the card to a one-line receipt — a check and "Applied — *title*," or a muted "Dismissed — *title*" — and applying flashes the section of the editor it touched, so you can see exactly what moved.
 
 The server never mutates your draft directly: accepted mutations are applied client-side through the same controller manual edits use, so autosave and diagnostics all just work.
+
+## Allow edits
+
+A switch in the dock's header turns the accept gate off. With **allow edits** on, copilot's changes apply as they arrive and it keeps working instead of stopping to wait for you — the cards still render, marked "Applied automatically", so the turn remains a record of what changed rather than a black box. Everything else is unchanged: the same typed mutations, the same validation, the same client-side write path, and Undo is still your editor's own draft history plus the fact that nothing is live until you publish.
+
+The switch is scoped to this sitting. It starts off every time you open the dock, and is deliberately not remembered across tabs or sessions — "the copilot may edit without asking" is a decision worth making on purpose each time.
+
+## Watching it work
+
+The dock shows the turn, not just its conclusions. Copilot's reasoning streams into a collapsible work box as it thinks, and each tool call it makes appears as a step on the box's rail with its own state — the same rail-in-box grammar the [chat](/docs/building/chat) timeline uses, one size down. Steps that already have a suggestion card of their own aren't repeated in the rail; what shows up there is the work that would otherwise be invisible, including a call copilot got wrong and had to correct. If a turn is interrupted — you stop it, the socket drops — anything still in flight settles as canceled rather than spinning forever.
 
 ## Connection
 

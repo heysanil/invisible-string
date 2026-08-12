@@ -219,6 +219,13 @@ export interface AgentSessionDto {
   origin: SessionOrigin;
   status: AgentSessionStatus;
   /**
+   * Generated thread title (2026-08-11 spec D9). NULL is the normal early
+   * state, not an error: the titler runs asynchronously after the first user
+   * message and stays silent on failure, so clients MUST fall back to
+   * truncating the first message rather than rendering "Untitled".
+   */
+  title: string | null;
+  /**
    * eve's session id. Null until eve acks — `POST /eve/v1/session` is async
    * (202) so creation responses may carry null here.
    */
@@ -227,6 +234,9 @@ export interface AgentSessionDto {
   updatedAt: string;
 }
 
+/** Upper bound on a generated session title (also the DB column's budget). */
+export const SESSION_TITLE_MAX_CHARS = 80;
+
 export const agentSessionDtoSchema = z.object({
   id: productId,
   agentId: productId,
@@ -234,6 +244,7 @@ export const agentSessionDtoSchema = z.object({
   workflowId: productId.nullable(),
   origin: sessionOriginSchema,
   status: agentSessionStatusSchema,
+  title: z.string().max(SESSION_TITLE_MAX_CHARS).nullable(),
   eveSessionId: z.string().nullable(),
   createdAt: isoTimestamp,
   updatedAt: isoTimestamp,
@@ -1409,11 +1420,18 @@ export type ListModelCapabilitiesResponse = z.infer<
 // (Lifecycle routes — publish, build status, dry-run-compile, sessions — are
 // documented at their schemas above.) Deleting an agent referenced by
 // workflows or sessions answers 409 `agent_in_use` — the UI warns before
-// deleting. NOTE the agent NAME feeds the content hash via its slug:
-// renaming re-keys the world DB + JWT audience on the next publish, exactly
-// like renaming a workflow used to.
+// deleting. NOTE the content hash keys on the agent's stable `id`, NOT on its
+// name (2026-08-11 spec D1) — duplicate names are legal and renaming does not
+// collide two agents onto one world DB. Renaming still re-keys the world DB +
+// JWT audience on the next publish, because the human name remains in emitted
+// bytes (the generated package name and the model-visible identity line).
 
-const agentNameSchema = z.string().trim().min(1).max(120);
+/**
+ * Agent display name. Exported because the copilot's `setName` mutation must
+ * validate against exactly this schema — a proposal the copilot considers
+ * valid and the PATCH route then rejects is the drift this prevents.
+ */
+export const agentNameSchema = z.string().trim().min(1).max(120);
 
 /**
  * Full agent row. `draft` is served AS STORED (jsonb, draft-lenient); use

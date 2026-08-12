@@ -5,10 +5,23 @@
  *   user frame → [model round-trip → (validate tool calls → proposal frames →
  *   await accepted/rejected → tool results)]* → done frame
  *
- * Invalid tool calls (schema or semantic) are NEVER forwarded to the client;
- * they return to the model as tool-error results so it self-corrects. Valid
- * calls pause the loop until the client reports the mutation outcome — the
- * outcome IS the tool result, so the model knows what was applied.
+ * Invalid tool calls (schema or semantic) are NEVER forwarded to the client as
+ * PROPOSALS; they return to the model as tool-error results so it
+ * self-corrects. Valid calls pause the loop until the client reports the
+ * mutation outcome — the outcome IS the tool result, so the model knows what
+ * was applied — unless ALLOW-EDITS is on for the turn (spec D7.2), in which
+ * case the proposal is streamed with `autoApplied: true` and the loop
+ * continues immediately: the client still applies (single writer, unchanged)
+ * and still renders the card, so the turn stays an audit trail.
+ *
+ * What the client SEES of all this (spec D7.1) is three frame kinds beyond
+ * `delta`: a `thought` per round-trip that carries the model's reasoning
+ * cumulatively, a `step` per tool call carrying only lifecycle
+ * (pending → ok/error) so the dock can render the chat's rail-in-box grammar,
+ * and the existing `proposal`. Step frames are emitted for INVALID calls too —
+ * that is not a leak of the self-correction protocol, because the preview is
+ * the (workspace-derived, user-safe) validation problem, never the model-facing
+ * "INVALID TOOL CALL …" scaffolding, and never a card the user could accept.
  *
  * History invariant: every assistant tool-call message is ALWAYS followed by
  * a tool message pairing each call with a result — aborting mid-proposal
@@ -17,10 +30,12 @@
  * tool_use without a matching tool_result).
  */
 import type { ModelMessage } from "ai";
-import type {
-  CopilotMutationOutcome,
-  CopilotServerFrame,
-  CopilotSurface,
+import {
+  summarizeToolResult,
+  type CopilotMutationOutcome,
+  type CopilotServerFrame,
+  type CopilotStepState,
+  type CopilotSurface,
 } from "@invisible-string/shared";
 
 import type { CopilotConfig } from "./config";
@@ -116,6 +131,13 @@ export class CopilotSession {
     message: string;
     draft: Record<string, unknown>;
     inventory: WorkspaceInventory;
+    /**
+     * ALLOW-EDITS for THIS turn (spec D7.2) — carried per turn by the client,
+     * never held as session state, so a mid-turn toggle or a reconnect cannot
+     * leave the server and the dock disagreeing about the mode. Default false:
+     * an omission gets the accept gate, the safe direction.
+     */
+    allowEdits?: boolean;
   }): Promise<number> {
     if (this.turnRunning) {
       this.deps.send({
@@ -155,6 +177,20 @@ export class CopilotSession {
         type ToolCall = { toolCallId: string; toolName: string; input: unknown };
         const toolCalls: ToolCall[] = [];
         let stepText = "";
+        // One thought block per round-trip, keyed `step:<index>` (the chat
+        // rail's stepIndex convention). Its text is CUMULATIVE on the wire, so
+        // a dropped frame self-heals on the next one; a provider that opens
+        // several reasoning blocks in one step has them joined here rather than
+        // racing for the same key.
+        //
+        // Reasoning is DISPLAY ONLY — it is never pushed back into `messages`.
+        // That is correct while nothing asks for reasoning (see transport.ts),
+        // but Anthropic's extended thinking + tool use requires the thinking
+        // blocks to be echoed in the assistant turn: whoever turns thinking on
+        // must round-trip them here as well, or the next request 400s.
+        const thoughtKey = `step:${step}`;
+        let stepReasoning = "";
+        let reasoningBlockId: string | null = null;
 
         for await (const part of this.deps.transport.stream({
           system,
@@ -166,11 +202,38 @@ export class CopilotSession {
           if (part.type === "text-delta") {
             stepText += part.text;
             this.deps.send({ type: "delta", text: part.text });
+          } else if (part.type === "reasoning-delta") {
+            if (reasoningBlockId !== null && reasoningBlockId !== part.id) {
+              stepReasoning += "\n\n";
+            }
+            reasoningBlockId = part.id;
+            stepReasoning += part.text;
+            this.deps.send({
+              type: "thought",
+              key: thoughtKey,
+              text: stepReasoning,
+              streaming: true,
+            });
           } else if (part.type === "tool-call") {
             toolCalls.push(part);
           } else if (part.type === "finish") {
-            outputTokens += part.outputTokens ?? Math.ceil(stepText.length / 4);
+            // Reasoning is billed output: when the provider reports usage it
+            // already includes it, and when it does not the fallback estimate
+            // must count it too or a thinking turn meters as a cheap one.
+            outputTokens +=
+              part.outputTokens ??
+              Math.ceil((stepText.length + stepReasoning.length) / 4);
           }
+        }
+        // Seal the block: a later frame under this key would be the client's
+        // cue that the same step resumed, which never happens.
+        if (stepReasoning) {
+          this.deps.send({
+            type: "thought",
+            key: thoughtKey,
+            text: stepReasoning,
+            streaming: false,
+          });
         }
 
         if (outputTokens > this.deps.config.maxOutputTokensPerTurn) {
@@ -202,9 +265,10 @@ export class CopilotSession {
         });
 
         // Resolve each call: invalid → tool error back to the model; valid →
-        // proposal to the client, pause until accepted/rejected. The results
-        // message is pushed in `finally` so an abort mid-proposal still pairs
-        // every tool call with a (synthesized) result — see header invariant.
+        // proposal to the client, then pause until accepted/rejected (or, under
+        // allow-edits, do not pause at all). The results message is pushed in
+        // `finally` so an abort mid-proposal still pairs every tool call with a
+        // (synthesized) result — see header invariant.
         const toolResults: ModelMessage = { role: "tool", content: [] };
         const resultFor = (call: ToolCall, text: string) => ({
           type: "tool-result" as const,
@@ -216,6 +280,14 @@ export class CopilotSession {
         try {
           for (const call of toolCalls) {
             abortController.signal.throwIfAborted();
+            // The step goes pending as its resolution BEGINS, not when the
+            // call arrives: the loop resolves calls one at a time, and waiting
+            // for the user is the long part — a later call must not claim to
+            // be running while an earlier proposal is still on screen. A step
+            // never sealed here (an abort mid-proposal) stays pending on the
+            // wire and the client renders it canceled; the server has nothing
+            // further to say about it.
+            this.sendStep(call.toolCallId, call.toolName, "pending", null);
             const validation = validateMutation(
               call.toolName,
               call.input,
@@ -225,6 +297,15 @@ export class CopilotSession {
             let resultText: string;
             if (!validation.ok) {
               resultText = `INVALID TOOL CALL (not shown to the user): ${validation.message}. Fix the call and try again.`;
+              // The PROBLEM is user-safe (it is built from this workspace's own
+              // inventory); the model-facing wrapper above is not, and is not
+              // what ships.
+              this.sendStep(
+                call.toolCallId,
+                call.toolName,
+                "error",
+                validation.message,
+              );
             } else {
               const rationale = extractRationale(call.input);
               this.deps.send({
@@ -235,20 +316,60 @@ export class CopilotSession {
                   params: validation.params,
                   rationale,
                 } as never,
+                ...(opts.allowEdits ? { autoApplied: true } : {}),
               });
-              const result = await this.waitForOutcome(
-                call.toolCallId,
-                abortController.signal,
-              );
-              if (result.outcome === "accepted") {
+              if (opts.allowEdits) {
+                // Allow-edits: no park, no waiter registered — so a
+                // `mutation_result` for this id finds nothing to resolve and is
+                // ignored, exactly as the frame contract states. The client is
+                // still the writer; it just was not asked first.
                 applyAcceptedMutation(
                   draftState,
                   validation.tool,
                   validation.params,
                 );
-                resultText = "accepted — the user applied this change to the draft";
+                resultText =
+                  "accepted — allow-edits is on, so this change was applied to the draft immediately";
+                this.sendStep(
+                  call.toolCallId,
+                  call.toolName,
+                  "ok",
+                  "Applied automatically",
+                );
               } else {
-                resultText = `rejected — the user dismissed this proposal${result.reason ? `: ${result.reason}` : ""}`;
+                const result = await this.waitForOutcome(
+                  call.toolCallId,
+                  abortController.signal,
+                );
+                if (result.outcome === "accepted") {
+                  applyAcceptedMutation(
+                    draftState,
+                    validation.tool,
+                    validation.params,
+                  );
+                  resultText =
+                    "accepted — the user applied this change to the draft";
+                  this.sendStep(
+                    call.toolCallId,
+                    call.toolName,
+                    "ok",
+                    "Applied to the draft",
+                  );
+                } else {
+                  resultText = `rejected — the user dismissed this proposal${result.reason ? `: ${result.reason}` : ""}`;
+                  // `ok`, not `error`: dismissing a proposal is a decision the
+                  // user made and the step completed on, not a failure. The
+                  // copilot's step vocabulary has no `rejected` value — the
+                  // proposal CARD carries that, this carries lifecycle only.
+                  this.sendStep(
+                    call.toolCallId,
+                    call.toolName,
+                    "ok",
+                    result.reason
+                      ? `Dismissed: ${result.reason}`
+                      : "Dismissed by you",
+                  );
+                }
               }
             }
             (toolResults.content as unknown[]).push(resultFor(call, resultText));
@@ -294,6 +415,26 @@ export class CopilotSession {
       this.turnRunning = false;
     }
     return outputTokens;
+  }
+
+  /**
+   * One tool step's lifecycle frame. The preview runs through the SAME
+   * summarizer the chat thread uses (`summarizeToolResult`), so both surfaces
+   * clamp and flatten identically and neither can drift into showing JSON.
+   */
+  private sendStep(
+    key: string,
+    toolName: string,
+    state: CopilotStepState,
+    preview: string | null,
+  ): void {
+    this.deps.send({
+      type: "step",
+      key,
+      toolName,
+      state,
+      resultPreview: preview === null ? null : summarizeToolResult(preview),
+    });
   }
 
   private waitForOutcome(

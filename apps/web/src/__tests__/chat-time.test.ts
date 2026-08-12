@@ -1,9 +1,10 @@
-/** Relative-time + recency-bucket tests for the session list. */
+/** Relative-time, recency-bucket and row-title tests for the session list. */
 import { expect, test } from "bun:test";
 
 import {
   recencyGroup,
   relativeTime,
+  sessionRowTitle,
   titleFromMessage,
 } from "../lib/chat/time";
 
@@ -30,4 +31,39 @@ test("titleFromMessage takes the first non-empty line and truncates", () => {
   expect(titleFromMessage("\n\n  Trim me  \nsecond")).toBe("Trim me");
   expect(titleFromMessage("")).toBe("New conversation");
   expect(titleFromMessage("x".repeat(100)).endsWith("…")).toBe(true);
+});
+
+// ── sessionRowTitle (spec D9) ───────────────────────────────────────────────
+
+const AGENT = { agentName: "Executive assistant" };
+
+test("a generated title wins over everything", () => {
+  expect(
+    sessionRowTitle({ ...AGENT, title: "Launch announcement draft" }, "hi there"),
+  ).toBe("Launch announcement draft");
+});
+
+test("no title falls back to the first message, truncated", () => {
+  expect(sessionRowTitle({ ...AGENT, title: null }, "Draft the launch post")).toBe(
+    "Draft the launch post",
+  );
+  expect(
+    sessionRowTitle({ ...AGENT, title: null }, "y".repeat(100)).endsWith("…"),
+  ).toBe(true);
+});
+
+test("no title and no message falls back to the agent — never 'New conversation'", () => {
+  // `titleFromMessage("")` answers "New conversation", which is a worse label
+  // than the agent's name; the emptiness guard is what keeps it out.
+  expect(sessionRowTitle({ ...AGENT, title: null })).toBe("Executive assistant");
+  expect(sessionRowTitle({ ...AGENT, title: null }, "")).toBe("Executive assistant");
+  expect(sessionRowTitle({ ...AGENT, title: null }, "   \n ")).toBe(
+    "Executive assistant",
+  );
+});
+
+test("a whitespace-only title is treated as no title", () => {
+  expect(sessionRowTitle({ ...AGENT, title: "   " }, "Draft the post")).toBe(
+    "Draft the post",
+  );
 });

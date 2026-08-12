@@ -20,6 +20,18 @@ chip. Picking an Agent opens a new thread that targets its currently published
 version and pins that version for the session's life: republishing the Agent
 later never moves a thread that's already running.
 
+Sending the first message puts you **in the thread immediately** — your message
+renders while the session is still being created, rather than holding the
+composer until the server answers. If creation fails, you land back on the
+composer with your text still in it.
+
+Threads name themselves. Shortly after your first message the platform writes a
+short title for the session, and that is what the sidebar shows from then on;
+until it lands (or if it never does — titling is best-effort and silent about
+failure) the row falls back to a truncation of the first message. Titles are
+generated once, for new threads, and are not rewritten as a conversation moves
+on.
+
 ## The composer
 
 | Key | Effect |
@@ -43,6 +55,15 @@ collapsible box beside a rail. Every thinking pass is kept, not just the last
 one, so a run that thinks, calls a tool, then thinks again shows both passes in
 place. A tool call on the rail shows its own status as it happens — running,
 succeeded, failed, rejected, or awaiting your approval.
+
+Tool calls read as English, not as wire names. `linear__create_issue` renders
+as **Linear · Create issue**, with the connection's own description of the tool
+underneath it where the server published one, and a short summary of the result
+in place of serialized JSON — the raw output stays reachable, just never by
+default. None of that costs a network call: the names and descriptions come
+from what the connection reported the last time it was probed. A tool from a
+connection that has since been detached still humanizes; it just loses the
+connection name.
 
 A work box's header tells you what it's doing: **Working** while it's live,
 with a running M:SS counter; **Waiting on you** while it's parked on an
@@ -111,6 +132,18 @@ if the Agent behind the thread isn't published. See
 [Troubleshooting](/docs/reference/troubleshooting) for what each of those
 states means and how to recover.
 
+## The thread header
+
+The header answers "how much room is left?", not "which build is this?". A
+small **context meter** shows the share of the model's context window the
+session has used — a hairline bar, the percentage, and the window size, with
+the exact token counts on hover — turning amber past 80%, where a compaction is
+worth considering, and red past 95%. It reads from what the runs actually
+reported, so it survives a reload; when either the usage or the model's window
+size is unknown the meter is simply absent rather than guessing at a number.
+Beside it, the model appears as its friendly preset label (Powerful, Balanced,
+Quick) rather than a raw provider slug.
+
 ## Origin and editing
 
 A session started by something other than chat — a webhook, a Slack event, a
@@ -133,8 +166,11 @@ Agent remembers:
 
 Clear and compact both fire immediately with no confirmation, and leave a
 marker in the thread where they happened, so the transcript never silently
-disagrees with what the Agent knows. If a run is in flight, every row in this
-menu is disabled.
+disagrees with what the Agent knows. Those markers are part of the run's
+recorded history, not a passing bit of UI state, so they are still there after
+a reload. One honest exception: compacting a context that is already empty (or
+that you just cleared) does no work and therefore leaves no marker. If a run is
+in flight, every row in this menu is disabled.
 
 See [Sessions & runs](/docs/concepts/sessions-and-runs) for how a session and
 its runs relate, [Agents](/docs/concepts/agents) for what gets published into

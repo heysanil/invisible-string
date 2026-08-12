@@ -7,7 +7,10 @@
  *   without ANTHROPIC_API_KEY). Tool input schemas are passed as raw JSON
  *   schema with a pass-through validator: the session loop owns validation
  *   (zod + semantic) so invalid calls become model-facing tool errors instead
- *   of transport crashes.
+ *   of transport crashes. No tool carries an `execute`, so ai@7 never runs one
+ *   and the stream never yields `tool-result` parts — every result is
+ *   synthesized by the session from the CLIENT's outcome, which is why the
+ *   step frames it emits are minted there rather than forwarded from here.
  * - `createScriptedTransport` — deterministic fake for unit/integration
  *   tests (COPILOT_FAKE_SCRIPT): a sequence of {text?, toolCalls?} steps,
  *   one consumed per round-trip.
@@ -36,6 +39,22 @@ export interface TransportToolSpec {
 
 export type TransportPart =
   | { type: "text-delta"; text: string }
+  /**
+   * Model reasoning (2026-08-11 spec D7.1) — surfaced so the dock can render a
+   * thinking block instead of a silent gap between deltas. `id` is the
+   * provider's reasoning-block id: a single round-trip can contain several,
+   * and the session joins them under one per-step thought key.
+   *
+   * Whether ANY arrive is the provider's call, not ours: we do not ask for
+   * reasoning, and with the pinned `@openrouter/ai-sdk-provider` we could not
+   * if we wanted to — its chat model whitelists the request body it builds
+   * (model/input/stream/maxOutputTokens/temperature/topP/tools/toolChoice/text)
+   * so neither `extraBody` nor a passthrough `reasoning` key reaches the wire.
+   * Models that reason by default still emit these parts, and the direct
+   * Anthropic path can be given `providerOptions.anthropic.thinking` later
+   * without touching anything downstream of here.
+   */
+  | { type: "reasoning-delta"; id: string; text: string }
   | { type: "tool-call"; toolCallId: string; toolName: string; input: unknown }
   | { type: "finish"; outputTokens: number | undefined };
 
@@ -100,6 +119,9 @@ export function createModelTransport(
           case "text-delta":
             yield { type: "text-delta", text: part.text };
             break;
+          case "reasoning-delta":
+            yield { type: "reasoning-delta", id: part.id, text: part.text };
+            break;
           case "tool-call":
             yield {
               type: "tool-call",
@@ -128,12 +150,44 @@ export function createModelTransport(
 
 // ── scripted fake transport ──────────────────────────────────────────────────
 
-/** One scripted model round-trip: optional text, then optional tool calls. */
+/**
+ * One scripted model round-trip: optional reasoning, then optional text, then
+ * optional tool calls — the order a real stream produces them in.
+ */
 export interface ScriptedStep {
   text?: string;
+  /**
+   * Scripted reasoning for this round-trip, emitted as `reasoning-delta` parts
+   * BEFORE any text (spec D7.1). Optional so every pre-existing script — and
+   * the E2E harness's — keeps its exact behavior.
+   */
+  reasoning?: string;
   toolCalls?: Array<{ toolName: string; input: unknown }>;
-  /** Reported output-token usage for this step (default: text length / 4). */
+  /**
+   * Reported output-token usage for this step (default: (reasoning + text)
+   * length / 4 — reasoning is billed output, so an estimate that ignored it
+   * would under-meter every thinking turn).
+   */
   outputTokens?: number;
+}
+
+/** Emit a scripted step's reasoning as two deltas of one block. */
+function* scriptedReasoning(
+  reasoning: string | undefined,
+  blockId: string,
+): Generator<TransportPart> {
+  if (!reasoning) return;
+  const mid = Math.ceil(reasoning.length / 2);
+  yield { type: "reasoning-delta", id: blockId, text: reasoning.slice(0, mid) };
+  yield { type: "reasoning-delta", id: blockId, text: reasoning.slice(mid) };
+}
+
+/** Default token estimate for a scripted step (reasoning counts as output). */
+function scriptedOutputTokens(step: ScriptedStep): number {
+  return (
+    step.outputTokens ??
+    Math.ceil(((step.text?.length ?? 0) + (step.reasoning?.length ?? 0)) / 4)
+  );
 }
 
 /**
@@ -157,6 +211,7 @@ export function createScriptedTransport(script: ScriptedStep[]): CopilotTranspor
         yield { type: "finish", outputTokens: 0 };
         return;
       }
+      yield* scriptedReasoning(step.reasoning, `fake_reasoning_${cursor}`);
       if (step.text) {
         // Emit in two chunks so delta streaming is observable.
         const mid = Math.ceil(step.text.length / 2);
@@ -173,11 +228,7 @@ export function createScriptedTransport(script: ScriptedStep[]): CopilotTranspor
           input: call.input,
         };
       }
-      yield {
-        type: "finish",
-        outputTokens:
-          step.outputTokens ?? Math.ceil((step.text?.length ?? 0) / 4),
-      };
+      yield { type: "finish", outputTokens: scriptedOutputTokens(step) };
     },
   };
 }
@@ -242,6 +293,11 @@ function lastToolResultsSummary(messages: ModelMessage[]): string {
  * which carries no ref slug — agents are matched by exact name).
  * Unresolvable placeholders are left as-is so schema validation rejects them
  * loudly (a script bug, never a silent pass).
+ *
+ * Agent NAMES are not unique in a workspace (spec D1 dropped the unique index),
+ * so `{{agentId:…}}` resolves to the first inventory line with that name — a
+ * harness affordance only. Nothing in the product addresses an agent by name;
+ * every tool takes an id.
  */
 function substituteInventoryIds(input: unknown, system: string): unknown {
   const raw = JSON.stringify(input);
@@ -294,6 +350,12 @@ export function createKeyedScriptedTransport(
         yield { type: "finish", outputTokens: 0 };
         return;
       }
+      // Block id salted like the tool-call ids below: stateless replay must
+      // not reuse a thought key across turns on one socket.
+      yield* scriptedReasoning(
+        step.reasoning,
+        `fake_reasoning_${request.messages.length}_${stepIndex}`,
+      );
       if (step.text) {
         const text = step.text.replace(
           "{{toolResults}}",
@@ -317,10 +379,7 @@ export function createKeyedScriptedTransport(
           input: substituteInventoryIds(call.input, request.system),
         };
       }
-      yield {
-        type: "finish",
-        outputTokens: step.outputTokens ?? Math.ceil((step.text?.length ?? 0) / 4),
-      };
+      yield { type: "finish", outputTokens: scriptedOutputTokens(step) };
     },
   };
 }

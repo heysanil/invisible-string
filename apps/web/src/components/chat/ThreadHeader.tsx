@@ -1,8 +1,16 @@
 /**
- * Thread header: session title, monogram-fronted agent chip + pinned agent
- * version, resolved model chip, a workflow provenance chip for
- * trigger-origin sessions, the session-actions menu (eve 0.31 context
- * controls) and an "Edit agent ↗" link into the agent editor.
+ * Thread header: session title, monogram-fronted agent chip, a CONTEXT-BUDGET
+ * meter, a friendly model label, a workflow provenance chip for trigger-origin
+ * sessions, the session-actions menu (eve 0.31 context controls) and an
+ * "Edit agent ↗" link into the agent editor.
+ *
+ * BUILD IDENTITY IS GONE FROM HERE (2026-08-11 spec D6). The pinned version
+ * hash and the exact model id were build facts standing where a budget
+ * belongs: the reader of a thread wants to know how much room is left, not
+ * which artifact answers them. The meter is absent — never zero, never a
+ * guess — whenever either half is unknown (no step has reported usage yet, or
+ * the catalog does not publish a context window for the resolved model), and
+ * the model stays discoverable as a preset label rather than a raw slug.
  *
  * The menu is Popover + Button — the house pattern (TestRunPopover,
  * ContextAttachments). Clear and compact are non-destructive and fire
@@ -15,7 +23,6 @@ import {
   ArrowUpRight,
   Cpu,
   Eraser,
-  GitBranch,
   Layers,
   MoreHorizontal,
   RotateCcw,
@@ -24,6 +31,7 @@ import {
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 
+import { cn } from "../../lib/cn";
 import { AgentMonogram } from "../agents/AgentMonogram";
 import { Button } from "../ui/Button";
 import { Popover } from "../ui/Popover";
@@ -37,14 +45,34 @@ import type {
 /** The three eve 0.31 session context controls. */
 export type SessionContextAction = "clear" | "compact" | "reset";
 
+/**
+ * How much of the model's context window this session is currently using.
+ *
+ * Both halves come from sources that can genuinely be absent — `usedTokens` is
+ * `usage.inputTokens` off the newest persisted `step.completed`, `windowTokens`
+ * is the OpenRouter catalog's `context_length` for the resolved model — so the
+ * whole object is null when either is missing. There is no partial state and
+ * no default window: an invented denominator would make the meter fiction.
+ */
+export interface ContextUsageView {
+  usedTokens: number;
+  windowTokens: number;
+}
+
 export interface ThreadHeaderProps {
   title: string;
   agentName: string;
   agentId: string;
-  /** Pinned agent version (short hash / id) — the session's frozen version. */
-  versionLabel: string | null;
-  /** Resolved model id from the run's session.started event. */
+  /**
+   * The model as a person would name it — the preset it is pointed at
+   * ("Balanced"), falling back to the model's own short name. Never the raw
+   * `provider/model-id` slug; null renders no chip at all.
+   */
+  modelLabel: string | null;
+  /** Full resolved model id — hover-only provenance behind {@link modelLabel}. */
   modelId: string | null;
+  /** Context budget, or null when either half is unknown (render nothing). */
+  contextUsage: ContextUsageView | null;
   /** Workflow provenance — set only for trigger-origin sessions. */
   workflowName: string | null;
   sessionStatus: AgentSessionStatus;
@@ -100,12 +128,71 @@ const CONTEXT_ACTIONS: readonly {
   },
 ];
 
+/**
+ * Compact token counts: 1_048_576 → "1M", 356_000 → "356K". The full figures
+ * ride the meter's tooltip, so the chip stays a glance and never a table.
+ */
+function compactTokens(value: number): string {
+  if (value >= 1_000_000) {
+    const millions = value / 1_000_000;
+    return `${millions >= 10 ? Math.round(millions) : Math.round(millions * 10) / 10}M`;
+  }
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+  return String(value);
+}
+
+/**
+ * The context budget: a hairline meter plus the actual percentage.
+ *
+ * Colour is MEANING, not decoration (E1): neutral ink while there is room,
+ * amber past 80% — the point where a compaction is worth considering — and red
+ * past 95%, where the next long turn is likely to be truncated. It reports
+ * `role="meter"` with the percentage as its value, so a screen reader hears
+ * "Context used, 46%" rather than a decorative bar.
+ */
+function ContextMeter({ usage }: { usage: ContextUsageView }) {
+  const ratio = usage.usedTokens / usage.windowTokens;
+  if (!Number.isFinite(ratio) || ratio < 0) return null;
+  const percent = Math.min(100, Math.round(ratio * 100));
+  const tone =
+    percent >= 95 ? "bg-err" : percent >= 80 ? "bg-warn" : "bg-ink-3";
+  return (
+    <span
+      role="meter"
+      aria-label="Context used"
+      aria-valuenow={percent}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuetext={`${percent}% of the context window used`}
+      title={`Context used — ${usage.usedTokens.toLocaleString()} of ${usage.windowTokens.toLocaleString()} tokens`}
+      className="inline-flex max-w-full items-center gap-1.5 rounded-capsule border border-black/[0.07] bg-black/[0.035] px-2 py-0.5 text-[11.5px] font-medium text-ink-2"
+    >
+      <span
+        aria-hidden="true"
+        className="h-1 w-9 shrink-0 overflow-hidden rounded-capsule bg-black/[0.09]"
+      >
+        {/* Floor the fill at 2% so a live-but-tiny context still reads as a
+            meter with something in it rather than as an empty track. */}
+        <span
+          className={cn("block h-full rounded-capsule", tone)}
+          style={{ width: `${Math.max(2, percent)}%` }}
+        />
+      </span>
+      <span className="tabular-nums">{percent}%</span>
+      <span className="text-ink-4">
+        · {compactTokens(usage.windowTokens)} ctx
+      </span>
+    </span>
+  );
+}
+
 export function ThreadHeader({
   title,
   agentName,
   agentId,
-  versionLabel,
+  modelLabel,
   modelId,
+  contextUsage,
   workflowName,
   sessionStatus,
   lastRunStatus,
@@ -141,14 +228,13 @@ export function ThreadHeader({
           >
             {agentName}
           </Chip>
-          {versionLabel !== null ? (
-            <Chip icon={GitBranch} mono title="Pinned agent version">
-              {versionLabel}
-            </Chip>
-          ) : null}
-          {modelId !== null ? (
-            <Chip icon={Cpu} mono title="Resolved model">
-              {modelId}
+          {contextUsage !== null ? <ContextMeter usage={contextUsage} /> : null}
+          {modelLabel !== null ? (
+            <Chip
+              icon={Cpu}
+              title={modelId !== null ? `Model · ${modelId}` : "Model"}
+            >
+              {modelLabel}
             </Chip>
           ) : null}
           {workflowName !== null ? (

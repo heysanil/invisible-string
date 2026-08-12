@@ -1,7 +1,8 @@
 /**
- * Time presentation for the chat surface: compact relative timestamps
- * ("now", "5m", "3h", "2d", then a short date) and recency buckets for the
- * session list ("Today" / "Yesterday" / "Previous 7 days" / "Earlier").
+ * Time and title presentation for the chat surface: compact relative
+ * timestamps ("now", "5m", "3h", "2d", then a short date), recency buckets for
+ * the session list ("Today" / "Yesterday" / "Previous 7 days" / "Earlier"),
+ * and how a session row is NAMED.
  */
 
 export function relativeTime(iso: string, now: Date = new Date()): string {
@@ -53,4 +54,33 @@ export function titleFromMessage(message: string, max = 64): string {
   const compact = line.replace(/\s+/g, " ").trim();
   if (compact.length === 0) return "New conversation";
   return compact.length > max ? `${compact.slice(0, max - 1).trimEnd()}…` : compact;
+}
+
+/**
+ * How a session row is NAMED, in falling order of usefulness (2026-08-11
+ * spec, D9). Every row used to read the agent's name, so a workspace that
+ * chats with one agent had a sidebar of identical rows.
+ *
+ *  1. The title the control plane generated after the first user message.
+ *  2. A truncation of that first message — the fallback while the titler is
+ *     still running, and the permanent answer for a session whose titling
+ *     failed (it fails SILENTLY by design), that predates the column, or that
+ *     the titler declined to name.
+ *  3. The agent's name, which is at least true.
+ *
+ * (2) is only reachable when the caller HAS the first message: the session
+ * LIST DTO carries none, so it comes from a detail this tab already holds or
+ * from a chat this tab just started (see `ChatShell`). `titleFromMessage`
+ * answers "New conversation" for an empty string — a worse row label than the
+ * agent's name — hence the emptiness guard rather than a bare `??` chain.
+ */
+export function sessionRowTitle(
+  session: { title: string | null; agentName: string },
+  firstMessage?: string | null,
+): string {
+  const generated = session.title?.trim() ?? "";
+  if (generated.length > 0) return generated;
+  const message = firstMessage?.trim() ?? "";
+  if (message.length > 0) return titleFromMessage(message);
+  return session.agentName;
 }

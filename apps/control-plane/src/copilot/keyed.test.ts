@@ -186,6 +186,9 @@ function compileDepsFor(definition: AgentDefinition): CompileDeps {
     versions: RUNTIME_VERSIONS,
     resolvedModel: { provider: "openrouter", modelId, reasoning },
     workspaceSlug: "keyed-smoke",
+    // Stable identity for the hash (spec D1); this smoke test has one agent,
+    // so any fixed id serves — what matters is that it is not the slug.
+    agentId: "11111111-1111-4111-8111-111111111111",
     agentSlug: "support-agent",
     connections,
     skills,

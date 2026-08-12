@@ -5,7 +5,10 @@
  * the matching toolset and prompt. Both prompts carry: the copilot role, the
  * CURRENT draft JSON, the workspace inventory (with the exact ids the
  * mutation tools accept), the @reference grammar, and strict instructions to
- * only propose changes via tools.
+ * only propose changes via tools. The agent prompt additionally carries the
+ * agent's IDENTITY (name + one-line description, spec D7.3/D7.4) when the
+ * editor puts it on the draft — those live on the `agents` row rather than in
+ * the definition, so they arrive alongside it, not inside it.
  */
 import { z } from "zod";
 import {
@@ -28,6 +31,10 @@ const TOOL_DESCRIPTIONS: Record<CopilotMutationTool, string> = {
   setInstructions:
     "Propose replacing the workflow's INSTRUCTIONS markdown wholesale. Use @references only for valid trigger paths and the selected agent's published context.",
   // agent surface
+  setName:
+    "Propose renaming the agent (1–120 characters; keep it to a few words). Use it when the user asks for a name, or when the agent still carries a placeholder name like \"Untitled agent\" and the conversation has made its purpose clear. Duplicate names are allowed in a workspace, so a name never has to be refused for being taken.",
+  setDescription:
+    "Propose the agent's one-line description (max 200 characters, a single line) — the summary shown on agent cards and in the editor header. Say what the agent DOES for the workspace, in one sentence; never restate the persona.",
   setPersona:
     "Propose replacing the agent's PERSONA markdown wholesale. @reference only context attached to this agent; @trigger paths are not allowed in personas.",
   setModel:
@@ -128,7 +135,7 @@ References must start with a letter; segments are letters/digits/_/-.
 ## Hard rules
 1. You NEVER edit the draft yourself. Every change must be proposed through exactly one of the mutation tools; the user previews and accepts or rejects each proposal in the builder.
 2. Each tool result tells you whether the user accepted or rejected the proposal — adapt to rejections instead of re-proposing the same thing.
-3. Use only ids from the inventory above; never invent agents. Only PUBLISHED agents may be set via setAgent.
+3. Use only ids from the inventory above; never invent agents. Only PUBLISHED agents may be set via setAgent. Agent NAMES are not unique in a workspace — two agents may share one exactly — so the id is the only way to name one; if the user's wording matches several, ask which they mean instead of picking.
 4. Keep instructions consistent with the selected agent: only @reference connections/skills in ITS published context (propose setAgent first when the draft has no agent), and only @trigger paths legal for the draft's trigger type.
 5. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
 }
@@ -178,12 +185,33 @@ function buildAgentSystemPrompt(
     )
     .join("\n");
 
+  // IDENTITY (name + description) lives on the `agents` row, not in the
+  // definition, so it only reaches the prompt if the editor put it on the
+  // draft. Rendered only when present — inventing a "(unknown)" line would
+  // invite the model to "fix" a name it cannot actually see.
+  const name =
+    typeof draft.name === "string" && draft.name.trim()
+      ? promptSafe(draft.name, 120)
+      : null;
+  const description =
+    typeof draft.description === "string" && draft.description.trim()
+      ? promptSafe(draft.description)
+      : null;
+  // The description line is worth stating as "(none yet)" — that absence is
+  // itself a prompt to write one — but only once the editor has proven it
+  // sends identity at all, which the name does.
+  const identity =
+    name === null
+      ? ""
+      : `Name: "${name}"\nDescription: ${description ?? "(none yet)"}`;
+
   return `You are the agent copilot for invisible-string, docked in the agent editor. \
 An agent has three parts: PERSONA (markdown identity and standing behavior), MODEL \
 (workspace preset or allowlisted specific model, plus reasoning effort), CONTEXT \
-(attached MCP connections and skills). Published agents handle chat directly and are \
-delegated to by workflows.
-
+(attached MCP connections and skills). It also carries a NAME and a one-line \
+DESCRIPTION, which you may propose with setName/setDescription. Published agents \
+handle chat directly and are delegated to by workflows.
+${identity ? `\n## This agent\n${identity}\n` : ""}
 ## Current draft (JSON)
 ${JSON.stringify(draft, null, 2)}
 
@@ -210,5 +238,6 @@ References must start with a letter; segments are letters/digits/_/-.
 4. Keep the persona consistent with attached context: do not @reference a connection or skill that is not attached to the CONTEXT — propose addContext for it first, then setPersona.
 5. Only models on the allowlist may be set via setModel.modelId; prefer a preset (powerful/balanced/quick) unless a specific model is required.
 6. Reasoning effort is inherited unless the draft sets one. Leave it inherited unless the user asks for a specific level; propose only an effort the effective model lists above ("unknown" means any level is acceptable), and use "provider-default" for "send no reasoning setting at all".
-7. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
+7. Name and description are the agent's IDENTITY, not its behavior: propose setName/setDescription when the user asks, or once when a placeholder name like "Untitled agent" still stands and the agent's purpose has become clear — then leave them alone. Never re-propose a name or description the agent already has, and never use them to restate the persona.
+8. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
 }

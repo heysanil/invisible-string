@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   addModelAllowlistEntryRequestSchema,
   agentDtoSchema,
+  agentSessionDtoSchema,
   agentSessionSummaryDtoSchema,
   agentSummaryDtoSchema,
   agentVersionDtoSchema,
@@ -29,6 +30,7 @@ import {
   resetSessionRequestSchema,
   resetSessionResponseSchema,
   RUN_STREAM_EVENT_NAMES,
+  SESSION_TITLE_MAX_CHARS,
   runDtoSchema,
   runInputRequestSchema,
   runWorkflowRequestSchema,
@@ -195,6 +197,48 @@ describe("workflow CRUD schemas", () => {
   });
 });
 
+describe("session titles (spec D9)", () => {
+  const session = {
+    id: UUID,
+    agentId: UUID_2,
+    agentVersionId: UUID_2,
+    workflowId: null,
+    origin: "chat",
+    status: "active",
+    eveSessionId: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+
+  test("title is a required key with a nullable value", () => {
+    expect(agentSessionDtoSchema.safeParse({ ...session, title: null }).success).toBe(
+      true,
+    );
+    expect(
+      agentSessionDtoSchema.safeParse({ ...session, title: "Ship the notes" }).success,
+    ).toBe(true);
+    // Omitted entirely is a serializer bug — clients must be able to tell
+    // "no title yet" (null → fall back to the message truncation) apart from
+    // a field the server forgot to send.
+    expect(agentSessionDtoSchema.safeParse(session).success).toBe(false);
+  });
+
+  test("a title longer than the column budget is rejected", () => {
+    expect(
+      agentSessionDtoSchema.safeParse({
+        ...session,
+        title: "x".repeat(SESSION_TITLE_MAX_CHARS),
+      }).success,
+    ).toBe(true);
+    expect(
+      agentSessionDtoSchema.safeParse({
+        ...session,
+        title: "x".repeat(SESSION_TITLE_MAX_CHARS + 1),
+      }).success,
+    ).toBe(false);
+  });
+});
+
 describe("sessions list schemas", () => {
   test("query accepts optional agentId + workflowId + status", () => {
     expect(listSessionsQuerySchema.safeParse({}).success).toBe(true);
@@ -217,6 +261,8 @@ describe("sessions list schemas", () => {
         workflowId: null,
         origin: "chat",
         status: "active",
+        // Untitled until the titler lands — the normal early state.
+        title: null,
         eveSessionId: null,
         createdAt: NOW,
         updatedAt: NOW,
@@ -235,6 +281,7 @@ describe("sessions list schemas", () => {
         workflowId: UUID_2,
         origin: "webhook",
         status: "active",
+        title: "Nightly digest",
         eveSessionId: "eve_1",
         createdAt: NOW,
         updatedAt: NOW,
@@ -272,6 +319,7 @@ describe("session context controls (eve 0.31)", () => {
     workflowId: null,
     origin: "chat",
     status: "active",
+    title: "Ship the release notes",
     eveSessionId: "wrun_01KZFM7CCZWQ4SXBPVV0CGA9HN",
     createdAt: NOW,
     updatedAt: NOW,

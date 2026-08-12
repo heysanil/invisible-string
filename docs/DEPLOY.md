@@ -299,6 +299,26 @@ fail to dispatch until the rows are cleared; see AGENTS.md known residuals).
    the next version PR computes past it); otherwise the `version` job exits 1
    on every push to `main`.
 
+### A `COMPILER_VERSION` bump makes the first publish of every agent slow
+
+`COMPILER_VERSION` (`packages/compiler/src/version.ts`) participates in the
+agent-version content hash, so bumping it re-keys **every** artifact. Nothing
+breaks and nothing needs doing — but the build cache is cold for the whole
+fleet, so the first publish of each agent after the upgrade runs a real
+`eve build` (npm install + bundle, minutes, not seconds) instead of returning
+a cache hit, and each one provisions a fresh `ag_v_<hash12>` world database.
+Expect that on the smoke checklist below and don't read it as a regression.
+Already-running agents keep serving their existing version until they are
+republished.
+
+The **5.0.0** bump (2026-08-11) is one of these: the hash now keys on the
+agent's stable `agents.id` rather than on its slugified display name, which
+also drops the unique index `agents_organization_id_name_uidx` (migration
+`0011`). Old world databases from the previous hashes are orphaned once their
+versions are retired — drop them with `DROP DATABASE … WITH (FORCE)` when you
+prune, exactly as for any retired version (see
+`packages/compiler/WORLD-ISOLATION.md`).
+
 ---
 
 ## 11. Smoke checklist

@@ -304,6 +304,8 @@ function chatRun(userMessage: string): RunView {
     modelId: "deepseek/deepseek-v4-pro",
     canceled: false,
     contextCleared: false,
+    contextCompacted: false,
+    inputTokens: null,
   };
 }
 

@@ -8,6 +8,11 @@
  *
  * `AgentSections` is exported for the fixture editor, which drives the same
  * components over a local reducer without queries.
+ *
+ * Publishing is NON-BLOCKING (spec D2): the POST returns as soon as the
+ * version exists and the workspace-level publish store carries the build the
+ * rest of the way, announcing it by name wherever the user has got to. This
+ * screen therefore never awaits a build — it only mounts the store's sink.
  */
 import { useNavigate } from "@tanstack/react-router";
 import { Cpu, FileText, Plug, UserRound } from "lucide-react";
@@ -35,6 +40,8 @@ import {
   type AgentEditorState,
   type AgentSection,
 } from "../../lib/agents/model";
+import { chatEntryDecision } from "../../lib/agents/publish-machine";
+import { useAgentPublishSink } from "../../lib/agents/use-publish-store";
 import {
   agentEditorStateFromAgent,
   useAgentController,
@@ -84,6 +91,9 @@ export function AgentEditorScreen({
   const { toast } = useToast();
   const updateAgent = useUpdateAgent(workspaceId);
   const deleteAgent = useDeleteAgent(workspaceId);
+  // Publish completions are announced from the store, not from here — this
+  // just gives it a toast sink and scopes it to the active workspace.
+  useAgentPublishSink(workspaceId);
 
   const initialState = useMemo(
     () => agentEditorStateFromAgent(agent),
@@ -170,10 +180,23 @@ export function AgentEditorScreen({
   // The adapter reads the LIVE draft through a ref — never a stale capture.
   const draftRef = useRef<AgentDefinition>(state.definition);
   draftRef.current = state.definition;
+  // Identity (name + description) is NOT in the draft — it lives on the agent
+  // ROW — so the two identity cards read it through their own live ref. The
+  // name comes from the DTO (the header PATCHes it and the query refetches);
+  // the description is reducer state, which the editor field also writes.
+  const identityRef = useRef({ name: agent.name, description: state.description });
+  identityRef.current = { name: agent.name, description: state.description };
   const adapter = agentCopilotAdapter({
     agentId: agent.id,
     getDraft: () => draftRef.current,
+    getIdentity: () => identityRef.current,
     dispatch,
+    // An accepted rename takes the SAME path the header's inline edit takes —
+    // without this seam the card would apply nothing and still print
+    // "Applied", which is the one thing a receipt may never do.
+    setName: (name) => {
+      void commitName(name);
+    },
     resources,
     onApplied: onSuggestionApplied,
   });
@@ -190,34 +213,27 @@ export function AgentEditorScreen({
     }
   }
 
-  async function onPublish() {
-    const response = await controller.publish();
-    if (response && response.buildStatus === "succeeded") {
-      toast({
-        variant: "success",
-        message: response.cached
-          ? "Published — served from build cache."
-          : "Published and built.",
-      });
-    }
+  function onPublish() {
+    // Fire and forget: the rail shows the phase off the store subscription,
+    // and the store toasts the outcome — here, or three screens from here.
+    void controller.publish();
   }
 
   async function onChatWithAgent() {
     setChatPending(true);
     try {
-      // Publish first, ALWAYS — chat pins the published version's BUILD, so
-      // a clean-but-build-failed publish must be caught here (with a clear
-      // message and a build retry), not fail session creation later with raw
-      // protocol copy ("version_not_ready"). For an already-published,
-      // already-built draft this is an idempotent content-hash cache hit.
-      const response = await controller.publish();
-      if (!response) return; // publish surfaced its own error
-      if (response.buildStatus !== "succeeded") {
+      // Publish first, ALWAYS — chat pins the published version, and for an
+      // already-published, already-built draft this is an idempotent
+      // content-hash cache hit. What changed under D2 is that we no longer
+      // WAIT for the build: we wait only for the version to exist, and
+      // `chatEntryDecision` says what that answer means (its own comment
+      // carries the reasoning; the store announces the build either way).
+      const decision = chatEntryDecision(await controller.publish());
+      if (!decision.enter) return;
+      if (decision.warnStillBuilding) {
         toast({
-          variant: "error",
-          message: "The agent must build cleanly before you can chat with it.",
+          message: `“${agent.name}” is still building — your first message needs the build to land.`,
         });
-        return;
       }
       navigate({ to: "/chat", search: { agent: agent.id } });
     } finally {
@@ -253,7 +269,7 @@ export function AgentEditorScreen({
         <AgentRail
           name={agent.name}
           publishedVersionId={agent.publishedVersionId}
-          isDirty={controller.isDirty}
+          lifecycle={controller.lifecycle}
           state={state}
           diagnostics={diagnostics}
           activeSection={activeSection}

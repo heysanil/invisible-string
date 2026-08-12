@@ -52,6 +52,7 @@ nothing stops you from publishing a longer persona, up to the hard cap.
 | SSE heartbeat | 15 seconds | `SSE_HEARTBEAT_MS` |
 | Schedule ticker interval | 30 seconds | `SCHEDULE_TICK_MS` |
 | MCP registry sync interval | 6 hours | `REGISTRY_SYNC_INTERVAL_MS` |
+| Chat session title generation | On the first message of a new thread; 15-second cap, silent on failure | `SESSION_TITLE_ENABLED`, `SESSION_TITLE_TIMEOUT_MS` |
 | Connection health probe auto-refresh | Refreshes when a detail view opens and the last check is older than 15 minutes | — |
 | eve session input-token budget | 40 million input tokens, then a session-limit prompt appears | eve's own limit — not something invisible-string configures |
 

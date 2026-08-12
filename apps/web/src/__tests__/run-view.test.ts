@@ -19,6 +19,7 @@ import {
   inputRequestKindOf,
   reduceRunView,
   previewValue,
+  rawResultText,
   type RunSegment,
   type SpeechSegment,
   type ThoughtItem,
@@ -278,7 +279,7 @@ test("a late action.result updates its item in a closed segment, in place", () =
   const items = workItems(view);
   expect(items).toHaveLength(1);
   expect((items[0] as ToolItem).state).toBe("ok");
-  expect((items[0] as ToolItem).resultPreview).toBe("finally");
+  expect((items[0] as ToolItem).resultSummary).toBe("finally");
 });
 
 test("action.partial after action.result does not walk the step backwards", () => {
@@ -296,7 +297,7 @@ test("action.partial after action.result does not walk the step backwards", () =
   const items = workItems(view);
   expect(items).toHaveLength(1);
   expect((items[0] as ToolItem).state).toBe("ok");
-  expect((items[0] as ToolItem).resultPreview).toBe("final output");
+  expect((items[0] as ToolItem).resultSummary).toBe("final output");
 });
 
 test("completed turn reduces to a timeline ending in the final reply", async () => {
@@ -379,7 +380,7 @@ test("a resolved action clears its pending approval and marks the step ok", () =
   const view = reduceRunView(runRow("running"), store, "running");
   const step = toolItems(view).find((s) => s.toolName === "do_thing");
   expect(step?.state).toBe("ok");
-  expect(step?.resultPreview).toBe("ok");
+  expect(step?.resultSummary).toBe("ok");
   // Once running (not waiting), the answered approval is gone.
   expect(view.pendingInputs.length).toBe(0);
 });
@@ -490,6 +491,118 @@ test("context.cleared marks the run and retires pending requests", () => {
   expect(view.pendingInputs.length).toBe(0);
 });
 
+// ── compaction persists the way clearing does (2026-08-11 spec D4) ──────────
+
+test("a completed compaction marks the run, replayably", () => {
+  const events: EveStreamEvent[] = [
+    { type: "compaction.requested", data: { modelId: "m", sequence: 0, sessionId: "s1", turnId: "t", usageInputTokens: 900_000 } },
+    { type: "compaction.completed", data: { modelId: "m", sequence: 1, sessionId: "s1", turnId: "t" } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.contextCompacted).toBe(true);
+  // Clearing and compacting are different boundaries and must not be conflated.
+  expect(view.contextCleared).toBe(false);
+});
+
+test("compacting an EMPTY context claims nothing — eve emits no compaction.* at all", () => {
+  // D4's edge case, straight off the wire contract (spike finding 24): a
+  // compact over an empty or already-cleared context answers 202 and emits
+  // only `session.waiting`. A marker here would be an outright lie.
+  const events: EveStreamEvent[] = [
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.contextCompacted).toBe(false);
+});
+
+test("a compaction that was only REQUESTED claims nothing either", () => {
+  // `compaction.completed` is absent when summarization fails, and the session
+  // then keeps its previous history — nothing was summarized, so there is no
+  // boundary to draw.
+  const events: EveStreamEvent[] = [
+    { type: "compaction.requested", data: { modelId: "m", sequence: 0, sessionId: "s1", turnId: "t", usageInputTokens: 900_000 } },
+    { type: "session.waiting", data: { wait: "next-user-message" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.contextCompacted).toBe(false);
+});
+
+// ── context budget numerator (2026-08-11 spec D6) ───────────────────────────
+
+test("input tokens come off step.completed usage, last write winning", () => {
+  // eve carries usage on `step.completed`, NOT on `turn.completed`; and the
+  // LAST measurement wins rather than the max, so a compaction that shrinks
+  // the context is allowed to shrink the meter.
+  const events: EveStreamEvent[] = [
+    { type: "step.completed", data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId: "t", usage: { inputTokens: 900_000, outputTokens: 40 } } },
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId: "t", usage: { inputTokens: 120_000, outputTokens: 80 } } },
+    { type: "turn.completed", data: { sequence: 0, turnId: "t" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.inputTokens).toBe(120_000);
+});
+
+test("a run whose steps report no usage has NO input-token figure", () => {
+  // The header must then render no meter at all — never zero, never a guess.
+  const events: EveStreamEvent[] = [
+    { type: "step.completed", data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId: "t" } },
+    { type: "turn.completed", data: { sequence: 0, turnId: "t" } },
+  ];
+  const view = reduceRunView(runRow("succeeded"), storeOf(events), "succeeded");
+  expect(view.inputTokens).toBeNull();
+});
+
+// ── tool steps read as English (2026-08-11 spec D5) ─────────────────────────
+
+test("a tool result summarizes instead of serializing, keeping the raw payload", () => {
+  const output = {
+    content: [{ type: "text", text: "5 issues: 2 bugs, 3 features" }],
+    isError: false,
+  };
+  const events: EveStreamEvent[] = [
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__list_issues", input: { limit: 5 } }], sequence: 0, stepIndex: 0, turnId: "t" } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__list_issues", output }, status: "completed", sequence: 1, stepIndex: 0, turnId: "t" } },
+  ];
+  const step = toolItems(reduceRunView(runRow("succeeded"), storeOf(events), "succeeded"))[0]!;
+  // The MCP envelope's text part, not `{"content":[{"type":"text"…`.
+  expect(step.resultSummary).toBe("5 issues: 2 bugs, 3 features");
+  expect(step.rawResult).toContain('"isError": false');
+  // The WIRE name is preserved — presentation resolves it, the reducer never
+  // rewrites it (a raw view keyed on a humanized name could not be looked up).
+  expect(step.toolName).toBe("linear__list_issues");
+});
+
+test("a failed tool step says why, and still offers whatever it returned", () => {
+  const events: EveStreamEvent[] = [
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "linear__create_issue", input: {} }], sequence: 0, stepIndex: 0, turnId: "t" } },
+    { type: "action.result", data: { result: { callId: "c1", kind: "tool-result", toolName: "linear__create_issue", output: { detail: "team not found" } }, status: "failed", error: { code: "tool_error", message: "Tool call failed: 404" }, sequence: 1, stepIndex: 0, turnId: "t" } },
+  ];
+  const step = toolItems(reduceRunView(runRow("failed"), storeOf(events), "failed"))[0]!;
+  expect(step.state).toBe("error");
+  expect(step.resultSummary).toBe("Tool call failed: 404");
+  expect(step.rawResult).toContain("team not found");
+});
+
+test("a tool call with no output has no raw disclosure to offer", () => {
+  const events: EveStreamEvent[] = [
+    { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "noop", input: {} }], sequence: 0, stepIndex: 0, turnId: "t" } },
+  ];
+  const step = toolItems(reduceRunView(runRow("running"), storeOf(events), "running"))[0]!;
+  expect(step.resultSummary).toBeNull();
+  expect(step.rawResult).toBeNull();
+});
+
+test("rawResultText pretty-prints structures, passes strings, and caps length", () => {
+  expect(rawResultText({ a: 1 })).toBe('{\n  "a": 1\n}');
+  expect(rawResultText("plain")).toBe("plain");
+  expect(rawResultText(null)).toBeNull();
+  expect(rawResultText("   ")).toBeNull();
+  const huge = rawResultText("x".repeat(9000));
+  expect(huge?.endsWith("\n…")).toBe(true);
+  expect((huge ?? "").length).toBeLessThan(4100);
+});
+
 test("action.partial previews live tool output without settling the step", () => {
   const events: EveStreamEvent[] = [
     { type: "actions.requested", data: { actions: [{ callId: "c1", kind: "tool-call", toolName: "crawl", input: {} }], sequence: 0, stepIndex: 0, turnId: "t" } },
@@ -498,7 +611,7 @@ test("action.partial previews live tool output without settling the step", () =>
   const view = reduceRunView(runRow("running"), storeOf(events), "running");
   const step = toolItems(view)[0]!;
   expect(step.state).toBe("pending");
-  expect(step.resultPreview).toBe("12 pages so far");
+  expect(step.resultSummary).toBe("12 pages so far");
 });
 
 // ── active, waiting, and streaming derivations ──────────────────────────────
@@ -778,4 +891,47 @@ test("a malformed authorization payload reduces without crashing", () => {
   expect(auth.host).toBeNull();
   expect(auth.userCode).toBeNull();
   expect(auth.outcome).toBeNull();
+});
+
+// ── the fixture surfaces stay honest (VITE_FIXTURE_MODE=1) ──────────────────
+//
+// Fixture mode is the design/E2E preview for all of this, and a preview that
+// silently stops exercising a state is worse than no preview — so the two
+// 2026-08-11 additions are asserted through the REAL reducer here.
+
+test("the compacted fixture session reduces to a compaction marker", async () => {
+  const { FIXTURE_SESSIONS } = await import("../lib/chat/fixtures");
+  const session = FIXTURE_SESSIONS.find((s) => s.summary.id === "s_compacted");
+  if (session === undefined) throw new Error("no compacted fixture session");
+  const fixtureRun = session.runs[0]!;
+  const view = reduceRunView(fixtureRun.run, {
+    frames: fixtureRun.frames,
+    maxSeq: fixtureRun.frames.length - 1,
+  });
+  expect(view.contextCompacted).toBe(true);
+  expect(view.contextCleared).toBe(false);
+  // And it carries a numerator for the header's meter.
+  expect(view.inputTokens).toBe(903_000);
+});
+
+test("the fixture tool directory resolves the fixture runs' qualified calls", async () => {
+  const { FIXTURE_SESSIONS, FIXTURE_TOOL_DIRECTORY } = await import(
+    "../lib/chat/fixtures"
+  );
+  const { indexToolDirectory, resolveToolDisplay } = await import(
+    "@invisible-string/shared"
+  );
+  const index = indexToolDirectory(FIXTURE_TOOL_DIRECTORY);
+  const done = FIXTURE_SESSIONS.find((s) => s.summary.id === "s_done")!;
+  const view = reduceRunView(done.runs[0]!.run, {
+    frames: done.runs[0]!.frames,
+    maxSeq: done.runs[0]!.frames.length - 1,
+  });
+  const step = toolItems(view)[0]!;
+  const display = resolveToolDisplay(step.toolName, index, step.resultSummary);
+  expect(display.connectionName).toBe("Linear");
+  expect(display.label).toBe("List issues");
+  expect(display.description).toBe("List issues in a team, newest first.");
+  // The MCP envelope summarizes to its text part, never to serialized JSON.
+  expect(display.resultSummary).toBe("5 issues: 2 bugs, 3 features");
 });

@@ -103,21 +103,16 @@ async function assertRunAsMember(
   if (!membership) throw errors.runAsUserNotMember(userId);
 }
 
-/** Agent names are unique per workspace (the slug feeds the content hash). */
-async function assertNameFree(
-  db: Db,
-  organizationId: string,
-  name: string,
-  exceptId?: string,
-): Promise<void> {
-  const rows = await db
-    .select({ id: schema.agents.id })
-    .from(schema.agents)
-    .where(and(eq(schema.agents.organizationId, organizationId), eq(schema.agents.name, name)))
-    .limit(1);
-  const clash = rows[0];
-  if (clash && clash.id !== exceptId) throw errors.nameTaken("agent", name);
-}
+/*
+ * Agent names are NOT unique per workspace, deliberately (2026-08-11 spec D1).
+ * The content hash keys on the agent's stable id, so two agents named the same
+ * thing can no longer collide onto one `ag_v_<hash12>` world database, and the
+ * unique index `agents_organization_id_name_uidx` was dropped with migration
+ * 0011. The 409 this file used to raise on a duplicate name was enforcing a
+ * constraint that no longer exists — new drafts are still auto-numbered
+ * ("Untitled agent 2") client-side, but that is a readability nicety now, and
+ * nothing may block a rename.
+ */
 
 export async function listAgents(
   deps: ResourceDeps,
@@ -177,7 +172,6 @@ export async function createAgent(
   if (runAsUserId !== actor.userId) {
     await assertRunAsMember(deps, actor.organizationId, runAsUserId);
   }
-  await assertNameFree(deps.db, actor.organizationId, input.name);
   const rows = await deps.db
     .insert(schema.agents)
     .values({
@@ -205,10 +199,6 @@ export async function updateAgent(
   if (input.runAsUserId !== undefined && input.runAsUserId !== existing.runAsUserId) {
     await assertRunAsMember(deps, actor.organizationId, runAsUserId);
   }
-  if (input.name !== undefined && input.name !== existing.name) {
-    await assertNameFree(deps.db, actor.organizationId, input.name, id);
-  }
-
   const patch: Partial<typeof schema.agents.$inferInsert> = {};
   if (input.name !== undefined) patch.name = input.name;
   if (input.description !== undefined) patch.description = input.description;
@@ -236,7 +226,7 @@ export async function updateAgent(
         compileDeps(deps),
         actor.organizationId,
         agent.runAsUserId,
-        agent.name,
+        agent,
         input.draft,
       );
     } catch {

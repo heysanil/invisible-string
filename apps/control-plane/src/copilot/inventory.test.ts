@@ -4,6 +4,12 @@
  * `health` and the bare tool names from the probe's `toolsCache` (capped at
  * 40, with the full cached count alongside so the prompt can render a
  * truncation marker). Rendering of these fields is covered in copilot.test.ts.
+ *
+ * Also guards the D1 consequence at the level where it is actually decided —
+ * the database: two agents may now share one name in a workspace, and the
+ * loader must surface both as distinct id-addressed rows. This test cannot
+ * pass without migration 0011 having dropped `agents_organization_id_name_uidx`
+ * (the insert itself would fail), which is precisely the point.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -111,6 +117,35 @@ describe.skipIf(!TEST_DATABASE_URL)(
       expect(unprobed!.health).toBe("unknown");
       expect(unprobed!.tools).toEqual([]);
       expect(unprobed!.toolCount).toBe(0);
+    });
+
+    test("two agents may share a name (spec D1) and both load as distinct id-addressed rows", async () => {
+      const [first, second] = await handle.db
+        .insert(schema.agents)
+        .values([
+          {
+            organizationId: orgId,
+            name: "Untitled agent",
+            runAsUserId: userId,
+            draft: {},
+          },
+          {
+            organizationId: orgId,
+            name: "Untitled agent",
+            runAsUserId: userId,
+            draft: {},
+          },
+        ])
+        .returning({ id: schema.agents.id });
+      expect(first!.id).not.toBe(second!.id);
+
+      const inventory = await createInventoryLoader(handle.db)(orgId, userId);
+      const twins = inventory.agents.filter((a) => a.name === "Untitled agent");
+      expect(twins).toHaveLength(2);
+      // Nothing collapsed on the name: both ids survive the load.
+      expect(new Set(twins.map((a) => a.id))).toEqual(
+        new Set([first!.id, second!.id]),
+      );
     });
   },
 );

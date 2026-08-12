@@ -38,6 +38,10 @@ function startedResponse(): CreateSessionResponse {
       workflowId: "wf-1",
       origin: "chat",
       status: "active",
+      // A just-created session is genuinely untitled: the D9 titler runs in
+      // the background after the first user message, so null is the correct
+      // value here, not a placeholder.
+      title: null,
       eveSessionId: null,
       createdAt: at,
       updatedAt: at,

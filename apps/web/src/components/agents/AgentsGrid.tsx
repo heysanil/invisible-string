@@ -3,12 +3,18 @@
  * — agents are few and identity-rich, so each gets a card (monogram, name,
  * description, lifecycle chip) that links straight into the editor. "New
  * agent" creates an untitled draft and opens it (the editor is the form).
+ *
+ * This screen also mounts the publish store's sink, so a build kicked off in
+ * the editor still announces itself while the user browses the list (and so
+ * the settled row's `buildStatus` chip refreshes underneath them).
  */
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Bot, Plus } from "lucide-react";
 import type { AgentSummaryDto } from "@invisible-string/shared";
 
 import { errorMessage } from "../../lib/forms";
+import { nextUntitledAgentName } from "../../lib/agents/naming";
+import { useAgentPublishSink } from "../../lib/agents/use-publish-store";
 import { useAgents, useCreateAgent } from "../../lib/queries/agents";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
@@ -24,10 +30,16 @@ export function AgentsGrid({ workspaceId }: { workspaceId: string }) {
   const { toast } = useToast();
   const agents = useAgents(workspaceId);
   const createAgent = useCreateAgent(workspaceId);
+  useAgentPublishSink(workspaceId);
 
   async function createNew() {
     try {
-      const result = await createAgent.mutateAsync({ name: "Untitled agent" });
+      // Auto-numbered purely for readability — duplicate names are LEGAL now
+      // that the content hash keys on the agent id (spec D1), so a collision
+      // here would be cosmetic, not an error to guard against.
+      const result = await createAgent.mutateAsync({
+        name: nextUntitledAgentName(agents.data ?? []),
+      });
       navigate({
         to: "/agents/$agentId",
         params: { agentId: result.agent.id },

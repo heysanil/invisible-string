@@ -9,9 +9,9 @@ import { ensureDomForThisFile } from "../test/setup";
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
 
-import type { RunInputRequest } from "@invisible-string/shared";
+import { indexToolDirectory, type RunInputRequest } from "@invisible-string/shared";
 
-import type { RunView, WorkSegment } from "../lib/chat/run-view";
+import type { RunView, ToolItem, WorkSegment } from "../lib/chat/run-view";
 import { ThreadView } from "../components/chat/ThreadView";
 import { RunMessage } from "../components/chat/RunMessage";
 import { WorkingBlock } from "../components/chat/WorkingBlock";
@@ -36,8 +36,9 @@ const HEADER: ThreadHeaderProps = {
   title: "Test thread",
   agentName: "Executive assistant",
   agentId: "ag1",
-  versionLabel: "a1b2c3",
+  modelLabel: "Balanced",
   modelId: "deepseek/deepseek-v4-pro",
+  contextUsage: { usedTokens: 262_144, windowTokens: 1_048_576 },
   workflowName: null,
   sessionStatus: "active",
   lastRunStatus: "succeeded",
@@ -55,11 +56,13 @@ function baseRun(overrides: Partial<RunView> = {}): RunView {
     modelId: "deepseek/deepseek-v4-pro",
     canceled: false,
     contextCleared: false,
+    contextCompacted: false,
+    inputTokens: null,
     ...overrides,
   };
 }
 
-test("thread header shows agent, version and model chips", async () => {
+test("thread header shows the agent, the context budget and a friendly model label", async () => {
   const view = renderWithRouter(
     <ThreadView
       header={HEADER}
@@ -77,11 +80,34 @@ test("thread header shows agent, version and model chips", async () => {
   );
   // RouterProvider resolves its initial route asynchronously.
   expect(await view.findByText("Executive assistant")).toBeTruthy();
-  expect(view.getByText("a1b2c3")).toBeTruthy();
-  expect(view.getByText("deepseek/deepseek-v4-pro")).toBeTruthy();
+  // Build identity is GONE (spec D6): no pinned version hash, no raw model id.
+  expect(view.queryByText("a1b2c3")).toBeNull();
+  expect(view.queryByText("deepseek/deepseek-v4-pro")).toBeNull();
+  expect(view.getByText("Balanced")).toBeTruthy();
+  const meter = view.getByRole("meter", { name: "Context used" });
+  expect(meter.getAttribute("aria-valuenow")).toBe("25");
+  expect(meter.textContent).toContain("25%");
   expect(view.getByText("Edit agent")).toBeTruthy();
   // Chat-origin sessions carry no workflow provenance chip.
   expect(view.queryByTitle("Started by workflow")).toBeNull();
+});
+
+test("the context meter is ABSENT when either half is unknown", async () => {
+  // Never zero and never a guess: no usage measured yet, or no published
+  // context window for the resolved model, means no meter at all.
+  const view = renderWithRouter(
+    <ThreadView
+      header={{ ...HEADER, contextUsage: null, modelLabel: null }}
+      runs={[baseRun()]}
+      isChatOrigin
+      onRespond={() => {}}
+      onSend={() => {}}
+    />,
+  );
+  await view.findByText("Executive assistant");
+  expect(view.queryByRole("meter")).toBeNull();
+  // And with no friendly label, no chip — rather than falling back to a slug.
+  expect(view.queryByText("deepseek/deepseek-v4-pro")).toBeNull();
 });
 
 test("a trigger-origin header adds the workflow provenance chip", async () => {
@@ -103,7 +129,14 @@ function workSegment(over: Partial<WorkSegment> = {}): WorkSegment {
     key: "work:t0:0",
     items: [
       { kind: "thought", key: "t0:0", text: "Weighing the options", seconds: 4, streaming: false },
-      { kind: "tool", key: "c1", toolName: "list_runs", state: "ok", resultPreview: "14 runs" },
+      {
+        kind: "tool",
+        key: "c1",
+        toolName: "list_runs",
+        state: "ok",
+        resultSummary: "14 runs",
+        rawResult: null,
+      },
     ],
     elapsedSeconds: 24,
     startedAt: "2026-01-01T00:00:00.000Z",
@@ -127,10 +160,100 @@ test("expanding a settled segment reveals thoughts and tools in rail order", () 
   fireEvent.click(view.getByRole("button", { name: /Worked/ }));
   expect(view.getByText("Weighing the options")).toBeTruthy();
   expect(view.getByText("Thought for 4s")).toBeTruthy();
-  expect(view.getByText("list_runs")).toBeTruthy();
+  // A builtin has no connection prefix; it still reads as English, never as
+  // the wire name (spec D5).
+  expect(view.getByText("List runs")).toBeTruthy();
+  expect(view.queryByText("list_runs")).toBeNull();
   const items = view.container.querySelectorAll("li");
   expect(items[0]!.textContent).toContain("Weighing the options");
-  expect(items[1]!.textContent).toContain("list_runs");
+  expect(items[1]!.textContent).toContain("List runs");
+});
+
+// ── tool calls read as English (2026-08-11 spec D5) ─────────────────────────
+
+const TOOL_DIRECTORY = indexToolDirectory({
+  agentVersionId: "dddddddd-0001-4000-8000-000000000001",
+  connections: [
+    {
+      slug: "linear",
+      connectionId: "cn_testlinear000001",
+      connectionName: "Linear",
+      tools: [
+        {
+          name: "create_issue",
+          description: "Create an issue in a team.",
+          params: ["teamId", "title"],
+        },
+      ],
+    },
+  ],
+});
+
+function toolSegment(item: Partial<ToolItem> = {}): WorkSegment {
+  return workSegment({
+    items: [
+      {
+        kind: "tool",
+        key: "c1",
+        toolName: "linear__create_issue",
+        state: "ok",
+        resultSummary: "Created ENG-42",
+        rawResult: '{\n  "id": "ENG-42"\n}',
+        ...item,
+      },
+    ],
+  });
+}
+
+test("a qualified tool call renders connection, humanized name and description", () => {
+  const view = render(
+    <WorkingBlock segment={toolSegment()} toolDirectory={TOOL_DIRECTORY} />,
+  );
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.getByText("Linear ·")).toBeTruthy();
+  expect(view.getByText("Create issue")).toBeTruthy();
+  expect(view.getByText("Create an issue in a team.")).toBeTruthy();
+  expect(view.getByText("Created ENG-42")).toBeTruthy();
+  // The wire name never reaches the screen.
+  expect(view.queryByText("linear__create_issue")).toBeNull();
+});
+
+test("an unknown slug still names its source instead of going blank", () => {
+  // A connection detached since the run, or a directory that never loaded:
+  // humanize the slug rather than dropping the only provenance the step has.
+  const view = render(
+    <WorkingBlock
+      segment={toolSegment({ toolName: "github__create_pull_request" })}
+    />,
+  );
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.getByText("Github ·")).toBeTruthy();
+  expect(view.getByText("Create pull request")).toBeTruthy();
+});
+
+test("raw tool output is reachable on demand and never shown by default", () => {
+  const view = render(
+    <WorkingBlock segment={toolSegment()} toolDirectory={TOOL_DIRECTORY} />,
+  );
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.queryByText(/"id": "ENG-42"/)).toBeNull();
+  const toggle = view.getByRole("button", {
+    name: "Show raw output from Create issue",
+  });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(toggle);
+  expect(view.getByText(/"id": "ENG-42"/)).toBeTruthy();
+});
+
+test("a step with nothing to disclose offers no raw toggle", () => {
+  const view = render(
+    <WorkingBlock
+      segment={toolSegment({ rawResult: null, resultSummary: null })}
+      toolDirectory={TOOL_DIRECTORY}
+    />,
+  );
+  fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+  expect(view.queryByRole("button", { name: /raw output/i })).toBeNull();
 });
 
 test("an active segment defaults open and announces Working", () => {
@@ -470,6 +593,27 @@ test("the context controls are blocked with a reason while a run is in flight", 
   expect(within(menu).getByText(/Wait for the current run to finish/)).toBeTruthy();
   const clear = within(menu).getByText("Clear context").closest("button");
   expect((clear as HTMLButtonElement).disabled).toBe(true);
+});
+
+// ── compaction persists the way clearing does (2026-08-11 spec D4) ─────────
+
+test("a run that observed a completed compaction draws the divider inline", () => {
+  const view = render(
+    <RunMessage
+      run={baseRun({ contextCompacted: true })}
+      isChatOrigin
+      onRespond={() => {}}
+    />,
+  );
+  expect(view.getByText("Context compacted")).toBeTruthy();
+  expect(view.queryByText("Context cleared")).toBeNull();
+});
+
+test("a run with no compaction event claims no compaction", () => {
+  const view = render(
+    <RunMessage run={baseRun()} isChatOrigin onRespond={() => {}} />,
+  );
+  expect(view.queryByText("Context compacted")).toBeNull();
 });
 
 test("a landed clear renders the neutral context marker", async () => {

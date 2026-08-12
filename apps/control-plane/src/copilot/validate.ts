@@ -26,7 +26,11 @@
  * - `setModel.modelId` must be on the enabled workspace allowlist, and an
  *   explicit `setModel.reasoning` must be an effort the EFFECTIVE model
  *   advertises — but only when the catalog answered (fail-open, same rule as
- *   the allowlist-add catalog check).
+ *   the allowlist-add catalog check);
+ * - `setName`/`setDescription` (spec D7.3/D7.4) edit the `agents` ROW rather
+ *   than the definition, so there is no publish rule to mirror: the schemas
+ *   are the PATCH route's own and the only semantic check is "this changes
+ *   nothing", which spares the user a card they would just dismiss.
  */
 import {
   agentCopilotMutationParamSchemas,
@@ -70,6 +74,14 @@ export interface AgentDraftState {
   connectionIds: Set<string>;
   skillIds: Set<string>;
   /**
+   * The agent's IDENTITY as the editor last sent it (spec D7.3/D7.4). Null
+   * when the editor sends no identity with the draft — the no-op checks below
+   * then simply do not fire, which is the right failure direction: a missing
+   * baseline must never turn a legitimate rename into an error.
+   */
+  name: string | null;
+  description: string | null;
+  /**
    * The draft's MODEL selection, needed to know which model an effort-only
    * `setModel` would actually apply to. Loose strings: mid-edit drafts are
    * lenient, and an unrecognized preset simply finds no mapping (no check).
@@ -108,6 +120,10 @@ export function draftStateFor(
     skillIds: ids(context.skillIds),
     preset: typeof model.preset === "string" ? model.preset : null,
     modelId: typeof model.modelId === "string" ? model.modelId : null,
+    // Identity rides ALONGSIDE the definition draft (it lives on the `agents`
+    // row), so it is read off the top level, not out of `context`/`model`.
+    name: typeof draft.name === "string" ? draft.name : null,
+    description: typeof draft.description === "string" ? draft.description : null,
   };
 }
 
@@ -149,6 +165,16 @@ export function applyAcceptedMutation(
       if (model.modelId !== undefined) state.modelId = model.modelId;
       break;
     }
+    case "setName":
+      // Same reason: an accepted rename makes a second identical rename later
+      // in the turn the no-op the check below catches.
+      state.name = (params as CopilotMutationParams["setName"]).name;
+      break;
+    case "setDescription":
+      state.description = (
+        params as CopilotMutationParams["setDescription"]
+      ).description;
+      break;
     default:
       break;
   }
@@ -431,6 +457,29 @@ function agentSemanticProblem(
             supported.join(", ") || "(none — use provider-default)"
           }`;
         }
+      }
+      return null;
+    }
+    case "setName": {
+      // Nothing to check against the inventory: duplicate agent names are
+      // legal since spec D1 dropped `agents_organization_id_name_uidx`, and
+      // the shape is exactly the PATCH route's own `agentNameSchema`. The one
+      // real problem is a proposal that changes nothing — a card the user has
+      // to dismiss for no reason.
+      const { name } = params as CopilotMutationParams["setName"];
+      if (draftState.name !== null && draftState.name.trim() === name.trim()) {
+        return `the agent is already named "${name}" — propose a rename only when it should actually change`;
+      }
+      return null;
+    }
+    case "setDescription": {
+      const { description } =
+        params as CopilotMutationParams["setDescription"];
+      if (
+        draftState.description !== null &&
+        draftState.description.trim() === description.trim()
+      ) {
+        return "the agent already has exactly this description — propose a change only when it should actually change";
       }
       return null;
     }

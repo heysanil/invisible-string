@@ -21,6 +21,12 @@ import { DiffView } from "../builder/DiffView";
 export interface SuggestionCardProps {
   proposal: CopilotProposal;
   status: SuggestionStatus;
+  /**
+   * Applied without an accept gate (allow-edits, spec D7.2). The card exists
+   * precisely so an unasked edit still leaves a trace, so the receipt must
+   * SAY it was automatic — "Applied" alone would read as "you applied this".
+   */
+  autoApplied?: boolean;
   /** Presentation computed by the surface adapter against the LIVE draft. */
   description: ProposalDescription;
   onApply: () => void;
@@ -30,7 +36,7 @@ export interface SuggestionCardProps {
 }
 
 export function SuggestionCard(props: SuggestionCardProps) {
-  const { proposal, status, onApply, onDismiss, focusRef } = props;
+  const { proposal, status, autoApplied, onApply, onDismiss, focusRef } = props;
   const live = props.description;
   // Receipts must not drift: the description is recomputed from the LIVE
   // draft (right for a pending preview), but once the card settles the apply
@@ -52,7 +58,12 @@ export function SuggestionCard(props: SuggestionCardProps) {
           <X size={13} className="shrink-0 text-ink-4" aria-hidden="true" />
         )}
         <span className="truncate">
-          {status === "applied" ? "Applied" : "Dismissed"} — {description.title}
+          {status === "applied"
+            ? autoApplied
+              ? "Applied automatically"
+              : "Applied"
+            : "Dismissed"}{" "}
+          — {description.title}
         </span>
       </div>
     );

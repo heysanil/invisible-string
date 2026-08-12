@@ -6,8 +6,10 @@
  * which supersedes those sections (new models, and an effort per preset).
  *
  * `seedWorkspace(db, organizationId, ownerUserId?)` is idempotent and safe to
- * call at workspace-creation time and on every deploy: rows are upserted with
- * ON CONFLICT DO NOTHING so workspace admins' later edits are never
+ * call at workspace-creation time and on every deploy: presets and allowlist
+ * rows are upserted with ON CONFLICT DO NOTHING, and the starter agents are
+ * name-filtered under the workspace's advisory lock (their unique index is
+ * gone — see `seedAgents`), so workspace admins' later edits are never
  * clobbered. Seeded agents run as `ownerUserId` (agents.run_as_user_id is
  * NOT NULL); when omitted, the workspace's owner member is resolved from the
  * database.
@@ -16,7 +18,7 @@
  *   - seeds every existing organization
  *   - SEED_DEMO=1 additionally creates a demo user + demo org (idempotent)
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 
 import { createDb, type Db } from "./client";
 import { member, organization, user } from "./schema/auth";
@@ -248,10 +250,47 @@ export async function seedWorkspace(
 
   const runAsUserId =
     ownerUserId ?? (await resolveOwnerUserId(db, organizationId));
-  await db
-    .insert(agents)
-    .values(buildAgentRows(organizationId, runAsUserId))
-    .onConflictDoNothing({ target: [agents.organizationId, agents.name] });
+  await seedAgents(db, organizationId, runAsUserId);
+}
+
+/**
+ * Insert the starter agents this workspace does not already have, by NAME.
+ *
+ * Why not ON CONFLICT: the 2026-08-11 spec's D1 dropped
+ * `agents_organization_id_name_uidx` (migration 0011) — the content hash keys
+ * on the agent's stable id, so duplicate names are legal and the index is no
+ * longer load-bearing. Postgres can only infer an ON CONFLICT arbiter from a
+ * unique or exclusion constraint, so the old `.onConflictDoNothing({ target:
+ * [organizationId, name] })` now fails outright (42P10) — which would break
+ * workspace creation itself. Idempotency is explicit instead: read the
+ * workspace's agent names, insert only the missing seeds.
+ *
+ * The read-then-write is serialized per workspace by the same
+ * transaction-scoped advisory lock the run-cap check uses, so two concurrent
+ * seeds (workspace creation racing the deploy-time CLI sweep) cannot both
+ * observe an empty workspace and each insert a full set of starters — the
+ * duplicate-name protection the dropped unique index used to give for free.
+ */
+async function seedAgents(
+  db: Db,
+  organizationId: string,
+  runAsUserId: string,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${`seed:${organizationId}`})::bigint)`,
+    );
+    const existing = await tx
+      .select({ name: agents.name })
+      .from(agents)
+      .where(eq(agents.organizationId, organizationId));
+    const taken = new Set(existing.map((row) => row.name));
+    const rows = buildAgentRows(organizationId, runAsUserId).filter(
+      (row) => !taken.has(row.name),
+    );
+    if (rows.length === 0) return;
+    await tx.insert(agents).values(rows);
+  });
 }
 
 // ── Demo user/org (dev + integration-test convenience) ─────────────────────

@@ -280,12 +280,11 @@ export const errors = {
       "no_pending_input",
       "run is not waiting on input — nothing to resolve",
     ),
-  nameTaken: (resource: string, name: string) =>
-    new RuntimeApiError(
-      409,
-      `${resource}_name_taken`,
-      `a ${resource.replace(/_/g, " ")} named "${name}" already exists in this workspace`,
-    ),
+  // NOTE: there is no `nameTaken` here any more. Its only consumer was the
+  // agents CRUD duplicate-name guard, retired with the unique index on
+  // (organization_id, name) by the 2026-08-11 spec's D1 — the content hash
+  // keys on the agent's stable id, so duplicate display names are legal.
+  // Connections raise their own `duplicate_connection_name` and never used it.
 
   workflowNotPublished: () =>
     new RuntimeApiError(

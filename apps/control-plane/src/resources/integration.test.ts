@@ -5,10 +5,12 @@
  * Covers the authz matrix (outsider 403 on paths / 404 on foreign rows; member
  * ok; owner/admin-only ops), secrets-never-echoed, the registry proxy (stubbed
  * registry), delete-referenced-connection 409 (agents reference connections
- * now), the skill attachment upload→agent-publish path (bytes threaded into
- * the compiler), model preset guards, agents CRUD (+ inline dry-run
- * diagnostics, run-as membership, delete guard), member passthrough, and the
- * HITL run-input round trip against a fake eve worker that parks on approval.
+ * now), the per-agent-version tool directory (spec D5: slug → connection name
+ * + probe-cached descriptions, and all three of its degradations), the skill
+ * attachment upload→agent-publish path (bytes threaded into the compiler),
+ * model preset guards, agents CRUD (+ inline dry-run diagnostics, run-as
+ * membership, delete guard), member passthrough, and the HITL run-input round
+ * trip against a fake eve worker that parks on approval.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -23,6 +25,7 @@ import {
   type AgentDefinitionInput,
   type CreateSessionResponse,
   type GetAgentResponse,
+  type GetAgentVersionToolsResponse,
   type GetConnectionResponse,
   type GetModelPresetResponse,
   type GetSkillResponse,
@@ -45,6 +48,7 @@ import {
   type CompileRequest,
   type CompileAgentFn,
 } from "../build/compiler-contract";
+import { slugifyName } from "../build/compiler-adapter";
 import type { BuildSteps } from "../build/steps";
 import { runMigrations } from "../migrate";
 import type { OpenRouterModelInfo } from "./openrouter-catalog";
@@ -415,6 +419,44 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
 
   async function freshWorker(): Promise<void> {
     await db.update(schema.workers).set({ lastHeartbeatAt: new Date(), status: "live" }).where(eq(schema.workers.address, fixture.url));
+  }
+
+  /**
+   * An immutable `agent_versions` row for `agentId`, written directly and
+   * pointed at by `agents.published_version_id`.
+   *
+   * The tool directory READS that row (its `connection_slugs` map) joined to
+   * `connections`; what PRODUCES it — publish → `resolveCompileInputs` → the
+   * persisted map — is covered by runtime/compile-service.test.ts and the
+   * runtime integration suite. Inserting here keeps the directory cases
+   * independent of a build and lets them state the slug map explicitly, using
+   * the same `slugifyName` the publish path derives it with.
+   */
+  async function publishedVersion(
+    agentId: string,
+    definition: AgentDefinitionInput,
+    connectionSlugs: Record<string, string>,
+  ): Promise<string> {
+    const rows = await db
+      .insert(schema.agentVersions)
+      .values({
+        agentId,
+        definition: definition as unknown as Record<string, unknown>,
+        contentHash: `t6-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
+        compilerVersion: "stub-compiler-1",
+        eveVersion: STUB_EVE_VERSION,
+        modelProvider: "openrouter",
+        modelId: "vendor/test-model",
+        connectionSlugs,
+        buildStatus: "succeeded",
+      })
+      .returning({ id: schema.agentVersions.id });
+    const versionId = rows[0]!.id;
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: versionId })
+      .where(eq(schema.agents.id, agentId));
+    return versionId;
   }
 
   beforeAll(async () => {
@@ -851,6 +893,165 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(freed.status).toBe(200);
   });
 
+  // ── agent-version tool directory (2026-08-11 spec D5) ────────────────────
+
+  test("agent version tools: slug → connection name + probe-cached descriptions; never-probed reads empty, a detached slug drops, a pre-column version degrades", async () => {
+    const linearRes = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Linear D5", url: "https://mcp.example/linear-d5" },
+    });
+    expect(linearRes.status).toBe(201);
+    const linearId = ((await linearRes.json()) as GetConnectionResponse).connection.id;
+
+    const notionRes = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Notion D5", url: "https://mcp.example/notion-d5" },
+    });
+    expect(notionRes.status).toBe(201);
+    const notionId = ((await notionRes.json()) as GetConnectionResponse).connection.id;
+
+    // Only the FIRST connection gets a cache: the probe writes tools_cache
+    // exclusively on `ok`, which no server in this suite ever reaches, so the
+    // second stays the "never probed" case the thread must degrade through.
+    await db
+      .update(schema.connections)
+      .set({
+        toolsCache: [
+          { name: "create_issue", description: "Create a new issue in a team", params: ["team", "title"] },
+          { name: "search_issues", description: "Search issues by query", params: ["query"] },
+        ],
+        toolsCachedAt: new Date(),
+      })
+      .where(eq(schema.connections.id, linearId));
+
+    const draft = agentDraft({
+      persona: "Use the tools.",
+      context: { mcpConnectionIds: [linearId, notionId], skillIds: [] },
+    });
+    const agentRes = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tool Directory Agent", draft },
+    });
+    expect(agentRes.status).toBe(201);
+    const toolAgentId = ((await agentRes.json()) as GetAgentResponse).agent.id;
+    const versionId = await publishedVersion(toolAgentId, draft, {
+      [slugifyName("Linear D5")]: linearId,
+      [slugifyName("Notion D5")]: notionId,
+    });
+
+    const path = `/workspaces/${orgId}/agents/${toolAgentId}/versions/${versionId}/tools`;
+    const res = await api("GET", path, { cookie: ownerCookie });
+    expect(res.status).toBe(200);
+    const { directory } = (await res.json()) as GetAgentVersionToolsResponse;
+    // Echoed version id: a client cache keyed per version cannot mis-attribute.
+    expect(directory.agentVersionId).toBe(versionId);
+    // The slugs are the compiler's own (`slugifyName`) — the `<slug>__` prefix
+    // the run stream's qualified tool names actually carry.
+    expect(directory.connections.map((c) => c.slug)).toEqual(["linear-d5", "notion-d5"]);
+
+    const linear = directory.connections[0]!;
+    expect(linear.connectionId).toBe(linearId);
+    expect(linear.connectionName).toBe("Linear D5");
+    expect(linear.tools.find((t) => t.name === "create_issue")?.description).toBe(
+      "Create a new issue in a team",
+    );
+
+    // Never probed OK → tools EMPTY, never absent: the step renders its
+    // humanized name with no subtitle instead of the request failing.
+    expect(directory.connections[1]!.connectionName).toBe("Notion D5");
+    expect(directory.connections[1]!.tools).toEqual([]);
+
+    // Display projection only — no endpoint, transport, or auth material.
+    const serialized = JSON.stringify(directory);
+    expect(serialized).not.toContain("mcp.example");
+    expect(serialized).not.toContain("authConfig");
+
+    // A slug whose connection is gone (or has left the agent's scope) is
+    // DROPPED — the thread falls back to the slug it already has, and the
+    // surviving entries still resolve.
+    await db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: { "linear-d5": linearId, ghost: "cn_0000000000000000" } })
+      .where(eq(schema.agentVersions.id, versionId));
+    const ghosted = (await (
+      await api("GET", path, { cookie: ownerCookie })
+    ).json()) as GetAgentVersionToolsResponse;
+    expect(ghosted.directory.connections.map((c) => c.slug)).toEqual(["linear-d5"]);
+
+    // A version published before `connection_slugs` existed carries null:
+    // an empty directory, still a 200 (republish backfills the map).
+    await db
+      .update(schema.agentVersions)
+      .set({ connectionSlugs: null })
+      .where(eq(schema.agentVersions.id, versionId));
+    const historical = await api("GET", path, { cookie: ownerCookie });
+    expect(historical.status).toBe(200);
+    expect(
+      ((await historical.json()) as GetAgentVersionToolsResponse).directory.connections,
+    ).toEqual([]);
+  });
+
+  test("agent version tools: authz matrix — anonymous 401, outsider 403/404, member reads; another agent's version and junk ids are 404 not 500", async () => {
+    const mineDraft = agentDraft({ persona: "A." });
+    const mine = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tools Authz A", draft: mineDraft },
+    });
+    const mineId = ((await mine.json()) as GetAgentResponse).agent.id;
+    const mineVersionId = await publishedVersion(mineId, mineDraft, {});
+
+    const otherDraft = agentDraft({ persona: "B — a different agent." });
+    const other = await api("POST", `/workspaces/${orgId}/agents`, {
+      cookie: ownerCookie,
+      body: { name: "Tools Authz B", draft: otherDraft },
+    });
+    const otherId = ((await other.json()) as GetAgentResponse).agent.id;
+    const otherVersionId = await publishedVersion(otherId, otherDraft, {});
+
+    const path = `/workspaces/${orgId}/agents/${mineId}/versions/${mineVersionId}/tools`;
+
+    expect((await api("GET", path)).status).toBe(401);
+
+    const stranger = await signUpWithOrg("Tools Stranger");
+    // Foreign workspace path → 403 (the macro), foreign row under the
+    // stranger's OWN path → 404 (existence-hiding).
+    expect((await api("GET", path, { cookie: stranger.cookie })).status).toBe(403);
+    const foreignRow = await api(
+      "GET",
+      `/workspaces/${stranger.orgId}/agents/${mineId}/versions/${mineVersionId}/tools`,
+      { cookie: stranger.cookie },
+    );
+    expect(foreignRow.status).toBe(404);
+
+    // Another agent's version under this agent's path → 404: a version id is
+    // never enough on its own to read someone else's tool inventory.
+    const crossed = await api(
+      "GET",
+      `/workspaces/${orgId}/agents/${mineId}/versions/${otherVersionId}/tools`,
+      { cookie: ownerCookie },
+    );
+    expect(crossed.status).toBe(404);
+    expect(((await crossed.json()) as { error: { code: string } }).error.code).toBe(
+      "agent_version_not_found",
+    );
+
+    // Junk uuids are 404, not the 500 a raw `= $1` against a uuid column gives.
+    expect(
+      (await api("GET", `/workspaces/${orgId}/agents/${mineId}/versions/nope/tools`, { cookie: ownerCookie })).status,
+    ).toBe(404);
+    expect(
+      (await api("GET", `/workspaces/${orgId}/agents/nope/versions/${mineVersionId}/tools`, { cookie: ownerCookie })).status,
+    ).toBe(404);
+
+    // Reading a thread is a MEMBER operation — the directory is too.
+    await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    try {
+      expect((await api("GET", path, { cookie: ownerCookie })).status).toBe(200);
+    } finally {
+      await db.update(schema.member).set({ role: "owner" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
+    }
+  });
+
   // ── skills + attachments → agent publish threads bytes into the compiler ──
 
   test("skills: CRUD + attachment upload; agent publish emits the packaged skill", async () => {
@@ -1133,12 +1334,24 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     // run-as defaults to the creator.
     expect(agent.runAsUserId).toBe(ownerUserId);
 
-    // Duplicate name → 409 (names feed the content hash via the slug).
+    // Duplicate names are LEGAL, on create AND on rename (2026-08-11 spec D1:
+    // the content hash keys on the agent's stable id, so two same-named agents
+    // no longer collide onto one world DB, and the unique index on
+    // (organization_id, name) was dropped with migration 0011).
     const dup = await api("POST", `/workspaces/${orgId}/agents`, {
       cookie: ownerCookie,
       body: { name: "Custom" },
     });
-    expect(dup.status).toBe(409);
+    expect(dup.status).toBe(201);
+    const dupAgent = ((await dup.json()) as GetAgentResponse).agent;
+    expect(dupAgent.id).not.toBe(agent.id);
+
+    const renameOnto = await api("PATCH", `/workspaces/${orgId}/agents/${dupAgent.id}`, {
+      cookie: ownerCookie,
+      body: { name: "Custom" },
+    });
+    expect(renameOnto.status).toBe(200);
+    await api("DELETE", `/workspaces/${orgId}/agents/${dupAgent.id}`, { cookie: ownerCookie });
 
     // Draft PATCH returns dry-run diagnostics inline: a non-allowlisted
     // model override is the diagnostics PAYLOAD, not a failed save.

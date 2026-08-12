@@ -8,6 +8,16 @@ Entries from `v0.3.0` onward are written at merge time as
 reconstruction** from the conventional-commit log between tags, not authored
 release notes.
 
+## v0.6.0 — 2026-08-12
+
+### Breaking changes
+- **compiler, control-plane, db, design-tokens, shared, site, web** — The agent content hash now keys on the agent's stable id instead of its slugified display name, so every agent rebuilds once on its next publish and duplicate agent names are legal; alongside it, publishing no longer blocks the editor and its build watch follows you across the whole app, the editor separates unsaved from unpublished changes, chat sessions enter instantly and title themselves (falling back to the thread's first message, which the session list now carries), tool calls and a context-budget meter replace raw slugs and build identity in the thread, clearing or compacting the context leaves a divider that survives a reload while a compaction with nothing to summarize says so, and the copilot shows its steps and reasoning, can set an agent's name and description and sees both as the editor currently holds them, can apply edits without the accept gate, and reports an edit that failed to apply as failed.
+
+### Features
+- **site** — Bring the marketing/docs site back in sync with everything shipped since the agents-first pivot: a new Chat page covering the run timeline, Stop, the message queue and context controls; reasoning effort documented across Models, Agents and Overview; corrected tool-filter scope on Context & MCP; guarded egress and OAuth token custody on Security; the search index on Architecture and Deploy your own.
+- **site** — Flesh out the docs site into a comprehensive reference: expand all seventeen existing pages past their placeholder state, add a Guides section with five task-based walkthroughs and a Reference section with a glossary, limits and defaults, troubleshooting, and keyboard and accessibility notes, and add new Building pages for Skills and Settings.
+- **site** — Prerender every landing and docs route to static HTML with per-page title, description, canonical, OG and JSON-LD metadata, and add a generated sitemap.xml, robots.txt and llms.txt, real 404 statuses, a 301 for /docs, and noindex on preview deploys.
+
 ## v0.5.0 — 2026-08-11
 
 ### Breaking changes

@@ -317,6 +317,23 @@ for the seeded (OpenRouter) quick preset the effort cannot reach the wire until
 that pin moves. The code asks correctly and says so; AGENTS.md's `extraBody`
 rule is about the compiled agent's `3.0.0` pin, not this process.
 
+> **SUPERSEDED — the pin moved.** `apps/control-plane` is now aligned to
+> `packages/compiler/versions.json` (`@openrouter/ai-sdk-provider@3.0.0`,
+> `ai@7.0.58`, `@ai-sdk/anthropic@4.0.36`), retiring an alpha that semver had
+> been sorting *above* the stable line since 2026-01. **The ceiling described
+> above was real but the remedy was only half of one:** bumping the pin alone
+> changes nothing, because 3.0.0's `getArgs()` *also* never destructures ai@7's
+> top-level `reasoning` call option. So the routing became per-provider, in
+> `apps/control-plane/src/model/reasoning.ts` — OpenRouter takes the effort on
+> the model's `extraBody` exactly as a compiled agent does (verbatim, no `max`
+> clamp; the clamp belongs to Anthropic's narrower union), Anthropic keeps the
+> top-level option. AGENTS.md's `extraBody` rule is therefore no longer
+> compiled-agent-only. `model/reasoning-wire.test.ts` asserts both routes on
+> real request bytes — OpenRouter through the titler and the copilot, Anthropic
+> through the helper — including the negative that justifies the detour, and the
+> control-plane pin block in `tests/integration/toolchain-pins.test.ts` keeps
+> the matrix and the control plane from diverging again.
+
 *The kill switch reads the stack's env record.* `SESSION_TITLE_*` is resolved
 into `RuntimeConfig` beside the platform provider keys and consumed from there.
 Reading `process.env` inside the titler honored an injected key while ignoring

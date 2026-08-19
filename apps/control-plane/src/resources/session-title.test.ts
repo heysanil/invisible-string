@@ -32,7 +32,6 @@ import {
   loadSessionTitleConfig,
   resolveQuickPresetModel,
   sanitizeSessionTitle,
-  titleReasoningEffort,
   type SessionTitleConfig,
   type SessionTitlerDeps,
   type TitleGenerator,
@@ -152,24 +151,13 @@ describe("loadSessionTitleConfig", () => {
   });
 });
 
-describe("titleReasoningEffort", () => {
-  test("clamps the platform's max onto the AI SDK's xhigh ceiling", () => {
-    // LanguageModelV4CallOptions["reasoning"] has no "max" member; both values
-    // mean "spend the most" (same clamp the compiler's anthropic branch makes).
-    expect(titleReasoningEffort("max")).toBe("xhigh");
-  });
-
-  test("passes the other efforts through, and omits provider-default", () => {
-    // `low` is the SEEDED QUICK PRESET's effort — the only thing separating it
-    // from `balanced`, which is the same model id (packages/db/src/seed.ts).
-    expect(titleReasoningEffort("low")).toBe("low");
-    expect(titleReasoningEffort("none")).toBe("none");
-    expect(titleReasoningEffort("xhigh")).toBe("xhigh");
-    // Omitted entirely: "let the provider decide" is the ABSENCE of the field,
-    // and is distinct from an explicit "none" (reasoning off).
-    expect(titleReasoningEffort("provider-default")).toBeUndefined();
-  });
-});
+// The effort→provider mapping this module used to own now lives in
+// src/model/reasoning.ts, because the copilot needs the same two branches.
+// Its unit cover is reasoning.test.ts (both providers, every effort in the
+// vocabulary) and its WIRE behaviour is reasoning-wire.test.ts — which is the
+// test that would have caught the pin drift this all came from. `low` remains
+// the seeded quick preset's effort, the only thing separating it from
+// `balanced` (same model id; packages/db/src/seed.ts).
 
 describe("session title config resolution", () => {
   /**

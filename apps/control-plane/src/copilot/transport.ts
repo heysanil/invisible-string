@@ -28,6 +28,10 @@ import { jsonSchema, streamText, tool, type ModelMessage } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 
+import {
+  anthropicReasoningEffort,
+  openRouterReasoningSettings,
+} from "../model/reasoning";
 import type { CopilotConfig } from "./config";
 
 export interface TransportToolSpec {
@@ -45,14 +49,13 @@ export type TransportPart =
    * provider's reasoning-block id: a single round-trip can contain several,
    * and the session joins them under one per-step thought key.
    *
-   * Whether ANY arrive is the provider's call, not ours: we do not ask for
-   * reasoning, and with the pinned `@openrouter/ai-sdk-provider` we could not
-   * if we wanted to — its chat model whitelists the request body it builds
-   * (model/input/stream/maxOutputTokens/temperature/topP/tools/toolChoice/text)
-   * so neither `extraBody` nor a passthrough `reasoning` key reaches the wire.
-   * Models that reason by default still emit these parts, and the direct
-   * Anthropic path can be given `providerOptions.anthropic.thinking` later
-   * without touching anything downstream of here.
+   * Whether any arrive is usually the MODEL's call, not ours: the copilot asks
+   * for a specific effort only when COPILOT_REASONING_EFFORT is set, and its
+   * default (`provider-default`) sends no reasoning block at all, so models
+   * that reason by default are the common source of these parts. When the
+   * effort IS configured it reaches the wire on both providers — see
+   * model/reasoning.ts for the per-provider routes and reasoning-wire.test.ts
+   * for the proof on real request bytes.
    */
   | { type: "reasoning-delta"; id: string; text: string }
   | { type: "tool-call"; toolCallId: string; toolName: string; input: unknown }
@@ -76,8 +79,14 @@ export function createModelTransport(
   config: CopilotConfig,
   env: Record<string, string | undefined> = process.env,
 ): CopilotTransport {
-  // Construct the provider model lazily so a keyless boot never throws
-  // (openrouter('slug') raises AI_LoadAPIKeyError at construction time).
+  // Construct the provider model lazily so a keyless boot never throws.
+  //
+  // REASONING EFFORT (COPILOT_REASONING_EFFORT, default `provider-default` =
+  // no reasoning block) takes a different route per provider — see
+  // model/reasoning.ts. On OpenRouter it must ride the model's `extraBody`,
+  // because the provider's getArgs() never destructures ai@7's top-level
+  // `reasoning` call option; on Anthropic that call option is the right route
+  // and is applied at the streamText call below.
   const makeModel = () => {
     if (config.provider === "anthropic") {
       const anthropic = createAnthropic({ apiKey: env.ANTHROPIC_API_KEY });
@@ -87,8 +96,15 @@ export function createModelTransport(
       apiKey: env.OPENROUTER_API_KEY,
       ...(config.openRouterBaseUrl ? { baseURL: config.openRouterBaseUrl } : {}),
     });
-    return openrouter(config.model);
+    const settings = openRouterReasoningSettings(config.reasoningEffort);
+    return settings ? openrouter(config.model, settings) : openrouter(config.model);
   };
+
+  // Anthropic-only: on OpenRouter the effort already rode extraBody above.
+  const reasoning =
+    config.provider === "anthropic"
+      ? anthropicReasoningEffort(config.reasoningEffort)
+      : undefined;
 
   return {
     async *stream(request) {
@@ -113,6 +129,7 @@ export function createModelTransport(
         toolChoice: "auto",
         abortSignal: request.abortSignal,
         maxOutputTokens: request.maxOutputTokens,
+        ...(reasoning ? { reasoning } : {}),
       });
       for await (const part of result.fullStream) {
         switch (part.type) {

@@ -2,8 +2,8 @@
  * KEYED ACCEPTANCE — the full product path with the mock model OFF: a REAL
  * OpenRouter key flows control-plane → agent env → @openrouter/ai-sdk-provider
  * and real ~deepseek/deepseek-v4-flash-latest turns serve the runs. This is the suite
- * that watches the ai@7 ↔ @openrouter/ai-sdk-provider@6.0.0-alpha.1 pairing
- * (packages/compiler/versions.json) under real API traffic.
+ * that watches the ai@7 ↔ @openrouter/ai-sdk-provider pairing pinned in
+ * packages/compiler/versions.json under real API traffic.
  *
  * Proves (same agent spine as tests/integration/phase1-acceptance.test.ts,
  * but with NO EVE_MOCK_AUTHORED_MODELS and NO dead-port OPENROUTER_BASE_URL

@@ -21,6 +21,17 @@
  *  3. A new workflow (or a new job in an existing one) can reach for
  *     `oven-sh/setup-bun` / `actions/setup-node` out of habit, quietly
  *     reintroducing an unpinned second toolchain next to mise's.
+ *  4. `apps/control-plane` depends on the SAME AI SDK packages the matrix pins
+ *     for compiled agents, but nothing derived them from it — so an eve
+ *     upgrade could move the matrix and leave the control plane behind. It
+ *     did: the control plane sat on `@openrouter/ai-sdk-provider@6.0.0-alpha.1`
+ *     (a stale parallel alpha, published SIX MONTHS BEFORE the 3.0.0 the
+ *     matrix moved to) long after versions.json recorded that 3.0.0 "RETIRES
+ *     the 6.0.0-alpha.1 alpha-line residual". Nothing failed, because the
+ *     divergence is only observable on the WIRE: that provider silently drops
+ *     both reasoning routes, so every titled session ran at the model's
+ *     default effort while the code read as though it were asking. See
+ *     apps/control-plane/src/model/reasoning.ts.
  *
  * DELIBERATELY UNGATED, in the style of tests/integration/dockerfile-workspace
  * -manifests.test.ts: pure filesystem parsing — no DB, no docker, no network —
@@ -143,6 +154,65 @@ describe("mise.toml is the single source of truth for host tools", () => {
     expect(pins.length).toBeGreaterThan(0);
     for (const { file, tag } of pins) {
       expect({ file, tag }).toEqual({ file, tag: line });
+    }
+  });
+});
+
+/**
+ * versions.json key -> npm package name, for the AI SDK packages the control
+ * plane shares with the compiled agents. Mirrors spike/tests/pins.ts's
+ * SPIKE_PIN_MAP: adding one of these to the control plane means pinning it
+ * from the matrix, not retyping a version.
+ *
+ * Only the SHARED packages belong here. The control plane's own dependencies
+ * (elysia, better-auth, drizzle…) are not part of the runtime matrix and are
+ * deliberately free to move on their own.
+ */
+const CONTROL_PLANE_PIN_MAP: Readonly<Record<string, string>> = {
+  "@ai-sdk/anthropic": "anthropicProvider",
+  "@openrouter/ai-sdk-provider": "openrouterProvider",
+  ai: "ai",
+  zod: "zod",
+};
+
+describe("apps/control-plane's AI SDK pins match packages/compiler/versions.json", () => {
+  const manifest = JSON.parse(
+    readFileSync(join(ROOT, "apps", "control-plane", "package.json"), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  const deps = manifest.dependencies ?? {};
+
+  for (const [pkg, key] of Object.entries(CONTROL_PLANE_PIN_MAP)) {
+    test(`${pkg} is pinned to versions.json's \`${key}\``, () => {
+      // The matrix is the single source of truth for these four; a control
+      // plane that drifts off it talks to providers the compiled agents do
+      // not, and the difference shows up only in request bytes.
+      const expected = versions[key] ?? "";
+      expect(expected).toMatch(EXACT_SEMVER); // the matrix really has this pin
+      expect({ pkg, version: deps[pkg] }).toEqual({ pkg, version: expected });
+    });
+  }
+
+  test("no shared pin is a range — the matrix is exact by contract", () => {
+    // AGENTS.md: "Version pins are exact". A caret here would let an install
+    // resolve a provider the golden fixtures never saw.
+    for (const pkg of Object.keys(CONTROL_PLANE_PIN_MAP)) {
+      expect({ pkg, exact: EXACT_SEMVER.test(deps[pkg] ?? "") }).toEqual({
+        pkg,
+        exact: true,
+      });
+    }
+  });
+
+  test("the OpenRouter pin is not on the abandoned alpha line", () => {
+    // Belt and braces for the specific trap that caused the drift: 6.x is a
+    // PRERELEASE line that semver sorts ABOVE the 3.x `latest`, so "newer
+    // number" reads as "newer package" and `npm install @latest` never
+    // suggests it. Anything with a prerelease tag here is a regression.
+    for (const pkg of ["@openrouter/ai-sdk-provider", "ai", "@ai-sdk/anthropic"]) {
+      expect({ pkg, prerelease: (deps[pkg] ?? "").includes("-") }).toEqual({
+        pkg,
+        prerelease: false,
+      });
     }
   });
 });

@@ -591,3 +591,35 @@ The suite bootstraps the world DB, truncates stale workflow state, runs
 :4101, forwarding only `/eve/` and `/.well-known/workflow/`), and tears the
 processes down. Logs and captured NDJSON land in `spike/.artifacts/`
 (gitignored); committed captures live in `spike/tests/fixtures/`.
+
+---
+
+## Appended finding — the control-plane pin caught up (2026-08-19)
+
+35. **Finding 29's parenthetical "not the control plane's `6.0.0-alpha.1`" is
+    now HISTORY, and its mechanism turned out to be the CONTROL PLANE's problem
+    too.** `apps/control-plane` has been aligned to
+    `packages/compiler/versions.json` (`@openrouter/ai-sdk-provider@3.0.0`,
+    `ai@7.0.58`, `@ai-sdk/anthropic@4.0.36`), so there is no longer a second,
+    older provider line in this repo — the alpha was a stale PARALLEL
+    PRERELEASE (published 2026-01-07) that semver sorts permanently above the
+    3.0.0 stable `latest` (2026-07-06), which is how it survived the 0.31
+    upgrade unnoticed. Two consequences worth recording, both verified on
+    captured request bytes rather than by source-read
+    (`apps/control-plane/src/model/reasoning-wire.test.ts`):
+
+    (a) **Finding 29 is NOT eve-specific.** It is a property of the provider,
+    so it binds every direct ai@7 caller. Bumping the pin alone fixed nothing:
+    3.0.0's `getArgs()` still never destructures `reasoning`, so the control
+    plane's own callers (session titler, copilot) had to move onto
+    `settings.extraBody` exactly as the codegen does.
+
+    (b) **Anthropic's half, measured for the first time.** ai@7's top-level
+    `reasoning` option becomes `thinking: {type:"adaptive",
+    display:"summarized"}` plus `output_config.effort` on the wire; `"none"`
+    becomes `thinking: {type:"disabled"}`; and an OMITTED option sends no
+    `thinking` key at all. That last distinction is what makes
+    `provider-default` a real value rather than a synonym for `none`. The
+    provider's effort map is `minimal|low -> low, medium, high, xhigh` — no
+    `max` — which is why only the Anthropic branch clamps `max -> xhigh` while
+    OpenRouter takes `max` verbatim.

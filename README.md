@@ -327,6 +327,7 @@ Config knobs (all optional):
 | `COPILOT_MAX_SESSIONS` | `2` | per-workspace concurrent session cap |
 | `COPILOT_MAX_OUTPUT_TOKENS` | `8192` | per-turn budget |
 | `COPILOT_MAX_STEPS` | `12` | tool-loop round-trip cap |
+| `COPILOT_REASONING_EFFORT` | `provider-default` | reasoning effort for copilot turns; the default sends no reasoning block at all, since these tokens bill to the platform key on every turn |
 | `COPILOT_FAKE_SCRIPT` | — | deterministic scripted LLM for tests |
 
 Unit and integration suites use the scripted fake; the single real-model smoke

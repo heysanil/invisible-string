@@ -32,12 +32,12 @@
  *    message instead of titling it, or that returns the sentinel `NONE` for a
  *    contentless opener ("hi"), yields null — no title, fallback renders.
  *
- * The preset's effort rides ai@7's own top-level `reasoning` call option — the
- * only route a DIRECT SDK call has, and honored by exactly one of the two
- * providers on the control plane's pins today ({@link generateTitleWithModel}
- * spells out which and why). AGENTS.md's `extraBody` rule is about the
- * COMPILED AGENT's `@openrouter/ai-sdk-provider@3.0.0` pin
- * (packages/compiler/versions.json), not this process's 6.0.0-alpha.1 one.
+ * The preset's effort reaches the model by a DIFFERENT route per provider —
+ * `extraBody` on OpenRouter, ai@7's top-level `reasoning` call option on
+ * Anthropic. `model/reasoning.ts` owns that asymmetry and explains it;
+ * {@link generateTitleWithModel} just applies it. AGENTS.md's `extraBody` rule
+ * is no longer compiled-agent-only: since the control plane's provider pin was
+ * aligned to `packages/compiler/versions.json`, the same rule governs here.
  * `maxOutputTokens` is set well above what a title needs precisely because a
  * reasoning model spends output tokens thinking before it writes one.
  */
@@ -52,6 +52,10 @@ import {
   type ReasoningEffort,
 } from "@invisible-string/shared";
 
+import {
+  anthropicReasoningEffort,
+  openRouterReasoningSettings,
+} from "../model/reasoning";
 import type { Db } from "../db";
 
 // ── configuration ────────────────────────────────────────────────────────────
@@ -340,63 +344,60 @@ export async function resolveQuickPresetModel(
 // ── the model round-trip ─────────────────────────────────────────────────────
 
 /**
- * The AI SDK's own effort union (`LanguageModelV4CallOptions["reasoning"]` in
- * @ai-sdk/provider@4) tops out at `xhigh`, so the platform's `max` clamps
- * there — the same clamp the compiler's anthropic branch makes, for the same
- * reason: both mean "spend the most". `provider-default` returns undefined so
- * the field is omitted entirely (distinct from an explicit `"none"`).
- */
-export function titleReasoningEffort(
-  effort: ReasoningEffort,
-): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
-  if (effort === "provider-default") return undefined;
-  return effort === "max" ? "xhigh" : effort;
-}
-
-/**
  * One non-streaming completion against the resolved model. Returns null when
  * the provider's platform key is absent — a keyless deployment must not throw
  * here, it simply has no titles (same stance the copilot takes by not mounting
  * its socket at all).
  *
- * REASONING EFFORT rides ai@7's top-level `reasoning` call setting, which is
- * the only route a direct SDK call has. Honored per provider, verified against
- * the pins in apps/control-plane/package.json — do not assume symmetry:
- * - `@ai-sdk/anthropic@4.0.7` is spec-v4 and its `getArgs()` DOES destructure
- *   `reasoning`, mapping it onto a thinking budget/effort. It lands.
- * - `@openrouter/ai-sdk-provider@6.0.0-alpha.1` does NOT. Its chat model
- *   builds a whitelisted Responses-API body (model/input/stream/
- *   maxOutputTokens/temperature/topP/tools/toolChoice/text), so this option is
- *   dropped — and so would `extraBody` be (the provider stores that setting
- *   and never reads it on this line). copilot/transport.ts documents the same
- *   ceiling. We still ASK: it costs nothing, it is the SDK-blessed route, and
- *   it starts landing the day the pin moves. Note AGENTS.md's "effort must
- *   ride extraBody" rule is about the COMPILED AGENT's 3.0.0 pin
- *   (packages/compiler/versions.json), where extraBody genuinely is spread
- *   over the body — that mechanism does not exist here.
+ * REASONING EFFORT takes a DIFFERENT ROUTE PER PROVIDER, and the asymmetry is
+ * the whole point — `model/reasoning.ts` documents the mechanism and
+ * `model/reasoning-wire.test.ts` proves both on real request bytes — this
+ * caller's OpenRouter path end to end, the Anthropic mapping via the helper:
+ * - `@ai-sdk/anthropic` is spec-v4 and its `getArgs()` DOES destructure ai@7's
+ *   top-level `reasoning` call option. That is the SDK-blessed route and it
+ *   lands, with `max` clamped to the union's `xhigh` ceiling.
+ * - `@openrouter/ai-sdk-provider` does NOT destructure it, on the current pin
+ *   or any other. The effort rides the MODEL's `extraBody`, which the chat
+ *   model spreads last over the request body — the same route, and the same
+ *   emitted shape, as a compiled agent's `openrouter(MODEL_ID, {extraBody})`.
+ *
+ * This used to send the top-level option on BOTH branches, which meant every
+ * OpenRouter title silently ran at the model's default effort while the code
+ * read as though it were asking.
  */
-const generateTitleWithModel: TitleGenerator = async ({
+export const generateTitleWithModel: TitleGenerator = async ({
   model,
   message,
   keys,
   signal,
 }) => {
-  // Model construction is lazy for the same reason as copilot/transport.ts:
-  // `openrouter(slug)` raises AI_LoadAPIKeyError at construction time.
+  // Model construction is lazy so a keyless boot never throws. (Under the
+  // pinned provider the key is resolved lazily anyway — AI_LoadAPIKeyError is
+  // raised at the first CALL, not at construction — but the null-return below
+  // is what actually keeps a keyless deployment titleless rather than broken.)
   const languageModel = (() => {
     if (model.provider === "anthropic") {
       if (!keys.anthropicApiKey) return null;
       return createAnthropic({ apiKey: keys.anthropicApiKey })(model.modelId);
     }
     if (!keys.openrouterApiKey) return null;
-    return createOpenRouter({
+    const openrouter = createOpenRouter({
       apiKey: keys.openrouterApiKey,
       ...(keys.openrouterBaseUrl ? { baseURL: keys.openrouterBaseUrl } : {}),
-    })(model.modelId);
+    });
+    // `provider-default` yields undefined settings -> a bare openrouter(id),
+    // byte-identical to what the compiler emits for the same effort.
+    const settings = openRouterReasoningSettings(model.reasoning);
+    return settings ? openrouter(model.modelId, settings) : openrouter(model.modelId);
   })();
   if (!languageModel) return null;
 
-  const reasoning = titleReasoningEffort(model.reasoning);
+  // Anthropic-only: on OpenRouter the effort already rode extraBody above, and
+  // adding it here too would be inert (the provider drops it) but misleading.
+  const reasoning =
+    model.provider === "anthropic"
+      ? anthropicReasoningEffort(model.reasoning)
+      : undefined;
   const result = await generateText({
     model: languageModel,
     system: TITLE_SYSTEM_PROMPT,

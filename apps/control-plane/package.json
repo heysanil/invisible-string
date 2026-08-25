@@ -13,15 +13,15 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "4.0.7",
+    "@ai-sdk/anthropic": "4.0.36",
     "@better-auth/sso": "^1.6.23",
     "@elysiajs/cors": "^1.4.2",
     "@invisible-string/compiler": "workspace:*",
     "@invisible-string/db": "workspace:*",
     "@invisible-string/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "1.29.0",
-    "@openrouter/ai-sdk-provider": "6.0.0-alpha.1",
-    "ai": "7.0.14",
+    "@openrouter/ai-sdk-provider": "3.0.0",
+    "ai": "7.0.58",
     "better-auth": "^1.6.23",
     "drizzle-orm": "^0.45.2",
     "elysia": "^1.4.29",

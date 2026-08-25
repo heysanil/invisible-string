@@ -1701,6 +1701,36 @@ describe("copilot config guards", () => {
       loadCopilotConfig({ COPILOT_FAKE_SCRIPT: '[{"text":"fake"}]' }).fakeScript,
     ).toBe('[{"text":"fake"}]');
   });
+
+  test("COPILOT_REASONING_EFFORT defaults to provider-default — adopting a release costs nothing", () => {
+    // Reasoning tokens bill to the PLATFORM key on every copilot turn, so the
+    // default must be the historical behaviour: no reasoning block on the
+    // wire. Opting in is a per-deployment decision.
+    expect(loadCopilotConfig({}).reasoningEffort).toBe("provider-default");
+  });
+
+  test("COPILOT_REASONING_EFFORT accepts the shared 8-value vocabulary", () => {
+    expect(loadCopilotConfig({ COPILOT_REASONING_EFFORT: "high" }).reasoningEffort).toBe(
+      "high",
+    );
+    expect(loadCopilotConfig({ COPILOT_REASONING_EFFORT: " max " }).reasoningEffort).toBe(
+      "max",
+    );
+    expect(loadCopilotConfig({ COPILOT_REASONING_EFFORT: "none" }).reasoningEffort).toBe(
+      "none",
+    );
+  });
+
+  test("an unrecognised COPILOT_REASONING_EFFORT falls back instead of throwing", () => {
+    // Config parsing here is TOTAL, like positiveInt: a typo in a deployment's
+    // env must degrade to the default, never take the copilot down at boot.
+    expect(
+      loadCopilotConfig({ COPILOT_REASONING_EFFORT: "extreme" }).reasoningEffort,
+    ).toBe("provider-default");
+    expect(loadCopilotConfig({ COPILOT_REASONING_EFFORT: "" }).reasoningEffort).toBe(
+      "provider-default",
+    );
+  });
 });
 
 describe("validateMutation", () => {

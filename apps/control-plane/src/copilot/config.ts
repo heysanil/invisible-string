@@ -5,6 +5,11 @@
  * until a key is provided.
  */
 
+import {
+  reasoningEffortSchema,
+  type ReasoningEffort,
+} from "@invisible-string/shared";
+
 export type CopilotProvider = "openrouter" | "anthropic";
 
 /**
@@ -19,6 +24,22 @@ export interface CopilotConfig {
   model: string;
   /** OPENROUTER_BASE_URL override (tests point this at a stub). */
   openRouterBaseUrl: string | undefined;
+  /**
+   * Reasoning effort for the copilot's own turns (COPILOT_REASONING_EFFORT).
+   *
+   * Defaults to `provider-default` — i.e. NO reasoning block on the wire, the
+   * copilot's historical behaviour — because reasoning tokens are billed to
+   * the PLATFORM key on every turn, so adopting a release must never start
+   * spending them silently. An operator opts in per deployment.
+   *
+   * Unlike an agent's effort (resolved at publish from its preset and hashed
+   * into the artifact), this is deployment-wide config: the copilot has no
+   * preset of its own, it runs the platform's own model.
+   *
+   * An unrecognised value falls back to the default rather than throwing —
+   * config parsing here is total, matching `positiveInt` below.
+   */
+  reasoningEffort: ReasoningEffort;
   /** Per-workspace concurrent copilot session cap (COPILOT_MAX_SESSIONS, default 2). */
   maxSessionsPerWorkspace: number;
   /** Per-turn model OUTPUT token budget (COPILOT_MAX_OUTPUT_TOKENS, default 8192). */
@@ -57,6 +78,17 @@ function positiveInt(
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+/**
+ * Parse COPILOT_REASONING_EFFORT against the shared 8-value vocabulary,
+ * falling back to `provider-default` (no reasoning block) for anything absent
+ * or unrecognised. Deliberately total: a typo in a deployment's env must
+ * degrade to the historical behaviour, never take the copilot down at boot.
+ */
+function reasoningEffort(raw: string | undefined): ReasoningEffort {
+  const parsed = reasoningEffortSchema.safeParse(raw?.trim());
+  return parsed.success ? parsed.data : "provider-default";
+}
+
 export function loadCopilotConfig(
   env: Record<string, string | undefined> = process.env,
 ): CopilotConfig {
@@ -68,6 +100,7 @@ export function loadCopilotConfig(
       env.COPILOT_MODEL?.trim() ||
       (provider === "anthropic" ? "claude-sonnet-4-5" : DEFAULT_COPILOT_MODEL),
     openRouterBaseUrl: env.OPENROUTER_BASE_URL?.trim() || undefined,
+    reasoningEffort: reasoningEffort(env.COPILOT_REASONING_EFFORT),
     maxSessionsPerWorkspace: positiveInt(env.COPILOT_MAX_SESSIONS, 2),
     maxOutputTokensPerTurn: positiveInt(env.COPILOT_MAX_OUTPUT_TOKENS, 8_192),
     maxStepsPerTurn: positiveInt(env.COPILOT_MAX_STEPS, 12),

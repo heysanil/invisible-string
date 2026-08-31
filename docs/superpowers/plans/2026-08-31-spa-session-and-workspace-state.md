@@ -77,7 +77,9 @@
 
 - [ ] **Step 1: Teach the auth mock to model the server**
 
-The mock currently hand-writes reactive hooks (`useSyncExternalStore`, `notifyOrgStore`). Leave those in place for now — later tasks still consume them — but add the two async calls the viewer query makes, and make `signIn`/`signUp` establish a session the way the server does.
+The mock currently hand-writes reactive hooks (`useSyncExternalStore`, `notifyOrgStore`) and its mutations update only that *atom-shaped* state. Leave the hooks in place for now — Tasks 2–7 still consume them — but add the two async calls the viewer query makes, make `signIn`/`signUp` establish a session, and make **every successful mutation update the server-shaped state too** (`authMockState.session.session.activeOrganizationId` and `authMockState.organizations`).
+
+That last part is not optional bookkeeping. The viewer reads *only* `session.activeOrganizationId` and `organization.list()`, so a mock whose `setActive` updates only `activeOrganization` would let later tests assert that `setActive` was *called* while the viewer never actually becomes active — a test that passes without proving anything.
 
 In `apps/web/src/test/auth-mock.ts`, add to `authMockState`:
 
@@ -90,6 +92,7 @@ In `apps/web/src/test/auth-mock.ts`, add to `authMockState`:
   getSessionError: null as MockAuthError | null,
   listOrganizationsCalls: 0,
   getSessionCalls: 0,
+  signOutResult: ok(),
 ```
 
 Reset them in `resetAuthMock()`:
@@ -100,6 +103,20 @@ Reset them in `resetAuthMock()`:
   authMockState.getSessionError = null;
   authMockState.listOrganizationsCalls = 0;
   authMockState.getSessionCalls = 0;
+  authMockState.signOutResult = ok();
+```
+
+Add a helper next to `demoSession()` so mutations can rewrite the session's active workspace without losing the user:
+
+```ts
+/** Mirror the server: rewrite the session's active organization in place. */
+function setSessionActiveOrganization(organizationId: string | null): void {
+  if (!authMockState.session) return;
+  authMockState.session = {
+    ...authMockState.session,
+    session: { activeOrganizationId: organizationId },
+  };
+}
 ```
 
 Add `list` to `organizationMock` (place it beside `setActive`):
@@ -143,7 +160,89 @@ And make the credential calls establish the session, as the server does:
   },
 ```
 
-Apply the same three added lines to `signUp.email`.
+Apply the same three added lines to `signUp.email`. Also make `signOut` return the new state field:
+
+```ts
+  signOut: async () => authMockState.signOutResult,
+```
+
+- [ ] **Step 1b: Make the mutations update server-shaped state**
+
+Still in `apps/web/src/test/auth-mock.ts`. Keep every existing `notifyOrgStore()` call and the `activeOrganization` writes — the old hooks are still live until Task 8 — and **add** the server-shaped updates beside them.
+
+`setActive` — activate on the session, and learn organizations the client list did not know about (exactly what happens right after accepting an invitation):
+
+```ts
+  setActive: async (args: Record<string, unknown>) => {
+    authMockState.setActiveCalls.push(args);
+    const result = authMockState.setActiveResult;
+    if (result.error) return result;
+    const id = (args["organizationId"] as string | null) ?? null;
+    if (!id) {
+      authMockState.activeOrganization = null;
+      setSessionActiveOrganization(null);
+      notifyOrgStore();
+      return result;
+    }
+    let org = authMockState.organizations.find((candidate) => candidate.id === id);
+    if (!org) {
+      org = { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" };
+      authMockState.organizations = [...authMockState.organizations, org];
+    }
+    authMockState.activeOrganization = org;
+    setSessionActiveOrganization(id);
+    notifyOrgStore();
+    return result;
+  },
+```
+
+`create` — the real `/organization/create` activates the new organization server-side, so the mock must too:
+
+```ts
+  create: async (args: Record<string, unknown>) => {
+    authMockState.createOrganizationCalls.push(args);
+    const result = authMockState.createOrganizationResult;
+    if (!result.error && result.data) {
+      const org = result.data as MockOrganization;
+      authMockState.organizations = [...authMockState.organizations, org];
+      // Better Auth activates a newly created organization server-side
+      // (crud-org.mjs), which is why the client sends no setActive.
+      authMockState.activeOrganization = org;
+      setSessionActiveOrganization(org.id);
+      notifyOrgStore();
+    }
+    return result;
+  },
+```
+
+`update` — a rename must actually rename, or the "name updates live" test proves nothing:
+
+```ts
+  update: async (args: Record<string, unknown>) => {
+    authMockState.updateOrganizationCalls.push(args);
+    const result = authMockState.updateOrganizationResult;
+    if (!result.error) {
+      const id = args["organizationId"] as string;
+      const name = (args["data"] as { name?: string } | undefined)?.name;
+      if (name) {
+        authMockState.organizations = authMockState.organizations.map((org) =>
+          org.id === id ? { ...org, name } : org,
+        );
+        if (authMockState.activeOrganization?.id === id)
+          authMockState.activeOrganization = {
+            ...authMockState.activeOrganization,
+            name,
+          };
+        notifyOrgStore();
+      }
+    }
+    return result;
+  },
+```
+
+Accepting an invitation needs no change here: `accept-invitation` follows a successful accept with `setActive`, and the `setActive` above now adds the unknown organization to the list.
+
+Note the deliberate divergence from the previous mock's comment about *not* notifying on `create`: it existed to stop `useWorkspace`'s fire-and-forget self-heal from firing a duplicate `setActive`. That self-heal is deleted in Task 5, so the hazard is gone.
 
 - [ ] **Step 2: Write the failing contract test**
 
@@ -363,15 +462,35 @@ async function call<T>(fn: () => Promise<AuthCallResult<T>>): Promise<AuthCallRe
   }
 }
 
-function createdAtMs(workspace: { createdAt: string }): number {
-  const ms = new Date(workspace.createdAt).getTime();
-  return Number.isNaN(ms) ? 0 : ms;
+/**
+ * Better Auth types `createdAt` as a `Date` (organization/client.d.mts) and
+ * its JSON parser revives it, so normalize before it escapes into `Viewer` —
+ * an interface promising a string must not hand out a Date.
+ */
+interface RawOrganization {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: string | Date;
 }
 
-function sortWorkspaces(list: ViewerWorkspace[]): ViewerWorkspace[] {
-  return [...list].sort(
-    (a, b) => createdAtMs(a) - createdAtMs(b) || a.id.localeCompare(b.id),
-  );
+function toIsoString(value: string | Date): string {
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date(0).toISOString() : date.toISOString();
+}
+
+function toWorkspaces(list: RawOrganization[]): ViewerWorkspace[] {
+  return list
+    .map((org) => ({
+      id: org.id,
+      name: org.name,
+      slug: org.slug,
+      createdAt: toIsoString(org.createdAt),
+    }))
+    .sort(
+      (a, b) =>
+        a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+    );
 }
 
 interface SessionShape {
@@ -389,8 +508,8 @@ export async function fetchViewer(): Promise<Viewer | null> {
   }
   if (!session.data?.user) return null;
 
-  const orgs = await call<ViewerWorkspace[]>(
-    () => authClient.organization.list() as Promise<AuthCallResult<ViewerWorkspace[]>>,
+  const orgs = await call<RawOrganization[]>(
+    () => authClient.organization.list() as Promise<AuthCallResult<RawOrganization[]>>,
   );
   if (orgs.error) {
     // The session was valid a moment ago, so a 401 here means it just died.
@@ -405,7 +524,7 @@ export async function fetchViewer(): Promise<Viewer | null> {
       name: session.data.user.name,
     },
     activeWorkspaceId: session.data.session?.activeOrganizationId ?? null,
-    workspaces: sortWorkspaces(orgs.data ?? []),
+    workspaces: toWorkspaces(orgs.data ?? []),
   };
 }
 
@@ -563,9 +682,9 @@ function RootLayout() {
 }
 ```
 
-If `Route.useRouteContext()` does not type-check on the root route, use
-`useRouter().options.context.queryClient` instead (import `useRouter` from
-`@tanstack/react-router`) — same value, same instance.
+`Route.useRouteContext()` is defined directly on `RootRoute`
+(@tanstack/react-router `src/route.tsx:542`) and returns the root match's
+accumulated context, so this is the supported read — no fallback needed.
 
 - [ ] **Step 2: Pass the context at router creation**
 
@@ -611,7 +730,11 @@ Expected: typecheck clean (a missing `context` is now a type error), suite green
 - [ ] **Step 5: Commit**
 
 ```bash
-git add apps/web/src/routes/__root.tsx apps/web/src/main.tsx apps/web/src/__tests__
+git add apps/web/src/routes/__root.tsx apps/web/src/main.tsx \
+        apps/web/src/__tests__/login.test.tsx \
+        apps/web/src/__tests__/shell.test.tsx \
+        apps/web/src/__tests__/create-workspace.test.tsx \
+        apps/web/src/__tests__/accept-invitation.test.tsx
 git commit -m "refactor(web): put the query client in router context"
 ```
 
@@ -646,7 +769,6 @@ import {
 
 import {
   authMockState,
-  demoSession,
   demoWorkspace,
   registerAuthMock,
   resetAuthMock,
@@ -712,22 +834,22 @@ test("a signed-in viewer with an unset active workspace has one selected for the
     session: { activeOrganizationId: null },
   };
   authMockState.organizations = [demoWorkspace()];
-  renderApp("/chat");
-  await waitFor(() => {
-    expect(authMockState.setActiveCalls).toContainEqual({
-      organizationId: "org_test_1",
-    });
+  const { view } = renderApp("/chat");
+  // Assert the OUTCOME, not the call: the shell renders, which it only can
+  // once the session actually carries an active workspace.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(authMockState.setActiveCalls).toContainEqual({
+    organizationId: "org_test_1",
   });
+  expect(authMockState.session?.session?.activeOrganizationId).toBe("org_test_1");
 });
 
 test("a fully signed-in viewer renders the shell", async () => {
   signInToDemoWorkspace();
-  authMockState.sessionAfterSignIn = demoSession();
+  // A positive assertion, never `queryBy…` to be null — an absent element is
+  // also absent mid-transition, so a negative-only assertion passes vacuously.
   const { view } = renderApp("/chat");
-  await waitFor(() => {
-    expect(view.queryByText("Create your workspace")).toBeNull();
-  });
-  expect(view.container.querySelector("nav")).toBeTruthy();
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
 });
 ```
 
@@ -741,7 +863,7 @@ Expected: FAIL — the retry-card test fails (today the app redirects to `/login
 Create `apps/web/src/components/auth/SessionUnavailableScreen.tsx`:
 
 ```tsx
-import { useRouter, type ErrorComponentProps } from "@tanstack/react-router";
+import { useRouter } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { viewerQueryKey } from "../../lib/auth/viewer";
@@ -752,14 +874,19 @@ import { AuthCard } from "./AuthCard";
  * Shown when the session could NOT be determined — a network failure or a
  * 5xx, never a 401. A user whose session is fine must not be handed a login
  * form served by a server that cannot answer it.
+ *
+ * Do NOT call the `reset` prop. `ErrorComponentProps` declares it, but for an
+ * error thrown from `beforeLoad`/`loader` the router passes
+ * `reset={undefined as any}` (@tanstack/react-router `src/Match.tsx:382`), so
+ * calling it throws a TypeError. `router.invalidate()` is the supported
+ * recovery: it resets errored matches to pending and reloads them.
  */
-export function SessionUnavailableScreen({ reset }: ErrorComponentProps) {
+export function SessionUnavailableScreen() {
   const queryClient = useQueryClient();
   const router = useRouter();
 
   function retry() {
     queryClient.removeQueries({ queryKey: viewerQueryKey });
-    reset();
     void router.invalidate();
   }
 
@@ -812,7 +939,12 @@ import {
  */
 export const Route = createFileRoute("/_app")({
   beforeLoad: async ({ context, location, cause }) => {
-    // Preloading may warm data; it may never decide authentication.
+    // Preloading must never decide authentication. `beforeLoad` runs again
+    // for the real navigation (router-core `load-matches.ts`), so returning
+    // here cannot let an actual navigation bypass the guard. Note this returns
+    // BEFORE fetching, so a preload warms nothing — and any future loader on a
+    // descendant route would therefore run during preload with no viewer in
+    // context. Add one only if it tolerates that.
     if (cause === "preload") return;
     // Fixture mode is a backendless design/E2E harness — there is no session.
     if (FIXTURE_MODE) return;
@@ -1016,10 +1148,11 @@ test("workspace content resolves immediately after that single sign-in", async (
   await view.findByText("Welcome back");
   submitLogin(view, "demo@example.com", "hunter2hunter2");
 
-  await waitFor(() => {
-    expect(view.queryByText("No workspace yet")).toBeNull();
-    expect(view.queryByText("Welcome back")).toBeNull();
-  });
+  // Positive assertion first: waiting only for elements to be ABSENT would
+  // also pass during the blank frame between the form and the shell.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(view.queryByText("No workspace yet")).toBeNull();
+  expect(view.queryByText("Welcome back")).toBeNull();
 });
 
 test("a deep link is preserved across the sign-in bounce", async () => {
@@ -1127,8 +1260,7 @@ import { ensureDomForThisFile } from "../test/setup";
 import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, render } from "@testing-library/react";
-import { QueryClientProvider } from "@tanstack/react-query";
+import { cleanup } from "@testing-library/react";
 
 import {
   authMockState,
@@ -1137,22 +1269,24 @@ import {
   registerAuthMock,
   resetAuthMock,
 } from "../test/auth-mock";
-import { installFetchMock, type FetchMock } from "../test/harness";
-import { createAppQueryClient } from "../lib/query-client";
+import {
+  installFetchMock,
+  renderWithProviders,
+  type FetchMock,
+} from "../test/harness";
 
 ensureDomForThisFile();
 registerAuthMock();
 
 const { WorkspaceGate } = await import("../components/WorkspaceGate");
 
+// renderWithProviders already supplies an isolated QueryClient and the
+// ToastProvider (test/harness.tsx) — do not hand-roll another one.
 function renderGate() {
-  const client = createAppQueryClient();
-  return render(
-    <QueryClientProvider client={client}>
-      <WorkspaceGate title="Members">
-        {({ workspaceName }) => <p>ws:{workspaceName}</p>}
-      </WorkspaceGate>
-    </QueryClientProvider>,
+  return renderWithProviders(
+    <WorkspaceGate title="Members">
+      {({ workspaceName }) => <p>ws:{workspaceName}</p>}
+    </WorkspaceGate>,
   );
 }
 
@@ -1374,61 +1508,61 @@ git commit -m "fix(web): resolve workspaces from the viewer and surface outages"
 - Consumes: `refetchViewer`, `completeSignOut`, `SignOutFailedError` (Task 1).
 - Produces: no new exports.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Replace the contradicting test, then add the new ones**
 
-Append to `apps/web/src/__tests__/create-workspace.test.tsx`:
+`apps/web/src/__tests__/create-workspace.test.tsx` currently contains a test named **"creating a workspace calls create + setActive and reveals the shell"** which asserts the exact behaviour this task removes. **Replace that test** — do not append alongside it, or the suite cannot go green.
+
+Replace it with:
 
 ```tsx
-test("creating a workspace does not fire a redundant setActive", async () => {
+test("creating a workspace reveals the shell without a redundant setActive", async () => {
   // The server already activates a newly created organization
   // (better-auth crud-org.mjs) — a second client call is a round trip that
   // can fail after the workspace exists.
   authMockState.session = zeroOrgSession();
   authMockState.createOrganizationResult = {
     data: {
-      id: "org_new",
-      name: "Acme",
-      slug: "acme",
-      createdAt: "2026-08-31T00:00:00.000Z",
+      id: "org_new_1",
+      name: "Acme Inc",
+      slug: "acme-inc-abcdef12",
+      createdAt: "2026-07-08T00:00:00.000Z",
     },
     error: null,
   };
-  const { view } = renderApp("/chat");
+  const { view } = renderApp();
   await view.findByText("Create your workspace");
-  fireEvent.change(view.getByLabelText("Workspace name"), {
-    target: { value: "Acme" },
+  fireEvent.input(view.getByLabelText("Workspace name"), {
+    target: { value: "  Acme Inc  " },
   });
   submitForm(view);
-  await waitFor(() => {
-    expect(authMockState.createOrganizationCalls).toHaveLength(1);
-  });
-  expect(authMockState.setActiveCalls).toHaveLength(0);
-});
 
+  // Wait for the SHELL, not merely for the create call to be recorded: the
+  // component has not finished its post-create work at that point, so
+  // asserting on setActive there could pass against the old code too.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(authMockState.createOrganizationCalls).toHaveLength(1);
+  expect(authMockState.setActiveCalls).toHaveLength(0);
+  expect(view.queryByText("Create your workspace")).toBeNull();
+});
+```
+
+Keep whatever the replaced test asserted about the trimmed name/slug — carry those assertions across rather than dropping them.
+
+Then append:
+
+```tsx
 test("a failed sign-out keeps the user where they are", async () => {
   authMockState.session = zeroOrgSession();
   authMockState.signOutResult = { data: null, error: { status: 500 } };
-  const { router, view } = renderApp("/chat");
+  const { router, view } = renderApp();
   await view.findByText("Create your workspace");
   fireEvent.click(view.getByRole("button", { name: /sign out/i }));
-  await waitFor(() => {
-    expect(view.getByText("Could not sign out. Try again.")).toBeTruthy();
-  });
+  expect(await view.findByText("Could not sign out. Try again.")).toBeTruthy();
   expect(router.state.location.pathname).not.toBe("/login");
 });
 ```
 
-Add the mock state this needs, in `apps/web/src/test/auth-mock.ts`:
-
-```ts
-  signOutResult: ok(),
-```
-
-reset it in `resetAuthMock()` (`authMockState.signOutResult = ok();`), and make the factory's `signOut` return it:
-
-```ts
-  signOut: async () => authMockState.signOutResult,
-```
+The `signOutResult` mock state was already added in Task 1.
 
 - [ ] **Step 2: Run to confirm failure**
 
@@ -1465,9 +1599,24 @@ Add `const queryClient = useQueryClient();` beside the other hooks, and replace 
       // The server activates the new organization as part of /organization/create,
       // so no setActive round trip is needed — only a fresh read of the viewer.
       // No navigation either: the layout flips into the shell at this URL.
-      await refetchViewer(queryClient);
-      toast({ variant: "success", message: "Workspace created." });
+      //
+      // The workspace EXISTS from here on. A refresh failure is a partial
+      // success: never tell the user nothing was created, or they will create
+      // a second one.
+      try {
+        await refetchViewer(queryClient);
+        toast({ variant: "success", message: "Workspace created." });
+      } catch {
+        toast({
+          variant: "error",
+          title: "Workspace created",
+          message: "Couldn't load it just yet — reload to continue.",
+        });
+      }
+      return;
 ```
+
+Because the `try` block's outer `catch` currently maps *any* throw to `connectionFailed()`, the inner `try/catch` above is what stops a post-create refresh failure from being reported as "nothing was created".
 
 Replace `handleSignOut`:
 
@@ -1510,8 +1659,14 @@ import { completeSignOut, refetchViewer } from "../../lib/auth/viewer";
 Add `const queryClient = useQueryClient();`, then after a successful rename refresh the viewer so the shell's workspace name updates:
 
 ```tsx
-      await refetchViewer(queryClient);
+      // The rename has already landed server-side; a failed refresh must not
+      // be reported as a failed rename.
       toast({ variant: "success", message: "Workspace renamed." });
+      try {
+        await refetchViewer(queryClient);
+      } catch {
+        // The name is saved; the shell will pick it up on the next viewer read.
+      }
 ```
 
 and replace `handleSignOut` with the `completeSignOut` version from Step 3.
@@ -1557,7 +1712,12 @@ Delete the `SessionProbe` type, the `sessionProbe`/`setSessionProbe` state, and 
 ```tsx
 import { useQueryClient } from "@tanstack/react-query";
 import { authClient } from "../lib/auth-client";
-import { completeSignOut, refetchViewer, useViewer } from "../lib/auth/viewer";
+import {
+  completeSignOut,
+  refetchViewer,
+  useViewer,
+  viewerQueryKey,
+} from "../lib/auth/viewer";
 ```
 
 Inside the component, replace the probe state with:
@@ -1591,7 +1751,17 @@ Replace the three pre-content branches:
   }
 
   if (sessionError) {
-    return <ConnectionErrorCard onRetry={() => setAttempt((n) => n + 1)} />;
+    // `attempt` no longer feeds the viewer query, so bumping it alone would
+    // leave the same cached error in place and the card could never recover.
+    // Drop the cached error, then let the query refetch.
+    return (
+      <ConnectionErrorCard
+        onRetry={() => {
+          queryClient.removeQueries({ queryKey: viewerQueryKey });
+          setAttempt((n) => n + 1);
+        }}
+      />
+    );
   }
 
   if (!viewer || sessionLost) {
@@ -1657,9 +1827,33 @@ test("an undetermined session shows the retry card, not a login bounce", async (
   expect(await view.findByText("Can't load this invitation")).toBeTruthy();
   expect(router.state.location.pathname).toContain("/accept-invitation/");
 });
+
+test("Try again recovers once the server answers", async () => {
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  const { view } = renderInvite("inv_1");
+  await view.findByText("Can't load this invitation");
+
+  // The retry must drop the CACHED error, not just re-run an effect.
+  authMockState.getSessionError = null;
+  authMockState.session = demoSession();
+  authMockState.getInvitationResult = {
+    data: {
+      id: "inv_1",
+      email: "demo@example.com",
+      role: "member",
+      status: "pending",
+      organizationId: "org_test_1",
+      organizationName: "Acme",
+      inviterEmail: "owner@example.com",
+    },
+    error: null,
+  };
+  fireEvent.click(view.getByRole("button", { name: /try again/i }));
+  expect(await view.findByText("Join Acme")).toBeTruthy();
+});
 ```
 
-Match the existing file's render helper name if it differs from `renderInvite`.
+Match the existing file's render helper name if it differs from `renderInvite`, and add `demoSession` / `fireEvent` to that file's imports if they are not already there.
 
 - [ ] **Step 4: Verify**
 
@@ -1791,37 +1985,42 @@ git commit -m "refactor(web): stop exporting Better Auth React hooks"
 ## Task 9: End-to-end coverage
 
 **Files:**
-- Create: `e2e/specs/auth-flow.e2e.ts`
+- Modify: `e2e/specs/auth.e2e.ts` (add one case — do **not** create a parallel spec file)
+- Modify: `e2e/README.md` (its "Specs" section is the spec inventory)
 - Read first: `e2e/README.md`, `e2e/support/flows.ts`
 
 **Interfaces:**
-- Consumes: `e2e/support/flows.ts`'s `Account` type and `signUp` helper.
-- Produces: an E2E spec that does **not** start with `page.goto("/login")`.
+- Consumes: `e2e/support/flows.ts`'s `Account` type, `signUp`, and `createWorkspace` helpers.
+- Produces: an E2E case that does **not** start with `page.goto("/login")`.
 
 - [ ] **Step 1: Read the harness**
 
-Read `e2e/README.md` and `e2e/support/flows.ts` in full, plus one existing spec under `e2e/specs/`, to match the fixture and account-provisioning conventions exactly.
+Read `e2e/README.md` and `e2e/support/flows.ts` in full, plus the whole of `e2e/specs/auth.e2e.ts`, to match the fixture and account-provisioning conventions exactly. `auth.e2e.ts` already covers signup → shell, logout, login, and a bad-password path; this task adds the ordering case it is missing, in that same file.
 
-- [ ] **Step 2: Write the spec**
+- [ ] **Step 2: Add the case**
 
-Create `e2e/specs/auth-flow.e2e.ts`. It must:
+Add a test to `e2e/specs/auth.e2e.ts`. It must:
 
 1. Provision an account **with a workspace** using the existing helpers (`signUp` then `createWorkspace`), then sign out through the UI.
 2. Navigate to `/chat` **while signed out** and let the SPA redirect to `/login` on its own. Do not `page.goto("/login")` — that full navigation rebuilds the Better Auth client singleton and destroys the precondition this spec exists to cover (`e2e/support/flows.ts:48` is why CI never caught the bug).
 3. Fill and submit the form **once**.
 4. Assert `page.waitForURL("**/chat")` and that a workspace-scoped element is visible without any reload — assert on real shell content, not merely the URL.
 
-Add a comment at the top of the file stating rule 2 and why, so nobody "simplifies" it back to `flows.login()`.
+Add a comment above the test stating rule 2 and why, so nobody "simplifies" it back to `flows.login()`.
 
-- [ ] **Step 3: Run it**
+- [ ] **Step 3: Update the spec inventory**
 
-Run: `cd e2e && bunx playwright test specs/auth-flow.e2e.ts --workers=1`
+`e2e/README.md`'s "Specs (`specs/*.e2e.ts`)" section is the inventory and must not go stale. Extend its **auth** bullet to mention the new case, e.g. *"…login (+ a bad-password path); and signing in ONCE after a signed-out visit to a protected route, without the `page.goto("/login")` that would reset the SPA's auth client."*
+
+- [ ] **Step 4: Run it**
+
+Run: `cd e2e && bunx playwright test specs/auth.e2e.ts --workers=1`
 Expected: PASS. (The harness self-manages its stack; `--workers=1` per the repo's e2e notes.)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add e2e/specs/auth-flow.e2e.ts
+git add e2e/specs/auth.e2e.ts e2e/README.md
 git commit -m "test(e2e): cover signing in without a prior page navigation"
 ```
 
@@ -1855,11 +2054,11 @@ Add a row to the living-documents table in `AGENTS.md`:
 
 - [ ] **Step 4: Write the changeset**
 
-Create `.changeset/spa-session-state.md`. Remember: the summary is ONE line, and the bold scope label in the changelog is derived from the package names sorted alphabetically.
+Create `.changeset/spa-session-state.md`. Remember: the summary is ONE line, and the bold scope label in the changelog is derived from the package names sorted alphabetically. `patch` is correct — AGENTS.md reserves `minor` for features and 0.x breaking changes, and this is a bug fix.
 
 ```md
 ---
-"@invisible-string/web": minor
+"@invisible-string/web": patch
 ---
 
 Fix signing in requiring two attempts and workspace content staying blank until a reload, by moving SPA identity off Better Auth's React hooks onto a viewer query gated in the router.
@@ -1888,4 +2087,4 @@ git commit -m "docs: record the SPA identity rewrite and retire the session-atom
 
 - **Spec coverage**: §3 → Task 1; §4.1 → Task 2; §4.2/§4.3 → Task 3; §5 → Tasks 1, 4, 6; §6.1/§6.2/§6.5 → Task 5; §6.3 → Task 6; §6.4 → Task 7; §6.6 → Task 8; §7.1 → Tasks 1 and 8; §7.2 → Task 4; §7.3 → Task 9; §9 file table → Tasks 1–10.
 - **Type consistency**: `refetchViewer` is the single refresh primitive used by Tasks 4, 6, and 7; `activateWorkspace` is used only by the gate; `useViewer(enabled?)` is the only hook. `viewerQueryKey` is spelled once, in `lib/auth/viewer.ts`.
-- **Interim state**: after Task 3 and before Task 5, `_app` reads the viewer while `lib/workspace.ts` still reads Better Auth atoms. Both work; the suite must stay green at that boundary.
+- **Interim state**: after Task 3 and before Task 5, `_app` reads the viewer while `lib/workspace.ts` still reads Better Auth atoms, and principal-change cache clearing does not land until Task 6. The suite must stay green at every boundary, but **Tasks 3–5 are non-shippable intermediate commits**: a first login works because the old organization hooks first mount after the new gate, while remount and account-switch behaviour stays unsafe until Task 5. Do not cut a release from the middle of this sequence.

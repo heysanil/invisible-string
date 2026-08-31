@@ -51,6 +51,15 @@ export const authMockState = {
   signUpResult: ok(),
   signInCalls: [] as Array<Record<string, unknown>>,
   signUpCalls: [] as Array<Record<string, unknown>>,
+  /** The session the server hands back when signIn/signUp succeeds. */
+  sessionAfterSignIn: null as MockSessionData | null,
+  /** Force `organization.list()` to fail with this error (viewer contract tests). */
+  listOrganizationsError: null as MockAuthError | null,
+  /** Force `getSession()` to fail with this error (viewer contract tests). */
+  getSessionError: null as MockAuthError | null,
+  listOrganizationsCalls: 0,
+  getSessionCalls: 0,
+  signOutResult: ok(),
 
   // Organization plugin state
   organizations: [] as MockOrganization[],
@@ -87,6 +96,12 @@ export function resetAuthMock(): void {
   authMockState.signUpResult = ok();
   authMockState.signInCalls = [];
   authMockState.signUpCalls = [];
+  authMockState.sessionAfterSignIn = null;
+  authMockState.listOrganizationsError = null;
+  authMockState.getSessionError = null;
+  authMockState.listOrganizationsCalls = 0;
+  authMockState.getSessionCalls = 0;
+  authMockState.signOutResult = ok();
 
   authMockState.organizations = [];
   authMockState.activeOrganization = null;
@@ -119,6 +134,15 @@ export function demoSession(): MockSessionData {
   return {
     user: { id: "u1", email: "demo@example.com", name: "Demo" },
     session: { activeOrganizationId: DEMO_WORKSPACE_ID },
+  };
+}
+
+/** Mirror the server: rewrite the session's active organization in place. */
+function setSessionActiveOrganization(organizationId: string | null): void {
+  if (!authMockState.session) return;
+  authMockState.session = {
+    ...authMockState.session,
+    session: { activeOrganizationId: organizationId },
   };
 }
 
@@ -177,16 +201,23 @@ const organizationMock = {
     authMockState.setActiveCalls.push(args);
     const result = authMockState.setActiveResult;
     if (result.error) return result;
-    const id = args["organizationId"] as string;
-    const known = authMockState.organizations.find((org) => org.id === id);
-    // Unknown id: mirror the real client — the active-org store refetches
-    // from the server, which knows orgs the (stale) list hook does not,
-    // e.g. right after accepting an invitation.
-    authMockState.activeOrganization =
-      known ??
-      (id
-        ? { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" }
-        : null);
+    const id = (args["organizationId"] as string | null) ?? null;
+    if (!id) {
+      authMockState.activeOrganization = null;
+      setSessionActiveOrganization(null);
+      notifyOrgStore();
+      return result;
+    }
+    let org = authMockState.organizations.find((candidate) => candidate.id === id);
+    if (!org) {
+      // Unknown id: mirror the real client — the active-org store refetches
+      // from the server, which knows orgs the (stale) list hook does not,
+      // e.g. right after accepting an invitation.
+      org = { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" };
+      authMockState.organizations = [...authMockState.organizations, org];
+    }
+    authMockState.activeOrganization = org;
+    setSessionActiveOrganization(id);
     notifyOrgStore();
     return result;
   },
@@ -194,21 +225,26 @@ const organizationMock = {
     authMockState.createOrganizationCalls.push(args);
     const result = authMockState.createOrganizationResult;
     if (!result.error && result.data) {
-      // Mirror the real client: /organization/create fires $listOrg, so
-      // list hooks re-read — append so layout gates flip in tests. Do NOT
-      // notify subscribers here: every caller in this codebase immediately
-      // follows a successful create with setActive (see CreateWorkspaceScreen),
-      // and notifying now would let a subscribed component observe a
-      // half-updated store (list non-empty, no active org yet) and run its
-      // own first-org self-heal (useWorkspace) — a spurious extra setActive
-      // call. Deferring notification to setActive() below means the two
-      // fields always change together from a subscriber's point of view.
-      authMockState.organizations = [
-        ...authMockState.organizations,
-        result.data as MockOrganization,
-      ];
+      const org = result.data as MockOrganization;
+      authMockState.organizations = [...authMockState.organizations, org];
+      // Better Auth activates a newly created organization server-side
+      // (crud-org.mjs), which is why the client sends no setActive.
+      authMockState.activeOrganization = org;
+      setSessionActiveOrganization(org.id);
+      notifyOrgStore();
     }
     return result;
+  },
+  list: async (): Promise<MockAuthResult> => {
+    authMockState.listOrganizationsCalls++;
+    if (authMockState.listOrganizationsError)
+      return { data: null, error: authMockState.listOrganizationsError };
+    // The real endpoint requires a session: no session means 401, which the
+    // viewer reads as "signed out". Modelling this is the whole point — the
+    // old mock returned data regardless and could never reproduce the bug.
+    if (!authMockState.session)
+      return { data: null, error: { status: 401, message: "UNAUTHORIZED" } };
+    return { data: authMockState.organizations, error: null };
   },
   getInvitation: async (args: Record<string, unknown>) => {
     authMockState.getInvitationCalls.push(args);
@@ -228,7 +264,23 @@ const organizationMock = {
   },
   update: async (args: Record<string, unknown>) => {
     authMockState.updateOrganizationCalls.push(args);
-    return authMockState.updateOrganizationResult;
+    const result = authMockState.updateOrganizationResult;
+    if (!result.error) {
+      const id = args["organizationId"] as string;
+      const name = (args["data"] as { name?: string } | undefined)?.name;
+      if (name) {
+        authMockState.organizations = authMockState.organizations.map((org) =>
+          org.id === id ? { ...org, name } : org,
+        );
+        if (authMockState.activeOrganization?.id === id)
+          authMockState.activeOrganization = {
+            ...authMockState.activeOrganization,
+            name,
+          };
+        notifyOrgStore();
+      }
+    }
+    return result;
   },
   listInvitations: async () => authMockState.listInvitationsResult,
   acceptInvitation: async (args: Record<string, unknown>) => {
@@ -278,7 +330,12 @@ export function registerAuthMock(): void {
 
 const authMockFactory = () => ({
   authClient: {
-    getSession: async () => ({ data: authMockState.session, error: null }),
+    getSession: async (): Promise<MockAuthResult> => {
+      authMockState.getSessionCalls++;
+      if (authMockState.getSessionError)
+        return { data: null, error: authMockState.getSessionError };
+      return { data: authMockState.session, error: null };
+    },
     organization: organizationMock,
   },
   useSession: () => ({
@@ -292,16 +349,22 @@ const authMockFactory = () => ({
   signIn: {
     email: async (args: Record<string, unknown>) => {
       authMockState.signInCalls.push(args);
-      return authMockState.signInResult;
+      const result = authMockState.signInResult;
+      if (!result.error && authMockState.sessionAfterSignIn)
+        authMockState.session = authMockState.sessionAfterSignIn;
+      return result;
     },
   },
   signUp: {
     email: async (args: Record<string, unknown>) => {
       authMockState.signUpCalls.push(args);
-      return authMockState.signUpResult;
+      const result = authMockState.signUpResult;
+      if (!result.error && authMockState.sessionAfterSignIn)
+        authMockState.session = authMockState.sessionAfterSignIn;
+      return result;
     },
   },
-  signOut: async () => ok(),
+  signOut: async () => authMockState.signOutResult,
 });
 
 // First-import registration: when a mock-consuming file is the first to

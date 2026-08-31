@@ -9,6 +9,7 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 
+import { createAppQueryClient } from "../lib/query-client";
 import {
   authMockState,
   demoSession,
@@ -42,6 +43,7 @@ function renderInvite() {
     history: createMemoryHistory({
       initialEntries: ["/accept-invitation/inv_1"],
     }),
+    context: { queryClient: createAppQueryClient() },
   });
   const view = render(<RouterProvider router={router} />);
   return { router, view };

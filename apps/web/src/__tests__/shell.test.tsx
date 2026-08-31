@@ -9,6 +9,7 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 
+import { createAppQueryClient } from "../lib/query-client";
 import {
   authMockState,
   registerAuthMock,
@@ -31,6 +32,7 @@ function renderAt(path: string) {
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries: [path] }),
+    context: { queryClient: createAppQueryClient() },
   });
   const view = render(<RouterProvider router={router} />);
   return { router, view };

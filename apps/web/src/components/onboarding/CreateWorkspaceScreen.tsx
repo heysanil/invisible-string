@@ -1,7 +1,9 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useState, type FormEvent } from "react";
 
 import { authClient, signOut } from "../../lib/auth-client";
+import { activateWorkspace } from "../../lib/auth/viewer";
 import { workspaceSlug } from "../../lib/slug";
 import { AuthCard } from "../auth/AuthCard";
 import { Button } from "../ui/Button";
@@ -14,12 +16,15 @@ const FIELD_ID = "workspace-name";
 /**
  * First-run onboarding: a signed-in user with no workspace names one and
  * lands in the shell. Creation MUST go through `authClient` — the server's
- * afterCreateOrganization hook seeds the locked workspace defaults, and the
- * client's $listOrg store refetches on create so the `_app` gate flips
- * without a reload or navigation.
+ * afterCreateOrganization hook seeds the locked workspace defaults. The
+ * `_app` gate now reads the viewer query rather than Better Auth's org
+ * atoms, so activation goes through `activateWorkspace` (viewer.ts), which
+ * refetches that query — that refetch, not a store subscription, is what
+ * flips the gate into the shell.
  */
 export function CreateWorkspaceScreen() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const [name, setName] = useState("");
@@ -70,11 +75,9 @@ export function CreateWorkspaceScreen() {
         }
         return;
       }
-      await authClient.organization.setActive({
-        organizationId: created.data.id,
-      });
+      await activateWorkspace(queryClient, created.data.id);
       toast({ variant: "success", message: "Workspace created." });
-      // No navigation: the org-list store refetched on create, so the
+      // No navigation: activateWorkspace refetched the viewer query, so the
       // `_app` gate re-renders into the shell at the current URL.
     } catch {
       connectionFailed();

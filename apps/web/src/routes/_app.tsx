@@ -1,36 +1,74 @@
-import { createFileRoute, Navigate, Outlet } from "@tanstack/react-router";
+import {
+  createFileRoute,
+  Navigate,
+  Outlet,
+  redirect,
+} from "@tanstack/react-router";
 
 import { AppShell } from "../components/AppShell";
+import { SessionUnavailableScreen } from "../components/auth/SessionUnavailableScreen";
 import { CreateWorkspaceScreen } from "../components/onboarding/CreateWorkspaceScreen";
 import { Spinner } from "../components/ui/Spinner";
 import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import {
-  useActiveOrganization,
-  useListOrganizations,
-  useSession,
-} from "../lib/auth-client";
-
-export const Route = createFileRoute("/_app")({ component: AppLayout });
+  activateWorkspace,
+  activeWorkspace,
+  useViewer,
+  viewerQueryOptions,
+} from "../lib/auth/viewer";
 
 /**
- * Authenticated shell layout. Session comes from the better-auth client;
- * unauthenticated (or unreachable-API) visitors are sent to /login, which
- * remains fully usable offline.
+ * The authenticated shell.
  *
- * This layout is also the single owner of the zero-workspace state: a
- * signed-in user with no organizations gets the first-run
- * CreateWorkspaceScreen instead of the shell. The active-organization check
- * matters after invite acceptance — /organization/accept-invitation does not
- * fire the client's $listOrg refetch (only create/delete/update do), but
- * setActive refreshes the active-org store, which must win here.
+ * The auth decision happens HERE, in `beforeLoad`, and never in render. A
+ * render-time gate is what produced the double-login bug: it read a Better
+ * Auth atom that reported `isPending: false` over a resolved-null snapshot
+ * captured before the user signed in, and bounced them straight back to
+ * /login. `throw redirect(...)` is atomic with navigation resolution, so no
+ * render can observe a half-resolved session at all.
  */
-function AppLayout() {
-  const { data: session, isPending } = useSession();
-  const organizations = useListOrganizations();
-  const activeOrganization = useActiveOrganization();
+export const Route = createFileRoute("/_app")({
+  beforeLoad: async ({ context, location, cause }) => {
+    // Preloading must never decide authentication. `beforeLoad` runs again
+    // for the real navigation (router-core `load-matches.ts`), so returning
+    // here cannot let an actual navigation bypass the guard. Note this returns
+    // BEFORE fetching, so a preload warms nothing — and any future loader on a
+    // descendant route would therefore run during preload with no viewer in
+    // context. Add one only if it tolerates that.
+    if (cause === "preload") return;
+    // Fixture mode is a backendless design/E2E harness — there is no session.
+    if (FIXTURE_MODE) return;
 
-  // Fixture mode is a backendless design/E2E harness — skip the auth gate so
-  // canned screens render without a control plane.
+    // fetchQuery, not ensureQueryData: ensureQueryData returns stale cached
+    // data without revalidating, which would let the gate authorize from a
+    // stale cache — the same defect in a different library.
+    const viewer = await context.queryClient.fetchQuery(viewerQueryOptions());
+
+    if (!viewer) {
+      throw redirect({
+        to: "/login",
+        search: { redirect: location.href },
+        replace: true,
+      });
+    }
+
+    // A fresh login (or an invite acceptance) can leave the session with no
+    // active organization. Activation is AWAITED here so its failure is an
+    // error the user can see and retry, rather than the fire-and-forget
+    // effect that used to leave useWorkspace() pending forever.
+    if (activeWorkspace(viewer) === null && viewer.workspaces.length > 0) {
+      await activateWorkspace(context.queryClient, viewer.workspaces[0]!.id);
+    }
+  },
+  errorComponent: SessionUnavailableScreen,
+  component: AppLayout,
+});
+
+function AppLayout() {
+  // Kept mounted so a focus refetch that resolves null (session revoked or
+  // signed out in another tab) leaves the shell instead of stranding it.
+  const { viewer, isPending } = useViewer(!FIXTURE_MODE);
+
   if (FIXTURE_MODE) {
     return (
       <AppShell>
@@ -39,12 +77,7 @@ function AppLayout() {
     );
   }
 
-  const orgsResolving =
-    session !== null &&
-    session !== undefined &&
-    (organizations.isPending || activeOrganization.isPending);
-
-  if (isPending || orgsResolving) {
+  if (isPending) {
     return (
       <div
         role="status"
@@ -56,17 +89,8 @@ function AppLayout() {
     );
   }
 
-  if (!session) return <Navigate to="/login" replace />;
-
-  // If org resolution errored, fall through to the shell — WorkspaceGate's
-  // designed empty state handles it; never mis-onboard a user who may
-  // already own workspaces.
-  const orgResolutionFailed =
-    organizations.error != null || activeOrganization.error != null;
-  const hasWorkspace =
-    (organizations.data?.length ?? 0) > 0 || activeOrganization.data !== null;
-
-  if (!orgResolutionFailed && !hasWorkspace) return <CreateWorkspaceScreen />;
+  if (!viewer) return <Navigate to="/login" replace />;
+  if (viewer.workspaces.length === 0) return <CreateWorkspaceScreen />;
 
   return (
     <AppShell>

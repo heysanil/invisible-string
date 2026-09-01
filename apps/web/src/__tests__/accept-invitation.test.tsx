@@ -3,6 +3,7 @@ import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
 import {
   createMemoryHistory,
   createRouter,
@@ -13,6 +14,7 @@ import { createAppQueryClient } from "../lib/query-client";
 import {
   authMockState,
   demoSession,
+  demoWorkspace,
   registerAuthMock,
   resetAuthMock,
 } from "../test/auth-mock";
@@ -60,6 +62,7 @@ beforeEach(() => {
 afterEach(() => {
   fetchMock.restore();
   cleanup();
+  focusManager.setFocused(true);
 });
 
 test("signed-out visitors are sent to login carrying the redirect", async () => {
@@ -165,6 +168,62 @@ test("a viewer refresh that fails after accepting never blames the invitation", 
   });
   expect(authMockState.getInvitationCalls.length).toBe(invitationReads);
   expect(authMockState.acceptInvitationCalls).toHaveLength(1);
+});
+
+/**
+ * The commit-point protection above stops the invitation effect from
+ * re-firing when the SAME retry click drives a viewer read. But
+ * `refetchOnWindowFocus: "always"` (viewer.ts) means ANY refocus refetches
+ * the viewer unconditionally, even while its data is still well inside the
+ * 30s staleTime — a background tab and a returning network, not a race. If
+ * that refetch's payload genuinely differs (the newly-joined org now shows
+ * up in `organization.list`), `query.data` gets a new identity, and without
+ * a guard tied to the commit point itself (not just to the in-flight retry)
+ * the invitation-fetch effect re-enters, re-reads the now-CONSUMED
+ * invitation, and the server's 400 replaces the joined card with "This
+ * invitation is no longer valid" — stranding a user who already joined.
+ */
+test("a post-commit refocus never re-reads the consumed invitation", async () => {
+  authMockState.session = demoSession();
+  authMockState.getInvitationResult = { data: INVITATION, error: null };
+  const { view } = renderInvite();
+  await view.findByText("Join Acme");
+
+  // Membership lands, then activateWorkspace's own internal viewer refetch
+  // hits a transient 503 — same setup as the retry test above, just without
+  // clicking "Try again" afterward.
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  fireEvent.click(view.getByRole("button", { name: /accept invitation/i }));
+  expect(await view.findByText("Joined Acme")).toBeTruthy();
+  expect(
+    await view.findByText(
+      "You're a member — we just couldn't open the workspace",
+    ),
+  ).toBeTruthy();
+
+  // The server recovers, and the join is now visible in the org list — a
+  // genuinely different payload, not one query-core's structural sharing
+  // would collapse back to the same reference. The invitation itself is
+  // consumed server-side, so re-reading it now returns the real 400.
+  authMockState.getSessionError = null;
+  authMockState.organizations = [demoWorkspace()];
+  authMockState.getInvitationResult = {
+    data: null,
+    error: { message: "Invitation not found!", status: 400 },
+  };
+  const sessionCallsBefore = authMockState.getSessionCalls;
+  const invitationReads = authMockState.getInvitationCalls.length;
+
+  focusManager.setFocused(false);
+  focusManager.setFocused(true);
+
+  await waitFor(() => {
+    expect(authMockState.getSessionCalls).toBeGreaterThan(sessionCallsBefore);
+  });
+
+  expect(view.getByText("Joined Acme")).toBeTruthy();
+  expect(view.queryByText("This invitation is no longer valid")).toBeNull();
+  expect(authMockState.getInvitationCalls.length).toBe(invitationReads);
 });
 
 test("declining rejects the invitation and shows the declined state", async () => {

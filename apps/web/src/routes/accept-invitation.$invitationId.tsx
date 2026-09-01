@@ -5,7 +5,7 @@ import {
   useNavigate,
   useRouter,
 } from "@tanstack/react-router";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { AuthCard } from "../components/auth/AuthCard";
 import { Button } from "../components/ui/Button";
@@ -71,6 +71,15 @@ function AcceptInvitationPage() {
   const [sessionLost, setSessionLost] = useState(false);
 
   const [view, setView] = useState<InviteView>({ kind: "loading" });
+  // Set alongside the `joined`/`declined` transitions below — both consume
+  // the invitation server-side, so once either lands, no code path may read
+  // it again. A `view.kind` dependency on the effect would work too, but the
+  // effect's own `setView({kind: "loading"})` would then flip `view.kind`
+  // between "loading" and "ready"/"error" and re-trigger itself forever; a
+  // ref sidesteps that without touching the effect's deps, and (since refs
+  // are always current) without the stale-closure risk of reading `view`
+  // from inside the effect without listing it.
+  const committedRef = useRef(false);
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [attempt, setAttempt] = useState(0);
@@ -83,7 +92,7 @@ function AcceptInvitationPage() {
   // authClient.getSession() probe because the old useSession() atom could hold
   // a stale resolved-null right after login; that atom is gone.
   useEffect(() => {
-    if (!viewer || sessionLost) return;
+    if (!viewer || sessionLost || committedRef.current) return;
     let cancelled = false;
     setView({ kind: "loading" });
     void authClient.organization
@@ -200,7 +209,12 @@ function AcceptInvitationPage() {
     // ---- COMMIT POINT ----
     // The invitation is consumed and the membership exists. Everything past
     // here is recoverable on its own terms; nothing may fall back to a state
-    // whose retry re-reads the invitation.
+    // whose retry re-reads the invitation. `committedRef` must be set BEFORE
+    // `enterWorkspace()` starts (not just before `setView`): the invitation-
+    // fetch effect above depends on `viewer`, and `enterWorkspace()` is what
+    // changes it (`activateWorkspace` -> `refetchViewer`), so a viewer
+    // refetch racing that same call must already see the guard up.
+    committedRef.current = true;
     setView({
       kind: "joined",
       organizationId: invitation.organizationId,
@@ -257,6 +271,9 @@ function AcceptInvitationPage() {
         }
         return;
       }
+      // Also a commit point: `rejectInvitation` consumes the invitation
+      // server-side too, so a later re-read would 400 the same way.
+      committedRef.current = true;
       setView({
         kind: "declined",
         organizationName: invitation.organizationName,

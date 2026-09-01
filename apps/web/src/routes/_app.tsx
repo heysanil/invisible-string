@@ -25,12 +25,18 @@ import {
 /**
  * The authenticated shell.
  *
- * The auth decision happens HERE, in `beforeLoad`, and never in render. A
- * render-time gate is what produced the double-login bug: it read a Better
- * Auth atom that reported `isPending: false` over a resolved-null snapshot
- * captured before the user signed in, and bounced them straight back to
- * /login. `throw redirect(...)` is atomic with navigation resolution, so no
- * render can observe a half-resolved session at all.
+ * A NAVIGATION's auth decision happens HERE, in `beforeLoad` — never from a
+ * snapshot read during render, which is not the same as "never in render":
+ * `AppLayout` below keeps a live render-time observer on purpose, because
+ * `beforeLoad` runs only on navigation and a session can end without one.
+ * The rule is about the VALUE, not the location. What produced the
+ * double-login bug was a render-time gate reading a Better Auth atom that
+ * reported `isPending: false` over a resolved-null snapshot captured before
+ * the user signed in, and bouncing them straight back to /login;
+ * authoritative query state with an honest `isPending` is safe to branch on
+ * in render, which is what `AppLayout` does below. `throw redirect(...)`
+ * here is atomic with navigation resolution, so no render can observe a
+ * half-resolved session for a NAVIGATION at all.
  */
 export const Route = createFileRoute("/_app")({
   beforeLoad: async ({ context, location, cause }) => {
@@ -164,14 +170,21 @@ function AppLayout() {
     activeWorkspace(viewer) === null;
 
   useEffect(() => {
-    if (!needsActivation) return;
+    // `error` is checked here too, not just below: this effect is declared
+    // ahead of the render's `if (error)` arm (hooks can't follow a
+    // conditional return), so without this a viewer that is simultaneously
+    // errored AND missing a resolvable active workspace would invalidate
+    // while the retry card is on screen — harmless today (an extra
+    // `beforeLoad` against a warm cache) but it couples two arms the render
+    // ordering deliberately keeps independent.
+    if (!needsActivation || error) return;
     // `invalidate()` re-runs `beforeLoad` (router-core's `shouldSkipLoader`
     // does not skip a successful match), and the viewer it re-reads is the
     // one this render just saw — so the gate activates and the flag clears.
     // A failure there throws into `errorComponent`; it cannot spin, because
     // the effect only fires on the transition into this state.
     void router.invalidate();
-  }, [needsActivation, router]);
+  }, [needsActivation, error, router]);
 
   if (FIXTURE_MODE) {
     return (

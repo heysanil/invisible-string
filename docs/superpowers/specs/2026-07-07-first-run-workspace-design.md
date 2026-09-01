@@ -2,6 +2,8 @@
 
 **Date:** 2026-07-07 · **Status:** approved (reviewed via artifact) · **Scope:** `apps/web` only — zero server changes
 
+> **Partly superseded by `2026-08-31-spa-session-and-workspace-state-design.md`.** Its product decisions stand — the zero-org gate lives in the `_app` layout, the single-field `AuthCard` screen, the invite states. Three *technical* decisions below do not: the `useListOrganizations` subscription in §1 (that atom fetches once per page load and freezes at 401; the zero-org branch now reads `viewer.workspaces.length === 0`), the explicit post-create `setActive` (the server already activates a newly created organization, so the client call is a second round trip that can fail after the workspace exists), and nanostore-driven shell resolution (the layout re-renders because the viewer query refetched, not because an atom signalled).
+
 ## Context
 
 A brand-new account dead-ends. Signup navigates to `/chat`; `useWorkspace`

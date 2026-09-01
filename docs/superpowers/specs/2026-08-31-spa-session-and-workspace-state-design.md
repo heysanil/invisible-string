@@ -1,6 +1,12 @@
 # SPA session + workspace state — Design (2026-08-31)
 
-Supersedes the auth-gating and workspace-resolution decisions of the 2026-07-02 design spec and the 2026-07-10 agents-first redesign wherever they assume the SPA reads identity through Better Auth's React hooks. It also **retires the "Better Auth session-atom staleness" known residual** in `AGENTS.md` — the per-route `authClient.getSession()` probe that residual describes is removed here, not generalized.
+Supersedes the auth-gating and workspace-resolution decisions of the 2026-07-02 design spec and the 2026-07-10 agents-first redesign wherever they assume the SPA reads identity through Better Auth's React hooks. It also supersedes three decisions of the **2026-07-07 first-run workspace design**, whose §1 and §2 still prescribe them:
+
+- **`useListOrganizations` as the zero-org signal.** That atom is exactly the one §1.2 shows fetching once per page load and freezing at 401. The zero-org branch reads `viewer.workspaces.length === 0` instead.
+- **The explicit post-create `setActive`.** `/organization/create` already activates the new organization server-side; the client call is a second round trip that can fail after the workspace exists (§6.3).
+- **Nanostore-driven shell resolution** — "the moment a workspace exists the layout re-renders into the normal app". The layout re-renders because the viewer query is refetched, not because an atom signalled.
+
+Its product decisions — the zero-org gate living in the `_app` layout, the single-field `AuthCard` screen, the invite flow's states — are unchanged. It also **retires the "Better Auth session-atom staleness" known residual** in `AGENTS.md` — the per-route `authClient.getSession()` probe that residual describes is removed here, not generalized.
 
 Nothing in `apps/control-plane` changes. No schema change, no migration, no `COMPILER_VERSION` bump, no `BUILD_ENV_EPOCH` bump.
 
@@ -76,7 +82,7 @@ Four rules, in force from this spec onward:
 
 1. **`apps/web` never imports a Better Auth React hook.** `useSession`, `useActiveOrganization`, and `useListOrganizations` stop being exported from `lib/auth-client.ts`.
 2. **Identity is one query.** One `viewer` query owns user, active workspace, and workspace list.
-3. **The auth decision happens in `beforeLoad`, never in render.**
+3. **A navigation's auth decision happens in `beforeLoad`.** Never from a snapshot read during render — which is not the same as "never in render": §4.3 keeps a live render-time observer on purpose, because `beforeLoad` runs only on navigation and a session can end without one. The rule is about the VALUE, not the location. Authoritative query state with an honest `isPending` is safe to branch on; a Better Auth atom reporting `isPending: false` over data it never fetched is not.
 4. **"Signed out" and "couldn't ask" are different answers** and must stay different all the way to the UI.
 
 ---
@@ -121,15 +127,31 @@ A 401 on `/organization/list` is treated as signed out rather than as an error: 
 ```ts
 staleTime: 30_000,
 retry: false,
-refetchOnWindowFocus: true,
-refetchOnReconnect: true,
+refetchOnWindowFocus: "always",
+refetchOnReconnect: "always",
 ```
 
 - `staleTime: 30_000` keeps `beforeLoad` a cache hit for in-app navigation. Without it, every route change inside `_app` would issue a `/get-session`.
 - `retry: false` overrides the app default (`retry: 1`, `__root.tsx:9`). The gate blocks navigation, so it must fail fast into the retry card rather than double the time-to-error.
-- `refetchOnWindowFocus: true` overrides the app default of `false`. This is load-bearing, not a nicety: it is how a session revoked or signed out in another tab is noticed. Leaving Better Auth's session manager costs us its `BroadcastChannel` cross-tab sync, and a focus refetch reproduces the practical effect of it with no new machinery.
+- `refetchOnWindowFocus: "always"` overrides the app default of `false`. This is load-bearing, not a nicety: it is how a session revoked or signed out in another tab is noticed. Leaving Better Auth's session manager costs us its `BroadcastChannel` cross-tab sync, and a focus refetch reproduces the practical effect of it with no new machinery.
 
-### 3.3 What is deliberately not fetched
+  **`"always"`, not `true`.** In `@tanstack/query-core@5.101.2` the option is resolved by `shouldFetchOn`:
+
+  ```js
+  return value === "always" || (value !== false && isStale(query, options));
+  ```
+
+  So `true` means "refetch on focus **if stale**" — and this query is deliberately fresh for 30 s. A session revoked in another tab five seconds ago would therefore survive the very refocus meant to catch it, and staleness alone never schedules a request: nothing would happen until the next navigation or reload. `refetchOnReconnect` reads through the identical helper and gets the identical treatment. The cost is two requests per refocus (`/get-session` + `/organization/list`), which is the price of the guarantee.
+
+### 3.3 Every request is bounded
+
+`AUTH_REQUEST_TIMEOUT_MS` (15 s) bounds `getSession`, `organization.list`, and `organization.setActive`. Without it a proxy that ACCEPTS the request and never completes the response leaves `beforeLoad`'s promise pending forever: the protected route never commits, and the retry card is unreachable precisely because nothing throws.
+
+The signal rides `fetchOptions`, which Better Auth's dynamic-path proxy spreads into the options it hands `@better-fetch/fetch` (`dist/client/proxy.mjs`); better-fetch prefers `opts.signal` over its own controller and passes it straight to `fetch`. Its own `timeout` option is deliberately unused — it is cleared the moment response *headers* arrive, so a body that never completes would still hang.
+
+A timeout must surface as **undetermined**, and it does for free: an aborted `fetch` rejects, and better-fetch calls `await fetch(...)` with no `try`/`catch`, so the rejection reaches the same wrapper that already converts transport failures to `ViewerUnavailableError`.
+
+### 3.4 What is deliberately not fetched
 
 `/organization/get-full-organization` is dropped entirely. The active workspace is derived:
 
@@ -159,7 +181,11 @@ beforeLoad: async ({ context, location, cause }) => {
     throw redirect({ to: "/login", search: { redirect: location.href }, replace: true });
   }
   if (activeWorkspace(viewer) === null && viewer.workspaces.length > 0) {
-    await activateWorkspace(context.queryClient, viewer.workspaces[0]!.id);
+    const activated = await activateWorkspace(context.queryClient, viewer.workspaces[0]!.id);
+    if (!activated) throw redirect({ to: "/login", search: { redirect: location.href }, replace: true });
+    if (activeWorkspace(activated) === null && activated.workspaces.length > 0) {
+      throw new ActivateWorkspaceError("The workspace could not be selected.");
+    }
   }
 },
 errorComponent: SessionUnavailableScreen,
@@ -176,19 +202,25 @@ Four decisions in that block:
 
 **Activation is awaited here, not fired-and-forgotten in a hook.** `lib/workspace.ts:45` currently calls `authClient.organization.setActive()` from an effect, ignores the result, and latches `activationRequested.current = true` so it never retries. A failed activation with a non-empty org list leaves `isPending` true **forever** — an infinite spinner with no error state and no recovery. Moving it into `beforeLoad` makes it awaited, makes its failure an error that reaches `errorComponent`, and makes it resolved before first paint.
 
+**Activation's RESULT is checked, not discarded.** `activateWorkspace` re-reads the viewer, and that read can answer any of the three ways the viewer query can. `null` means the session died mid-activation: it has to redirect *here*, while `location.href` is still the page the user asked for — committing the route and letting §4.3's `<Navigate>` handle it carries no `redirect` search param, so signing back in silently drops them on `/chat`. A viewer that still has no active workspace means the activation did not stick, which must fail visibly rather than commit a shell `WorkspaceGate` cannot resolve. (The `workspaces.length > 0` guard on that second check matters: a user who was removed from every workspace legitimately has no active one, and that is first-run onboarding, not an error.)
+
+**A 401 from `setActive` is signed-out, not an outage.** The session can expire between the viewer read and this call. `activateWorkspace` therefore returns `Viewer | null` on the same contract as the query itself and only wraps non-401 failures as `ActivateWorkspaceError`; a rejected promise (transport, or the timeout abort from §3.3) is wrapped, because it is an absence of an answer rather than an answer.
+
 Workspace selection is deterministic: `workspaces[0]` after the sort defined in §3, never "whatever row order the API returned".
 
 ### 4.3 `errorComponent` and `AppLayout`
 
 `SessionUnavailableScreen` renders the designed retry card — the same shape `accept-invitation.$invitationId.tsx` already uses for this exact condition. "Try again" invalidates the viewer query and calls the router's `reset`.
 
-`AppLayout` keeps only what genuinely belongs in render:
+`AppLayout` keeps only what genuinely belongs in render — a live `useQuery(viewerQueryOptions())` observer, branching on **all three** arms of §3.1 in the gate's own order:
 
-- a live `useQuery(viewerQueryOptions())` observer, so a focus refetch that resolves `null` (expired or signed out elsewhere) leaves the shell for `/login`;
-- zero workspaces → `CreateWorkspaceScreen`;
+- `error` → `SessionUnavailableScreen`. Undetermined is not "fine": a focus refetch that throws leaves `useViewer()` holding both the previous viewer and an error, and rendering the shell over that stale data silently downgrades "couldn't ask" to "everything is fine". Ignoring this arm is what made the contract hold only on initial navigation.
+- `null` → `/login`. Expired, or signed out in another tab.
+- workspaces but no *resolvable* active one → re-enter the gate (`router.invalidate()` from an effect) and hold a pending state. `beforeLoad` is the only place that awaits activation and it does not re-run without a navigation, so this state — the active organization removed elsewhere — used to leave the shell up over a `WorkspaceGate` that could only show its defensive empty state: stuck until a manual reload. `invalidate()` re-runs `beforeLoad` (router-core's `shouldSkipLoader` does not skip a successful match); a failure there throws into `errorComponent`, and the effect fires only on the transition into the state, so it cannot spin.
+- zero workspaces → `CreateWorkspaceScreen`.
 - otherwise → `AppShell`.
 
-A render-time redirect is acceptable **here** and not in today's code, because the value being read is authoritative query state whose `isPending` is honest, not a snapshot that reports `isPending: false` over data it never fetched.
+**This render-time decision is deliberate and is not the bug returning.** §2's rule 3 is about the VALUE, not the location: what made the old gate unsafe was reading a Better Auth atom that reported `isPending: false` over data it never fetched. This observer reads authoritative query state whose `isPending` is honest. It exists because `beforeLoad` runs only on navigation while a session can end without one, so *something* has to branch on the viewer between navigations — and the gate remains the only thing that decides a navigation.
 
 ---
 
@@ -221,7 +253,29 @@ return ref.scope === "user" ? ["me"] : ["ws", ref.workspaceId];
 
 Nothing clears that today, so signing out and signing in as a different user in the same tab can read the previous account's cached data before any refetch lands. Clearing on **every** principal change — sign-in, sign-up, and sign-out — makes the cache principal-scoped by construction, which is simpler and safer than partitioning every key by user id.
 
-### 5.2 Sign-out must check its result
+### 5.2 A principal can change without this tab doing anything
+
+`completeSignIn`/`completeSignOut` only cover a switch made in **this** tab. Cookies are shared across tabs; QueryClients are not. So if another tab signs Alice out and Bob in, this tab simply refetches its viewer and becomes Bob — while every `["me"]` entry still holds Alice's rows, under a prefix that is byte-identical for every user. A mounted personal-skill or personal-connection route then renders Alice's instructions as Bob.
+
+The purge is therefore keyed on the **resolved principal**, not on the sign-in call, and it runs inside the viewer query function:
+
+```ts
+queryFn: async ({ client }) => {
+  const viewer = await fetchViewer();
+  purgeOnPrincipalChange(client, viewer);   // removes every non-viewer query
+  return viewer;
+},
+```
+
+Three properties make that placement the right one:
+
+- **It is strictly before the commit.** The query function resolves before `setData`, so no render can observe the new principal beside the old principal's data. A `useEffect` afterwards is too late by construction — the offending frame has already painted.
+- **`undefined` is not a change.** A cache that has never resolved a viewer has no previous principal to leak from. `getQueryData` distinguishes it from a cached `null`, which *is* a principal (nobody).
+- **A throw is not a change.** The function never reaches the purge, which is correct: "couldn't ask" must evict nothing.
+
+`null → Viewer`, `Viewer → null`, and `Viewer(a) → Viewer(b)` all count. The same principal resolving again does not, or every refocus would become a full app reload.
+
+### 5.3 Sign-out must check its result
 
 Better Auth resolves HTTP failures as `{ error }` rather than throwing. All three current call sites — `CreateWorkspaceScreen.tsx:89`, `settings/WorkspacePanel.tsx:66`, `accept-invitation.$invitationId.tsx:209` — `await signOut()` inside a `try/catch` and then navigate, so a failed sign-out sends the user to `/login` with a still-valid session cookie. `completeSignOut` throws on `{ error }` so the existing `catch` blocks do what they already look like they do.
 
@@ -251,6 +305,8 @@ Three fixes:
 
 Its bespoke `sessionProbe` state machine — which exists solely to work around §1.1 — is replaced by the shared viewer query. Its three states map one-to-one (`checking` → `isPending`, `authenticated`/`unauthenticated` → `Viewer`/`null`, `failed` → thrown). After accept + `setActive`, the viewer is invalidated so the shell resolves the new workspace.
 
+**Acceptance is a commit point.** `acceptInvitation` consumes the invitation and creates the membership, both irreversible. Anything that fails after it must not route the user back to a state whose only recovery re-reads the invitation: the retry would fetch a consumed invite and report "no longer valid", stranding somebody who is already a member. So a `joined` view is set the instant acceptance returns, and it is rendered **ahead of** every session and invitation guard on the page — a session hiccup must not fall through to "Can't load this invitation", and a `null` viewer must not bounce to `/login` carrying the consumed invitation as its redirect. Its only control retries workspace entry (activate → refresh viewer → navigate). Same partial-success principle as `login.tsx`, `signup.tsx`, and `CreateWorkspaceScreen.tsx`; this is the fourth instance of that shape, not a new one.
+
 ### 6.5 `_app.settings.members.tsx`
 
 Swaps `useSession()` for `useViewer()`. No behaviour change.
@@ -278,7 +334,16 @@ The test that must exist asserts the **ordering** that broke, in one continuous 
 
 Step 4 is the assertion today's code fails. Any test that starts at `/login`, or that re-creates the router between steps, tests nothing — it destroys the precondition.
 
-### 7.3 E2E
+### 7.3 Tests that must fail when their subject is deleted
+
+A test that cannot fail is worse than no test, and several here could not:
+
+- The signed-out gate case could not tell WHICH code redirected — `AppLayout`'s render-time `<Navigate>` produces the same final pathname, and `router.state.matches` after settling is identical either way. It records every route id that ever commits (a route the gate turns away never appears) and pins the `?redirect=` search param, which only `beforeLoad` builds.
+- The activation case could not detect a missing `await`: the mock mutated its session synchronously before returning an already-resolved promise, so ordering was unobservable. Activation parks on a deferred promise instead.
+- The principal purge is asserted per rendered FRAME, not on the settled DOM — an effect that cleaned up afterwards would pass an "eventually correct" assertion while still having painted the leak.
+- The focus options are covered behaviourally (a revoked session inside `staleTime`), so flipping them back to `true` fails the suite; asserting the literal option value would only restate the code.
+
+### 7.4 E2E
 
 A spec that deliberately does **not** call `flows.login()`, because that helper's `page.goto("/login")` (`e2e/support/flows.ts:48`) is exactly what masks this in CI. Navigate to `/chat` signed out, let the SPA redirect, sign in once, and assert workspace content is on screen.
 
@@ -311,6 +376,10 @@ A spec that deliberately does **not** call `flows.login()`, because that helper'
 | `apps/web/src/routes/_app.settings.members.tsx` | `useViewer()` |
 | `apps/web/src/test/auth-mock.ts` | drop the hooks; stub the async calls |
 | `apps/web/src/__tests__/auth-flow.test.tsx` | **new** — the §7.2 regression test |
+| `apps/web/src/__tests__/viewer-principal.test.tsx` | **new** — §5.2, asserted per rendered frame |
+| `apps/web/src/__tests__/viewer-focus.test.tsx` | **new** — focus/reconnect liveness (§3.2) and the activation re-entry (§4.3) |
+| `apps/web/src/__tests__/workspace-panel.test.tsx` | **new** — rename-refresh partial success, both sign-out outcomes |
 | `e2e/specs/*.e2e.ts` | **new** — the §7.3 spec |
 | `AGENTS.md` | retire the residual; add the Better Auth hooks rule |
+| `docs/superpowers/specs/2026-07-07-first-run-workspace-design.md` | mark its three superseded technical decisions |
 | `.changeset/*.md` | release note |

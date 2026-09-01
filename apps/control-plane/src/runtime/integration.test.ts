@@ -35,6 +35,7 @@ import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
   newId,
+  newStepId,
   parseMasterKey,
   type AgentDefinitionInput,
   type ApiErrorBody,
@@ -44,6 +45,7 @@ import {
   type PostMessageResponse,
   type PublishAgentResponse,
   type ResetSessionResponse,
+  type RunDto,
   type RunEventFrame,
   type RunStatusFrame,
   type SessionContextControlResponse,
@@ -957,22 +959,37 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
   // ── workflow manual "Run now" ────────────────────────────────────────────
 
-  test("workflow /run dispatches the published snapshot with a rendered taskMessage", async () => {
+  test("workflow /run starts a PIPELINE run; the agent step dispatches the rendered child; overlap-free reruns work", async () => {
     await freshWorkerHeartbeat();
-    // A webhook-shaped workflow delegating to the published agent.
-    const created = await api("POST", `/workspaces/${orgId}/workflows`, {
-      cookie: ownerCookie,
-      body: {
-        name: "Runtime Run-now Workflow",
-        draft: {
-          trigger: { type: "webhook" },
+    // A webhook-shaped one-agent-step pipeline bound to the published agent.
+    // The snapshot is written directly (workflow publish routes are proven in
+    // resources/workflows.test.ts; this suite targets the runtime /run route).
+    const config = {
+      version: 2,
+      trigger: { type: "webhook" },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
           agentId,
-          instructions: { markdown: "Reply politely to @trigger.customer.email about their request." },
+          instructions: {
+            markdown: "Reply politely to @trigger.customer.email about their request.",
+          },
+          session: "fresh",
         },
-      },
-    });
-    expect(created.status).toBe(201);
-    const wfId = ((await created.json()) as { workflow: { id: string } }).workflow.id;
+      ],
+    };
+    const inserted = await db
+      .insert(schema.workflows)
+      .values({
+        organizationId: orgId,
+        name: "Runtime Run-now Workflow",
+        draft: config as unknown as Record<string, unknown>,
+        enabled: true,
+      })
+      .returning({ id: schema.workflows.id });
+    const wfId = inserted[0]!.id;
 
     // Run-now before publish → typed 409.
     const early = await api(
@@ -985,12 +1002,13 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       "workflow_not_published",
     );
 
-    const published = await api(
-      "POST",
-      `/workspaces/${orgId}/workflows/${wfId}/publish`,
-      { cookie: ownerCookie },
-    );
-    expect(published.status).toBe(200);
+    await db
+      .update(schema.workflows)
+      .set({
+        published: config as unknown as Record<string, unknown>,
+        publishedAt: new Date(),
+      })
+      .where(eq(schema.workflows.id, wfId));
 
     const res = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
       cookie: ownerCookie,
@@ -1000,25 +1018,18 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       },
     });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as CreateSessionResponse;
+    const body = (await res.json()) as { run: RunDto };
 
-    // Workflow provenance on the session; the exact agent version pinned.
-    expect(body.session.workflowId).toBe(wfId);
-    expect(body.session.agentId).toBe(agentId);
-    expect(body.session.agentVersionId).toBe(versionId);
-
-    // The agent received the RENDERED task message, not the raw envelope —
-    // and the run row carries it as provenance.
-    expect(body.run.taskMessage).not.toBeNull();
-    expect(body.run.taskMessage!).toContain("<workflow-task>");
-    expect(body.run.taskMessage!).toContain("kim@example.com");
+    // Pipeline parent: no session, workflow provenance ON the run.
+    expect(body.run.mode).toBe("pipeline");
+    expect(body.run.agentSessionId).toBeNull();
+    expect(body.run.workflowId).toBe(wfId);
+    expect(body.run.taskMessage).toBeNull();
     expect(body.run.triggerEvent).toMatchObject({
-      agentId,
       workflowId: wfId,
       triggerType: "manual",
+      message: "manual test run",
     });
-    const eveSession = fixture.sessions.get(body.session.eveSessionId!)!;
-    expect(eveSession.receivedMessages[0]).toBe(body.run.taskMessage!);
 
     await until(async () => {
       const rows = await db
@@ -1026,7 +1037,32 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .from(schema.runs)
         .where(eq(schema.runs.id, body.run.id));
       return rows[0]?.status === "succeeded" || undefined;
-    }, "run-now run to succeed");
+    }, "run-now parent run to succeed");
+
+    // The agent step's CHILD run pinned the published version and received
+    // the RENDERED instructions as its eve task message.
+    const steps = await db
+      .select()
+      .from(schema.runSteps)
+      .where(eq(schema.runSteps.runId, body.run.id));
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.status).toBe("succeeded");
+    const childRun = (
+      await db.select().from(schema.runs).where(eq(schema.runs.id, steps[0]!.childRunId!))
+    )[0]!;
+    expect(childRun.taskMessage).toContain("kim@example.com");
+    expect(childRun.taskMessage).not.toContain("@trigger.customer.email");
+    const childSession = (
+      await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, childRun.agentSessionId!))
+    )[0]!;
+    expect(childSession.agentId).toBe(agentId);
+    expect(childSession.agentVersionId).toBe(versionId);
+    expect(childSession.workflowId).toBe(wfId);
+    const eveSession = fixture.sessions.get(childSession.eveSessionId!)!;
+    expect(eveSession.receivedMessages[0]).toBe(childRun.taskMessage!);
   });
 
   // ── SSE ─────────────────────────────────────────────────────────────────
@@ -1511,9 +1547,14 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     const deadRun = await orphanRun(deadSession.id);
 
     // The two live HOLD tails from the caps test are skipped (still owned by
-    // this process's tailer manager) — only true orphans are touched.
+    // this process's tailer manager) — only true orphans are touched. The
+    // counts are lower bounds, not exact: the reconcile sweep is DB-global
+    // and other gated suites sharing this database leave their own
+    // interrupted agent runs behind (bun runs every file in one process);
+    // the per-run assertions below carry the real semantics.
     const outcome = await reconcileInterruptedRuns(stack.runtime!);
-    expect(outcome).toMatchObject({ resumed: 1, failed: 1 });
+    expect(outcome.resumed).toBeGreaterThanOrEqual(1);
+    expect(outcome.failed).toBeGreaterThanOrEqual(1);
 
     const dead = await db
       .select({ status: schema.runs.status, completedAt: schema.runs.completedAt, error: schema.runs.error })

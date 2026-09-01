@@ -161,6 +161,16 @@ describe("renderTaskMessage", () => {
     expect(rendered).toContain("Mail ada@example.com about @@nothing");
   });
 
+  test("pipeline heads (@steps/@state/@item/@now) stay verbatim — pipeline-template owns them", () => {
+    const rendered = renderTaskMessage(
+      "Post @steps.search.result to @state.channel per @item at @now",
+      { message: "", data: {} },
+    );
+    expect(rendered).toContain(
+      "Post @steps.search.result to @state.channel per @item at @now",
+    );
+  });
+
   test("multi-line instructions render inside one task block", () => {
     const rendered = renderTaskMessage(
       "1. Read @trigger.report\n2. Summarize it\n3. Post via @slack-alerts",

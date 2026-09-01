@@ -1,10 +1,16 @@
 /**
  * Workflows CRUD + publish (workspace-scoped). A workflow is a standing
- * delegation — trigger → agent → instructions — and compiles NOTHING: the
- * agent is the compile unit. Publish validates the draft (shared workflow
- * validator), snapshots `draft` → `published` (+ `published_agent_id`,
- * `published_at`), and syncs the trigger row (type / slack binding rules /
+ * PIPELINE — TRIGGER → STEPS — and compiles NOTHING: the control plane
+ * interprets the steps (src/pipeline), and `agent` steps ride their bound
+ * agent's current published version as child runs. Publish validates the
+ * draft (shared workflow validator), snapshots `draft` → `published`
+ * (+ `published_at`), and syncs the trigger row (type / slack binding rules /
  * form schema / cron + next_fire_at) — instant, no build.
+ *
+ * `published_agent_id` is no longer written (pipeline redesign amendment A1:
+ * agents bind per STEP, not per workflow — the column survives only because
+ * migrations are additive, and its delete-protection role moved to the agent
+ * DELETE path's published-config scan in resources/agents.ts).
  *
  * Role rules are enforced at the route (member creates/edits/publishes;
  * owner/admin deletes). GET/PATCH/create answer validator diagnostics next to
@@ -12,8 +18,9 @@
  * builder gets validation without a second round-trip; diagnostics are
  * strictly best-effort on reads and never fail the request.
  *
- * Dispatch consumers ((a)'s manual /run, (c)'s trigger ingress) load the
- * snapshot through {@link loadPublishedWorkflow} / {@link publishedWorkflowOf}.
+ * Dispatch consumers (manual /run, trigger ingress, the schedule ticker) load
+ * the snapshot through {@link loadPublishedWorkflow} /
+ * {@link publishedWorkflowOf} and hand it to the pipeline runner.
  */
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -21,6 +28,8 @@ import {
   createWorkflowRequestSchema,
   parseWorkflowConfig,
   updateWorkflowRequestSchema,
+  walkSteps,
+  WORKFLOW_SUMMARY_MAX_STEP_KINDS,
   type DeleteResourceResponse,
   type GetWorkflowResponse,
   type ListWorkflowsResponse,
@@ -40,7 +49,7 @@ import {
 import { errors } from "../runtime/errors";
 import { parseBody, type ResourceDeps } from "./common";
 import {
-  loadAgentValidationSnapshot,
+  loadPipelineValidationResources,
   stalenessDiagnostics,
   validateWorkflowConfig,
   workflowValidationFailedError,
@@ -69,11 +78,28 @@ function draftTriggerType(draft: unknown): string | null {
   return typeof type === "string" ? type : null;
 }
 
-/** `agentId` out of a stored config blob (draft or published), if any. */
-function agentIdOf(config: unknown): string | null {
-  if (typeof config !== "object" || config === null) return null;
-  const agentId = (config as { agentId?: unknown }).agentId;
-  return typeof agentId === "string" && agentId.length > 0 ? agentId : null;
+/**
+ * The draft's step kinds in document order (pre-order walk), truncated to the
+ * list chip's cap. Empty while the draft has no parseable pipeline shape.
+ */
+function draftStepKinds(draft: unknown): string[] {
+  const config = parseWorkflowConfig(draft);
+  if (!config) return [];
+  return walkSteps(config.steps)
+    .map((entry) => entry.step.kind)
+    .slice(0, WORKFLOW_SUMMARY_MAX_STEP_KINDS);
+}
+
+/**
+ * The agent a SOLE-agent-step pipeline delegates to (the list row renders its
+ * name instead of a kind capsule); null for every other shape.
+ */
+function soleAgentStepAgentId(draft: unknown): string | null {
+  const config = parseWorkflowConfig(draft);
+  if (!config) return null;
+  const entries = walkSteps(config.steps);
+  const only = entries.length === 1 ? entries[0] : undefined;
+  return only && only.step.kind === "agent" ? only.step.agentId : null;
 }
 
 export function workflowSummaryDto(
@@ -85,6 +111,7 @@ export function workflowSummaryDto(
     name: row.name,
     triggerType: draftTriggerType(row.draft),
     agentName,
+    stepKinds: draftStepKinds(row.draft),
     enabled: row.enabled,
     publishedAt: row.publishedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
@@ -135,26 +162,20 @@ async function computeDiagnostics(
   row: Row,
 ): Promise<WorkflowDiagnostics | undefined> {
   try {
-    const draftAgentId = agentIdOf(row.draft);
-    const draftAgent = draftAgentId
-      ? await loadAgentValidationSnapshot(db, organizationId, draftAgentId)
-      : null;
+    // One resource load covers both configs — the validator resolves every
+    // agent/connection id either one references.
+    const resources = await loadPipelineValidationResources(db, organizationId, [
+      row.draft,
+      ...(row.published ? [row.published] : []),
+    ]);
     const diagnostics = [
       ...validateWorkflowConfig(
-        { config: row.draft, agent: draftAgent },
+        { config: row.draft, resources },
         { validateCron: cronFires },
       ),
     ];
-
     if (row.published) {
-      const publishedAgentId = agentIdOf(row.published) ?? row.publishedAgentId;
-      const publishedAgent =
-        publishedAgentId === draftAgentId
-          ? draftAgent
-          : publishedAgentId
-            ? await loadAgentValidationSnapshot(db, organizationId, publishedAgentId)
-            : null;
-      diagnostics.push(...stalenessDiagnostics(row.published, publishedAgent));
+      diagnostics.push(...stalenessDiagnostics(row.published, resources));
     }
     return diagnostics;
   } catch {
@@ -181,11 +202,13 @@ export async function listWorkflows(
     .where(eq(schema.workflows.organizationId, organizationId))
     .orderBy(desc(schema.workflows.updatedAt));
 
-  // Batched agent-name resolution for the list chips (draft's agent).
+  // Batched agent-name resolution for the list chips (sole-agent-step
+  // pipelines render the delegated agent's name; multi-step rows render
+  // their kind capsule instead).
   const agentIds = [
     ...new Set(
       rows
-        .map((row) => agentIdOf(row.draft))
+        .map((row) => soleAgentStepAgentId(row.draft))
         .filter((id): id is string => id !== null),
     ),
   ];
@@ -205,7 +228,7 @@ export async function listWorkflows(
 
   return {
     workflows: rows.map((row) => {
-      const agentId = agentIdOf(row.draft);
+      const agentId = soleAgentStepAgentId(row.draft);
       return workflowSummaryDto(
         row,
         agentId ? (agentNames.get(agentId) ?? null) : null,
@@ -294,8 +317,8 @@ export async function deleteWorkflow(
   id: string,
 ): Promise<DeleteResourceResponse> {
   await loadOwned(deps.db, organizationId, id);
-  // Trigger rows cascade with the workflow; sessions survive with
-  // workflowId nulled (provenance outlives the delegation).
+  // Trigger rows and workflow_state cascade with the workflow; sessions and
+  // runs survive with workflowId nulled (provenance outlives the delegation).
   await deps.db
     .delete(schema.workflows)
     .where(
@@ -308,10 +331,11 @@ export async function deleteWorkflow(
 
 /**
  * Publish = validate → snapshot → sync trigger row. No compile, no build:
- * the response is the updated row, immediately dispatchable (FLOATING agent
- * binding — dispatch resolves the agent's current published version).
- * Error-severity diagnostics block with 422 `workflow_validation_failed`
- * (diagnostics in `details`).
+ * the response is the updated row, immediately dispatchable (agent steps keep
+ * FLOATING bindings — dispatch resolves each bound agent's current published
+ * version). Error-severity diagnostics block with 422
+ * `workflow_validation_failed` (diagnostics in `details`); warnings (e.g. the
+ * advisory tools-cache check) never block.
  */
 export async function publishWorkflow(
   deps: ResourceDeps,
@@ -320,36 +344,37 @@ export async function publishWorkflow(
 ): Promise<PublishWorkflowResponse> {
   const row = await loadOwned(deps.db, organizationId, id);
 
-  const agentId = agentIdOf(row.draft);
-  const agent = agentId
-    ? await loadAgentValidationSnapshot(deps.db, organizationId, agentId)
-    : null;
+  const resources = await loadPipelineValidationResources(
+    deps.db,
+    organizationId,
+    [row.draft],
+  );
   const diagnostics = validateWorkflowConfig(
-    { config: row.draft, agent },
+    { config: row.draft, resources },
     { validateCron: cronFires },
   );
   const blocking = diagnostics.filter((d) => d.severity === "error");
   if (blocking.length > 0) throw workflowValidationFailedError(blocking);
 
   // Shape-guarded by the validator above; parse to the canonical config the
-  // snapshot stores and dispatch reads.
+  // snapshot stores and the pipeline runner interprets.
   const config = parseWorkflowConfig(row.draft);
-  if (!config || config.agentId === null) {
+  if (!config) {
     // Unreachable after validation — belt and braces for TS narrowing.
     throw workflowValidationFailedError([
-      { path: "agentId", message: "workflow draft has no agent", severity: "error" },
+      { path: "config", message: "workflow draft does not parse", severity: "error" },
     ]);
   }
 
   // Snapshot + trigger sync are one atomic step: a republished snapshot must
   // never run against a stale trigger row (e.g. old slack routing rules).
+  // NOTE: published_agent_id is deliberately NOT written (amendment A1).
   const published = await deps.db.transaction(async (tx) => {
     const updated = await tx
       .update(schema.workflows)
       .set({
         published: config as unknown as Record<string, unknown>,
         publishedAt: new Date(),
-        publishedAgentId: config.agentId,
       })
       .where(
         and(
@@ -372,13 +397,11 @@ export async function publishWorkflow(
 
 // ── Published-workflow loader (dispatch surface) ─────────────────────────────
 
-/** A workflow's published snapshot, ready for dispatch. */
+/** A workflow's published snapshot, ready for the pipeline runner. */
 export interface PublishedWorkflow {
   workflow: Row;
   /** The parsed `published` snapshot (dispatch reads THIS, never the draft). */
   config: WorkflowConfig;
-  /** The delegated agent (publish guarantees one) — FLOATING binding. */
-  agentId: string;
 }
 
 /**
@@ -391,14 +414,15 @@ export interface PublishedWorkflow {
 export function publishedWorkflowOf(row: Row): PublishedWorkflow {
   if (!row.published) throw errors.workflowNotPublished();
   const config = parseWorkflowConfig(row.published);
-  if (!config || config.agentId === null) throw errors.workflowNotPublished();
-  return { workflow: row, config, agentId: config.agentId };
+  if (!config) throw errors.workflowNotPublished();
+  return { workflow: row, config };
 }
 
 /**
- * Load a workflow's published snapshot for dispatch ((a)'s manual /run,
- * (c)'s trigger ingress). Workspace-scoped: 404 when the row is not owned by
- * `organizationId`; 409 `workflow_not_published` when never published.
+ * Load a workflow's published snapshot for dispatch (manual /run, trigger
+ * ingress, the schedule ticker). Workspace-scoped: 404 when the row is not
+ * owned by `organizationId`; 409 `workflow_not_published` when never
+ * published.
  */
 export async function loadPublishedWorkflow(
   db: DbClient,

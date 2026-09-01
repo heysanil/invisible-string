@@ -104,4 +104,15 @@ export const queryKeys = {
     list: (workspaceId: string, workflowId: string) =>
       ["triggers", workspaceId, workflowId, "list"] as const,
   },
+  /** Pipeline run history + the per-run step ledger (Runs tab). */
+  workflowRuns: {
+    all: (workspaceId: string, workflowId: string) =>
+      ["workflow-runs", workspaceId, workflowId] as const,
+    list: (workspaceId: string, workflowId: string, status?: string) =>
+      ["workflow-runs", workspaceId, workflowId, "list", status ?? null] as const,
+  },
+  runSteps: {
+    detail: (runId: string, full: boolean) =>
+      ["run-steps", runId, full ? "full" : "preview"] as const,
+  },
 } as const;

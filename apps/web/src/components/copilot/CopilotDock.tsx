@@ -1,20 +1,15 @@
 /**
- * Copilot dock — the docked right rail shared by the workflow and agent
- * editors (spec §12). Streams a message thread over the per-workspace copilot
- * WS, renders mutation proposals as structured Apply/Dismiss suggestion
- * cards, and applies accepted mutations through the injected
- * {@link CopilotSurfaceAdapter} (single writer — the surface controller's
- * dispatch). Open/closed state persists per workspace in localStorage.
+ * Copilot dock — the docked right RAIL SHELL used by the agent editor
+ * (spec §12; the workflow editor's primary surface is ComposerPane). Owns
+ * only what is rail-specific: the collapse pill + per-workspace open
+ * persistence, the narrow-viewport auto-collapse, the session-scoped
+ * allow-edits toggle, and the open/collapse focus choreography. The
+ * conversation itself is the shared {@link CopilotThread} +
+ * {@link CopilotComposer} pair over one {@link useCopilot} socket.
  *
  * Everything surface-specific — entity identity, live-draft reads, proposal
  * application/presentation, empty-state copy, prompt chips — rides the
- * adapter; this component owns only the surface-agnostic behavior below.
- *
- * Depth (2026-08-11 spec D7.1): the model's thinking and its tool steps ride
- * the same rail-in-box grammar as the main chat, one {@link CopilotWorkBlock}
- * per contiguous stretch of interior work. Steps that already have a
- * suggestion card are filtered out of the rail — the card is the richer view
- * of that same tool call.
+ * injected {@link CopilotSurfaceAdapter}.
  *
  * Allow-edits (D7.2) is a session-scoped toggle owned HERE, defaulting off and
  * deliberately NOT persisted: "the copilot may edit my agent without asking"
@@ -22,54 +17,31 @@
  * previous tab. It is also unmistakable while on — a checked switch, an
  * explanatory strip above the thread, and the send button's accessible name.
  *
- * Accessibility/interaction contract:
- * - the thread is a `role="log"`; announcements go through a dedicated
- *   sr-only live region (never per-token);
- * - focus follows intent: open → composer, collapse → pill, apply/dismiss →
- *   next pending card (else composer);
- * - auto-scroll only sticks when the reader is already at the bottom;
- * - the composer never silently drops input: text stays put until the
- *   socket accepts the frame, and sends are blocked mid-turn;
- * - state NEVER rides the composer's `placeholder` or `ariaLabel` (both are
- *   `useEditor` construction options — changing either rebuilds the editor and
- *   destroys the user's draft, see AGENTS.md). Mode and connection state ride
- *   separate elements and the submit button's accessible name instead.
+ * Focus follows intent: open → composer, collapse → pill; the thread's
+ * apply/dismiss choreography and the composer's draft-preservation contract
+ * live with the extracted components.
  */
-import {
-  ArrowDown,
-  ChevronRight,
-  RefreshCw,
-  Send,
-  Sparkles,
-  Square,
-} from "lucide-react";
+import { ChevronRight, Sparkles } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import type { CopilotSurfaceAdapter } from "../../lib/copilot/adapter";
 import type { WebSocketFactory } from "../../lib/copilot/socket";
-import {
-  proposalIdsOf,
-  visibleTimelineItems,
-  type CopilotThreadItem,
-} from "../../lib/copilot/thread";
 import { useCopilot } from "../../lib/copilot/useCopilot";
-import { cn } from "../../lib/cn";
-import { Markdown } from "../chat/Markdown";
-import { LazyComposerEditor } from "../editor/LazyComposerEditor";
-import type { RichTextEditorHandle } from "../editor/RichTextEditor";
-import { CopilotWorkBlock } from "./CopilotWorkBlock";
-import { SuggestionCard } from "./SuggestionCard";
+import {
+  AllowEditsSwitch,
+  AutoApplyBanner,
+  CopilotComposer,
+  ReconnectingBanner,
+  type CopilotComposerHandle,
+  type CopilotPrefill,
+} from "./CopilotComposer";
+import { CopilotThread } from "./CopilotThread";
+
+export type { CopilotPrefill } from "./CopilotComposer";
 
 const OPEN_STORAGE_PREFIX = "is.copilot.open";
 /** Below this viewport width the dock auto-collapses to the pill. */
 const NARROW_VIEWPORT_QUERY = "(max-width: 1179px)";
-/** "At the bottom" tolerance for sticky auto-scroll. */
-const STICK_THRESHOLD_PX = 40;
-
-export interface CopilotPrefill {
-  id: number;
-  text: string;
-}
 
 export interface CopilotDockProps {
   workspaceId: string;
@@ -105,14 +77,11 @@ export function CopilotDock(props: CopilotDockProps) {
   const [open, setOpen] = useState(() => readStoredOpen(workspaceId));
   // Session-scoped, default OFF, never persisted — see the module header.
   const [allowEdits, setAllowEdits] = useState(false);
+  // Composer text lives HERE so an unsent draft survives a collapse/reopen
+  // (the composer component unmounts with the panel).
   const [composer, setComposer] = useState("");
-  const [stuckToLatest, setStuckToLatest] = useState(true);
-  const [announcement, setAnnouncement] = useState("");
-  const threadRef = useRef<HTMLDivElement | null>(null);
-  const composerRef = useRef<RichTextEditorHandle | null>(null);
+  const composerRef = useRef<CopilotComposerHandle | null>(null);
   const pillRef = useRef<HTMLButtonElement | null>(null);
-  const cardRefs = useRef(new Map<string, HTMLDivElement>());
-  const stickRef = useRef(true);
   // Focus intents consumed by effects after the open/collapse re-render.
   const focusComposerNext = useRef(false);
   const focusPillNext = useRef(false);
@@ -167,124 +136,16 @@ export function CopilotDock(props: CopilotDockProps) {
     }
   }, [open]);
 
-  // Keep the newest message in view — but only when the reader is already at
-  // the bottom; never yank someone re-reading an earlier suggestion.
-  useEffect(() => {
-    const el = threadRef.current;
-    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [copilot.items]);
-
-  // Screen-reader announcements: once per state change, never per delta.
-  const prevGenerating = useRef(false);
-  useEffect(() => {
-    if (copilot.generating && !prevGenerating.current) {
-      setAnnouncement("Copilot is responding");
-    } else if (!copilot.generating && prevGenerating.current) {
-      const lastAssistant = [...copilot.items]
-        .reverse()
-        .find(
-          (item): item is Extract<CopilotThreadItem, { kind: "message" }> =>
-            item.kind === "message" && item.role === "assistant",
-        );
-      setAnnouncement(lastAssistant ? `Copilot: ${lastAssistant.text}` : "Copilot finished");
-    }
-    prevGenerating.current = copilot.generating;
-  }, [copilot.generating, copilot.items]);
-  const pendingCount = copilot.items.filter(
-    (item) => item.kind === "suggestion" && item.status === "pending",
-  ).length;
-  const prevPendingCount = useRef(0);
-  useEffect(() => {
-    if (pendingCount > prevPendingCount.current) {
-      setAnnouncement("Copilot made a suggestion — review it in the panel");
-    }
-    prevPendingCount.current = pendingCount;
-  }, [pendingCount]);
-  // Auto-applied cards never go through `pending`, so the announcement above
-  // would never fire for them — an edit that lands without a word is exactly
-  // what allow-edits must not become.
-  const autoAppliedCount = copilot.items.filter(
-    (item) => item.kind === "suggestion" && item.autoApplied,
-  ).length;
-  const prevAutoAppliedCount = useRef(0);
-  useEffect(() => {
-    if (autoAppliedCount > prevAutoAppliedCount.current) {
-      setAnnouncement("Copilot applied an edit automatically — review it in the panel");
-    }
-    prevAutoAppliedCount.current = autoAppliedCount;
-  }, [autoAppliedCount]);
-
   function toggleAllowEdits() {
     // Computed outside the updater: updaters must stay pure (StrictMode
     // double-invokes them), and this one announces.
     const next = !allowEdits;
     setAllowEdits(next);
-    setAnnouncement(
+    composerRef.current?.announce(
       next
         ? "Auto-apply on — copilot edits the draft without asking"
         : "Auto-apply off — copilot asks before every edit",
     );
-  }
-
-  function onThreadScroll() {
-    const el = threadRef.current;
-    if (!el) return;
-    const nearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < STICK_THRESHOLD_PX;
-    stickRef.current = nearBottom;
-    setStuckToLatest(nearBottom);
-  }
-
-  function jumpToLatest() {
-    const el = threadRef.current;
-    if (!el) return;
-    stickRef.current = true;
-    setStuckToLatest(true);
-    el.scrollTop = el.scrollHeight;
-  }
-
-  function submit() {
-    // `composer` trails the editor by one serialize debounce, so the last
-    // keystrokes before Enter are not in it yet — read the document directly.
-    const text = composerRef.current?.flush() ?? composer;
-    // Only clear the composer when the frame was actually delivered — a
-    // still-connecting socket or an in-flight turn keeps the text in place.
-    if (!copilot.send(text)) return;
-    // The imperative write is the one that empties the document: clearing
-    // takes `composer` from "" back to "" in a single React batch, so the
-    // prop never changes and the reconcile effect would never fire.
-    composerRef.current?.setValue("");
-    setComposer("");
-  }
-
-  /** Enter sends; Shift+Enter is a newline (the composer grows to fit). */
-  function onComposerKeyDown(event: KeyboardEvent): boolean {
-    if (event.key !== "Enter" || event.shiftKey) return false;
-    if (event.isComposing || event.keyCode === 229) return false;
-    submit();
-    return true;
-  }
-
-  /** Apply/Dismiss a card, then move focus to the next pending card (or composer). */
-  function decide(itemId: string, outcome: "apply" | "dismiss") {
-    const pendingIds = copilot.items
-      .filter(
-        (item): item is Extract<CopilotThreadItem, { kind: "suggestion" }> =>
-          item.kind === "suggestion" && item.status === "pending",
-      )
-      .map((item) => item.id);
-    if (outcome === "apply") copilot.applySuggestion(itemId);
-    else copilot.dismissSuggestion(itemId);
-    const remaining = pendingIds.filter((id) => id !== itemId);
-    const at = pendingIds.indexOf(itemId);
-    const nextId =
-      remaining.find((_, index) => index >= Math.max(0, at)) ?? remaining.at(-1);
-    // After React commits the receipt swap, land focus somewhere useful.
-    setTimeout(() => {
-      const target = nextId ? cardRefs.current.get(nextId) : undefined;
-      if (target && target.isConnected) target.focus();
-      else composerRef.current?.focus();
-    }, 0);
   }
 
   if (!open) {
@@ -313,36 +174,11 @@ export function CopilotDock(props: CopilotDockProps) {
     );
   }
 
-  const isEmpty = copilot.items.length === 0;
-  const reconnecting = copilot.status === "reconnecting";
-  const connecting = copilot.status === "connecting";
-  const canSend = copilot.status === "open" && !copilot.generating;
-  const lastItem = copilot.items.at(-1);
-  // Something visible is already moving: streaming prose, or a live work box
-  // with its own spinner. Only when neither is true does the dots line earn
-  // its place — two spinners for one wait reads as two waits.
-  const streamingNow =
-    (lastItem?.kind === "message" &&
-      lastItem.role === "assistant" &&
-      lastItem.streaming) ||
-    (lastItem?.kind === "work" && !lastItem.sealed);
-  const promptChips = adapter.promptChips();
-  const emptyCopy = adapter.emptyStateCopy;
-  // Every mutation step carries a card; the card is the richer rendering, so
-  // the rail shows only what has none (thinking + self-corrected bad calls).
-  const cardedStepKeys = proposalIdsOf(copilot.items);
-
   return (
     <aside
       aria-label="Copilot"
       className="glass-panel panel-enter flex h-full w-[clamp(260px,22vw,320px)] shrink-0 flex-col overflow-hidden"
     >
-      {/* Dedicated announcer: messages/suggestions are spoken when they
-          SETTLE — the log itself is not a live region (no per-token spam). */}
-      <div aria-live="polite" role="status" className="sr-only">
-        {announcement}
-      </div>
-
       <header className="flex items-center gap-2 px-4 pb-3 pt-4">
         <span className="flex size-7 items-center justify-center rounded-full bg-ink text-white">
           <Sparkles size={14} aria-hidden="true" />
@@ -369,274 +205,22 @@ export function CopilotDock(props: CopilotDockProps) {
       <div className="flex items-center px-3 pt-2.5">
         <AllowEditsSwitch checked={allowEdits} onToggle={toggleAllowEdits} />
       </div>
-      {allowEdits ? (
-        <p
-          data-testid="copilot-auto-apply-banner"
-          className="mx-3 mt-2 rounded-card border border-ink/15 bg-ink/[0.045] px-3 py-1.5 text-[11.5px] leading-snug text-ink-2"
-        >
-          Copilot edits this draft without asking. Every change still lands as a
-          card below, so you can see exactly what it changed.
-        </p>
-      ) : null}
+      {allowEdits ? <AutoApplyBanner /> : null}
+      {copilot.status === "reconnecting" ? <ReconnectingBanner /> : null}
 
-      {reconnecting ? (
-        <div
-          role="status"
-          className="mx-3 mt-2 flex items-center gap-1.5 rounded-card border border-warn/30 bg-warn/[0.06] px-3 py-1.5 text-[12px] text-ink-2"
-        >
-          <RefreshCw size={12} aria-hidden="true" className="text-warn" />
-          Reconnecting — your draft will resync automatically.
-        </div>
-      ) : null}
+      <CopilotThread
+        copilot={copilot}
+        adapter={adapter}
+        onFocusComposer={() => composerRef.current?.focus()}
+      />
 
-      {/* Thread */}
-      <div className="relative flex min-h-0 flex-1 flex-col">
-        <div
-          ref={threadRef}
-          role="log"
-          // role="log" implies aria-live="polite" — explicitly off so streamed
-          // deltas are not re-announced token by token; the dedicated
-          // announcer above speaks messages when they settle.
-          aria-live="off"
-          aria-label="Copilot conversation"
-          onScroll={onThreadScroll}
-          className="thin-scroll flex flex-1 flex-col gap-2.5 overflow-y-auto p-3"
-        >
-          {isEmpty ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3 p-2 text-center">
-              <span className="flex size-11 items-center justify-center rounded-full bg-black/[0.04] text-ink-3">
-                <Sparkles size={18} aria-hidden="true" />
-              </span>
-              <p className="text-[13px] font-medium text-ink">{emptyCopy.title}</p>
-              <p className="text-[12px] leading-relaxed text-ink-3">
-                {emptyCopy.description}
-              </p>
-              <div className="flex flex-col gap-1.5">
-                {promptChips.map((prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    disabled={!canSend}
-                    onClick={() => copilot.send(prompt)}
-                    className={cn(
-                      "lift rounded-capsule border border-black/10 bg-white/50 px-3 py-1.5 text-[12px] font-medium text-ink-2 hover:text-ink",
-                      !canSend && "opacity-50",
-                    )}
-                  >
-                    {prompt}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <>
-              {copilot.items.map((item) => {
-                if (item.kind === "work") {
-                  const rows = visibleTimelineItems(item.items, cardedStepKeys);
-                  // A box whose every row had a card would be an empty box.
-                  if (rows.length === 0) return null;
-                  return (
-                    <CopilotWorkBlock
-                      key={item.id}
-                      items={rows}
-                      active={!item.sealed && copilot.generating}
-                    />
-                  );
-                }
-                if (item.kind === "suggestion") {
-                  return (
-                    <SuggestionCard
-                      key={item.id}
-                      proposal={item.proposal}
-                      status={item.status}
-                      autoApplied={item.autoApplied}
-                      description={adapter.describeProposal(item.proposal)}
-                      onApply={() => decide(item.id, "apply")}
-                      onDismiss={() => decide(item.id, "dismiss")}
-                      focusRef={(el) => {
-                        if (el) cardRefs.current.set(item.id, el);
-                        else cardRefs.current.delete(item.id);
-                      }}
-                    />
-                  );
-                }
-                if (item.kind === "error") {
-                  return (
-                    <p
-                      key={item.id}
-                      role="alert"
-                      className="rounded-card border border-err/25 bg-err/[0.05] px-3 py-2 text-[12px] text-ink-2"
-                    >
-                      {item.text}
-                    </p>
-                  );
-                }
-                if (item.kind === "notice") {
-                  return (
-                    <p
-                      key={item.id}
-                      data-testid="copilot-notice"
-                      className="px-2 py-0.5 text-center text-[11.5px] italic text-ink-3"
-                    >
-                      {item.text}
-                    </p>
-                  );
-                }
-                return item.role === "user" ? (
-                  // Markdown, for the same reason as the chat bubble: the
-                  // composer above emits it, so plain text would echo the
-                  // author's own syntax back at them.
-                  <div
-                    key={item.id}
-                    className="ml-6 self-end rounded-card-lg bg-ink px-3 py-2 text-white"
-                  >
-                    <Markdown
-                      text={item.text}
-                      className="md-on-ink text-[13px] leading-relaxed [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
-                    />
-                  </div>
-                ) : (
-                  <div key={item.id} className="mr-2">
-                    <Markdown
-                      text={item.text}
-                      className="text-[13px]"
-                      streaming={item.streaming}
-                    />
-                  </div>
-                );
-              })}
-              {copilot.generating && !streamingNow ? (
-                <div
-                  data-testid="copilot-thinking"
-                  className="flex items-center gap-1.5 px-2 py-1 text-[12px] text-ink-3"
-                >
-                  <span className="dot-pulse inline-block size-1.5 rounded-full bg-ink-3" />
-                  {pendingCount > 0
-                    ? "More suggestions may follow — respond to the card above."
-                    : "Thinking…"}
-                </div>
-              ) : null}
-            </>
-          )}
-        </div>
-
-        {!stuckToLatest && !isEmpty ? (
-          <button
-            type="button"
-            onClick={jumpToLatest}
-            className="lift absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-capsule border border-black/10 bg-white/90 px-3 py-1 text-[11.5px] font-medium text-ink-2 shadow-[0_2px_10px_rgba(0,0,0,0.08)]"
-          >
-            <ArrowDown size={11} aria-hidden="true" /> Jump to latest
-          </button>
-        ) : null}
-      </div>
-
-      {/* Connecting used to ride the composer's placeholder. It cannot any
-          more: the placeholder is an editor construction option, so changing
-          it re-creates the editor — and a draft typed while the socket was
-          still opening would vanish the moment it opened. */}
-      {connecting ? (
-        <p className="px-4 pb-1 text-[11.5px] text-ink-3" role="status">
-          Connecting…
-        </p>
-      ) : null}
-
-      {/* Composer */}
-      <form
-        className="flex items-end gap-2 border-t border-black/[0.06] p-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          submit();
-        }}
-      >
-        {/* The capsule owns the surface and the focus ring; the editor inside
-            it is chrome-free and grows with the draft up to ~5 lines. A long
-            paste is a scroll region, never a dock that swallows the thread. */}
-        <div className="flex min-w-0 flex-1 items-center rounded-card-lg border border-black/10 bg-white/60 px-3 py-1.5 transition-colors duration-150 focus-within:border-ink/40">
-          <LazyComposerEditor
-            ref={composerRef}
-            value={composer}
-            onChange={setComposer}
-            ariaLabel="Ask copilot"
-            placeholder="Ask copilot…"
-            onKeyDown={onComposerKeyDown}
-            className="thin-scroll tt-host-composer max-h-28 w-full overflow-y-auto text-[13px] leading-relaxed"
-          />
-        </div>
-        {copilot.generating ? (
-          <button
-            type="button"
-            onClick={copilot.stop}
-            aria-label="Stop generating"
-            className="lift flex size-9 shrink-0 items-center justify-center rounded-full bg-ink text-white"
-          >
-            <Square size={13} aria-hidden="true" />
-          </button>
-        ) : (
-          <button
-            type="submit"
-            // The mode rides the BUTTON's accessible name (never the editor's
-            // placeholder/aria-label — those rebuild the editor and eat the
-            // draft; see the module header).
-            aria-label={
-              allowEdits ? "Send to copilot (auto-apply on)" : "Send to copilot"
-            }
-            disabled={composer.trim().length === 0 || !canSend}
-            className={cn(
-              "lift flex size-9 shrink-0 items-center justify-center rounded-full bg-ink text-white",
-              (composer.trim().length === 0 || !canSend) && "opacity-40",
-            )}
-          >
-            <Send size={14} aria-hidden="true" />
-          </button>
-        )}
-      </form>
+      <CopilotComposer
+        ref={composerRef}
+        copilot={copilot}
+        allowEdits={allowEdits}
+        value={composer}
+        onChange={setComposer}
+      />
     </aside>
-  );
-}
-
-/**
- * Allow-edits switch (spec D7.2) — a capsule with a real `role="switch"`, so
- * the mode is exposed to assistive tech as a mode rather than as a button that
- * did something. Checked state is carried by BOTH fill and knob position:
- * position alone fails at a glance, fill alone fails for anyone who cannot
- * distinguish the two ink tones.
- */
-function AllowEditsSwitch({
-  checked,
-  onToggle,
-}: {
-  checked: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      onClick={onToggle}
-      className={cn(
-        "lift inline-flex items-center gap-2 rounded-capsule border px-2 py-1 text-[11.5px] font-medium transition-colors duration-150 ease-out",
-        checked
-          ? "border-ink/25 bg-ink/[0.06] text-ink"
-          : "border-black/10 bg-white/50 text-ink-3 hover:text-ink-2",
-      )}
-    >
-      <span
-        aria-hidden="true"
-        className={cn(
-          "relative inline-flex h-[13px] w-[22px] shrink-0 items-center rounded-capsule transition-colors duration-150 ease-out",
-          checked ? "bg-ink" : "bg-black/15",
-        )}
-      >
-        <span
-          className={cn(
-            "absolute size-[9px] rounded-full bg-white transition-[left] duration-150 ease-out",
-            checked ? "left-[11px]" : "left-[2px]",
-          )}
-        />
-      </span>
-      Auto-apply edits
-    </button>
   );
 }

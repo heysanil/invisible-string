@@ -3,12 +3,18 @@
  * real Elysia server with injected fakes: mocked workspace lookups, a static
  * inventory, and the deterministic scripted transport (the same fake-LLM
  * mode COPILOT_FAKE_SCRIPT enables). Both surfaces are covered: workflow
- * (setTrigger/setAgent/setInstructions) and agent
- * (setPersona/setModel/addContext/removeContext).
+ * (setTrigger + the granular pipeline mutations addStep/updateStep/
+ * removeStep/moveStep, plus the inline read tools) and agent
+ * (setPersona/setModel/addContext/removeContext/setName/setDescription).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { CopilotServerFrame } from "@invisible-string/shared";
+import {
+  STEP_ID_PATTERN,
+  pipelineStepSchema,
+  type CopilotServerFrame,
+  type PipelineStep,
+} from "@invisible-string/shared";
 import { Elysia } from "elysia";
 
 import type { WorkspaceDeps } from "../workspace";
@@ -18,6 +24,7 @@ import { copilotPlugin, type CopilotDeps } from "./plugin";
 import { buildSystemPrompt, buildToolSpecs } from "./prompt";
 import { createScriptedTransport, type ScriptedStep } from "./transport";
 import {
+  applyAcceptedMutation,
   validateMutation,
   type AgentDraftState,
   type WorkflowDraftState,
@@ -26,11 +33,16 @@ import {
 const ORG = "org-1";
 const OTHER_ORG = "org-2";
 const WORKFLOW_ID = "aaaaaaaa-1111-4222-8333-444444444444";
-const CONNECTION_ID = "bbbbbbbb-1111-4222-8333-444444444444";
+const CONNECTION_ID = "cn_linear1234567890";
+const USER_CONNECTION_ID = "cn_notesuser1234567";
 const DISABLED_CONNECTION_ID = "bbbbbbbb-2222-4222-8333-444444444444";
 const SKILL_ID = "cccccccc-1111-4222-8333-444444444444";
 const PUBLISHED_AGENT_ID = "dddddddd-1111-4222-8333-444444444444";
 const UNPUBLISHED_AGENT_ID = "dddddddd-2222-4222-8333-444444444444";
+
+const SEARCH_STEP_ID = "st_search1234567890";
+const SUMMARIZE_STEP_ID = "st_summar1234567890";
+const LOOP_STEP_ID = "st_loopaaaaaaaaaaaa";
 
 const inventory: WorkspaceInventory = {
   connections: [
@@ -40,9 +52,39 @@ const inventory: WorkspaceInventory = {
       slug: "linear",
       description: "issue tracker",
       enabled: true,
+      scope: "workspace",
       health: "ok",
       tools: ["create_issue", "search_issues"],
       toolCount: 2,
+      cachedTools: [
+        {
+          name: "create_issue",
+          description: "Create a Linear issue",
+          params: ["title", "description"],
+          inputSchema: {
+            type: "object",
+            properties: { title: { type: "string" } },
+            required: ["title"],
+          },
+        },
+        {
+          name: "search_issues",
+          description: "Search Linear issues",
+          params: ["query"],
+        },
+      ],
+    },
+    {
+      id: USER_CONNECTION_ID,
+      name: "Personal Notes",
+      slug: "personal-notes",
+      description: null,
+      enabled: true,
+      scope: "user",
+      health: "ok",
+      tools: ["add_note"],
+      toolCount: 1,
+      cachedTools: [{ name: "add_note", description: "", params: ["text"] }],
     },
     {
       id: DISABLED_CONNECTION_ID,
@@ -50,9 +92,11 @@ const inventory: WorkspaceInventory = {
       slug: "old-crm",
       description: null,
       enabled: false,
+      scope: "workspace",
       health: "unknown",
       tools: [],
       toolCount: 0,
+      cachedTools: [],
     },
   ],
   skills: [
@@ -112,6 +156,32 @@ const inventory: WorkspaceInventory = {
   ],
   catalogAvailable: true,
 };
+
+/** Raw draft-shaped steps (defaults applied by the shared schema on parse). */
+const searchStepJson = {
+  id: SEARCH_STEP_ID,
+  slug: "search",
+  kind: "tool",
+  connectionId: CONNECTION_ID,
+  tool: "search_issues",
+  args: { query: "team-exec" },
+};
+const summarizeStepJson = {
+  id: SUMMARIZE_STEP_ID,
+  slug: "summarize",
+  kind: "infer",
+  preset: "quick",
+  prompt: { markdown: "Summarize @steps.search.text" },
+};
+const loopStepJson = {
+  id: LOOP_STEP_ID,
+  slug: "each-message",
+  kind: "for_each",
+  items: { $ref: "steps.search.result.messages" },
+  steps: [],
+};
+
+const parseStep = (raw: unknown): PipelineStep => pipelineStepSchema.parse(raw);
 
 /** Cookie-driven fake auth: "user=<id>;org=<org>" grants a session. */
 const fakeWorkspaceDeps: WorkspaceDeps = {
@@ -220,7 +290,7 @@ class Client {
     this.ws.send(JSON.stringify(frame));
   }
 
-  /** Wait until a frame matching `predicate` arrives; returns all frames so far. */
+  /** Wait until a frame matching `predicate` arrives; returns the first match. */
   async waitFor(
     predicate: (frame: CopilotServerFrame) => boolean,
     timeoutMs = 5_000,
@@ -250,15 +320,20 @@ class Client {
   }
 }
 
-function workflowMessage(message = "help me build this workflow") {
+function workflowMessage(
+  message = "help me build this workflow",
+  steps: unknown[] = [],
+  trigger: unknown = { type: "manual" },
+) {
   return {
     type: "user_message",
     surface: "workflow",
     entityId: WORKFLOW_ID,
     draft: {
-      trigger: { type: "manual" },
-      agentId: null,
-      instructions: { markdown: "" },
+      version: 2,
+      trigger,
+      steps,
+      overlap: "skip",
     },
     message,
   };
@@ -348,128 +423,175 @@ describe("copilot ws auth + scoping", () => {
   });
 });
 
-describe("copilot workflow-surface tool loop", () => {
-  test("propose → accept → final message round trip (deltas stream)", async () => {
+describe("copilot workflow-surface tool loop (pipeline mutations)", () => {
+  test("addStep propose → accept round trip: the step id is MINTED, the result hands it back", async () => {
     const server = startServer([
       {
-        text: "Setting a schedule.",
+        text: "Adding the search step.",
         toolCalls: [
           {
-            toolName: "setTrigger",
+            toolName: "addStep",
             input: {
-              trigger: { type: "schedule", cron: "0 9 * * 1-5" },
-              rationale: "run every weekday morning",
+              step: {
+                // A well-formed model-supplied id — must STILL be replaced.
+                id: "st_modelinvented123",
+                slug: "search",
+                kind: "tool",
+                connectionId: CONNECTION_ID,
+                tool: "search_issues",
+                args: { query: "team-exec" },
+              },
+              position: { after: null },
+              rationale: "find the messages first",
             },
           },
         ],
       },
-      { text: "Done — it now runs weekday mornings." },
+      { text: "Step one is in." },
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(workflowMessage("run this every weekday at 9"));
+    client.send(workflowMessage("search slack for team-exec"));
 
     const proposalFrame = await client.waitFor((f) => f.type === "proposal");
-    expect(proposalFrame.type === "proposal" && proposalFrame.proposal).toMatchObject({
-      tool: "setTrigger",
-      params: { trigger: { type: "schedule", cron: "0 9 * * 1-5" } },
-      rationale: "run every weekday morning",
-    });
+    if (proposalFrame.type !== "proposal") throw new Error("expected proposal");
+    expect(proposalFrame.proposal.tool).toBe("addStep");
+    expect(proposalFrame.proposal.rationale).toBe("find the messages first");
+    const params = proposalFrame.proposal.params as {
+      step: PipelineStep;
+      position: { after: null };
+    };
+    // Server-minted id: shaped, and NOT the one the model supplied.
+    expect(params.step.id).toMatch(STEP_ID_PATTERN);
+    expect(params.step.id).not.toBe("st_modelinvented123");
+    expect(params.step.slug).toBe("search");
     // rationale must be stripped from the applied params.
-    if (proposalFrame.type === "proposal") {
-      expect("rationale" in (proposalFrame.proposal.params as object)).toBe(false);
-    }
+    expect("rationale" in (proposalFrame.proposal.params as object)).toBe(false);
 
-    const proposalId =
-      proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "";
-    client.send({ type: "mutation_result", proposalId, outcome: "accepted" });
-
+    client.send({
+      type: "mutation_result",
+      proposalId: proposalFrame.proposal.id,
+      outcome: "accepted",
+    });
     const done = await client.waitFor((f) => f.type === "done");
     expect(done).toMatchObject({ type: "done", reason: "completed" });
-    const deltas = client
-      .all()
-      .filter((f) => f.type === "delta")
-      .map((f) => (f.type === "delta" ? f.text : ""))
-      .join("");
-    expect(deltas).toContain("Setting a schedule.");
-    expect(deltas).toContain("Done — it now runs weekday mornings.");
 
-    // The model saw the acceptance as the tool result.
-    const secondRequest = server.transport.requests[1]!;
-    const toolMessage = secondRequest.messages.find((m) => m.role === "tool");
-    expect(JSON.stringify(toolMessage)).toContain("accepted");
+    // The model was told the change landed AND which id was minted — it needs
+    // that id to chain the next step's position.
+    const toolMessage = JSON.stringify(
+      server.transport.requests[1]!.messages.find((m) => m.role === "tool"),
+    );
+    expect(toolMessage).toContain("accepted");
+    expect(toolMessage).toContain(params.step.id);
     client.close();
   });
 
-  test("propose → reject feeds the reason back and the model adapts", async () => {
+  test("read tools execute INLINE: step frames, tool results, no proposal, no park", async () => {
     const server = startServer([
       {
         toolCalls: [
-          { toolName: "setTrigger", input: { trigger: { type: "webhook" } } },
+          { toolName: "searchConnectionTools", input: { query: "issue" } },
         ],
       },
       {
         toolCalls: [
           {
-            toolName: "setTrigger",
-            input: { trigger: { type: "schedule", cron: "0 8 * * *" } },
+            toolName: "getConnectionTool",
+            input: { connectionId: CONNECTION_ID, toolName: "create_issue" },
           },
         ],
       },
-      { text: "Okay, schedule it is." },
+      { text: "Found the tool; proposing next." },
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(workflowMessage());
+    // No mutation_result is ever sent — read tools must not park the loop.
+    client.send(workflowMessage("what tools does linear have?"));
+    const done = await client.waitFor((f) => f.type === "done");
+    expect(done).toMatchObject({ type: "done", reason: "completed" });
 
-    const first = await client.waitFor((f) => f.type === "proposal");
-    const firstId = first.type === "proposal" ? first.proposal.id : "";
-    client.send({
-      type: "mutation_result",
-      proposalId: firstId,
-      outcome: "rejected",
-      reason: "I want a schedule, not a webhook",
-    });
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(0);
+    const steps = client.all().flatMap((f) => (f.type === "step" ? [f] : []));
+    const settled = steps.filter((s) => s.state === "ok");
+    expect(settled).toHaveLength(2);
+    expect(settled[0]!.toolName).toBe("searchConnectionTools");
+    expect(settled[0]!.resultPreview).toContain("match");
+    expect(settled[1]!.toolName).toBe("getConnectionTool");
+    expect(settled[1]!.resultPreview).toContain("create_issue");
 
-    const second = await client.waitFor(
-      (f) =>
-        f.type === "proposal" &&
-        JSON.stringify(f.proposal.params).includes("schedule"),
-    );
-    const secondId = second.type === "proposal" ? second.proposal.id : "";
-    client.send({ type: "mutation_result", proposalId: secondId, outcome: "accepted" });
-    await client.waitFor((f) => f.type === "done");
-
+    // The model received the search results and the tool detail as ordinary
+    // tool results.
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
-      "I want a schedule, not a webhook",
+      "create_issue",
+    );
+    expect(JSON.stringify(server.transport.requests[2]!.messages)).toContain(
+      "input schema",
     );
     client.close();
   });
 
-  test("setAgent must name a PUBLISHED agent — unpublished bounces to the model", async () => {
+  test("a read-tool miss (unknown connection) bounces to the model as a tool error", async () => {
     const server = startServer([
       {
         toolCalls: [
-          { toolName: "setAgent", input: { agentId: UNPUBLISHED_AGENT_ID } },
+          {
+            toolName: "searchConnectionTools",
+            input: { query: "x", connectionId: "cn_zzzzzzzzzzzzzzzz" },
+          },
+        ],
+      },
+      { text: "Sorry, wrong id." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(workflowMessage());
+    await client.waitFor((f) => f.type === "done");
+    const failed = client
+      .all()
+      .find((f) => f.type === "step" && f.state === "error");
+    expect(failed).toBeDefined();
+    const preview = failed?.type === "step" ? (failed.resultPreview ?? "") : "";
+    expect(preview).toContain("does not exist");
+    expect(preview).not.toContain("INVALID TOOL CALL");
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "does not exist",
+    );
+    client.close();
+  });
+
+  test("addStep with an unknown connection is bounced (never invent) and the corrected call passes", async () => {
+    const badStep = {
+      slug: "search",
+      kind: "tool",
+      connectionId: "cn_zzzzzzzzzzzzzzzz",
+      tool: "search_issues",
+      args: {},
+    };
+    const server = startServer([
+      {
+        toolCalls: [
+          { toolName: "addStep", input: { step: badStep, position: { after: null } } },
         ],
       },
       {
         toolCalls: [
-          { toolName: "setAgent", input: { agentId: PUBLISHED_AGENT_ID } },
+          {
+            toolName: "addStep",
+            input: {
+              step: { ...badStep, connectionId: CONNECTION_ID },
+              position: { after: null },
+            },
+          },
         ],
       },
-      { text: "Support Agent selected." },
+      { text: "fixed." },
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
-    client.send(workflowMessage("use the draft agent"));
-
+    client.send(workflowMessage());
     const proposalFrame = await client.waitFor((f) => f.type === "proposal");
-    // Only the published-agent call reaches the client.
+    // Only the corrected call surfaced.
     expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(1);
-    expect(proposalFrame.type === "proposal" && proposalFrame.proposal.params).toEqual(
-      { agentId: PUBLISHED_AGENT_ID },
-    );
     client.send({
       type: "mutation_result",
       proposalId: proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
@@ -477,94 +599,98 @@ describe("copilot workflow-surface tool loop", () => {
     });
     await client.waitFor((f) => f.type === "done");
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
-      "no published version",
+      "does not exist in this workspace",
     );
     client.close();
   });
 
-  test("setInstructions @refs must be in the (turn-updated) selected agent's published context", async () => {
+  test("a tool name the cache cannot confirm is ACCEPTED with a warning in the tool result", async () => {
     const server = startServer([
-      // No agent selected yet → bounced.
       {
         toolCalls: [
           {
-            toolName: "setInstructions",
-            input: { markdown: "Use @linear to file issues." },
-          },
-        ],
-      },
-      // Select the published agent first (accepted) …
-      {
-        toolCalls: [
-          { toolName: "setAgent", input: { agentId: PUBLISHED_AGENT_ID } },
-        ],
-      },
-      // … a slug outside its published context is still bounced …
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
-            input: { markdown: "Use @github to file issues." },
-          },
-        ],
-      },
-      // … and its own context slugs now validate.
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
+            toolName: "addStep",
             input: {
-              markdown: "Use @linear and follow @skill.triage-guide.",
+              step: {
+                slug: "close",
+                kind: "tool",
+                connectionId: CONNECTION_ID,
+                tool: "close_issue",
+                args: {},
+              },
+              position: { after: null },
             },
           },
         ],
       },
-      { text: "written." },
+      { text: "added." },
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
     client.send(workflowMessage());
-
-    const first = await client.waitFor((f) => f.type === "proposal");
-    expect(first.type === "proposal" && first.proposal.tool).toBe("setAgent");
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
     client.send({
       type: "mutation_result",
-      proposalId: first.type === "proposal" ? first.proposal.id : "",
-      outcome: "accepted",
-    });
-    const second = await client.waitFor(
-      (f) => f.type === "proposal" && f.proposal.tool === "setInstructions",
-    );
-    expect(
-      second.type === "proposal" && JSON.stringify(second.proposal.params),
-    ).toContain("@linear");
-    client.send({
-      type: "mutation_result",
-      proposalId: second.type === "proposal" ? second.proposal.id : "",
+      proposalId: proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
       outcome: "accepted",
     });
     await client.waitFor((f) => f.type === "done");
-    // Both invalid variants came back to the model as tool errors.
+    const messages = JSON.stringify(server.transport.requests[1]!.messages);
+    expect(messages).toContain("WARNINGS");
+    expect(messages).toContain("not in connection");
+    client.close();
+  });
+
+  test("@steps refs must name a PRECEDING step — position decides validity", async () => {
+    const inferStep = {
+      slug: "summarize",
+      kind: "infer",
+      preset: "quick",
+      prompt: { markdown: "Summarize @steps.search.text" },
+    };
+    const server = startServer([
+      // At the head of the list `search` does not precede it → bounced.
+      {
+        toolCalls: [
+          { toolName: "addStep", input: { step: inferStep, position: { after: null } } },
+        ],
+      },
+      // After the search step it validates.
+      {
+        toolCalls: [
+          {
+            toolName: "addStep",
+            input: { step: inferStep, position: { after: SEARCH_STEP_ID } },
+          },
+        ],
+      },
+      { text: "done." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(workflowMessage("summarize the results", [searchStepJson]));
+    const proposalFrame = await client.waitFor((f) => f.type === "proposal");
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(1);
+    client.send({
+      type: "mutation_result",
+      proposalId: proposalFrame.type === "proposal" ? proposalFrame.proposal.id : "",
+      outcome: "accepted",
+    });
+    await client.waitFor((f) => f.type === "done");
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
-      "has no agent",
-    );
-    expect(JSON.stringify(server.transport.requests[3]!.messages)).toContain(
-      "is not in agent",
+      "PRECEDING",
     );
     client.close();
   });
 
   test("@trigger refs are validated against the (turn-updated) draft trigger", async () => {
+    const inferWith = (markdown: string) => ({
+      step: { slug: "read", kind: "infer", preset: "quick", prompt: { markdown } },
+      position: { after: null },
+    });
     const server = startServer([
       // Manual trigger carries no dispatch data → bounced.
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
-            input: { markdown: "Read @trigger.subject first." },
-          },
-        ],
-      },
+      { toolCalls: [{ toolName: "addStep", input: inferWith("Read @trigger.subject first.") }] },
       // Switch to a form trigger (accepted) …
       {
         toolCalls: [
@@ -582,23 +708,9 @@ describe("copilot workflow-surface tool loop", () => {
         ],
       },
       // … an unknown field key is still bounced …
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
-            input: { markdown: "Read @trigger.body first." },
-          },
-        ],
-      },
+      { toolCalls: [{ toolName: "addStep", input: inferWith("Read @trigger.body first.") }] },
       // … and the matching key now validates.
-      {
-        toolCalls: [
-          {
-            toolName: "setInstructions",
-            input: { markdown: "Read @trigger.subject first." },
-          },
-        ],
-      },
+      { toolCalls: [{ toolName: "addStep", input: inferWith("Read @trigger.subject first.") }] },
       { text: "done." },
     ]);
     const client = new Client(server.url, `user=alice;org=${ORG}`);
@@ -615,12 +727,12 @@ describe("copilot workflow-surface tool loop", () => {
         triggerProposal.type === "proposal" ? triggerProposal.proposal.id : "",
       outcome: "accepted",
     });
-    const instructions = await client.waitFor(
-      (f) => f.type === "proposal" && f.proposal.tool === "setInstructions",
+    const stepProposal = await client.waitFor(
+      (f) => f.type === "proposal" && f.proposal.tool === "addStep",
     );
     client.send({
       type: "mutation_result",
-      proposalId: instructions.type === "proposal" ? instructions.proposal.id : "",
+      proposalId: stepProposal.type === "proposal" ? stepProposal.proposal.id : "",
       outcome: "accepted",
     });
     await client.waitFor((f) => f.type === "done");
@@ -908,6 +1020,26 @@ describe("copilot agent-surface tool loop", () => {
     expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(0);
     expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
       "not available on the agent surface",
+    );
+    client.close();
+  });
+
+  test("read tools are rejected on the agent surface", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          { toolName: "searchConnectionTools", input: { query: "issues" } },
+        ],
+      },
+      { text: "understood." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send(agentMessage());
+    await client.waitFor((f) => f.type === "done");
+    expect(client.all().filter((f) => f.type === "proposal")).toHaveLength(0);
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "workflow-surface read tool",
     );
     client.close();
   });
@@ -1255,6 +1387,59 @@ describe("copilot allow-edits (spec D7.2)", () => {
     expect(tools).toEqual(["addContext", "setPersona"]);
     client.close();
   });
+
+  test("workflow steps chain under allow-edits, and every applied addStep hands its minted id back", async () => {
+    const server = startServer([
+      {
+        toolCalls: [
+          {
+            toolName: "addStep",
+            input: {
+              step: {
+                slug: "search",
+                kind: "tool",
+                connectionId: CONNECTION_ID,
+                tool: "search_issues",
+                args: {},
+              },
+              position: { after: null },
+            },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            toolName: "addStep",
+            input: {
+              step: {
+                slug: "notify",
+                kind: "infer",
+                preset: "quick",
+                prompt: { markdown: "Write a short update." },
+              },
+              position: { after: null },
+            },
+          },
+        ],
+      },
+      { text: "Two steps in." },
+    ]);
+    const client = new Client(server.url, `user=alice;org=${ORG}`);
+    expect(await client.opened).toBe(true);
+    client.send({ ...workflowMessage("build it"), allowEdits: true });
+    await client.waitFor((f) => f.type === "done");
+    const proposals = client
+      .all()
+      .flatMap((f) => (f.type === "proposal" ? [f] : []));
+    expect(proposals).toHaveLength(2);
+    for (const frame of proposals) expect(frame.autoApplied).toBe(true);
+    // The first applied result carried the minted id the model would chain on.
+    expect(JSON.stringify(server.transport.requests[1]!.messages)).toContain(
+      "The new step's id is",
+    );
+    client.close();
+  });
 });
 
 describe("copilot agent identity tools (spec D7.3/D7.4)", () => {
@@ -1446,11 +1631,13 @@ describe("copilot budgets + aborts", () => {
     client.close();
   });
 
-  test("runaway tool loop hits the step cap", async () => {
+  test("runaway tool loop hits the per-surface step cap", async () => {
     const looping: ScriptedStep[] = Array.from({ length: 10 }, () => ({
       toolCalls: [{ toolName: "setModel", input: {} }],
     }));
-    const server = startServer(looping, { maxStepsPerTurn: 3 });
+    const server = startServer(looping, {
+      maxStepsPerTurn: { workflow: 3, agent: 3 },
+    });
     const client = new Client(server.url, `user=alice;org=${ORG}`);
     expect(await client.opened).toBe(true);
     client.send(agentMessage());
@@ -1731,17 +1918,431 @@ describe("copilot config guards", () => {
       "provider-default",
     );
   });
+
+  test("the step cap is PER SURFACE: workflow 24, agent 12; COPILOT_MAX_STEPS overrides both", () => {
+    // Pipeline building spends round-trips on read tools before proposals,
+    // and proposes steps one per call — the workflow surface needs headroom.
+    expect(loadCopilotConfig({}).maxStepsPerTurn).toEqual({
+      workflow: 24,
+      agent: 12,
+    });
+    expect(
+      loadCopilotConfig({ COPILOT_MAX_STEPS: "5" }).maxStepsPerTurn,
+    ).toEqual({ workflow: 5, agent: 5 });
+  });
 });
 
-describe("validateMutation", () => {
+describe("validateMutation — workflow pipeline", () => {
   const workflowState = (
     overrides: Partial<Omit<WorkflowDraftState, "surface">> = {},
   ): WorkflowDraftState => ({
     surface: "workflow",
     trigger: { type: "manual" },
-    agentId: null,
+    steps: [],
     ...overrides,
   });
+
+  const addStep = (step: unknown, position: unknown, state: WorkflowDraftState) =>
+    validateMutation("addStep", { step, position }, inventory, state);
+
+  test("addStep mints EVERY id server-side — even a valid model-supplied one, at every depth", () => {
+    const state = workflowState({ steps: [parseStep(searchStepJson)] });
+    const result = addStep(
+      {
+        // Copies an EXISTING step's id — must be re-minted, not honored.
+        id: SEARCH_STEP_ID,
+        slug: "each",
+        kind: "for_each",
+        items: { $ref: "state.queue" },
+        steps: [
+          {
+            id: "not-a-step-id",
+            slug: "inner",
+            kind: "tool",
+            connectionId: CONNECTION_ID,
+            tool: "search_issues",
+            args: {},
+          },
+        ],
+      },
+      { after: SEARCH_STEP_ID },
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    const step = (result.params as { step: PipelineStep }).step;
+    expect(step.id).toMatch(STEP_ID_PATTERN);
+    expect(step.id).not.toBe(SEARCH_STEP_ID);
+    if (step.kind !== "for_each") throw new Error("kind");
+    expect(step.steps[0]!.id).toMatch(STEP_ID_PATTERN);
+    expect(step.steps[0]!.id).not.toBe(step.id);
+  });
+
+  test("addStep rejects a duplicate slug (the @steps handle must stay unique)", () => {
+    const state = workflowState({ steps: [parseStep(searchStepJson)] });
+    const result = addStep(
+      {
+        slug: "search",
+        kind: "tool",
+        connectionId: CONNECTION_ID,
+        tool: "create_issue",
+        args: {},
+      },
+      { after: SEARCH_STEP_ID },
+      state,
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("duplicate step slug");
+  });
+
+  test("addStep rejects user-scoped and disabled connections for tool steps", () => {
+    const userScoped = addStep(
+      { slug: "note", kind: "tool", connectionId: USER_CONNECTION_ID, tool: "add_note", args: {} },
+      { after: null },
+      workflowState(),
+    );
+    expect(userScoped.ok).toBe(false);
+    expect(!userScoped.ok && userScoped.message).toContain("user-scoped");
+
+    const disabled = addStep(
+      { slug: "crm", kind: "tool", connectionId: DISABLED_CONNECTION_ID, tool: "x", args: {} },
+      { after: null },
+      workflowState(),
+    );
+    expect(disabled.ok).toBe(false);
+    expect(!disabled.ok && disabled.message).toContain("disabled");
+  });
+
+  test("addStep agent steps demand a PUBLISHED agent and legal thread sessions", () => {
+    const missing = addStep(
+      { slug: "triage", kind: "agent", agentId: null, instructions: { markdown: "go" } },
+      { after: null },
+      workflowState(),
+    );
+    expect(missing.ok).toBe(false);
+    expect(!missing.ok && missing.message).toContain("PUBLISHED agent");
+
+    const unpublished = addStep(
+      {
+        slug: "triage",
+        kind: "agent",
+        agentId: UNPUBLISHED_AGENT_ID,
+        instructions: { markdown: "go" },
+      },
+      { after: null },
+      workflowState(),
+    );
+    expect(unpublished.ok).toBe(false);
+    expect(!unpublished.ok && unpublished.message).toContain("no published version");
+
+    const threadOnManual = addStep(
+      {
+        slug: "triage",
+        kind: "agent",
+        agentId: PUBLISHED_AGENT_ID,
+        instructions: { markdown: "go" },
+        session: "thread",
+      },
+      { after: null },
+      workflowState(),
+    );
+    expect(threadOnManual.ok).toBe(false);
+    expect(!threadOnManual.ok && threadOnManual.message).toContain("slack trigger");
+
+    const ok = addStep(
+      {
+        slug: "triage",
+        kind: "agent",
+        agentId: PUBLISHED_AGENT_ID,
+        instructions: { markdown: "File it in @linear." },
+      },
+      { after: null },
+      workflowState(),
+    );
+    expect(ok.ok).toBe(true);
+  });
+
+  test("addStep infer preset must be a workspace preset", () => {
+    const result = addStep(
+      { slug: "sum", kind: "infer", preset: "turbo", prompt: { markdown: "hi" } },
+      { after: null },
+      workflowState(),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("quick");
+  });
+
+  test("@item is legal only inside a for_each body (the position decides)", () => {
+    const state = workflowState({
+      steps: [parseStep(searchStepJson), parseStep(loopStepJson)],
+    });
+    const inferStep = {
+      slug: "per-item",
+      kind: "infer",
+      preset: "quick",
+      prompt: { markdown: "Summarize @item.text" },
+    };
+    const topLevel = addStep(inferStep, { after: LOOP_STEP_ID }, state);
+    expect(topLevel.ok).toBe(false);
+    expect(!topLevel.ok && topLevel.message).toContain("for_each body");
+
+    const inBody = addStep(
+      inferStep,
+      { after: null, parent: { stepId: LOOP_STEP_ID, slot: "body" } },
+      state,
+    );
+    expect(inBody.ok).toBe(true);
+  });
+
+  test("$ref paths are validated (unknown heads bounce)", () => {
+    const result = addStep(
+      {
+        slug: "create",
+        kind: "tool",
+        connectionId: CONNECTION_ID,
+        tool: "create_issue",
+        args: { title: { $ref: "outputs.search.title" } },
+      },
+      { after: null },
+      workflowState(),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("unknown head");
+  });
+
+  test("addStep position with an unknown parent reports the draft's step roster", () => {
+    const result = addStep(
+      { slug: "x", kind: "filter", where: { truthy: true } },
+      { after: null, parent: { stepId: "st_zzzzzzzzzzzzzzzz", slot: "body" } },
+      workflowState({ steps: [parseStep(searchStepJson)] }),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain(SEARCH_STEP_ID);
+  });
+
+  test("updateStep bounces unknown stepIds with the known-id roster", () => {
+    const result = validateMutation(
+      "updateStep",
+      {
+        stepId: "st_zzzzzzzzzzzzzzzz",
+        step: searchStepJson,
+      },
+      inventory,
+      workflowState({ steps: [parseStep(searchStepJson)] }),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("does not exist in the draft");
+    expect(!result.ok && result.message).toContain(SEARCH_STEP_ID);
+    expect(!result.ok && result.message).toContain("Never invent step ids");
+  });
+
+  test("updateStep FORCES the root id — a replacement may rename a slug, never re-identify", () => {
+    const state = workflowState({ steps: [parseStep(searchStepJson)] });
+    const result = validateMutation(
+      "updateStep",
+      {
+        stepId: SEARCH_STEP_ID,
+        step: { ...searchStepJson, id: "st_modelinvented123", slug: "find" },
+      },
+      inventory,
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    expect((result.params as { step: PipelineStep }).step.id).toBe(SEARCH_STEP_ID);
+    expect((result.params as { step: PipelineStep }).step.slug).toBe("find");
+  });
+
+  test("a slug rename that strands a later @steps ref is accepted WITH a warning", () => {
+    const state = workflowState({
+      steps: [parseStep(searchStepJson), parseStep(summarizeStepJson)],
+    });
+    const result = validateMutation(
+      "updateStep",
+      { stepId: SEARCH_STEP_ID, step: { ...searchStepJson, slug: "find" } },
+      inventory,
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    expect(result.warnings.some((w) => w.includes("@steps.search"))).toBe(true);
+  });
+
+  test("removeStep of a referenced step is accepted WITH a warning; unknown ids bounce", () => {
+    const state = workflowState({
+      steps: [parseStep(searchStepJson), parseStep(summarizeStepJson)],
+    });
+    const removed = validateMutation(
+      "removeStep",
+      { stepId: SEARCH_STEP_ID },
+      inventory,
+      state,
+    );
+    if (!removed.ok) throw new Error(removed.message);
+    expect(removed.warnings.some((w) => w.includes("@steps.search"))).toBe(true);
+
+    const unknown = validateMutation(
+      "removeStep",
+      { stepId: "st_zzzzzzzzzzzzzzzz" },
+      inventory,
+      state,
+    );
+    expect(unknown.ok).toBe(false);
+  });
+
+  test("moveStep cannot target its own subtree, and a move that breaks the MOVED step's refs rejects", () => {
+    const loopWithChild = parseStep({
+      ...loopStepJson,
+      steps: [
+        {
+          id: "st_inner12345678901",
+          slug: "inner",
+          kind: "tool",
+          connectionId: CONNECTION_ID,
+          tool: "create_issue",
+          args: {},
+        },
+      ],
+    });
+    const state = workflowState({
+      steps: [parseStep(searchStepJson), loopWithChild],
+    });
+    const intoItself = validateMutation(
+      "moveStep",
+      {
+        stepId: LOOP_STEP_ID,
+        position: { after: null, parent: { stepId: LOOP_STEP_ID, slot: "body" } },
+      },
+      inventory,
+      state,
+    );
+    expect(intoItself.ok).toBe(false);
+    expect(!intoItself.ok && intoItself.message).toContain("own subtree");
+
+    // Moving `summarize` BEFORE `search` breaks its own @steps.search ref.
+    const orderState = workflowState({
+      steps: [parseStep(searchStepJson), parseStep(summarizeStepJson)],
+    });
+    const broken = validateMutation(
+      "moveStep",
+      { stepId: SUMMARIZE_STEP_ID, position: { after: null } },
+      inventory,
+      orderState,
+    );
+    expect(broken.ok).toBe(false);
+    expect(!broken.ok && broken.message).toContain("PRECEDING");
+  });
+
+  test("a valid moveStep re-orders and applies through the accepted state", () => {
+    const gate = parseStep({
+      id: "st_gateaaaaaaaaaaaa",
+      slug: "gate",
+      kind: "filter",
+      where: { truthy: true },
+    });
+    const state = workflowState({
+      steps: [parseStep(searchStepJson), gate],
+    });
+    const result = validateMutation(
+      "moveStep",
+      { stepId: "st_gateaaaaaaaaaaaa", position: { after: null } },
+      inventory,
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    applyAcceptedMutation(state, result.tool, result.params);
+    expect(state.steps.map((s) => s.slug)).toEqual(["gate", "search"]);
+  });
+
+  test("an accepted addStep threads into later validation in the same turn", () => {
+    const state = workflowState();
+    const first = validateMutation(
+      "addStep",
+      {
+        step: {
+          slug: "search",
+          kind: "tool",
+          connectionId: CONNECTION_ID,
+          tool: "search_issues",
+          args: {},
+        },
+        position: { after: null },
+      },
+      inventory,
+      state,
+    );
+    if (!first.ok) throw new Error(first.message);
+    applyAcceptedMutation(state, first.tool, first.params);
+    const mintedId = (first.params as { step: PipelineStep }).step.id;
+
+    // The follow-up references BOTH the minted id (position) and the slug.
+    const second = validateMutation(
+      "addStep",
+      {
+        step: {
+          slug: "summarize",
+          kind: "infer",
+          preset: "quick",
+          prompt: { markdown: "Summarize @steps.search.text" },
+        },
+        position: { after: mintedId },
+      },
+      inventory,
+      state,
+    );
+    expect(second.ok).toBe(true);
+  });
+
+  test("pre-existing draft problems never block an unrelated proposal", () => {
+    // The draft already carries a broken tool step (unknown connection).
+    const broken = parseStep({
+      id: "st_brokenaaaaaaaaaa",
+      slug: "broken",
+      kind: "tool",
+      connectionId: "cn_zzzzzzzzzzzzzzzz",
+      tool: "x",
+      args: {},
+    });
+    const state = workflowState({ steps: [broken] });
+    const result = validateMutation(
+      "addStep",
+      {
+        step: { slug: "sum", kind: "infer", preset: "quick", prompt: { markdown: "hi" } },
+        position: { after: null },
+      },
+      inventory,
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    // …and the old problem is not resurfaced as a warning either.
+    expect(result.warnings).toEqual([]);
+  });
+
+  test("setTrigger that strands existing steps is accepted WITH warnings (collateral, not the proposal's own subtree)", () => {
+    const threadStep = parseStep({
+      id: "st_threadaaaaaaaaaa",
+      slug: "reply",
+      kind: "agent",
+      agentId: PUBLISHED_AGENT_ID,
+      instructions: { markdown: "reply in thread" },
+      session: "thread",
+    });
+    const state = workflowState({
+      trigger: {
+        type: "slack",
+        binding: { mentionOnly: true, includeDirectMessages: false },
+      },
+      steps: [threadStep],
+    });
+    const result = validateMutation(
+      "setTrigger",
+      { trigger: { type: "manual" } },
+      inventory,
+      state,
+    );
+    if (!result.ok) throw new Error(result.message);
+    expect(result.warnings.some((w) => w.includes("slack trigger"))).toBe(true);
+  });
+});
+
+describe("validateMutation — agent surface", () => {
   const agentState = (
     overrides: Partial<Omit<AgentDraftState, "surface">> = {},
   ): AgentDraftState => ({
@@ -1755,35 +2356,13 @@ describe("validateMutation", () => {
     ...overrides,
   });
 
-  test("setAgent requires an existing, PUBLISHED agent", () => {
-    const ok = validateMutation(
-      "setAgent",
-      { agentId: PUBLISHED_AGENT_ID },
-      inventory,
-      workflowState(),
-    );
-    expect(ok.ok).toBe(true);
-    const unknown = validateMutation(
-      "setAgent",
-      { agentId: "eeeeeeee-1111-4222-8333-444444444444" },
-      inventory,
-      workflowState(),
-    );
-    expect(unknown.ok).toBe(false);
-    expect(!unknown.ok && unknown.message).toContain("does not exist");
-    const unpublished = validateMutation(
-      "setAgent",
-      { agentId: UNPUBLISHED_AGENT_ID },
-      inventory,
-      workflowState(),
-    );
-    expect(unpublished.ok).toBe(false);
-    expect(!unpublished.ok && unpublished.message).toContain("no published version");
-  });
-
   test("unknown tool name is invalid on both surfaces", () => {
     expect(
-      validateMutation("dropDatabase", {}, inventory, workflowState()).ok,
+      validateMutation("dropDatabase", {}, inventory, {
+        surface: "workflow",
+        trigger: { type: "manual" },
+        steps: [],
+      }).ok,
     ).toBe(false);
     expect(validateMutation("dropDatabase", {}, inventory, agentState()).ok).toBe(
       false,
@@ -1795,7 +2374,7 @@ describe("validateMutation", () => {
       "setPersona",
       { markdown: "Be nice." },
       inventory,
-      workflowState(),
+      { surface: "workflow", trigger: { type: "manual" }, steps: [] },
     );
     expect(personaOnWorkflow.ok).toBe(false);
     expect(!personaOnWorkflow.ok && personaOnWorkflow.message).toContain(
@@ -1811,6 +2390,17 @@ describe("validateMutation", () => {
     expect(!triggerOnAgent.ok && triggerOnAgent.message).toContain(
       "not available on the agent surface",
     );
+  });
+
+  test("read tools bounce on the agent surface with a surface hint", () => {
+    const result = validateMutation(
+      "getConnectionTool",
+      { connectionId: CONNECTION_ID, toolName: "create_issue" },
+      inventory,
+      agentState(),
+    );
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.message).toContain("workflow-surface read tool");
   });
 
   test("setModel modelId must be allowlisted AND enabled", () => {
@@ -1919,85 +2509,147 @@ describe("validateMutation", () => {
     expect(!result.ok && result.message).toContain("unknown connection");
   });
 
-  test("setPersona rejects @trigger refs outright", () => {
-    const result = validateMutation(
+  test("setPersona rejects @trigger and pipeline-scope refs outright", () => {
+    const trigger = validateMutation(
       "setPersona",
       { markdown: "Always read @trigger.subject." },
       inventory,
       agentState(),
     );
-    expect(result.ok).toBe(false);
-    expect(!result.ok && result.message).toContain("not allowed in an agent persona");
+    expect(trigger.ok).toBe(false);
+    expect(!trigger.ok && trigger.message).toContain("not allowed in an agent persona");
+
+    const pipelineScope = validateMutation(
+      "setPersona",
+      { markdown: "Use @steps.search.text and @state.cursor." },
+      inventory,
+      agentState(),
+    );
+    expect(pipelineScope.ok).toBe(false);
+    expect(!pipelineScope.ok && pipelineScope.message).toContain(
+      "pipeline scope",
+    );
+  });
+});
+
+describe("workflow-surface system prompt (pipeline model)", () => {
+  const draft = { version: 2, trigger: { type: "manual" }, steps: [] };
+
+  test("states the pipeline model, the step-choice doctrine and the hard rules", () => {
+    const prompt = buildSystemPrompt({ surface: "workflow", draft, inventory });
+    expect(prompt).toContain("standing PIPELINE");
+    expect(prompt).toContain("## Choosing a step kind");
+    expect(prompt).toContain("CHEAPEST kind that suffices");
+    expect(prompt).toContain("NEVER invent MCP tool names");
+    expect(prompt).toContain("searchConnectionTools");
+    expect(prompt).toContain("NEVER invent step ids");
+    expect(prompt).toContain("minted server-side");
+    expect(prompt).toContain("ONE PER CALL, in execution order");
   });
 
-  test("workflow setInstructions checks refs against the SELECTED agent's published context", () => {
-    // No agent selected → any context ref is a problem.
-    const noAgent = validateMutation(
-      "setInstructions",
-      { markdown: "Use @linear." },
-      inventory,
-      workflowState(),
-    );
-    expect(noAgent.ok).toBe(false);
-    expect(!noAgent.ok && noAgent.message).toContain("has no agent");
-
-    // Selected but unpublished agent → still a problem.
-    const unpublished = validateMutation(
-      "setInstructions",
-      { markdown: "Use @linear." },
-      inventory,
-      workflowState({ agentId: UNPUBLISHED_AGENT_ID }),
-    );
-    expect(unpublished.ok).toBe(false);
-    expect(!unpublished.ok && unpublished.message).toContain("no published version");
-
-    // Selected agent that has since been deleted → still a problem.
-    const deleted = validateMutation(
-      "setInstructions",
-      { markdown: "Use @linear." },
-      inventory,
-      workflowState({ agentId: "ffffffff-1111-4222-8333-444444444444" }),
-    );
-    expect(deleted.ok).toBe(false);
-    expect(!deleted.ok && deleted.message).toContain("no longer exists");
-
-    // Published agent: its own context slugs pass, others bounce.
-    const selected = workflowState({ agentId: PUBLISHED_AGENT_ID });
-    const ok = validateMutation(
-      "setInstructions",
-      { markdown: "Use @linear and @skill.triage-guide." },
-      inventory,
-      selected,
-    );
-    expect(ok.ok).toBe(true);
-    const outside = validateMutation(
-      "setInstructions",
-      { markdown: "Use @github." },
-      inventory,
-      selected,
-    );
-    expect(outside.ok).toBe(false);
-    expect(!outside.ok && outside.message).toContain("is not in agent");
+  test("carries the extended @reference grammar and the tagged-JSON values", () => {
+    const prompt = buildSystemPrompt({ surface: "workflow", draft, inventory });
+    expect(prompt).toContain("@steps.<slug>.<path>");
+    expect(prompt).toContain("@state.<key>");
+    expect(prompt).toContain("@item");
+    expect(prompt).toContain("@now");
+    expect(prompt).toContain("@trigger.<path>");
+    expect(prompt).toContain('{"$ref": "steps.<slug>.<path>"}');
+    expect(prompt).toContain('{"$tpl":');
   });
 
-  test("workflow setInstructions flags bare @trigger and skips trigger checks on unparseable triggers", () => {
-    const bare = validateMutation(
-      "setInstructions",
-      { markdown: "Start from @trigger data." },
-      inventory,
-      workflowState({ trigger: { type: "webhook" } }),
+  test("renders the connection INDEX with health + capped tool names, and marks user scope", () => {
+    const prompt = buildSystemPrompt({ surface: "workflow", draft, inventory });
+    expect(prompt).toContain(
+      `- id=${CONNECTION_ID} name="Linear" ref=@linear health=ok tools=[create_issue, search_issues] — issue tracker`,
     );
-    expect(bare.ok).toBe(false);
-    expect(!bare.ok && bare.message).toContain("bare");
+    expect(prompt).toContain(
+      `- id=${USER_CONNECTION_ID} name="Personal Notes" ref=@personal-notes health=ok (user-scoped — NOT usable in tool steps) tools=[add_note]`,
+    );
+    // The index is explicitly not the source of truth for tool detail.
+    expect(prompt).toContain("This is an INDEX");
+  });
 
-    // Unparseable draft trigger (null) — lenient: trigger refs pass through.
-    const lenient = validateMutation(
-      "setInstructions",
-      { markdown: "Read @trigger.subject." },
+  test("the draft renders as pipeline JSON", () => {
+    const withSteps = {
+      version: 2,
+      trigger: { type: "manual" },
+      steps: [searchStepJson],
+    };
+    const prompt = buildSystemPrompt({
+      surface: "workflow",
+      draft: withSteps,
       inventory,
-      workflowState({ trigger: null }),
+    });
+    expect(prompt).toContain(SEARCH_STEP_ID);
+    expect(prompt).toContain('"slug": "search"');
+  });
+
+  test("two same-named agents both render, distinguished only by id (spec D1)", () => {
+    const twins: WorkspaceInventory = {
+      ...inventory,
+      agents: [
+        {
+          id: PUBLISHED_AGENT_ID,
+          name: "Untitled agent",
+          description: null,
+          published: true,
+          contextConnectionSlugs: [],
+          contextSkillSlugs: [],
+        },
+        {
+          id: UNPUBLISHED_AGENT_ID,
+          name: "Untitled agent",
+          description: null,
+          published: true,
+          contextConnectionSlugs: [],
+          contextSkillSlugs: [],
+        },
+      ],
+    };
+    const prompt = buildSystemPrompt({ surface: "workflow", draft, inventory: twins });
+    expect(prompt).toContain(`- id=${PUBLISHED_AGENT_ID} name="Untitled agent"`);
+    expect(prompt).toContain(`- id=${UNPUBLISHED_AGENT_ID} name="Untitled agent"`);
+    expect(prompt).toContain("Agent NAMES are not unique");
+    // Each id still resolves to its OWN row: an agent step may bind either.
+    for (const id of [PUBLISHED_AGENT_ID, UNPUBLISHED_AGENT_ID]) {
+      const result = validateMutation(
+        "addStep",
+        {
+          step: { slug: "run", kind: "agent", agentId: id, instructions: { markdown: "go" } },
+          position: { after: null },
+        },
+        twins,
+        { surface: "workflow", trigger: { type: "manual" }, steps: [] },
+      );
+      expect(result.ok).toBe(true);
+    }
+  });
+
+  test("the workflow toolset = 5 mutations + 2 read tools; rationale only on mutations", () => {
+    const specs = buildToolSpecs("workflow");
+    expect(specs.map((spec) => spec.name).sort()).toEqual(
+      [
+        "addStep",
+        "getConnectionTool",
+        "moveStep",
+        "removeStep",
+        "searchConnectionTools",
+        "setTrigger",
+        "updateStep",
+      ].sort(),
     );
-    expect(lenient.ok).toBe(true);
+    const hasRationale = (name: string) => {
+      const spec = specs.find((s) => s.name === name)!;
+      const properties = spec.inputSchema.properties as Record<string, unknown>;
+      return "rationale" in properties;
+    };
+    expect(hasRationale("addStep")).toBe(true);
+    expect(hasRationale("setTrigger")).toBe(true);
+    expect(hasRationale("searchConnectionTools")).toBe(false);
+    expect(hasRationale("getConnectionTool")).toBe(false);
+    // Identity tools stay agent-surface.
+    expect(specs.some((s) => s.name === "setName")).toBe(false);
   });
 });
 
@@ -2114,50 +2766,6 @@ describe("agent-surface system prompt — identity (spec D7.3/D7.4)", () => {
   });
 });
 
-describe("workflow-surface system prompt — agent names are not unique (spec D1)", () => {
-  test("two same-named agents both render, distinguished only by id", () => {
-    const twins: WorkspaceInventory = {
-      ...inventory,
-      agents: [
-        {
-          id: PUBLISHED_AGENT_ID,
-          name: "Untitled agent",
-          description: null,
-          published: true,
-          contextConnectionSlugs: [],
-          contextSkillSlugs: [],
-        },
-        {
-          id: UNPUBLISHED_AGENT_ID,
-          name: "Untitled agent",
-          description: null,
-          published: true,
-          contextConnectionSlugs: [],
-          contextSkillSlugs: [],
-        },
-      ],
-    };
-    const prompt = buildSystemPrompt({
-      surface: "workflow",
-      draft: { trigger: { type: "manual" } },
-      inventory: twins,
-    });
-    expect(prompt).toContain(`- id=${PUBLISHED_AGENT_ID} name="Untitled agent"`);
-    expect(prompt).toContain(`- id=${UNPUBLISHED_AGENT_ID} name="Untitled agent"`);
-    expect(prompt).toContain("Agent NAMES are not unique");
-    // Each id still resolves to its OWN row: nothing collapses on the name.
-    for (const id of [PUBLISHED_AGENT_ID, UNPUBLISHED_AGENT_ID]) {
-      const result = validateMutation(
-        "setAgent",
-        { agentId: id },
-        twins,
-        { surface: "workflow", trigger: { type: "manual" }, agentId: null },
-      );
-      expect(result.ok).toBe(true);
-    }
-  });
-});
-
 describe("agent-surface system prompt — connection tools + health", () => {
   const draft = { persona: "Be helpful.", model: { preset: "balanced" } };
 
@@ -2178,11 +2786,13 @@ describe("agent-surface system prompt — connection tools + health", () => {
           slug: "big-server",
           description: null,
           enabled: true,
+          scope: "workspace",
           health: "ok",
           // The loader caps `tools` at 40 while `toolCount` keeps the cache
           // total (inventory.test.ts proves that mapping against the DB).
           tools: Array.from({ length: 40 }, (_, i) => `tool_${i + 1}`),
           toolCount: 45,
+          cachedTools: [],
         },
       ],
     };
@@ -2198,5 +2808,13 @@ describe("agent-surface system prompt — connection tools + health", () => {
       `- id=${DISABLED_CONNECTION_ID} name="Old CRM" ref=@old-crm health=unknown (disabled)`,
     );
     expect(prompt).not.toContain("health=unknown (disabled) tools=");
+  });
+
+  test("the agent surface does NOT mark user scope (context may be user-scoped)", () => {
+    const prompt = buildSystemPrompt({ surface: "agent", draft, inventory });
+    expect(prompt).toContain(
+      `- id=${USER_CONNECTION_ID} name="Personal Notes" ref=@personal-notes health=ok tools=[add_note]`,
+    );
+    expect(prompt).not.toContain("NOT usable in tool steps");
   });
 });

@@ -16,8 +16,8 @@
  *     Chat sessions carry `workflowId: null`, and a fire-and-forget titler
  *     (resources/session-title.ts) names the thread from that first message.
  * - POST /workspaces/:workspaceId/workflows/:wfId/run {message?, data?}
- *     manual "Run now": dispatch the workflow's published snapshot through
- *     the shared trigger-dispatch path (renders the task message).
+ *     manual "Run now": start a PIPELINE run of the workflow's published
+ *     snapshot (the one workflow dispatch path — startPipelineRun).
  * - POST /sessions/:id/messages {message} — ID-addressed follow-up, new run.
  * - GET  /sessions/:id — session + runs.
  * - POST /runs/:id/input — HITL answer; POST /runs/:id/cancel — Stop (fronts
@@ -35,7 +35,7 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
@@ -76,7 +76,11 @@ import { createRunSseResponse, parseLastEventId } from "../runs/sse";
 import type { RunStore } from "../runs/store";
 import { ndjsonEvents, type RunTailerManager } from "../runs/tailer";
 import { kickSessionTitle } from "../resources/session-title";
-import { loadPublishedWorkflow } from "../resources/workflows";
+import {
+  cancelPipelineRun,
+  startPipelineRun,
+  type PipelineRunner,
+} from "../pipeline/runner";
 import { workspacePlugin, type WorkspaceDeps } from "../workspace";
 import { buildAgentEnv, decryptMcpEnv } from "./agent-env";
 import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
@@ -88,7 +92,10 @@ import {
   type CompileServiceDeps,
 } from "./compile-service";
 import type { RuntimeConfig } from "./config";
-import { dispatchTriggerRun } from "./dispatch";
+import {
+  publishedPipelineConfigOf,
+  PIPELINE_TRIGGER_AGENT_ID,
+} from "./dispatch";
 import { getAccessToken, type TokenLifecycleDeps } from "../oauth/tokens";
 import { errors, isRuntimeApiError, RuntimeApiError } from "./errors";
 import {
@@ -138,6 +145,15 @@ export interface RuntimeDeps {
   metrics: MetricsRegistry;
   /** Structured, redaction-safe logger (correlation ids threaded per call). */
   logger: Logger;
+  /**
+   * The pipeline interpreter (pipeline/runner.ts) — the ONLY workflow
+   * dispatch path (a trigger event always starts a pipeline run). Optional so
+   * focused fixtures need not wire it, and LATE-BOUND by index.ts (the runner
+   * is constructed beside the OAuth broker, after createRuntimeDeps returns —
+   * the same pattern as `oauthTokens`). Routes that need it answer a typed
+   * 503 when it is absent.
+   */
+  pipelines?: PipelineRunner;
 }
 
 // ── row loading + ownership ─────────────────────────────────────────────────
@@ -187,22 +203,30 @@ async function loadSessionOwned(
   return row;
 }
 
+/**
+ * Load a run with workspace-ownership enforcement. The session join is LEFT
+ * (pipelines join audit): pipeline runs have NO agent session, and an inner
+ * join would 404 every one of them — hiding them from their own workspace's
+ * cancel/stream routes. Ownership resolves as COALESCE(runs.organization_id,
+ * agent_sessions.organization_id) — new rows of both modes carry their own
+ * org, pre-column agent runs fall back to the session's.
+ */
 async function loadRunOwned(
   db: Db,
   organizationId: string,
   runId: string,
-): Promise<{ run: RunRow; session: SessionRow }> {
+): Promise<{ run: RunRow; session: SessionRow | null }> {
   const rows = await db
     .select({ run: schema.runs, session: schema.agentSessions })
     .from(schema.runs)
-    .innerJoin(
+    .leftJoin(
       schema.agentSessions,
       eq(schema.runs.agentSessionId, schema.agentSessions.id),
     )
     .where(
       and(
         eq(schema.runs.id, runId),
-        eq(schema.agentSessions.organizationId, organizationId),
+        sql`coalesce(${schema.runs.organizationId}, ${schema.agentSessions.organizationId}) = ${organizationId}`,
       ),
     )
     .limit(1);
@@ -249,7 +273,9 @@ export function sessionDto(row: SessionRow): AgentSessionDto {
 export function runDto(row: RunRow): RunDto {
   return {
     id: row.id,
+    mode: row.mode,
     agentSessionId: row.agentSessionId,
+    workflowId: row.workflowId,
     status: row.status,
     triggerEvent: row.triggerEvent as unknown as TriggerEvent,
     taskMessage: row.taskMessage,
@@ -268,6 +294,37 @@ function parseBody<T>(schemaLike: { safeParse(v: unknown): { success: boolean; d
     throw new RuntimeApiError(422, "invalid_body", "request body failed validation", result.error?.issues);
   }
   return result.data;
+}
+
+/**
+ * The pipeline interpreter, or a typed 503. Workflow dispatch has exactly one
+ * path (startPipelineRun), so a deployment without the runner cannot serve
+ * workflow triggers at all — surfaced honestly rather than as a crash.
+ * index.ts always wires it when the runtime is configured; this guard exists
+ * for focused fixtures and defensive completeness.
+ */
+export function requirePipelines(deps: RuntimeDeps): PipelineRunner {
+  if (!deps.pipelines) {
+    throw new RuntimeApiError(
+      503,
+      "pipelines_unavailable",
+      "the pipeline interpreter is not configured on this control plane",
+    );
+  }
+  return deps.pipelines;
+}
+
+/**
+ * `overlap: "skip"` refused to start the run — a run of this workflow is
+ * still live. 409 with a stable code so the manual "Run now" UI can render
+ * "already running" instead of a generic failure.
+ */
+export function runOverlapSkipped(): RuntimeApiError {
+  return new RuntimeApiError(
+    409,
+    "run_overlap_skipped",
+    "a run of this workflow is still in progress (overlap policy: skip)",
+  );
 }
 
 // ── dispatch helpers ────────────────────────────────────────────────────────
@@ -601,6 +658,51 @@ async function cancelEveTurnBestEffort(
       },
     });
   }
+}
+
+/**
+ * Cancel one AGENT-mode run by id without a live tail requirement — the
+ * pipeline cancel path uses this on the parent's linked CHILD runs (an
+ * agent step's eve turn must not outlive the user's Stop). Mirrors the cancel
+ * route's no-tail branch: settle the row first, then chase eve best-effort.
+ * Ownership is the caller's problem (the parent run was ownership-checked,
+ * and run_steps rows are org-denormalized).
+ */
+async function cancelChildRun(
+  deps: RuntimeDeps,
+  childRunId: string,
+  reason: string,
+): Promise<void> {
+  const rows = await deps.db
+    .select({ run: schema.runs, session: schema.agentSessions })
+    .from(schema.runs)
+    .leftJoin(
+      schema.agentSessions,
+      eq(schema.runs.agentSessionId, schema.agentSessions.id),
+    )
+    .where(eq(schema.runs.id, childRunId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return;
+  if (
+    row.run.status === "succeeded" ||
+    row.run.status === "failed" ||
+    row.run.status === "canceled"
+  ) {
+    return;
+  }
+  const hadTail = await deps.tailers.cancelRun(childRunId, reason);
+  if (hadTail) return;
+  await deps.runStore.markRun(childRunId, {
+    status: "canceled",
+    error: reason,
+    completedAt: new Date(),
+  });
+  deps.bus.publish(childRunId, {
+    kind: "status",
+    frame: { runId: childRunId, status: "canceled", error: reason },
+  });
+  if (row.session) await cancelEveTurnBestEffort(deps, row.session);
 }
 
 /**
@@ -1117,6 +1219,10 @@ export function runtimePlugin(deps: RuntimeDeps) {
             .insert(schema.runs)
             .values({
               agentSessionId: sessionRows[0]!.id,
+              // Every NEW run carries its own workspace scope (pipelines
+              // redesign) — readers COALESCE through the session only for
+              // pre-column rows.
+              organizationId: workspace.organizationId,
               triggerEvent: triggerEvent as unknown as Record<string, unknown>,
               status: "queued",
             })
@@ -1133,7 +1239,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
             worker.address,
             hash,
             await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-            message,
+            // Exactly `{message}`: chat sessions stay conversation-mode so a
+            // budget crossing parks on an answerable session-limit request.
+            { message },
           );
         } catch (error) {
           deps.metrics.recordTrigger("manual", "failed");
@@ -1170,55 +1278,63 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
     // ── manual "Run now" (workflow test run) ───────────────────────────────
     //
-    // Dispatches the workflow's PUBLISHED snapshot through the shared
-    // trigger-dispatch path — the instructions render into the task message
-    // exactly as a real trigger event would (`data` lets the test-run popover
-    // exercise webhook/form-shaped `@trigger.*` refs). Deliberately ignores
-    // `enabled` (that switch gates unattended trigger ingress; this is an
-    // explicit member action, like chat).
+    // Starts a PIPELINE run of the workflow's PUBLISHED snapshot — the one
+    // workflow dispatch path (`data` lets the test-run popover exercise
+    // webhook/form-shaped `@trigger.*` refs). Deliberately ignores `enabled`
+    // (that switch gates unattended trigger ingress; this is an explicit
+    // member action, like chat). No session exists for a pipeline run — the
+    // response is `{run}` alone, and the step timeline streams over
+    // `GET /runs/:id/stream`.
     .post(
       "/workspaces/:workspaceId/workflows/:wfId/run",
       async ({ workspace, params, body, set }) => {
         const input = parseBody(runWorkflowRequestSchema, body ?? {});
-        const { workflow, config, agentId } = await loadPublishedWorkflow(
-          db,
-          workspace.organizationId,
-          params.wfId,
-        );
+        const rows = await db
+          .select()
+          .from(schema.workflows)
+          .where(
+            and(
+              eq(schema.workflows.id, params.wfId),
+              eq(schema.workflows.organizationId, workspace.organizationId),
+            ),
+          )
+          .limit(1);
+        const workflow = rows[0];
+        if (!workflow) throw errors.workflowNotFound();
+        const config = publishedPipelineConfigOf(workflow);
+        const pipelines = requirePipelines(deps);
 
-        // FLOATING binding: resolve the agent's CURRENT published version;
-        // the session/run rows pin the exact version used. A snapshot whose
-        // agent vanished (deleted despite RESTRICT / cross-workspace drift)
-        // surfaces as the typed workflow_agent_missing, not a bare 404.
-        const agent = await loadAgentOwned(
-          db,
-          workspace.organizationId,
-          agentId,
-        ).catch((error) => {
-          if (isRuntimeApiError(error) && error.status === 404) {
-            throw errors.workflowAgentMissing();
-          }
-          throw error;
-        });
-        if (!agent.publishedVersionId) throw errors.agentNotPublished();
-        const ready = await requireReadyAgentVersion(deps, agent.publishedVersionId);
-
-        const result = await dispatchTriggerRun(deps, {
-          organizationId: workspace.organizationId,
-          workflow: { id: workflow.id, snapshot: config },
-          agent: ready,
-          origin: "chat",
+        deps.metrics.recordTrigger("manual", "received");
+        const triggerEvent: TriggerEvent = {
+          // No single agent backs a pipeline run — agents bind per step.
+          agentId: PIPELINE_TRIGGER_AGENT_ID,
+          workflowId: workflow.id,
           triggerType: "manual",
+          message: input.message ?? "",
+          data: input.data ?? {},
           principal: {
             workspaceId: workspace.organizationId,
             userId: workspace.userId,
             source: "manual",
           },
-          ingress: { message: input.message ?? "", data: input.data ?? {} },
-        });
+        };
+        let result;
+        try {
+          result = await startPipelineRun(pipelines, {
+            organizationId: workspace.organizationId,
+            workflow: { id: workflow.id, config },
+            triggerEvent,
+            origin: "chat",
+          });
+        } catch (error) {
+          deps.metrics.recordTrigger("manual", "failed");
+          throw error;
+        }
+        if (!result.started) throw runOverlapSkipped();
+        deps.metrics.recordTrigger("manual", "dispatched");
 
         set.status = 201;
-        return { session: sessionDto(result.session), run: runDto(result.run) };
+        return { run: runDto(result.run) };
       },
       { requireWorkspace: true },
     )
@@ -1286,6 +1402,8 @@ export function runtimePlugin(deps: RuntimeDeps) {
             .insert(schema.runs)
             .values({
               agentSessionId: session.id,
+              // Own workspace scope on every new run (pipelines redesign).
+              organizationId: workspace.organizationId,
               triggerEvent: triggerEvent as unknown as Record<string, unknown>,
               status: "queued",
             })
@@ -1316,7 +1434,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
               worker.address,
               hash,
               await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-              message,
+              { message },
             );
             eveSessionId = created.sessionId;
             await db
@@ -1376,6 +1494,10 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.runId,
         );
+        // A PIPELINE parent run has no session and never parks on input
+        // itself — its `waiting` mirrors a CHILD run's park, and the answer
+        // goes to the child run's id (run_steps.child_run_id names it).
+        if (!session) throw errors.noPendingInput();
         // Same 0.31 predicate as the follow-up route: an eve session id and a
         // non-terminal row. Gating on a continuation token would 409 every
         // HITL answer and park every gated run permanently.
@@ -1530,6 +1652,62 @@ export function runtimePlugin(deps: RuntimeDeps) {
           return { run: runDto(run) };
         }
 
+        // PIPELINE runs cancel through the interpreter, not the tailer: the
+        // decreed entry (cancelPipelineRun) asks the live driver to settle
+        // the run `canceled` at the next step boundary. False ⇒ no driver in
+        // this process (an orphan awaiting boot recovery) — CAS the row
+        // directly. Either way, any LIVE agent-step child run is canceled
+        // too (it has its own tail/session, and an eve turn must not outlive
+        // the user's Stop); a graceful shutdown deliberately never does this
+        // (stopAll interrupts without cancels so recovery can resume).
+        if (run.mode === "pipeline") {
+          const hadDriver = deps.pipelines
+            ? cancelPipelineRun(deps.pipelines, run.id)
+            : false;
+          const children = await db
+            .select({ childRunId: schema.runSteps.childRunId })
+            .from(schema.runSteps)
+            .where(
+              and(
+                eq(schema.runSteps.runId, run.id),
+                inArray(schema.runSteps.status, ["running", "waiting"]),
+              ),
+            );
+          for (const child of children) {
+            if (!child.childRunId) continue;
+            await cancelChildRun(
+              deps,
+              child.childRunId,
+              `parent pipeline run canceled: ${reason}`,
+            );
+          }
+          if (!hadDriver) {
+            await deps.runStore.markRun(run.id, {
+              status: "canceled",
+              error: reason,
+              completedAt: new Date(),
+            });
+            // No driver ⇒ nothing else settles the delivery obligation a
+            // slack-origin pipeline run was born owing (canceled runs owe no
+            // reply; deliver() no-ops for runs owing nothing).
+            await deps.delivery?.deliver({
+              runId: run.id,
+              status: "canceled",
+              lastAssistantMessage: null,
+            });
+            deps.bus.publish(run.id, {
+              kind: "status",
+              frame: { runId: run.id, status: "canceled", error: reason },
+            });
+          }
+          const updatedPipeline = await db
+            .select()
+            .from(schema.runs)
+            .where(eq(schema.runs.id, run.id))
+            .limit(1);
+          return { run: runDto(updatedPipeline[0] ?? run) };
+        }
+
         // A live tail (running run) is aborted and marked canceled by the
         // tailer (which owns the remote cancel); a parked (`waiting`) or
         // not-yet-tailed (`queued`) run has no live tail — mark it canceled
@@ -1562,8 +1740,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
           });
           // Best-effort: stop a turn eve may still be running for this
           // session so it cannot outlive the run row. Never boots the agent
-          // (see sessionControlTarget's `ensure: false`).
-          await cancelEveTurnBestEffort(deps, session);
+          // (see sessionControlTarget's `ensure: false`). Agent-mode runs
+          // always have a session; the null check is the LEFT-join type.
+          if (session) await cancelEveTurnBestEffort(deps, session);
         }
 
         const updated = await db

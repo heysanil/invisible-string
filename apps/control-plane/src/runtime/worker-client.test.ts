@@ -125,16 +125,40 @@ const HASH = "h".repeat(64);
 const JWT = "jwt-token";
 
 describe("createEveSession (0.31)", () => {
-  test("accepts the 202 body with no continuation token and sends ONLY {message}", async () => {
+  test("accepts the 202 body with no continuation token and sends the request VERBATIM", async () => {
     const { client, calls } = recordingClient(() =>
       Response.json({ ok: true, sessionId: "wrun_1", status: "accepted" }, { status: 202 }),
     );
-    const created = await client.createEveSession(WORKER, HASH, JWT, "hello");
+    const created = await client.createEveSession(WORKER, HASH, JWT, {
+      message: "hello",
+    });
     expect(created).toEqual({ sessionId: "wrun_1" });
     // A `continuationToken` key — at ANY value, since eve's guard is
-    // `key in body` — is a hard 400 on every session route.
+    // `key in body` — is a hard 400 on every session route; bodies are built
+    // only from the shared create contract.
     expect(calls[0]!.body).toEqual({ message: "hello" });
     expect(calls[0]!.url).toBe(`${WORKER}/agents/${HASH}/eve/v1/session`);
+  });
+
+  test("forwards task mode + outputSchema for a fresh agent-step child (spike finding 36)", async () => {
+    const { client, calls } = recordingClient(() =>
+      Response.json({ ok: true, sessionId: "wrun_t", status: "accepted" }, { status: 202 }),
+    );
+    const outputSchema = {
+      type: "object",
+      properties: { title: { type: "string" } },
+      required: ["title"],
+    };
+    await client.createEveSession(WORKER, HASH, JWT, {
+      message: "do the task",
+      mode: "task",
+      outputSchema,
+    });
+    expect(calls[0]!.body).toEqual({
+      message: "do the task",
+      mode: "task",
+      outputSchema,
+    });
   });
 
   test("falls back to the x-eve-session-id header when the body omits the id", async () => {
@@ -145,7 +169,9 @@ describe("createEveSession (0.31)", () => {
           headers: { "content-type": "application/json", "x-eve-session-id": "wrun_hdr" },
         }),
     );
-    expect(await client.createEveSession(WORKER, HASH, JWT, "hi")).toEqual({
+    expect(
+      await client.createEveSession(WORKER, HASH, JWT, { message: "hi" }),
+    ).toEqual({
       sessionId: "wrun_hdr",
     });
   });

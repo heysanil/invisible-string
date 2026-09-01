@@ -60,6 +60,9 @@ async function sessionRunFacts(
     .orderBy(asc(schema.runs.createdAt));
   const facts = new Map<string, SessionRunFacts>();
   for (const row of rows) {
+    // agentSessionId is nullable (pipeline runs carry no session) — the
+    // inArray filter above already excludes null rows in SQL; this narrows.
+    if (row.agentSessionId === null) continue;
     // Ascending createdAt → the last write per session wins (the latest run),
     // while the FIRST non-empty message is kept: that is the thread's opener,
     // and a message-less lead run (a schedule fires with none) must not lock

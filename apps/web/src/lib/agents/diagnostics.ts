@@ -162,6 +162,7 @@ function sectionFromCompileIssue(issue: WireIssue): AgentSection | null {
     case "UNRESOLVED_REFERENCE":
     case "TRIGGER_REF_NOT_ALLOWED":
     case "TRIGGER_REF_UNKNOWN_FIELD":
+    case "PIPELINE_REF_NOT_ALLOWED":
       return "persona";
     case "MODEL_MISMATCH":
       return "model";

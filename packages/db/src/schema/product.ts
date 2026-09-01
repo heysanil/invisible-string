@@ -13,8 +13,9 @@
  *   never be logged or put in model context.
  * - Agents are the compile unit: publishing an Agent snapshots its
  *   AgentDefinition into `agent_versions` and builds one artifact per content
- *   hash (`builds`). Workflows are standing delegations (trigger → agent →
- *   instructions) with no builds of their own.
+ *   hash (`builds`). Workflows are standing pipelines (trigger → steps; agents
+ *   participate as steps) with no builds of their own — the control plane
+ *   interprets them.
  * - `agent_sessions` are chat/eve sessions — distinct from Better Auth's
  *   `session` (login) table.
  */
@@ -127,6 +128,47 @@ export const runStatus = pgEnum("run_status", [
   "succeeded",
   "failed",
   "canceled",
+]);
+
+/**
+ * How a run executes (workflow-pipelines redesign): `agent` = one eve session
+ * turn (chat dispatch), `pipeline` = a control-plane-interpreted step pipeline
+ * with a `run_steps` ledger and no session of its own. Defaulted to `agent` so
+ * rows that predate the column read correctly.
+ */
+export const runMode = pgEnum("run_mode", ["agent", "pipeline"]);
+
+/**
+ * Step-instance lifecycle in the `run_steps` ledger. `waiting` = parked on a
+ * child run that is itself waiting (HITL input); `skipped` = a filter/branch
+ * decided against executing it — a terminal non-failure the run can still
+ * succeed through.
+ */
+export const runStepStatus = pgEnum("run_step_status", [
+  "pending",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+  "skipped",
+  "canceled",
+]);
+
+/**
+ * Pipeline step kinds. `script` is RESERVED: the enum ships the value day one
+ * because inserting mid-enum later is awkward, but the shared zod step union
+ * does not accept it yet — nothing writes it until the sandboxed script step
+ * lands (plan Phase 4/5).
+ */
+export const runStepKind = pgEnum("run_step_kind", [
+  "tool",
+  "infer",
+  "agent",
+  "for_each",
+  "branch",
+  "filter",
+  "state",
+  "script",
 ]);
 
 /**
@@ -474,13 +516,14 @@ export const builds = pgTable("builds", {
   updatedAt,
 });
 
-// ── Workflows: standing delegations (trigger → agent → instructions) ───────
+// ── Workflows: standing pipelines (trigger → steps) ────────────────────────
 
 /**
- * A workflow delegates trigger events to an agent with rendered instructions.
- * Publishing validates and snapshots `draft` → `published` — no compile/build
- * of its own (the agent's artifact does the work); dispatch reads only the
- * snapshot.
+ * A workflow is a pipeline the control plane interprets on each trigger event
+ * (workflow-pipelines redesign; supersedes the trigger → agent → instructions
+ * delegation model). Publishing validates and snapshots `draft` → `published`
+ * — no compile/build of its own (agent steps use the bound agent's artifact);
+ * dispatch reads only the snapshot.
  */
 export const workflows = pgTable(
   "workflows",
@@ -491,8 +534,8 @@ export const workflows = pgTable(
       .references(() => organization.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     /**
-     * Mutable draft WorkflowConfig JSON (trigger config, agent ref,
-     * instructions markdown with @refs). Schema is defined in packages/shared.
+     * Mutable draft WorkflowConfig JSON (`{version: 2, trigger, steps[], …}`;
+     * step markdown carries @refs). Schema is defined in packages/shared.
      */
     draft: jsonb("draft")
       .$type<Record<string, unknown>>()
@@ -507,10 +550,11 @@ export const workflows = pgTable(
     /** Kill switch: disabled workflows accept no trigger events. */
     enabled: boolean("enabled").default(true).notNull(),
     /**
-     * Denormalized from published.agentId so agent deletion is blocked
-     * (RESTRICT) while a published workflow still delegates to it. The binding
-     * floats: dispatch resolves the agent's CURRENT published version;
-     * sessions/runs pin the exact agent_version used.
+     * DEAD (pipelines redesign): agents bind per `agent` STEP now, so a single
+     * denormalized binding no longer models the workflow. Nothing writes it;
+     * kept (with its RESTRICT FK, inert on always-null rows) because
+     * migrations are additive. Its delete-protection role moved to the agent
+     * DELETE path, which scans published configs for step references and 409s.
      */
     publishedAgentId: uuid("published_agent_id").references(() => agents.id, {
       onDelete: "restrict",
@@ -635,9 +679,38 @@ export const runs = pgTable(
   "runs",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    agentSessionId: uuid("agent_session_id")
-      .notNull()
-      .references(() => agentSessions.id, { onDelete: "cascade" }),
+    /**
+     * The eve session this run rode (mode = 'agent'). NULL for pipeline runs:
+     * the control plane interprets those itself — no session exists, and any
+     * eve work happens in CHILD runs spawned by `agent` steps (linked back via
+     * run_steps.child_run_id). The pipelines redesign's ONE NOT NULL
+     * relaxation. ⚠️ Every `runs ⋈ agent_sessions` join must therefore be
+     * LEFT — an inner join silently drops pipeline runs (= cap bypass).
+     */
+    agentSessionId: uuid("agent_session_id").references(
+      () => agentSessions.id,
+      { onDelete: "cascade" },
+    ),
+    /**
+     * Workspace scoping, denormalized at dispatch. Historically derived by
+     * joining through agent_sessions; pipeline runs have no session, so the
+     * row carries its own org. Nullable only because the column is additive —
+     * every NEW run (both modes) sets it, and readers COALESCE through the
+     * session for pre-column rows.
+     */
+    organizationId: text("organization_id").references(() => organization.id, {
+      onDelete: "cascade",
+    }),
+    /**
+     * Workflow provenance for pipeline runs (agent runs keep theirs on
+     * agent_sessions.workflow_id). SET NULL on workflow deletion — the run
+     * record outlives the workflow that spawned it.
+     */
+    workflowId: uuid("workflow_id").references(() => workflows.id, {
+      onDelete: "set null",
+    }),
+    /** See runMode. Defaulted so pre-column rows read as agent runs. */
+    mode: runMode("mode").default("agent").notNull(),
     /**
      * Storage-only provenance: the normalized TriggerEvent envelope that
      * started this run (spec §8). Never sent to agents — dispatch renders it
@@ -666,7 +739,15 @@ export const runs = pgTable(
     createdAt,
     updatedAt,
   },
-  (table) => [index("runs_agent_session_id_idx").on(table.agentSessionId)],
+  (table) => [
+    index("runs_agent_session_id_idx").on(table.agentSessionId),
+    // Workspace cap + list scans for pipeline runs, which have no session row
+    // to reach organization scope through.
+    index("runs_organization_id_idx").on(table.organizationId),
+    // Workflow runs listing (GET …/workflows/:id/runs) and the SET NULL sweep
+    // on workflow deletion.
+    index("runs_workflow_id_idx").on(table.workflowId),
+  ],
 );
 
 /**
@@ -684,6 +765,105 @@ export const runEvents = pgTable(
     createdAt,
   },
   (table) => [primaryKey({ columns: [table.runId, table.seq] })],
+);
+
+// ── Pipelines: step ledger + durable workflow state ─────────────────────────
+
+/**
+ * Pipeline execution ledger — one row per step INSTANCE of a pipeline run (a
+ * step inside `for_each` yields one row per item). The unique (run_id, path)
+ * pair is the idempotent claim key crash recovery replays against: the driver
+ * claims an instance before executing, so a rebooted run resumes at the
+ * frontier instead of re-running finished steps. Terminal `output` snapshots
+ * are what scope rebuilding reads after a crash — which is why output is
+ * persisted (capped app-side) rather than recomputed. `agent` steps link the
+ * child run they spawned via child_run_id; the child rides the ordinary run
+ * machinery (tailer/SSE/reconcile) unchanged.
+ */
+export const runSteps = pgTable(
+  "run_steps",
+  {
+    /** `rs_<nanoid>`, generated app-side (packages/shared newId). */
+    id: text("id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "cascade" }),
+    /** Denormalized workspace scope, copied from the parent run at claim. */
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    /** The config step's stable `st_` id — survives slug renames. */
+    stepId: text("step_id").notNull(),
+    /** The step's slug as executed (renameable in config; snapshotted here). */
+    stepSlug: text("step_slug").notNull(),
+    /** Instance path, e.g. `st_loop/3/st_b` — one config step, many instances. */
+    path: text("path").notNull(),
+    /** Enclosing instance path (loop/branch bodies); null at top level. */
+    parentPath: text("parent_path"),
+    /** `for_each` item index for this instance; null outside loops. */
+    iteration: integer("iteration"),
+    kind: runStepKind("kind").notNull(),
+    status: runStepStatus("status").default("pending").notNull(),
+    /** 1-based; bumped per retry (visible in the run timeline). */
+    attempt: integer("attempt").default(1).notNull(),
+    /**
+     * Rendered input snapshot (refs resolved). The template resolver's scope
+     * is only {trigger, steps, state, item, now} — credentials are
+     * structurally unreachable, so this snapshot cannot contain secrets.
+     */
+    input: jsonb("input").$type<unknown>(),
+    /** Terminal output (capped app-side) — recovery's scope source of truth. */
+    output: jsonb("output").$type<Record<string, unknown>>(),
+    error: text("error"),
+    /**
+     * Stable machine classification (`tool_error`, `unreachable`,
+     * `validation_failed`, …). Open vocabulary — text, not an enum: executors
+     * mint classes and retry policy keys on them.
+     */
+    errorClass: text("error_class"),
+    childRunId: uuid("child_run_id").references(() => runs.id, {
+      onDelete: "set null",
+    }),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt,
+    updatedAt,
+  },
+  (table) => [
+    // The recovery claim key. Its leading column doubles as the run_id read
+    // index for ledger scans — no separate runs index needed.
+    uniqueIndex("run_steps_run_id_path_uidx").on(table.runId, table.path),
+  ],
+);
+
+/**
+ * Durable per-workflow key-value state — the substrate for cursors and dedupe
+ * ("everything since @state.cursor"). `state` steps write it at run
+ * completion boundaries (last write wins via the PK); reads are `@state.*`
+ * refs resolved into the run's scope snapshot. Caps are app-enforced (≤200
+ * keys/workflow, ≤64KB/value) — the DB stores whatever fits in jsonb.
+ * Operator cursor surgery rides GET/DELETE …/workflows/:id/state[/key].
+ */
+export const workflowState = pgTable(
+  "workflow_state",
+  {
+    workflowId: uuid("workflow_id")
+      .notNull()
+      .references(() => workflows.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    value: jsonb("value").$type<unknown>().notNull(),
+    /** Provenance: the run whose state write last touched this key. */
+    updatedByRunId: uuid("updated_by_run_id").references(() => runs.id, {
+      onDelete: "set null",
+    }),
+    /** Denormalized workspace scope. */
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    createdAt,
+    updatedAt,
+  },
+  (table) => [primaryKey({ columns: [table.workflowId, table.key] })],
 );
 
 // ── Trigger ingress: integrations + trigger bindings ────────────────────────

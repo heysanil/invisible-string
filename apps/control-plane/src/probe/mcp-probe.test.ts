@@ -20,7 +20,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 
 import { createGuardedFetch } from "../net/guarded-fetch";
-import { probeMcpServer } from "./mcp-probe";
+import {
+  probeMcpServer,
+  trimToolInputSchema,
+  MAX_INPUT_SCHEMA_DEPTH,
+} from "./mcp-probe";
 
 const guardedFetch = createGuardedFetch({ allowPrivate: true });
 
@@ -137,6 +141,15 @@ describe("probeMcpServer", () => {
       expect(
         tool.description.startsWith("Save a short note to the user's notebook."),
       ).toBe(true);
+      // The pipeline redesign: a TRIMMED inputSchema rides the cache entry so
+      // tool-step pre-flight and schema-aware arg forms can read it.
+      expect(tool.inputSchema).toBeDefined();
+      expect(tool.inputSchema!.type).toBe("object");
+      expect(tool.inputSchema!.required).toEqual(["note"]);
+      expect(tool.inputSchema!.properties?.note?.type).toBe("string");
+      expect(tool.inputSchema!.properties?.note?.description).toBe(
+        "The note text to save.",
+      );
     } finally {
       await fixture.close();
     }
@@ -210,6 +223,54 @@ describe("probeMcpServer", () => {
     expect(outcome.tools).toBeNull();
     expect(outcome.error).toBeTruthy();
   }, 15_000);
+
+  test("trimToolInputSchema keeps the subset, drops the rest", () => {
+    const trimmed = trimToolInputSchema({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      description: "Args.",
+      additionalProperties: false,
+      properties: {
+        note: { type: "string", pattern: "^.+$", format: "uri" },
+        tags: { type: "array", items: { type: "string" } },
+        kind: { type: "string", enum: ["a", "b", { nested: true }] },
+      },
+      required: ["note", 42],
+    });
+    expect(trimmed).toEqual({
+      type: "object",
+      description: "Args.",
+      required: ["note"], // non-string names dropped
+      properties: {
+        note: { type: "string" }, // pattern/format dropped
+        tags: { type: "array", items: { type: "string" } },
+        kind: { type: "string", enum: ["a", "b"] }, // non-primitive enum dropped
+      },
+    });
+  });
+
+  test("trimToolInputSchema caps nesting depth, keeping scalar keywords at the cap", () => {
+    // properties-nested chain one level deeper than the cap.
+    let node: Record<string, unknown> = { type: "string" };
+    for (let i = 0; i < MAX_INPUT_SCHEMA_DEPTH; i++) {
+      node = { type: "object", properties: { child: node } };
+    }
+    let trimmed = trimToolInputSchema(node);
+    for (let depth = 1; depth < MAX_INPUT_SCHEMA_DEPTH; depth++) {
+      expect(trimmed?.type).toBe("object");
+      trimmed = trimmed?.properties?.child;
+    }
+    // The node AT the cap keeps its type but its children are pruned.
+    expect(trimmed?.type).toBe("object");
+    expect(trimmed?.properties).toBeUndefined();
+  });
+
+  test("trimToolInputSchema yields undefined for non-objects and empty trims", () => {
+    expect(trimToolInputSchema(undefined)).toBeUndefined();
+    expect(trimToolInputSchema("string")).toBeUndefined();
+    expect(trimToolInputSchema([])).toBeUndefined();
+    expect(trimToolInputSchema({ pattern: "^x$" })).toBeUndefined();
+  });
 
   test("hung server → unreachable via the probe timeout", async () => {
     const fixture = await serveFixture(() => {

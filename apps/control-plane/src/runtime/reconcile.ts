@@ -4,9 +4,9 @@
  * cap slots, hanging their SSE streams on heartbeats, and never recording
  * eve's durably-completed turn).
  *
- * On startup, two sweeps:
+ * On startup, three sweeps:
  *
- * 1. INTERRUPTED RUNS — every queued/running run:
+ * 1. INTERRUPTED AGENT RUNS — every queued/running `mode: 'agent'` run:
  *    - session has an eve session AND its affinity worker is still live →
  *      restart the tail (tailRun is crash-safe: seq/startIndex derive from
  *      what is already persisted; the terminal gate handles a mid-turn
@@ -14,7 +14,13 @@
  *    - otherwise → mark the run failed with completedAt so the cap slot frees
  *      and any SSE follower terminates on the persisted status.
  *
- * 2. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
+ * 2. INTERRUPTED PIPELINE RUNS — `mode: 'pipeline'` runs (which have no
+ *    session or worker to re-tail) are re-driven from their `run_steps`
+ *    ledger instead: pipeline/recovery.ts adopts every queued/running/
+ *    waiting run whose per-run advisory lock is acquirable. Runs only when
+ *    the PipelineRunner is wired.
+ *
+ * 3. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
  *    `delivery_status` is still `pending`: succeeded ones (the process died
  *    between the terminal event and the Slack post) recover the final
  *    stop-message from persisted `run_events` and deliver late
@@ -26,6 +32,11 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
+import {
+  recoverPipelineRuns,
+  type PipelineRecoveryOutcome,
+} from "../pipeline/recovery";
+import type { PipelineRunner } from "../pipeline/runner";
 import type { DeliveryService } from "../runs/delivery";
 import { startTail, type RuntimeDeps } from "./routes";
 import { isWorkerLive, toSchedulableWorker } from "./scheduler";
@@ -33,11 +44,15 @@ import { isWorkerLive, toSchedulableWorker } from "./scheduler";
 export interface ReconcileOutcome {
   resumed: number;
   failed: number;
+  /** Pipeline-run sweep tally (zeros when no PipelineRunner is wired). */
+  pipelines: PipelineRecoveryOutcome;
   /** Stranded-delivery sweep tally (zeros when no DeliveryService is wired). */
   deliveries: { delivered: number; failed: number; skipped: number };
 }
 
 export interface ReconcileOptions {
+  /** Re-drives interrupted pipeline runs from their step ledgers. */
+  pipelines?: PipelineRunner;
   /** Settles terminal runs stuck with a pending outbound reply. */
   delivery?: DeliveryService;
   now?: Date;
@@ -68,11 +83,20 @@ export async function reconcileInterruptedRuns(
       schema.workers,
       eq(schema.agentSessions.affinityWorkerId, schema.workers.id),
     )
-    .where(and(inArray(schema.runs.status, ["queued", "running"])));
+    .where(
+      and(
+        inArray(schema.runs.status, ["queued", "running"]),
+        // Pipeline runs have no session/worker to resume from — sweep 2
+        // (recoverPipelineRuns) re-drives them; the inner session join above
+        // would exclude them anyway, but the filter keeps intent explicit.
+        eq(schema.runs.mode, "agent"),
+      ),
+    );
 
   const outcome: ReconcileOutcome = {
     resumed: 0,
     failed: 0,
+    pipelines: { resumed: 0, locked: 0, failed: 0 },
     deliveries: { delivered: 0, failed: 0, skipped: 0 },
   };
   for (const row of rows) {
@@ -106,6 +130,16 @@ export async function reconcileInterruptedRuns(
       });
       outcome.failed += 1;
     }
+  }
+
+  if (options.pipelines) {
+    // Before the delivery sweep on purpose: an unresumable pipeline run is
+    // marked failed here, and failOutright settles its own delivery ledger.
+    outcome.pipelines = await recoverPipelineRuns({
+      db: deps.db,
+      runner: options.pipelines,
+      logger: deps.logger,
+    });
   }
 
   if (options.delivery) {

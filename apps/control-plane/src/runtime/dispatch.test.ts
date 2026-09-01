@@ -1,9 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
-import { isModelAllowlisted, slackThreadKey } from "./dispatch";
+import {
+  isModelAllowlisted,
+  publishedPipelineConfigOf,
+  resolveEnabledPipeline,
+  slackThreadKey,
+} from "./dispatch";
 import { mapIngressBody, shouldStartNewSlackSession } from "../integrations/routes";
 import { isRuntimeApiError } from "./errors";
-import type { SlackInnerEvent, SlackTriggerBinding } from "@invisible-string/shared";
+import {
+  newStepId,
+  type SlackInnerEvent,
+  type SlackTriggerBinding,
+} from "@invisible-string/shared";
 
 describe("isModelAllowlisted (dispatch-time re-validation core)", () => {
   const allowlist = [
@@ -34,6 +43,60 @@ describe("slackThreadKey", () => {
   test("namespaces thread_ts by integration + channel", () => {
     expect(slackThreadKey("int-1", "C1", "1.0")).toBe("int-1:C1:1.0");
     expect(slackThreadKey("int-1", "C2", "1.0")).not.toBe(slackThreadKey("int-1", "C1", "1.0"));
+  });
+});
+
+describe("publishedPipelineConfigOf / resolveEnabledPipeline", () => {
+  const validPublished = {
+    version: 2,
+    trigger: { type: "webhook" },
+    steps: [
+      {
+        id: newStepId(),
+        slug: "reply",
+        kind: "agent",
+        agentId: null,
+        instructions: { markdown: "do it" },
+      },
+    ],
+  };
+  const workflowRow = (overrides: Record<string, unknown>) =>
+    ({
+      id: "wf-1",
+      organizationId: "org-1",
+      enabled: true,
+      published: validPublished,
+      ...overrides,
+    }) as never;
+
+  test("parses a published v2 snapshot (defaults applied)", () => {
+    const config = publishedPipelineConfigOf(workflowRow({}));
+    expect(config.version).toBe(2);
+    expect(config.overlap).toBe("skip"); // schema default
+    expect(config.steps).toHaveLength(1);
+  });
+
+  test("never-published and unparseable snapshots are BOTH workflow_not_published", () => {
+    for (const published of [null, { some: "pre-pipelines shape" }]) {
+      try {
+        publishedPipelineConfigOf(workflowRow({ published }));
+        throw new Error("expected a throw");
+      } catch (error) {
+        expect(isRuntimeApiError(error)).toBe(true);
+        if (isRuntimeApiError(error)) expect(error.code).toBe("workflow_not_published");
+      }
+    }
+  });
+
+  test("resolveEnabledPipeline checks the kill switch FIRST", () => {
+    try {
+      resolveEnabledPipeline(workflowRow({ enabled: false, published: null }));
+      throw new Error("expected a throw");
+    } catch (error) {
+      expect(isRuntimeApiError(error)).toBe(true);
+      if (isRuntimeApiError(error)) expect(error.code).toBe("trigger_disabled");
+    }
+    expect(resolveEnabledPipeline(workflowRow({})).version).toBe(2);
   });
 });
 

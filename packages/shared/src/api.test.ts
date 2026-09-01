@@ -10,14 +10,19 @@ import {
   connectionDtoSchema,
   createAgentRequestSchema,
   createConnectionRequestSchema,
+  connectionToolSchema,
   createSessionRequestSchema,
   createSkillRequestSchema,
   createWorkflowRequestSchema,
+  deleteWorkflowStateResponseSchema,
   deliveryStatusSchema,
   dryRunCompileResponseSchema,
+  getWorkflowStateResponseSchema,
   isRunStreamTerminalStatus,
   listModelCapabilitiesResponseSchema,
+  listRunStepsQuerySchema,
   listSessionsQuerySchema,
+  listWorkflowRunsQuerySchema,
   mcpAuthWriteSchema,
   modelCapabilityDtoSchema,
   modelIdShapeProblem,
@@ -34,10 +39,16 @@ import {
   SESSION_TITLE_MAX_CHARS,
   runDtoSchema,
   runInputRequestSchema,
+  runStepDetailDtoSchema,
+  runStepDtoSchema,
   runWorkflowRequestSchema,
   SESSION_BUSY_ERROR_CODE,
   SESSION_NOT_ACTIVE_ERROR_CODE,
   sessionContextControlResponseSchema,
+  testWorkflowStepRequestSchema,
+  testWorkflowStepResponseSchema,
+  WORKFLOW_SUMMARY_MAX_STEP_KINDS,
+  workflowSummaryDtoSchema,
   updateAgentRequestSchema,
   updateModelPresetRequestSchema,
   updateSkillRequestSchema,
@@ -120,9 +131,17 @@ const UUID = "3f2e2952-979d-456c-9c33-51f89124002a";
 const UUID_2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 const validDraft = {
+  version: 2,
   trigger: { type: "manual" },
-  agentId: UUID,
-  instructions: { markdown: "Do the thing." },
+  steps: [
+    {
+      id: "st_0000000000000001",
+      slug: "run",
+      kind: "agent",
+      agentId: UUID,
+      instructions: { markdown: "Do the thing." },
+    },
+  ],
 };
 
 describe("workflow CRUD schemas", () => {
@@ -177,6 +196,45 @@ describe("workflow CRUD schemas", () => {
         updatedAt: NOW,
       }).success,
     ).toBe(true);
+  });
+
+  test("summary DTO carries ordered stepKinds, capped for the list chip", () => {
+    const base = {
+      id: UUID,
+      name: "Ops bot",
+      triggerType: "schedule",
+      agentName: null,
+      enabled: true,
+      publishedAt: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    expect(
+      workflowSummaryDtoSchema.safeParse({
+        ...base,
+        stepKinds: ["tool", "for_each", "infer", "tool"],
+      }).success,
+    ).toBe(true);
+    // Empty is a real state (a fresh draft); open strings tolerate future kinds.
+    expect(
+      workflowSummaryDtoSchema.safeParse({ ...base, stepKinds: [] }).success,
+    ).toBe(true);
+    expect(
+      workflowSummaryDtoSchema.safeParse({ ...base, stepKinds: ["script"] })
+        .success,
+    ).toBe(true);
+    // The server truncates; more than the cap reaching a client is the bug.
+    expect(
+      workflowSummaryDtoSchema.safeParse({
+        ...base,
+        stepKinds: Array.from(
+          { length: WORKFLOW_SUMMARY_MAX_STEP_KINDS + 1 },
+          () => "tool",
+        ),
+      }).success,
+    ).toBe(false);
+    // Required — a list route that forgets it is a serializer bug.
+    expect(workflowSummaryDtoSchema.safeParse(base).success).toBe(false);
   });
 
   test("diagnostics carry path/message/severity", () => {
@@ -846,7 +904,9 @@ describe("stream helpers + dto parsing", () => {
   test("runDtoSchema parses a wire run payload (chat: no task message/delivery)", () => {
     const parsed = runDtoSchema.safeParse({
       id: UUID,
+      mode: "agent",
       agentSessionId: UUID_2,
+      workflowId: null,
       status: "waiting",
       triggerEvent: {
         agentId: UUID_2,
@@ -870,7 +930,9 @@ describe("stream helpers + dto parsing", () => {
   test("runDtoSchema parses a dispatched run (task message + slack delivery)", () => {
     const parsed = runDtoSchema.safeParse({
       id: UUID,
+      mode: "agent",
       agentSessionId: UUID_2,
+      workflowId: null,
       status: "succeeded",
       triggerEvent: {
         agentId: UUID_2,
@@ -889,6 +951,38 @@ describe("stream helpers + dto parsing", () => {
       createdAt: NOW,
     });
     expect(parsed.success).toBe(true);
+  });
+
+  test("runDtoSchema parses a pipeline run (no session, workflow provenance on the row)", () => {
+    const pipelineRun = {
+      id: UUID,
+      mode: "pipeline",
+      agentSessionId: null,
+      workflowId: UUID_2,
+      status: "running",
+      triggerEvent: {
+        agentId: UUID,
+        workflowId: UUID_2,
+        triggerType: "schedule",
+        message: "",
+        data: { firedAt: NOW },
+        principal: { workspaceId: "org_1", source: "schedule" },
+      },
+      taskMessage: null,
+      deliveryStatus: null,
+      eveRunId: null,
+      error: null,
+      startedAt: NOW,
+      completedAt: null,
+      createdAt: NOW,
+    };
+    expect(runDtoSchema.safeParse(pipelineRun).success).toBe(true);
+    // `mode` is required — a serializer that forgets it is a bug, not "agent".
+    const { mode: _mode, ...withoutMode } = pipelineRun;
+    expect(runDtoSchema.safeParse(withoutMode).success).toBe(false);
+    expect(
+      runDtoSchema.safeParse({ ...pipelineRun, mode: "script" }).success,
+    ).toBe(false);
   });
 
   test("dry-run compile response discriminates on ok", () => {
@@ -954,6 +1048,217 @@ describe("connection contracts", () => {
       createConnectionRequestSchema.safeParse({
         source: "registry",
         registryName: "app.linear/linear",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("cached tools may carry a trimmed inputSchema; old rows without one still parse", () => {
+    // Pre-widening cache entry — params only.
+    expect(
+      connectionToolSchema.safeParse({
+        name: "create_issue",
+        description: "Create a Linear issue",
+        params: ["title", "teamId"],
+      }).success,
+    ).toBe(true);
+    expect(
+      connectionToolSchema.safeParse({
+        name: "create_issue",
+        description: "Create a Linear issue",
+        params: ["title", "teamId"],
+        inputSchema: {
+          type: "object",
+          properties: { title: { type: "string" } },
+          required: ["title"],
+        },
+      }).success,
+    ).toBe(true);
+    // jsonb-object-shaped, not free scalars.
+    expect(
+      connectionToolSchema.safeParse({
+        name: "create_issue",
+        description: "",
+        params: [],
+        inputSchema: "object",
+      }).success,
+    ).toBe(false);
+  });
+});
+
+// ── Pipeline run surface ─────────────────────────────────────────────────────
+
+describe("run step ledger DTOs", () => {
+  const step = {
+    id: "rs_a1b2c3d4e5f6a7b8",
+    runId: UUID,
+    stepId: "st_0000000000000001",
+    slug: "search",
+    kind: "tool",
+    status: "succeeded",
+    path: "st_0000000000000001",
+    parentPath: null,
+    iteration: null,
+    attempt: 1,
+    errorClass: null,
+    error: null,
+    childRunId: null,
+    outputPreview: '{"result":{"messages":[]}}',
+    startedAt: NOW,
+    completedAt: NOW,
+    createdAt: NOW,
+  };
+
+  test("runStepDtoSchema parses top-level and loop-instance rows", () => {
+    expect(runStepDtoSchema.safeParse(step).success).toBe(true);
+    expect(
+      runStepDtoSchema.safeParse({
+        ...step,
+        id: "rs_ffffffffffffffff",
+        stepId: "st_0000000000000002",
+        slug: "summarize",
+        kind: "infer",
+        status: "failed",
+        path: "st_looploop00000000/3/st_0000000000000002",
+        parentPath: "st_looploop00000000/3",
+        iteration: 3,
+        attempt: 2,
+        errorClass: "validation_failed",
+        error: "output did not match the declared schema",
+        outputPreview: null,
+        completedAt: null,
+      }).success,
+    ).toBe(true);
+    // The ledger mirrors run_step pgEnums — not the run's own vocabulary.
+    expect(
+      runStepDtoSchema.safeParse({ ...step, status: "queued" }).success,
+    ).toBe(false);
+    expect(runStepDtoSchema.safeParse({ ...step, kind: "shell" }).success).toBe(
+      false,
+    );
+    // `script` is enum-reserved and must parse the day an executor ships.
+    expect(runStepDtoSchema.safeParse({ ...step, kind: "script" }).success).toBe(
+      true,
+    );
+  });
+
+  test("an agent step's row links its child run", () => {
+    expect(
+      runStepDtoSchema.safeParse({
+        ...step,
+        kind: "agent",
+        status: "waiting",
+        childRunId: UUID_2,
+        completedAt: null,
+      }).success,
+    ).toBe(true);
+  });
+
+  test("the ?full=1 detail shape adds capped input/output; previews stay valid rows", () => {
+    expect(runStepDetailDtoSchema.safeParse(step).success).toBe(true);
+    expect(
+      runStepDetailDtoSchema.safeParse({
+        ...step,
+        input: { query: "@team-exec" },
+        output: { result: { messages: [] }, text: null, isError: false },
+      }).success,
+    ).toBe(true);
+    expect(listRunStepsQuerySchema.safeParse({}).success).toBe(true);
+    expect(listRunStepsQuerySchema.safeParse({ full: "1" }).success).toBe(true);
+    expect(listRunStepsQuerySchema.safeParse({ full: "yes" }).success).toBe(false);
+  });
+});
+
+describe("workflow runs list query", () => {
+  test("status filters on the run vocabulary; limit coerces from the query string", () => {
+    expect(listWorkflowRunsQuerySchema.safeParse({}).success).toBe(true);
+    expect(
+      listWorkflowRunsQuerySchema.safeParse({ status: "failed", limit: "50" })
+        .success,
+    ).toBe(true);
+    expect(
+      listWorkflowRunsQuerySchema.safeParse({ status: "skipped" }).success,
+    ).toBe(false);
+    expect(listWorkflowRunsQuerySchema.safeParse({ limit: "0" }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe("workflow state DTOs", () => {
+  test("entries carry key/value/provenance; delete acks count keys", () => {
+    expect(
+      getWorkflowStateResponseSchema.safeParse({
+        entries: [
+          { key: "cursor", value: "1723525.0021", updatedByRunId: UUID, updatedAt: NOW },
+          { key: "seen", value: { ids: [1, 2] }, updatedByRunId: null, updatedAt: NOW },
+        ],
+      }).success,
+    ).toBe(true);
+    expect(
+      getWorkflowStateResponseSchema.safeParse({
+        entries: [{ key: "", value: 1, updatedByRunId: null, updatedAt: NOW }],
+      }).success,
+    ).toBe(false);
+    expect(
+      deleteWorkflowStateResponseSchema.safeParse({ deletedKeys: 0 }).success,
+    ).toBe(true);
+    expect(
+      deleteWorkflowStateResponseSchema.safeParse({ deletedKeys: -1 }).success,
+    ).toBe(false);
+  });
+});
+
+describe("per-step test route", () => {
+  test("request takes a partial scope (all members optional)", () => {
+    expect(testWorkflowStepRequestSchema.safeParse({}).success).toBe(true);
+    expect(
+      testWorkflowStepRequestSchema.safeParse({
+        scope: {
+          trigger: { text: "@team-exec ship it" },
+          steps: { search: { result: { messages: [] } } },
+          state: { cursor: "0" },
+          item: { text: "one message" },
+        },
+      }).success,
+    ).toBe(true);
+    // steps is slug → OUTPUT RECORD, mirroring PipelineScope.
+    expect(
+      testWorkflowStepRequestSchema.safeParse({
+        scope: { steps: { search: "not-a-record" } },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("response discriminates the executor outcome; failure is a 200 payload", () => {
+    expect(
+      testWorkflowStepResponseSchema.safeParse({
+        status: "succeeded",
+        input: { query: "@team-exec" },
+        output: { result: { messages: [] } },
+        durationMs: 412,
+      }).success,
+    ).toBe(true);
+    expect(
+      testWorkflowStepResponseSchema.safeParse({
+        status: "failed",
+        errorClass: "unreachable",
+        error: "dns lookup failed",
+        durationMs: 30_000,
+      }).success,
+    ).toBe(true);
+    // No `waiting` arm — neither testable kind (tool, infer) parks.
+    expect(
+      testWorkflowStepResponseSchema.safeParse({
+        status: "waiting",
+        childRunId: UUID,
+      }).success,
+    ).toBe(false);
+    expect(
+      testWorkflowStepResponseSchema.safeParse({
+        status: "failed",
+        errorClass: "",
+        error: "x",
+        durationMs: 1,
       }).success,
     ).toBe(false);
   });

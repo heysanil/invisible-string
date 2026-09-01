@@ -22,7 +22,7 @@ const SYSTEM = [
   '- id=22222222-2222-4222-8222-222222222222 name="notes archive" ref=@notes-archive',
   "Skills:",
   '- id=33333333-3333-4333-8333-333333333333 name="Triage Guide" ref=@skill.triage-guide',
-  "## Workspace agents (select with setAgent by id)",
+  "## Workspace agents (for agent steps)",
   '- id=44444444-4444-4444-8444-444444444444 name="General Purpose" published context=[(none)]',
 ].join("\n");
 
@@ -102,12 +102,14 @@ describe("createKeyedScriptedTransport", () => {
           {
             toolCalls: [
               {
-                toolName: "setAgent",
+                // The transport is tool-agnostic — any tool name rides; the
+                // placeholder machinery is what is under test here.
+                toolName: "addStep",
                 input: { agentId: "{{agentId:General Purpose}}" },
               },
               {
                 // Unresolvable names stay as-is so validation fails loudly.
-                toolName: "setAgent",
+                toolName: "addStep",
                 input: { agentId: "{{agentId:No Such Agent}}" },
               },
             ],

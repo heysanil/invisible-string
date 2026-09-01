@@ -93,6 +93,27 @@ export async function addCustomConnection(
 }
 
 /**
+ * Wait (on /context, via a reload poll) until the named connection's card
+ * shows the green "Healthy" dot — i.e. the fire-and-forget after-create probe
+ * has landed and cached the server's `tools/list`. Pipeline TOOL steps (and
+ * the copilot's tool-catalog read tools) key off that cache, so specs that
+ * drive either wait here first. The probe persists out-of-band server-side;
+ * the SPA has no push channel for it, hence the reload.
+ */
+export async function waitForConnectionHealthy(
+  page: Page,
+  connectionName: string,
+): Promise<void> {
+  await gotoSection(page, "Context");
+  const card = page.getByRole("button", { name: `${connectionName} details` });
+  await expect(async () => {
+    await page.reload();
+    await expect(card).toBeVisible({ timeout: 4_000 });
+    await expect(card.getByTitle("Healthy")).toBeVisible({ timeout: 4_000 });
+  }).toPass({ timeout: 60_000 });
+}
+
+/**
  * Install the stub registry server through the add-connection dialog's
  * community-search lane. The search is served by the control plane's
  * Meilisearch mirror (fed by the sync ETL from the stubbed registry, awaited

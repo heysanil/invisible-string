@@ -49,6 +49,21 @@ import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { createGuardedFetch } from "./net/guarded-fetch";
 import type { OauthBrokerDeps } from "./oauth/broker";
+import {
+  createPipelineRunner,
+  loadPipelineRunnerConfig,
+  type PipelineRunner,
+  type StepExecutorRegistry,
+} from "./pipeline/runner";
+import { pipelinePlugin, type PipelineRouteDeps } from "./pipeline/routes";
+import {
+  createDrizzleRunStepStore,
+  createDrizzleWorkflowStateStore,
+} from "./pipeline/step-store";
+import type { PipelineExecutorDeps } from "./pipeline/types";
+import { executeAgentStep } from "./pipeline/steps/agent";
+import { executeInferStep } from "./pipeline/steps/infer";
+import { executeToolStep } from "./pipeline/steps/tool";
 import { probeAndPersist } from "./probe/service";
 import { resourcesPlugin } from "./resources/plugin";
 import {
@@ -114,6 +129,12 @@ export interface AppStack {
   logger: Logger;
   /** Present when the runtime API is configured (see runtime/config.ts). */
   runtime: RuntimeDeps | null;
+  /**
+   * Pipeline interpreter (workflow-pipelines redesign) — present with the
+   * runtime. Also carried on `runtime` as `pipelines` (the RuntimeDeps
+   * intersection below) so dispatch/routes reach it through the deps graph.
+   */
+  pipelines: PipelineRunner | null;
   /** Present when the runtime API is configured (triggers/integrations). */
   integrations: IntegrationDeps | null;
   /**
@@ -157,6 +178,8 @@ export function buildApp(opts: {
   workspaceDeps: WorkspaceDeps;
   resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
+  /** Pipeline run/step/state/test routes — mounted beside the runtime API. */
+  pipelineDeps?: PipelineRouteDeps | null;
   integrationDeps?: IntegrationDeps | null;
   /** Copilot WS deps — the `/copilot` socket mounts when present. */
   copilotDeps?: CopilotDeps | null;
@@ -204,6 +227,9 @@ export function buildApp(opts: {
     .use(resourcesPlugin(resourceDeps));
   if (opts.runtimeDeps) {
     app.use(runtimePlugin(opts.runtimeDeps));
+  }
+  if (opts.pipelineDeps) {
+    app.use(pipelinePlugin(opts.pipelineDeps));
   }
   if (opts.integrationDeps) {
     app.use(integrationsPlugin(opts.integrationDeps));
@@ -437,14 +463,18 @@ export function createAppStack(
     },
   });
   const workspaceDeps = createWorkspaceDeps(auth, dbHandle.db);
-  const runtimeDeps = createRuntimeDeps({
-    env,
-    config,
-    db: dbHandle.db,
-    workspaceDeps,
-    logger,
-    overrides: runtimeOverrides,
-  });
+  // Intersection type so the pipeline runner can be late-bound below the
+  // same way `oauthTokens` is (RuntimeDeps is assignable to it; consumers of
+  // the field read it off the runtime graph).
+  const runtimeDeps: (RuntimeDeps & { pipelines?: PipelineRunner }) | null =
+    createRuntimeDeps({
+      env,
+      config,
+      db: dbHandle.db,
+      workspaceDeps,
+      logger,
+      overrides: runtimeOverrides,
+    });
   runtimeSlot.current = runtimeDeps;
   // Meilisearch registry-search mirror: constructed only when BOTH vars are
   // configured, and NEVER fatal — an unreachable Meilisearch degrades registry
@@ -505,6 +535,68 @@ export function createAppStack(
   // egress policy, one master key. Late-bound onto the runtime deps because
   // the broker assembles after createRuntimeDeps has returned.
   if (runtimeDeps) runtimeDeps.oauthTokens = oauthBroker;
+  // Pipeline interpreter (workflow-pipelines redesign): constructed beside
+  // the broker because tool steps ride the SAME guarded egress fetch and
+  // token lifecycle. Late-bound onto the runtime deps like `oauthTokens` so
+  // dispatch, the schedule ticker and the pipeline routes all reach it
+  // through the one deps graph.
+  let pipelineRunner: PipelineRunner | null = null;
+  let pipelineRouteDeps: PipelineRouteDeps | null = null;
+  if (runtimeDeps) {
+    // Executor registry for tool/infer/agent steps (pipeline/steps/*). The
+    // object is shared BY REFERENCE with the runner, so kinds registered
+    // after construction are picked up; a kind with no registered executor
+    // fails its step `executor_unavailable` rather than crashing the run.
+    // The `agent` executor reaches the dispatch machinery through the
+    // `runtimeDeps` handed to executorDeps below.
+    const stepExecutors: StepExecutorRegistry = {
+      tool: executeToolStep,
+      infer: executeInferStep,
+      agent: executeAgentStep,
+    };
+    // One executor dependency graph, shared between the runner and the
+    // pipeline routes' per-step test (both execute the same executors, so
+    // they must see the same egress fetch / oauth broker / provider keys).
+    const pipelineExecutorDeps: PipelineExecutorDeps = {
+      db: dbHandle.db,
+      logger,
+      masterKey: config.encryptionMasterKey,
+      fetchImpl: mcpEgressFetch,
+      oauthTokens: oauthBroker,
+      providerKeys: {
+        ...(runtimeDeps.runtime.openrouterApiKey
+          ? { openrouterApiKey: runtimeDeps.runtime.openrouterApiKey }
+          : {}),
+        ...(runtimeDeps.runtime.anthropicApiKey
+          ? { anthropicApiKey: runtimeDeps.runtime.anthropicApiKey }
+          : {}),
+        ...(runtimeDeps.runtime.openrouterBaseUrl
+          ? { openrouterBaseUrl: runtimeDeps.runtime.openrouterBaseUrl }
+          : {}),
+      },
+      runtimeDeps,
+    };
+    pipelineRunner = createPipelineRunner({
+      db: dbHandle.db,
+      runStore: runtimeDeps.runStore,
+      stepStore: createDrizzleRunStepStore(dbHandle.db),
+      stateStore: createDrizzleWorkflowStateStore(dbHandle.db),
+      bus: runtimeDeps.bus,
+      logger,
+      executors: stepExecutors,
+      executorDeps: pipelineExecutorDeps,
+      config: loadPipelineRunnerConfig(env),
+      workspaceRunCap: runtimeDeps.runtime.maxConcurrentRunsPerWorkspace,
+      ...(runtimeDeps.delivery ? { delivery: runtimeDeps.delivery } : {}),
+    });
+    runtimeDeps.pipelines = pipelineRunner;
+    pipelineRouteDeps = {
+      db: dbHandle.db,
+      workspaceDeps,
+      logger,
+      executorDeps: pipelineExecutorDeps,
+    };
+  }
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,
@@ -595,6 +687,7 @@ export function createAppStack(
     workspaceDeps,
     resourceDeps,
     runtimeDeps,
+    pipelineDeps: pipelineRouteDeps,
     integrationDeps,
     copilotDeps,
     health,
@@ -607,9 +700,13 @@ export function createAppStack(
     dbHandle,
     logger,
     runtime: runtimeDeps,
+    pipelines: pipelineRunner,
     integrations: integrationDeps,
     meili,
     close: async () => {
+      // Interrupt pipeline drivers WITHOUT terminal writes (their runs are
+      // re-adopted by the next boot's recovery), then drain the tailers.
+      await pipelineRunner?.stopAll();
       await runtimeDeps?.tailers.stopAll();
       await dbHandle.close();
     },
@@ -659,23 +756,27 @@ if (import.meta.main) {
   let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
-    // they hold cap slots and hang SSE streams forever otherwise. The
+    // they hold cap slots and hang SSE streams forever otherwise. Pipeline
+    // runs are re-driven from their step ledgers (pipeline/recovery.ts). The
     // delivery sweep settles TERMINAL runs stranded with a pending Slack
     // reply: succeeded ones deliver late (at-least-once), failed/canceled
     // ones settle the ledger (see runs/delivery.ts).
     void reconcileInterruptedRuns(stack.runtime, {
       delivery: stack.runtime.delivery,
+      ...(stack.pipelines ? { pipelines: stack.pipelines } : {}),
     })
-      .then(({ resumed, failed, deliveries }) => {
+      .then(({ resumed, failed, pipelines, deliveries }) => {
         if (
           resumed > 0 ||
           failed > 0 ||
+          pipelines.resumed > 0 ||
+          pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
-            fields: { resumed, failed, deliveries },
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            fields: { resumed, failed, pipelines, deliveries },
           });
         }
       })

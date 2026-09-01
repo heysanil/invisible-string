@@ -39,7 +39,14 @@ export async function lockWorkspaceRunCap(
   );
 }
 
-/** Count the workspace's active runs (join through agent_sessions ownership). */
+/**
+ * Count the workspace's active runs. The join is LEFT on purpose (pipelines
+ * redesign join audit): pipeline runs have NO agent session — an inner join
+ * silently drops every one of them, which is a workspace-cap bypass.
+ * Workspace scope resolves as COALESCE(runs.organization_id,
+ * agent_sessions.organization_id) — new rows of BOTH modes carry their own
+ * org, pre-column agent runs fall back to the session's.
+ */
 export async function countActiveRuns(
   db: DbClient,
   organizationId: string,
@@ -47,13 +54,13 @@ export async function countActiveRuns(
   const rows = await db
     .select({ value: count() })
     .from(schema.runs)
-    .innerJoin(
+    .leftJoin(
       schema.agentSessions,
       eq(schema.runs.agentSessionId, schema.agentSessions.id),
     )
     .where(
       and(
-        eq(schema.agentSessions.organizationId, organizationId),
+        sql`coalesce(${schema.runs.organizationId}, ${schema.agentSessions.organizationId}) = ${organizationId}`,
         inArray(schema.runs.status, [...ACTIVE_RUN_STATUSES]),
       ),
     );

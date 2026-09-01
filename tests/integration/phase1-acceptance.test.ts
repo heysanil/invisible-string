@@ -19,13 +19,17 @@
  *   → republish with a changed persona → a NEW chat session pins the new
  *     version hash, the OLD session stays pinned to the old one.
  *
- * The workflow leg (delegation, NO build):
- *   create a workflow (webhook trigger → that agent + instructions carrying
- *   `@trigger.<path>` and an `@connection` ref) → publish returns `{workflow}`
- *   instantly (no contentHash, zero new `builds` rows) → POST /t/:token →
- *   the run's persisted task message carries the `<workflow-task>` wrapper
- *   with the trigger value RESOLVED and the connection ref rewritten to a
- *   prose literal → events flow over the normal run SSE surface.
+ * The workflow leg (a PIPELINE the control plane interprets, NO build):
+ *   create a v2 workflow (webhook trigger → one `agent` step whose
+ *   instructions carry `@trigger.<path>` and an `@connection` ref) → publish
+ *   returns `{workflow}` instantly (no contentHash, zero new `builds` rows,
+ *   `published_agent_id` stays NULL — agents bind per step now) →
+ *   POST /t/:token acks `{accepted, runId}` (no session — the parent run is
+ *   `mode: 'pipeline'`) → the interpreter claims a `run_steps` ledger row for
+ *   the agent step and dispatches a CHILD `mode: 'agent'` run whose persisted
+ *   task message is the step's instructions RENDERED (trigger value resolved,
+ *   connection ref rewritten to a prose literal) → `pipeline.*` events land in
+ *   the parent's run_events and flow over the normal run SSE surface.
  *
  * Plus the onboarding kick: creating the workspace auto-publishes the seeded
  * "General Purpose" agent in the background (design §5.8) — asserted (and
@@ -55,6 +59,7 @@ import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   newId,
+  newStepId,
   parseMasterKey,
   generateMasterKeyBase64,
   type AgentDefinitionInput,
@@ -66,7 +71,6 @@ import {
   type PublishWorkflowResponse,
   type RunEventFrame,
   type RunStatusFrame,
-  type TriggerIngressResponse,
   type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
@@ -360,6 +364,7 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
   let firstRunSeqs: number[] = [];
 
   let workflowId: string;
+  let agentStepId: string;
 
   async function api(
     method: string,
@@ -802,17 +807,27 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
     20 * 60_000,
   );
 
-  // ── the workflow leg: delegation with NO build ─────────────────────────────
+  // ── the workflow leg: an interpreted pipeline with NO build ────────────────
 
-  test("create workflow (webhook trigger → agent + @referenced instructions) → publish instantly with NO build", async () => {
+  test("create v2 workflow (webhook trigger → one agent step with @referenced instructions) → publish instantly with NO build", async () => {
+    agentStepId = newStepId();
     const draft: WorkflowConfigInput = {
+      version: 2,
       trigger: { type: "webhook" },
-      agentId,
-      instructions: {
-        markdown:
-          "Handle the incoming event for the customer at @trigger.customer.email. " +
-          "Use @notes to store anything important, then do exactly what the trigger context asks.",
-      },
+      steps: [
+        {
+          id: agentStepId,
+          slug: "handle",
+          kind: "agent",
+          agentId,
+          session: "fresh",
+          instructions: {
+            markdown:
+              "Handle the incoming event for the customer at @trigger.customer.email. " +
+              "Use @notes to store anything important, then do exactly what this asks: @trigger.message",
+          },
+        },
+      ],
     };
     const created = await api("POST", `/workspaces/${orgId}/workflows`, {
       body: { name: "P1 Webhook Delegation", draft },
@@ -842,16 +857,18 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
     const versionsAfter = await db.select({ value: count() }).from(schema.agentVersions);
     expect(versionsAfter[0]!.value).toBe(versionsBefore[0]!.value);
 
-    // The snapshot is denormalized for the delete guard.
+    // Pipelines bind agents per STEP: nothing writes the dead denormalized
+    // column anymore (its delete-guard role moved to a published-config scan
+    // on the agent DELETE path).
     const rows = await db
       .select({ publishedAgentId: schema.workflows.publishedAgentId })
       .from(schema.workflows)
       .where(eq(schema.workflows.id, workflowId));
-    expect(rows[0]!.publishedAgentId).toBe(agentId);
+    expect(rows[0]!.publishedAgentId).toBeNull();
   });
 
   test(
-    "POST /t/:token → dispatch renders the task message (resolved @trigger value, <workflow-task> wrapper) → events flow to SSE",
+    "POST /t/:token → pipeline run interprets the agent step (rendered instructions on the CHILD run) → pipeline.* events flow to SSE",
     async () => {
       const mint = await api(
         "POST",
@@ -869,37 +886,68 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
         }),
       });
       expect(res.status).toBe(202);
-      const body = (await res.json()) as TriggerIngressResponse;
+      // Pipeline runs have no session — the ack is `{accepted, runId}` alone.
+      const body = (await res.json()) as { accepted: boolean; runId: string };
       expect(body.accepted).toBeTrue();
+      expect("sessionId" in body).toBeFalse();
 
-      await awaitRunSucceeded(body.runId, "webhook-dispatched run");
+      await awaitRunSucceeded(body.runId, "webhook-dispatched pipeline run");
 
-      // The persisted task message IS what the agent received: instructions
-      // with @trigger.customer.email RESOLVED and @notes rewritten to a prose
-      // literal, wrapped in <workflow-task>, with the ingress message riding
-      // in <trigger-context>. The TriggerEvent envelope never crossed the wire.
-      const runs = await db
-        .select({ taskMessage: schema.runs.taskMessage, triggerEvent: schema.runs.triggerEvent })
+      // The PARENT run is the interpreted pipeline: sessionless, no single
+      // task message, workflow provenance carried on the row itself.
+      const parents = await db
+        .select()
         .from(schema.runs)
         .where(eq(schema.runs.id, body.runId));
-      const taskMessage = runs[0]!.taskMessage;
+      expect(parents[0]).toMatchObject({
+        mode: "pipeline",
+        agentSessionId: null,
+        taskMessage: null,
+        workflowId,
+        organizationId: orgId,
+      });
+      expect((parents[0]!.triggerEvent as { workflowId?: string }).workflowId).toBe(workflowId);
+
+      // The run_steps ledger holds the agent step's instance, linked to the
+      // CHILD run the step dispatched.
+      const steps = await db
+        .select()
+        .from(schema.runSteps)
+        .where(eq(schema.runSteps.runId, body.runId));
+      expect(steps).toHaveLength(1);
+      expect(steps[0]).toMatchObject({
+        stepId: agentStepId,
+        stepSlug: "handle",
+        kind: "agent",
+        status: "succeeded",
+        path: agentStepId,
+      });
+      const childRunId = steps[0]!.childRunId;
+      expect(childRunId).not.toBeNull();
+
+      // The CHILD run's persisted task message IS what the agent received:
+      // the step's instructions with @trigger.customer.email RESOLVED and
+      // @notes rewritten to a prose literal. The TriggerEvent envelope never
+      // crossed the wire.
+      const children = await db
+        .select()
+        .from(schema.runs)
+        .where(eq(schema.runs.id, childRunId!));
+      expect(children[0]!.mode).toBe("agent");
+      expect(children[0]!.workflowId).toBe(workflowId);
+      const taskMessage = children[0]!.taskMessage;
       expect(taskMessage).not.toBeNull();
-      expect(taskMessage!).toContain("<workflow-task>");
-      expect(taskMessage!).toContain("</workflow-task>");
       expect(taskMessage!).toContain("ada@example.com"); // resolved @trigger value
       expect(taskMessage!).not.toContain("@trigger.customer.email"); // ref rewritten
       expect(taskMessage!).toContain('the "notes" connection'); // @connection → prose
-      expect(taskMessage!).toContain("<trigger-context>");
       expect(taskMessage!).toContain("Reply with exactly: acceptance-webhook");
-      // Provenance envelope on the run (storage-only).
-      expect((runs[0]!.triggerEvent as { workflowId?: string }).workflowId).toBe(workflowId);
 
-      // The session carries workflow provenance + pins the agent's CURRENT
-      // published version (floating binding resolved at dispatch).
+      // The child's session carries workflow provenance + pins the agent's
+      // CURRENT published version (floating binding resolved at dispatch).
       const sessions = await db
         .select()
         .from(schema.agentSessions)
-        .where(eq(schema.agentSessions.id, body.sessionId));
+        .where(eq(schema.agentSessions.id, children[0]!.agentSessionId!));
       expect(sessions[0]).toMatchObject({
         agentId,
         agentVersionId: versionIdV2,
@@ -907,26 +955,30 @@ describe.skipIf(!GATE)("phase 1 acceptance — compiler→build→run spine (age
         origin: "webhook",
       });
 
-      // The mock reply proves a full model turn ran against the task message…
+      // The mock reply proves a full model turn ran against the instructions…
       const events = await db
         .select({ event: schema.runEvents.event })
         .from(schema.runEvents)
-        .where(eq(schema.runEvents.runId, body.runId));
+        .where(eq(schema.runEvents.runId, childRunId!));
       const completed = events
         .map((e) => e.event as { type: string; data?: { message?: string | null } })
         .filter((e) => e.type === "message.completed")
         .map((e) => e.data?.message ?? "");
       expect(completed.some((m) => m.includes("acceptance-webhook"))).toBeTrue();
 
-      // …and the run streams over the SAME resumable SSE surface as chat.
+      // …and the PARENT streams its pipeline.* step lifecycle over the SAME
+      // resumable SSE surface as chat runs.
       const frames = await readSse(await api("GET", `/runs/${body.runId}/stream`), {
         until: (frame) => frame.event === "run_status",
       });
       const streamedTypes = frames
         .filter((f) => f.event === "run_event")
         .map((f) => (f.data as RunEventFrame).event.type);
-      expect(streamedTypes).toContain("turn.started");
-      expect(streamedTypes).toContain("message.completed");
+      expect(streamedTypes[0]).toBe("pipeline.started");
+      expect(streamedTypes).toContain("pipeline.step.started");
+      expect(streamedTypes).toContain("pipeline.step.waiting"); // parked on the child
+      expect(streamedTypes).toContain("pipeline.step.completed");
+      expect(streamedTypes).toContain("pipeline.completed");
       expect((frames.at(-1)!.data as RunStatusFrame).status).toBe("succeeded");
     },
     5 * 60_000,

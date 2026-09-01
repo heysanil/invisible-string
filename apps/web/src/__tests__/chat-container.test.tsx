@@ -155,7 +155,9 @@ function sessionResponse(status: RunStatus, title: string | null = null) {
     runs: [
       {
         id: RUN_ID,
+        mode: "agent",
         agentSessionId: SESSION_ID,
+        workflowId: null,
         status,
         triggerEvent: {
           agentId: AGENT_ID,

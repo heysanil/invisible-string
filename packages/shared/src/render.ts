@@ -1,13 +1,15 @@
 /**
- * Dispatch-time rendering: workflow instructions + trigger event → the task
- * message. `renderTaskMessage` produces the EXACT string the control plane
- * sends to the agent's eve session (create, then ID-addressed follow-ups)
- * and persists on `runs.task_message` — agents never see the TriggerEvent
- * envelope itself (trigger-event.ts is storage/provenance only). Shared so
- * the SPA can preview a rendered task message without a round-trip.
+ * Task-message rendering against ONE trigger event. Since the pipeline
+ * redesign, workflow dispatch renders per-step markdown through
+ * pipeline-template.ts (`renderMarkdownTemplate`, full run scope) — this
+ * module keeps the value helpers that rendering reuses
+ * ({@link formatTriggerValue}, {@link resolveTriggerPath}) and
+ * {@link renderTaskMessage}, the trigger-only task-block renderer the agent
+ * step's dispatcher wraps its rendered instructions with.
  *
- * Reference semantics (the dispatch half of the `@reference` contract; the
- * compile half — personas — lives in packages/compiler):
+ * Reference semantics (trigger-only — pipeline heads `@steps` / `@state` /
+ * `@item` / `@now` are left VERBATIM here; render those surfaces through
+ * pipeline-template.ts instead):
  * - `@trigger.<path>` → the value at that dot path in `event.data`,
  *   formatted per {@link formatTriggerValue} ("(not provided)" when missing).
  * - `@<connection>` / `@skill.<slug>` → prose literals (`the "<slug>"
@@ -83,16 +85,21 @@ export function renderTaskMessage(
 ): string {
   const refs = parseReferences(instructionsMarkdown);
 
-  // Rewrite from the end so earlier spans stay valid.
+  // Rewrite from the end so earlier spans stay valid. Pipeline-only heads
+  // (@steps/@state/@item/@now) have no meaning against a lone trigger event
+  // and stay verbatim — pipeline-template.ts owns those surfaces.
   let resolved = instructionsMarkdown;
   const referencedPaths: string[] = [];
   for (const ref of [...refs].reverse()) {
-    const replacement =
-      ref.kind === "trigger"
-        ? formatTriggerValue(resolveTriggerPath(event.data, ref.path))
-        : ref.kind === "skill"
-          ? `the "${ref.slug}" skill`
-          : `the "${ref.name}" connection`;
+    let replacement: string | null = null;
+    if (ref.kind === "trigger") {
+      replacement = formatTriggerValue(resolveTriggerPath(event.data, ref.path));
+    } else if (ref.kind === "skill") {
+      replacement = `the "${ref.slug}" skill`;
+    } else if (ref.kind === "connection") {
+      replacement = `the "${ref.name}" connection`;
+    }
+    if (replacement === null) continue;
     resolved =
       resolved.slice(0, ref.start) + replacement + resolved.slice(ref.end);
   }

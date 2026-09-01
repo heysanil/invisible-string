@@ -7,6 +7,7 @@
 
 import {
   reasoningEffortSchema,
+  type CopilotSurface,
   type ReasoningEffort,
 } from "@invisible-string/shared";
 
@@ -44,8 +45,15 @@ export interface CopilotConfig {
   maxSessionsPerWorkspace: number;
   /** Per-turn model OUTPUT token budget (COPILOT_MAX_OUTPUT_TOKENS, default 8192). */
   maxOutputTokensPerTurn: number;
-  /** Per-turn model round-trip cap — bounds runaway tool loops (default 12). */
-  maxStepsPerTurn: number;
+  /**
+   * Per-turn model round-trip cap PER SURFACE — bounds runaway tool loops.
+   * The workflow surface gets more headroom (default 24 vs the agent
+   * editor's 12): building a pipeline legitimately spends round-trips on the
+   * read tools (searchConnectionTools/getConnectionTool) BEFORE any proposal,
+   * and steps are proposed one per call in execution order. COPILOT_MAX_STEPS,
+   * when set, overrides BOTH surfaces with one value.
+   */
+  maxStepsPerTurn: Record<CopilotSurface, number>;
   /**
    * Rolling per-workspace spend window (COPILOT_BUDGET_WINDOW_MS, default 1h).
    * The per-turn caps above bound a single turn; these bound the AGGREGATE a
@@ -103,7 +111,10 @@ export function loadCopilotConfig(
     reasoningEffort: reasoningEffort(env.COPILOT_REASONING_EFFORT),
     maxSessionsPerWorkspace: positiveInt(env.COPILOT_MAX_SESSIONS, 2),
     maxOutputTokensPerTurn: positiveInt(env.COPILOT_MAX_OUTPUT_TOKENS, 8_192),
-    maxStepsPerTurn: positiveInt(env.COPILOT_MAX_STEPS, 12),
+    maxStepsPerTurn: {
+      workflow: positiveInt(env.COPILOT_MAX_STEPS, 24),
+      agent: positiveInt(env.COPILOT_MAX_STEPS, 12),
+    },
     budgetWindowMs: positiveInt(env.COPILOT_BUDGET_WINDOW_MS, 3_600_000),
     maxTurnsPerWindow: positiveInt(env.COPILOT_MAX_TURNS_PER_WINDOW, 60),
     maxTokensPerWindow: positiveInt(env.COPILOT_MAX_TOKENS_PER_WINDOW, 400_000),

@@ -8,11 +8,13 @@
  * service). Lifecycle verbs (publish, build status, dry-run-compile,
  * sessions) live in runtime/routes.ts.
  */
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   createAgentRequestSchema,
+  parseWorkflowConfig,
   updateAgentRequestSchema,
+  walkSteps,
   type AgentDto,
   type AgentSummaryDto,
   type DeleteResourceResponse,
@@ -245,9 +247,13 @@ export async function updateAgent(
 
 /**
  * Everything that still depends on this agent — the DELETE guard. Workflows
- * count when their published snapshot points at the agent (denormalized
- * `published_agent_id`) OR their draft names it; sessions count always
- * (deleting the agent would cascade away whole conversations + run history).
+ * count when their PUBLISHED pipeline snapshot contains an `agent` step bound
+ * to this agent (pipeline redesign amendment A1: agents bind per step, so
+ * this jsonb scan replaces the retired `published_agent_id` RESTRICT role —
+ * the column survives unwritten, per the additive-migrations rule). Draft
+ * references do NOT block: an un-published draft merely gains a validator
+ * diagnostic once the agent is gone. Sessions count always (deleting the
+ * agent would cascade away whole conversations + run history).
  */
 export async function agentReferences(
   db: Db,
@@ -256,12 +262,12 @@ export async function agentReferences(
 ): Promise<{ workflows: string[]; sessions: number }> {
   const [workflowRows, sessionRows] = await Promise.all([
     db
-      .select({ name: schema.workflows.name })
+      .select({ name: schema.workflows.name, published: schema.workflows.published })
       .from(schema.workflows)
       .where(
         and(
           eq(schema.workflows.organizationId, organizationId),
-          sql`(${schema.workflows.publishedAgentId} = ${agentId} OR ${schema.workflows.draft} ->> 'agentId' = ${agentId})`,
+          isNotNull(schema.workflows.published),
         ),
       )
       .orderBy(schema.workflows.name),
@@ -270,10 +276,19 @@ export async function agentReferences(
       .from(schema.agentSessions)
       .where(eq(schema.agentSessions.agentId, agentId)),
   ]);
-  return {
-    workflows: workflowRows.map((row) => row.name),
-    sessions: sessionRows.length,
-  };
+  // Steps nest (for_each bodies, branch lanes), so the reference scan walks
+  // the parsed tree rather than guessing at jsonb paths in SQL. Workspaces
+  // hold few workflows — the list endpoint already loads them all.
+  const workflows = workflowRows
+    .filter((row) => {
+      const config = parseWorkflowConfig(row.published);
+      if (!config) return false;
+      return walkSteps(config.steps).some(
+        (entry) => entry.step.kind === "agent" && entry.step.agentId === agentId,
+      );
+    })
+    .map((row) => row.name);
+  return { workflows, sessions: sessionRows.length };
 }
 
 export async function deleteAgent(

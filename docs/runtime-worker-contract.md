@@ -7,10 +7,12 @@ packages/compiler). The end-to-end proof is
 
 Agents-first (2026-07-10 redesign): the **Agent is the compile unit** — an
 **agent version** (immutable published snapshot, identified by content hash)
-is what gets built, stored, ensured, and dispatched. Workflows are standing
-delegations (trigger → agent → instructions) and compile NOTHING; compiled
-agents expose only eve's default channel, and every dispatch path speaks
-eve's session API.
+is what gets built, stored, ensured, and dispatched. Workflows are pipelines
+(trigger → steps; the 2026-08-31 workflow-pipelines spec) and compile
+NOTHING: the control plane interprets them in-process, and only two things
+ever speak eve's session API against a worker — chat sessions and a
+pipeline's **`agent` steps**, which dispatch child runs through the machinery
+this document describes. Compiled agents expose only eve's default channel.
 
 ## Worker HTTP surface the control plane calls
 
@@ -56,8 +58,9 @@ is useless against any other agent version. Compiled channels verify via
 eve's `verifyJwtHmac`.
 
 Used today by the control plane (this is the ONLY dispatch surface — there
-are no per-trigger channels; chat, webhook, form, Slack, schedule, and manual
-"Run now" all speak eve's session API):
+are no per-trigger channels; chat sessions and pipeline `agent` steps are its
+two callers — webhook, form, Slack, schedule, and manual "Run now" reach it
+only through an `agent` step's child run):
 
 ### eve session API v2 — ID-addressed (eve 0.31)
 
@@ -71,7 +74,7 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
 
 | Call (through `<worker>/agents/<hash>`) | Body | Answer |
 |---|---|---|
-| `POST .../eve/v1/session` | `{message}` (+ optional `mode`, `capabilities`) | **202** `{ok, sessionId, status:"accepted"}` + `x-eve-session-id` |
+| `POST .../eve/v1/session` | `{message}` (+ optional `mode`, `capabilities`, `outputSchema`) | **202** `{ok, sessionId, status:"accepted"}` + `x-eve-session-id` |
 | `POST .../eve/v1/session/:id` | `{message}` **XOR** `{inputResponses:[{requestId,optionId?,text?}]}` | 202 `{ok, sessionId, status:"accepted"}` · **409** `{ok:false, code:"session_not_active"}` |
 | `POST .../eve/v1/session/:id/cancel` | optional `{turnId}` | 202 `{…status:"accepted"}` · 200 `{…status:"no_active_turn"}` |
 | `POST .../eve/v1/session/:id/clear` | optional, empty | 202 `accepted` · 200 `no_active_session` |
@@ -104,7 +107,15 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
   `capabilities.requestInput` implies) parks on a deterministic Approve/Stop
   prompt carrying `kind: "session-limit"`; `task` skips the prompt and fails
   with `SESSION_TOKEN_LIMIT_REACHED`. A dispatch path with no human watching
-  wants the latter; a parked prompt nobody can answer hangs forever.
+  wants the latter; a parked prompt nobody can answer hangs forever. That is
+  exactly the split the platform ships: chat sessions and `session:"thread"`
+  continuations stay conversational, while a fresh `agent`-step child sends
+  `mode:"task"` — plus the step's declared `outputSchema`, which eve accepts
+  on create and answers with a `result.completed` event carrying the
+  schema-shaped payload (both live-proven, spike REPORT finding 36). Task
+  mode also TERMINATES the session on completion, and a follow-up send to a
+  completed task session is 202-and-dropped — never probe completion with a
+  send; read the child run row's status instead.
 - The **worker needs no change** for the four control routes: the proxy
   forwards all of `/eve/` generically, and the sandbox reaper's activity
   regex (`/^\/eve\/v1\/session\/([^/?]+)/`, `apps/worker/src/server.ts`)
@@ -221,7 +232,11 @@ authenticate by token/signature (no session):
   ONCE at mint) is SHA-256-hashed and matched against `triggers.token_hash`
   (constant-time indexed lookup; plaintext is never stored). Per-token +
   per-IP rate limits and a 256 KiB payload cap run BEFORE parsing. → 202
-  `{accepted, runId, sessionId}`.
+  `{accepted: true, runId}` (pipeline runs have no session) or 202
+  `{accepted: false, reason: "overlap_skipped"}` when the workflow's
+  `overlap: "skip"` policy dropped the event because a run is still live — a
+  2xx on purpose: the sender did nothing wrong. The idempotency cache stores
+  `{runId}`.
 - `POST /integrations/slack/events` — Slack Events API. Missing auth headers,
   per-IP rate limit, and a 256 KiB body cap are checked BEFORE the HMAC;
   signature (`v0` HMAC) + 5-min replay window next; `event_id` dedup makes
@@ -229,36 +244,68 @@ authenticate by token/signature (no session):
   mention arrives as BOTH, with different event_ids) is dropped whenever the
   message text contains the bot mention ANYWHERE (Slack fires `app_mention`
   for mid-text mentions too — a leading-only check would double-dispatch
-  them); routed by `team_id` → integration → bound workflows;
-  `thread_ts ↔ agent_session` continuation via the indexed
-  `agent_sessions.slack_thread_key` column (partial unique per workflow — two
-  racing first-messages of a new thread resolve to one session, the loser's
-  `session_busy` is logged and dropped). A session that reaches a TERMINAL
-  status (closed/error) RELEASES its thread key (`markSession` nulls it, and
-  the new-session re-check evicts any legacy terminal holder), so the next
+  them); routed by `team_id` → integration → bound workflows. **A Slack
+  event always starts a NEW pipeline run** — thread continuity is the `agent`
+  step's `session: "thread"`, keyed by the thread key the ingress stamps into
+  `TriggerEvent.data.slackThreadKey`. The thread GATE decides whether a
+  binding dispatches at all: a reply in a thread that already has a claimed
+  session dispatches regardless of the binding (thread replies continue
+  conversations); a fresh thread must pass the binding check. The session
+  claim itself — the indexed `agent_sessions.slack_thread_key` column,
+  partial unique per workflow, advisory-locked so two racing first-messages
+  of a new thread resolve to one session — now lives inside the `agent`
+  step's dispatch (`dispatchRenderedRun`): a claimed thread session's PINNED
+  version takes the step's message as a follow-up turn; no claim yet mints a
+  fresh conversational session. A session that reaches a TERMINAL status
+  (closed/error) RELEASES its thread key (`markSession` nulls it, and the
+  new-session re-check evicts any legacy terminal holder), so the next
   message in that thread mints a fresh session instead of being silently
   dropped forever. Since 0.31 that release has a SECOND trigger — an eve 409
   `session_not_active` on a continue (below) — because the platform row can
   lag eve's terminal truth indefinitely. DMs (`channel_type: im`) key the
   session on the IM channel itself, so a 1:1 conversation keeps one ongoing
-  session without threading.
+  session without threading. A workflow-level `overlap: "skip"` drop is
+  logged, never silent.
 - `GET /integrations/slack/callback` — single platform Slack app OAuth
   redirect-back (state-signed); per-team bot token stored envelope-encrypted,
   keyed by `team_id`. The install kickoff is workspace-scoped:
   `GET /workspaces/:id/integrations/slack/install`.
 
-**Dispatch (agents-first contract, `runtime/dispatch.ts`).** Every non-chat
-path (webhook / form / Slack / schedule / manual "Run now") resolves the
-workflow's published snapshot + the delegated agent's CURRENT published
-version (FLOATING binding — a new session runs the agent's current version;
-a continuation always runs the session's PINNED version), renders the
-workflow's instructions against the event (`renderTaskMessage`,
-`packages/shared`) and sends THAT string as the eve session message —
-`createEveSession` for a new session, `continueEveSession` for a thread
-reply. **The `TriggerEvent` envelope is never sent to the agent**; it is
-persisted on the run purely as provenance (`runs.trigger_event`, alongside
-the rendered `task_message`). There is no compiled trigger channel and no
-per-trigger agent env.
+**Dispatch (pipeline contract, `runtime/dispatch.ts` + `src/pipeline/`).**
+Every non-chat path (webhook / form / Slack / schedule / manual "Run now")
+resolves the workflow's published pipeline config and starts a PIPELINE run
+(`startPipelineRun`): a `mode: 'pipeline'` `runs` row with no eve session,
+inserted inside the advisory-locked workspace-cap transaction before any
+execution, then interpreted in-process by the runner — a sequential driver
+over the `run_steps` ledger, appending `pipeline.*` events into `run_events`
+under the same monotonic `seq` as eve events (so the SSE surface below
+carries step timelines unchanged). Nothing touches a worker until the driver
+reaches an **`agent` step**, which calls **`dispatchRenderedRun`** — the
+extracted spine of the old trigger dispatch: worker selection → cap-locked
+child session+run rows → allowlist re-check → ensure-agent →
+`createEveSession`/`continueEveSession` → `startTail`. It takes an
+ALREADY-RENDERED message (the runner renders the step's instructions against
+the full run scope via `renderMarkdownTemplate`); the agent binding stays
+FLOATING — a fresh child session runs the bound agent's CURRENT published
+version, a `session: "thread"` continuation always runs the session's PINNED
+version. Fresh children send `mode: "task"` (+ the step's declared
+`outputSchema`); thread continuations stay conversational. **The
+`TriggerEvent` envelope is never sent to any agent**; it is persisted on the
+parent run purely as provenance (`runs.trigger_event` — its `agentId` is the
+nil-uuid `PIPELINE_TRIGGER_AGENT_ID` placeholder, since a pipeline binds
+agents per step). There is no compiled trigger channel and no per-trigger
+agent env.
+
+A child run parking `waiting` (HITL) parks the parent step and run with it;
+`POST /runs/:id/input` on the CHILD resumes the chain (the sessionless
+parent answers 409 `no_pending_input`). `POST /runs/:id/cancel` on a
+pipeline run cancels the driver cooperatively at the next step boundary and
+cancels any live child run. Crash recovery (`reconcileInterruptedRuns` →
+`recoverPipelineRuns`) re-adopts orphaned pipeline runs whose per-run
+advisory lock is free and REPLAYS the config against the ledger — terminal
+`run_steps` outputs rebuild the scope, only the frontier re-executes, and an
+interrupted agent step re-attaches to its child by `child_run_id` instead of
+double-dispatching.
 
 **One run per eve session at a time (hole closed):** `waiting` (parked HITL)
 counts as busy alongside queued/running — a new message into a parked session
@@ -278,18 +325,20 @@ dispatching. Exactly one tail per eve NDJSON stream at any instant.
 `session_not_active` is a semantic *widening* of the 0.19 busy 409, not a
 rename, and it is why eve's truth can diverge from `agent_sessions.status`
 indefinitely: the default 30-day `sessionTimeoutMs` emits `session.completed`
-into a stream nobody is tailing, and a `reset` retires the id — in both the
-platform row stays `active`/`waiting`. (A task-mode token-budget breach would
-be a third cause, but the control plane never sends eve's session `mode` on
-any dispatch path, so every session runs in eve's default conversation mode
-and parks on a `session-limit` input request rather than failing. That is
-deliberate: chat, webhook, form, Slack and schedule runs are all observable
-and answerable in chat, so a budget prompt always has a human who can reach
-it. Sending `mode: "task"` would turn those into hard failures.)
+into a stream nobody is tailing, a `reset` retires the id, and a fresh
+`agent`-step child's task-mode token-budget breach fails the session — in
+all of these the platform row can stay `active`/`waiting`. The mode split is
+deliberate: chat sessions and `session:"thread"` continuations are
+observable and answerable in chat, so they run conversational and park on a
+`session-limit` prompt a human can reach; a task-mode child nobody watches
+fails fast instead of hanging on a prompt forever.
 The status-driven Slack thread-key eviction alone can
 never fire for those rows, so the eve-driven eviction (a 409
 `session_not_active` on a continue) is the second release trigger and is what
-keeps a Slack thread from bricking forever.
+keeps a Slack thread from bricking forever. The `agent` step executor is the
+workflow-side consumer of both 409s: `session_busy` is its one transient
+retry; `session_not_active` evicts the dead thread claim so the retry mints
+a fresh session; a failed child turn is never retried.
 
 **Turn cancellation.** `POST /runs/:id/cancel` remains the single platform
 contract (there is deliberately no second session-scoped cancel route); it now
@@ -341,22 +390,29 @@ version's baked artifact, never from `model_presets` (see "Compiler seam").
 
 Slack replies are posted by the control plane, never by the agent
 (`runs/delivery.ts` — the compiled Slack channel + `SLACK_BOT_TOKEN` agent-env
-injection are gone):
+injection are gone), and since the pipeline redesign they are **explicit
+only** — a pipeline has no well-defined "final assistant message", so nothing
+is delivered unless the workflow's config says what:
 
-- dispatch marks slack-origin runs `delivery_status = pending` (born owing a
-  reply);
-- the run tailer's finished-hook posts the run's final assistant reply
-  (`message.completed` with `finishReason: "stop"`) as a threaded
-  `chat.postMessage` with the team's decrypted bot token, then settles the
-  marker (`delivered` / `failed` with a reason);
-- paths that mark a run terminal OUTSIDE the tailer hook (`failDispatch`, the
-  dispatch-time allowlist failure, cancel of an untailed run, the sweeper's
-  no-eve-session fail) call `deliver()` themselves, so the marker settles at
-  the moment of failure instead of lingering `pending`;
+- the ONE writer of `delivery_status = 'pending'` is the pipeline run
+  creator, for slack-origin PARENT runs whose config declares
+  `onComplete.slackReply` (agent-step CHILD runs never owe a reply; the old
+  implicit last-assistant-message delivery is removed with the v1 dispatch);
+- the pipeline runner's terminal path renders the `onComplete.slackReply`
+  template against the FINAL run scope and posts it as a threaded
+  `chat.postMessage` with the team's decrypted bot token (the thread target
+  comes off the envelope's `slackThreadKey`), then settles the marker
+  (`delivered` / `failed` with a reason);
+- paths that mark a pipeline run terminal OUTSIDE the runner (the cancel
+  route's orphan fallback, recovery's `failOutright`) call `deliver()`
+  themselves, so the marker settles at the moment of failure instead of
+  lingering `pending` (`deliver()` no-ops for runs owing nothing);
 - boot recovery (`reconcileInterruptedRuns` → `recoverPending`) finds
-  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal event
-  and post) recover the reply from persisted `run_events` and deliver late;
-  failed/canceled ones settle the ledger.
+  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal
+  status and post) RE-RENDER the reply from the workflow's published
+  template + the scope rebuilt from the `run_steps` ledger
+  (`rebuildScopeSteps`) and deliver late; failed/canceled ones settle the
+  ledger.
 
 Semantics are **at-least-once** (documented residual): the Slack post happens
 before the marker flips, so a crash in between re-delivers on recovery. The
@@ -381,10 +437,13 @@ which workers never run (spike finding 6). Scheduling is a platform concern
   from NOW (**no backfill** — a control plane down over three windows fires
   ONCE, then resumes cadence) BEFORE dispatching. The advisory lock makes
   claims safe under concurrent tickers;
-- the dispatch is the ordinary workflow dispatch (origin/trigger type
-  `schedule`, `data.scheduledFor` = the window that fired, empty message —
-  the instructions carry the task). Scheduled runs are ordinary sessions and
-  can park on HITL approvals;
+- the dispatch is the ordinary pipeline start (`startPipelineRun`;
+  origin/trigger type `schedule`, `data.scheduledFor` = the window that
+  fired, empty message — the steps carry the task). Scheduled runs are
+  ordinary pipeline runs; an agent step's parked child can still park them on
+  HITL approvals. A workflow-level `overlap: "skip"` drop logs
+  `schedule.overlap_skipped` and, like a failure, never un-advances the
+  cursor;
 - a dispatch failure never un-advances the cursor (one failed run per window,
   never a hot loop); an unparseable cron clears `next_fire_at`, disarming the
   trigger until the next publish rewrites it.
@@ -419,9 +478,10 @@ database-per-version isolation below remains required (REPORT finding 26).
 
 **Hard constraint: at most one live agent process per version hash,
 fleet-wide.** Note the agents-first pivot CONCENTRATES load on this
-constraint: all of an agent's chat sessions AND all workflows delegating to
-it ride its one published version hash — one world DB, one writer. The
-platform enforces it operationally:
+constraint: all of an agent's chat sessions AND every workflow `agent` step
+delegating to it ride its one published version hash — one world DB, one
+writer (also why the pipeline runner executes `for_each` at concurrency 1).
+The platform enforces it operationally:
 
 - the scheduler prefers the warm worker for a hash (affinity → warm → cold),
   and in-flight placement RESERVATIONS (runtime/scheduler.ts) keep a burst of
@@ -513,8 +573,12 @@ Settings → Models says so on the panel. Design:
 `worker-token`), `LOG_LEVEL` (debug|info|warn|error, default info),
 `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
 `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
-(default 30000 — the schedule ticker's scan cadence), and the Slack app
-(`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
+(default 30000 — the schedule ticker's scan cadence), the pipeline runner's
+tuning knobs `PIPELINE_MAX_WALL_CLOCK_MS` (default 1800000 = 30 min per
+run), `PIPELINE_MAX_STEPS_PER_RUN` (default 200 executed step instances),
+`PIPELINE_MAX_STEP_OUTPUT_BYTES` (default 262144) and `PIPELINE_CHILD_POLL_MS`
+(default 5000 — the parked agent-step child-run poll cadence), and the Slack
+app (`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
 `SLACK_APP_REDIRECT_URL`, optional `SLACK_API_BASE_URL`).
 
 ## Phase-3 additions — scheduler pool, failover, per-worker identity
@@ -658,9 +722,10 @@ in-flight proxied requests, stops its agents, then deregisters.
   Slack event dedup, and OAuth nonce single-use are all in-process. A second
   replica would double-tail runs (the (run_id, seq) PK then crash-loops one
   tail), double-sweep failovers, and split SSE subscribers from their run's
-  tail. (The schedule ticker alone IS multi-instance-safe — its claims ride
-  per-trigger advisory locks — but nothing else is.) HA needs leader
-  election / shared state first — do not scale this process horizontally.
+  tail. (The schedule ticker and the pipeline runner's run adoption ARE
+  multi-instance-safe in isolation — per-trigger and per-run advisory locks —
+  but nothing else is.) HA needs leader election / shared state first — do
+  not scale this process horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface
   (register/heartbeat/deregister, `/internal/metrics`) and the agent-facing
   token broker (`/internal/connections/token`, platform-JWT-authed — see its

@@ -3,21 +3,26 @@
  * TEST_DATABASE_URL (skip cleanly when unset; the compose integration stage
  * provides it).
  *
- * AGENTS-FIRST: the fake agent/worker exposes ONLY eve's default channel
- * (`POST /eve/v1/session`, `POST /eve/v1/session/:id`, the NDJSON stream) —
- * there are no compiled trigger channels. The suite proves the new dispatch
- * contract end to end against a real Postgres, a stub Slack server, and a
- * stub compiler:
+ * PIPELINES: every trigger event now starts a PIPELINE run of the published
+ * v2 config; eve sessions exist only as `agent`-step CHILD runs, and the
+ * fake agent/worker exposes ONLY eve's default channel (`POST
+ * /eve/v1/session`, `POST /eve/v1/session/:id`, the NDJSON stream). The
+ * suite proves the new dispatch contract end to end against a real Postgres,
+ * a stub Slack server, and a stub compiler:
  *
- *   webhook ingress → RENDERED task message opens the eve session (resolved
- *     `@trigger.*` baked in; TriggerEvent stays storage-only provenance) ·
+ *   webhook ingress → pipeline run → agent step opens a TASK-mode eve child
+ *     session with the RENDERED instructions (resolved `@trigger.*` baked
+ *     in; TriggerEvent stays storage-only provenance) ·
  *   trigger-row form-schema validation · enabled/published gating · payload
  *     cap · rate-limit 429 · idempotency ·
- *   dispatch-time allowlist re-validation FAILS the run · run cancel ·
- *   Slack signature/replay/dedup/twin suppression · mention → dispatch (NO
- *     SLACK_BOT_TOKEN in agent env) → thread reply CONTINUES the same eve
- *     session · slack-origin runs owe `delivery_status = pending` and the
- *     DeliveryService settles them via chat.postMessage (threaded) ·
+ *   dispatch-time allowlist re-validation FAILS the agent step + the run ·
+ *   parent-run cancel cancels the live child ·
+ *   Slack signature/replay/dedup/twin suppression · mention → NEW pipeline
+ *     run whose `session: "thread"` agent step claims the thread session (NO
+ *     SLACK_BOT_TOKEN in agent env) → a thread reply's run CONTINUES the
+ *     same eve session · explicit `onComplete.slackReply` renders against
+ *     the final scope and the DeliveryService settles the parent's pending
+ *     marker via chat.postMessage (threaded) ·
  *   Slack OAuth install + callback + tenant binding · list / disconnect.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -34,12 +39,13 @@ import {
 import { signOAuthState } from "./slack-oauth";
 import {
   generateMasterKeyBase64,
+  newStepId,
   parseMasterKey,
   type AgentDefinition,
+  type AgentStepSession,
   type CreateWebhookTokenResponse,
   type RunDto,
   type TriggerConfig,
-  type TriggerIngressResponse,
   type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
@@ -100,6 +106,9 @@ interface SessionMessage {
   hash: string;
   sessionId: string;
   message: string;
+  /** eve create options observed on the wire (spike finding 36). */
+  mode?: string;
+  outputSchema?: unknown;
 }
 
 const TERMINAL = new Set(["session.waiting", "session.completed", "session.failed"]);
@@ -211,8 +220,19 @@ class FakeWorker {
       if (!(await this.verifyJwt(req, createMatch[1]!))) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
-      const parsed = parseCreateBody(await req.json().catch(() => ({})));
+      const raw = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      const parsed = parseCreateBody(raw);
       if (parsed instanceof Response) return parsed;
+      // Finding 36: eve PARSES outputSchema — a non-object is its own 400.
+      if (
+        raw.outputSchema !== undefined &&
+        (typeof raw.outputSchema !== "object" || raw.outputSchema === null)
+      ) {
+        return Response.json(
+          { error: "outputSchema must be an object", ok: false },
+          { status: 400 },
+        );
+      }
       const id = `eve-${++this.counter}`;
       const session: FakeSession = { id, dead: false, events: [], turns: 0 };
       this.sessions.set(id, session);
@@ -221,6 +241,8 @@ class FakeWorker {
         hash: createMatch[1]!,
         sessionId: id,
         message: parsed.message,
+        ...(typeof raw.mode === "string" ? { mode: raw.mode } : {}),
+        ...(raw.outputSchema !== undefined ? { outputSchema: raw.outputSchema } : {}),
       });
       this.pushTurn(session, parsed.message);
       return eveAccepted(session.id);
@@ -424,20 +446,47 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
   }
 
   /**
-   * Create a workflow delegating to the published agent. Publish = snapshot
-   * written by the test (workflow publish routes are proven in
-   * resources/workflows.test.ts; ingress only reads the snapshot + trigger
-   * row).
+   * Create a one-agent-step PIPELINE workflow bound to the published agent.
+   * Publish = snapshot written by the test (workflow publish routes are
+   * proven in resources/workflows.test.ts; ingress only reads the snapshot +
+   * trigger row). Slack workflows get `session: "thread"` + an explicit
+   * `onComplete.slackReply` unless overridden — the pipeline delivery shape.
    */
   async function createWorkflow(
     name: string,
     trigger: TriggerConfig,
-    options: { publish?: boolean; enabled?: boolean; instructions?: string } = {},
+    options: {
+      publish?: boolean;
+      enabled?: boolean;
+      instructions?: string;
+      session?: AgentStepSession;
+      onCompleteTemplate?: string;
+    } = {},
   ): Promise<string> {
+    const session: AgentStepSession =
+      options.session ?? (trigger.type === "slack" ? "thread" : "fresh");
     const config: WorkflowConfigInput = {
+      version: 2,
       trigger,
-      agentId,
-      instructions: { markdown: options.instructions ?? "Be helpful. @trigger.repo" },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
+          agentId,
+          instructions: {
+            markdown: options.instructions ?? "Be helpful. @trigger.repo",
+          },
+          session,
+        },
+      ],
+      ...(options.onCompleteTemplate !== undefined
+        ? {
+            onComplete: {
+              slackReply: { template: { markdown: options.onCompleteTemplate } },
+            },
+          }
+        : {}),
     };
     const rows = await db
       .insert(schema.workflows)
@@ -450,7 +499,6 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
           : {
               published: config as unknown as Record<string, unknown>,
               publishedAt: new Date(),
-              publishedAgentId: agentId,
             }),
         enabled: options.enabled ?? true,
       })
@@ -525,7 +573,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   // ── webhook ──────────────────────────────────────────────────────────────
 
-  test("webhook ingress: token-HASH lookup, RENDERED task message opens the eve session, run streams", async () => {
+  test("webhook ingress: token-HASH lookup starts a PIPELINE run; the agent step opens a TASK-mode eve child session with the RENDERED instructions", async () => {
     const wfId = await createWorkflow("Webhook WF", { type: "webhook" });
     const minted = await mintToken(wfId);
     expect(minted.token).toStartWith("whk_");
@@ -539,36 +587,53 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const before = worker.sessionMessages.length;
     const res = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ repo: "acme/app", message: "run it" }) });
     expect(res.status).toBe(202);
-    const ack = (await res.json()) as TriggerIngressResponse;
+    const ack = (await res.json()) as { accepted: boolean; runId: string };
     expect(ack.accepted).toBe(true);
 
-    // The dispatcher opened an eve session with the RENDERED task message:
-    // instructions with @trigger.repo resolved, trigger context appended.
+    // The agent step opened an eve CHILD session with the step's rendered
+    // instructions (@trigger.repo resolved against the run scope), in TASK
+    // mode — fresh agent-step children never park on prompts nobody answers.
     const opened = await until(
       async () => worker.sessionMessages.slice(before).find((m) => m.kind === "create" && m.message.includes("acme/app")),
-      "eve session created",
+      "eve child session created",
     );
-    expect(opened.message).toContain("<workflow-task>");
-    expect(opened.message).toContain("Be helpful. acme/app");
-    expect(opened.message).toContain("trigger.repo: acme/app");
-    expect(opened.message).toContain("run it");
+    expect(opened.message).toBe("Be helpful. acme/app");
+    expect(opened.mode).toBe("task");
+    expect(opened.outputSchema).toBeUndefined(); // no declared output schema
 
+    // The PARENT pipeline run settles off the child's terminal.
     const run = await until(async () => {
       const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
       return r[0] && (r[0].status === "succeeded" || r[0].status === "failed") ? r[0] : undefined;
-    }, "run terminal");
+    }, "parent run terminal");
     expect(run.status).toBe("succeeded");
-    // Provenance: the rendered message is persisted; the envelope carries the
-    // agent + workflow; webhooks owe no outbound delivery.
-    expect(run.taskMessage).toBe(opened.message);
-    const envelope = run.triggerEvent as { agentId?: string; workflowId?: string; message?: string };
-    expect(envelope.agentId).toBe(agentId);
+    expect(run.mode).toBe("pipeline");
+    expect(run.agentSessionId).toBeNull();
+    expect(run.workflowId).toBe(wfId);
+    expect(run.organizationId).toBe(orgId);
+    expect(run.deliveryStatus).toBeNull(); // webhooks owe no outbound delivery
+    const envelope = run.triggerEvent as { workflowId?: string; message?: string };
     expect(envelope.workflowId).toBe(wfId);
     expect(envelope.message).toBe("run it");
-    expect(run.deliveryStatus).toBeNull();
 
-    // The session pinned the agent + its published version.
-    const sessions = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, run.agentSessionId));
+    // The CHILD run carries the rendered instructions + real agent identity
+    // and links back through the step ledger.
+    const steps = await db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, run.id));
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.status).toBe("succeeded");
+    expect(steps[0]!.childRunId).not.toBeNull();
+    // Schemaless extraction: the child's final stop-message becomes `text`.
+    expect((steps[0]!.output as { text?: string }).text).toStartWith("echo:");
+    const childRun = (await db.select().from(schema.runs).where(eq(schema.runs.id, steps[0]!.childRunId!)))[0]!;
+    expect(childRun.mode).toBe("agent");
+    expect(childRun.status).toBe("succeeded");
+    expect(childRun.taskMessage).toBe(opened.message);
+    expect(childRun.workflowId).toBe(wfId);
+    expect(childRun.organizationId).toBe(orgId);
+    expect((childRun.triggerEvent as { agentId?: string }).agentId).toBe(agentId);
+
+    // The child session pinned the agent + its published version.
+    const sessions = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, childRun.agentSessionId!));
     expect(sessions[0]!.agentId).toBe(agentId);
     expect(sessions[0]!.workflowId).toBe(wfId);
   });
@@ -590,10 +655,9 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const wfId = await createWorkflow("Webhook Idem", { type: "webhook" });
     const minted = await mintToken(wfId);
     const headers = { "idempotency-key": "idem-abc" };
-    const a = (await (await api("POST", `/t/${minted.token}`, { rawBody: "{}", headers })).json()) as TriggerIngressResponse;
-    const b = (await (await api("POST", `/t/${minted.token}`, { rawBody: "{}", headers })).json()) as TriggerIngressResponse;
+    const a = (await (await api("POST", `/t/${minted.token}`, { rawBody: "{}", headers })).json()) as { runId: string };
+    const b = (await (await api("POST", `/t/${minted.token}`, { rawBody: "{}", headers })).json()) as { runId: string };
     expect(b.runId).toBe(a.runId);
-    expect(b.sessionId).toBe(a.sessionId);
   });
 
   test("kill switch: a disabled workflow accepts no trigger events (403)", async () => {
@@ -636,9 +700,8 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       async () => worker.sessionMessages.slice(before).find((m) => m.kind === "create"),
       "form dispatch",
     );
-    // Submitted values resolved into the task message + trigger context.
+    // Submitted values resolved into the agent step's rendered instructions.
     expect(opened.message).toContain("Be helpful. acme/app");
-    expect(opened.message).toContain("hello");
   });
 
   // ── rate limit ─────────────────────────────────────────────────────────────
@@ -657,7 +720,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   // ── dispatch-time allowlist re-validation ──────────────────────────────────
 
-  test("allowlist re-validation: a now-disallowed model FAILS the run (not executed)", async () => {
+  test("allowlist re-validation: a now-disallowed model FAILS the agent step and the run (not executed)", async () => {
     const wfId = await createWorkflow("Allowlist WF", { type: "webhook" });
     const minted = await mintToken(wfId);
 
@@ -671,14 +734,16 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const beforeSessions = worker.sessionMessages.length;
     const res = await api("POST", `/t/${minted.token}`, { rawBody: "{}" });
     expect(res.status).toBe(202);
-    const ack = (await res.json()) as TriggerIngressResponse;
+    const ack = (await res.json()) as { runId: string };
 
     const run = await until(async () => {
       const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
       return r[0] && r[0].status === "failed" ? r[0] : undefined;
-    }, "failed run");
+    }, "failed parent run");
     expect(run.error).toContain("no longer on this workspace's allowlist");
-    // Never dispatched to the agent.
+    // The step ledger carries the class; nothing ever reached the agent.
+    const steps = await db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, run.id));
+    expect(steps[0]!.errorClass).toBe("model_disallowed_at_dispatch");
     expect(worker.sessionMessages.length).toBe(beforeSessions);
 
     // Restore for other tests.
@@ -687,22 +752,37 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
   // ── run cancel ─────────────────────────────────────────────────────────────
 
-  test("run cancel: aborts a running run and marks it canceled", async () => {
-    const wfId = await createWorkflow("Cancel WF", { type: "webhook" });
+  test("run cancel: canceling the PARENT pipeline run cancels its live agent-step child too", async () => {
+    const wfId = await createWorkflow("Cancel WF", {
+      type: "webhook",
+    }, { instructions: "HOLD the line. @trigger.repo" });
     const minted = await mintToken(wfId);
 
-    // "HOLD" keeps the fake stream open → run stays running.
-    const res = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ message: "HOLD open" }) });
-    const ack = (await res.json()) as TriggerIngressResponse;
-    await until(async () => {
-      const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
+    // "HOLD" in the rendered instructions keeps the fake stream open → the
+    // CHILD run stays running, and the parent watches it.
+    const res = await api("POST", `/t/${minted.token}`, { rawBody: JSON.stringify({ repo: "r" }) });
+    const ack = (await res.json()) as { runId: string };
+    const child = await until(async () => {
+      const steps = await db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, ack.runId));
+      const childId = steps[0]?.childRunId;
+      if (!childId) return undefined;
+      const r = await db.select().from(schema.runs).where(eq(schema.runs.id, childId));
       return r[0]?.status === "running" ? r[0] : undefined;
-    }, "run running");
+    }, "child run running");
 
     const cancel = await api("POST", `/runs/${ack.runId}/cancel`, { cookie: ownerCookie, body: { reason: "changed my mind" } });
     expect(cancel.status).toBe(200);
-    const canceled = (await cancel.json()) as { run: RunDto };
-    expect(canceled.run.status).toBe("canceled");
+
+    // The driver settles the parent at the next boundary; the child's tail
+    // marks it canceled — poll both.
+    await until(async () => {
+      const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
+      return r[0]?.status === "canceled" ? r[0] : undefined;
+    }, "parent canceled");
+    await until(async () => {
+      const r = await db.select().from(schema.runs).where(eq(schema.runs.id, child.id));
+      return r[0]?.status === "canceled" ? r[0] : undefined;
+    }, "child canceled");
 
     // Idempotent second cancel.
     const again = await api("POST", `/runs/${ack.runId}/cancel`, { cookie: ownerCookie, body: {} });
@@ -809,12 +889,16 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     expect(res.status).toBe(401);
   });
 
-  test("Slack: mention dispatches (task message, NO bot token in agent env); a thread reply CONTINUES the same eve session; delivery settles the pending reply", async () => {
-    // Bind a slack-trigger workflow to the installed team integration.
+  test("Slack: a mention starts a PIPELINE run whose thread agent step claims the session (NO bot token in agent env); a thread reply's run CONTINUES the same eve session; explicit onComplete delivery settles the parent", async () => {
+    // Bind a slack-trigger workflow (thread agent step + explicit reply
+    // template rendered against the final scope) to the installed team.
     const wfId = await createWorkflow(
       "Slack WF",
       { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } },
-      { instructions: "Reply helpfully. @trigger.text" },
+      {
+        instructions: "Reply helpfully. @trigger.text",
+        onCompleteTemplate: "@steps.reply.text",
+      },
     );
     const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
     const bind = await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
@@ -836,35 +920,32 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const session1 = await until(async () => {
       const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
       return rows.find((s) => s.origin === "slack" && s.eveSessionId) ?? undefined;
-    }, "slack session created with an eve session id");
+    }, "slack thread session created with an eve session id");
+    expect(session1.slackThreadKey).toBe(`${integration.id}:C-slack:${rootTs}`);
 
-    // AGENTS-FIRST: the mention became a RENDERED task message on eve's
-    // default channel, and NO Slack secret ever entered agent env.
+    // The agent step became a RENDERED instruction message on eve's default
+    // channel — CONVERSATION mode (a human can answer in Slack), and NO
+    // Slack secret ever entered agent env.
     const opened = await until(
       async () => worker.sessionMessages.slice(beforeMessages).find((m) => m.kind === "create"),
-      "slack eve session",
+      "slack eve child session",
     );
     expect(opened.message).toContain("Reply helpfully. hello there");
+    expect(opened.mode).toBeUndefined(); // thread sessions are never task-mode
     for (const ensure of worker.ensureCalls) {
       expect(ensure.env.SLACK_BOT_TOKEN).toBeUndefined();
       expect(ensure.env.SLACK_API_BASE_URL).toBeUndefined();
     }
 
-    const firstRun = await until(async () => {
-      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session1.id));
-      return runs.find((r) => r.status === "succeeded");
-    }, "first slack run done");
-    // Slack-origin runs owe an outbound reply: dispatch marks `pending`, and
-    // the app stack's tailer-hooked DeliveryService settles it to `delivered`
-    // moments later (either state may be observed here — never null).
-    expect(firstRun.deliveryStatus).not.toBeNull();
-    expect(["pending", "delivered"]).toContain(firstRun.deliveryStatus!);
-
-    // The stack's own DeliveryService (tailer onFinish hook) posts the
-    // terminal reply back to the thread and settles the marker — through the
-    // real drizzle reader over the persisted rows.
+    // The PARENT pipeline run owes the reply (`onComplete.slackReply` +
+    // slack origin ⇒ born pending) and settles `delivered` once the child's
+    // text renders through the template.
+    const parent1 = await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.workflowId, wfId));
+      return runs.find((r) => r.mode === "pipeline" && r.status === "succeeded");
+    }, "first parent run done");
     const settled = await until(async () => {
-      const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, firstRun.id));
+      const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, parent1.id));
       return rows[0]!.deliveryStatus === "delivered" ? rows[0] : undefined;
     }, "reply delivered to slack");
     expect(settled.deliveryStatus).toBe("delivered");
@@ -872,11 +953,12 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       (m) => m.channel === "C-slack" && m.thread_ts === rootTs,
     )!;
     expect(posted).toBeTruthy();
+    // `@steps.reply.text` rendered to the child's final stop-message.
     expect(String(posted.text)).toStartWith("echo:");
 
-    // A second settle attempt (boot recovery racing the tailer hook) is
-    // CAS'd out — the marker only flips from `pending`, so the reply is
-    // never double-posted (at-least-once, single ledger writer).
+    // A second settle attempt (boot recovery racing the runner's terminal
+    // path) is CAS'd out — the marker only flips from `pending`, so the
+    // reply is never double-posted (at-least-once, single ledger writer).
     const delivery = createDeliveryService({
       reader: createDrizzleDeliveryReader(db),
       runStore: stack.runtime!.runStore,
@@ -885,26 +967,21 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       logger: createLogger({ sink: () => {}, minLevel: "error" }),
     });
     const outcome = await delivery.deliver({
-      runId: firstRun.id,
+      runId: parent1.id,
       status: "succeeded",
-      lastAssistantMessage: null, // would force recovery from run_events
+      lastAssistantMessage: null, // would force a ledger re-render
     });
     expect(outcome).toBe("skipped");
     expect(
       slack.postMessages.filter((m) => m.channel === "C-slack" && m.thread_ts === rootTs),
     ).toHaveLength(1);
 
-    // A reply IN the thread (thread_ts = the root ts), no mention — must ride
-    // the SAME eve session as a continuation (native eve session API).
+    // A reply IN the thread (thread_ts = the root ts), no mention — starts a
+    // NEW pipeline run whose agent step must ride the SAME eve session as a
+    // continuation (native eve session API).
     const reply = await postSlackEvent({ type: "message", channel: "C-slack", channel_type: "channel", user: "U777", text: "and one more thing", ts: "1720000200.000200", thread_ts: rootTs, team: "T-TEST" });
     expect(reply.status).toBe(200);
 
-    await until(async () => {
-      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session1.id));
-      return runs.length >= 2 ? true : undefined;
-    }, "thread reply continued the session");
-    // The run row is inserted BEFORE the eve continue POST reaches the worker
-    // stub — poll for the continue message itself rather than racing it.
     const continued = await until(
       async () =>
         worker.sessionMessages.find(
@@ -912,8 +989,12 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
         ),
       "continue message reached the worker",
     );
-    expect(continued).toBeTruthy();
     expect(continued.message).toContain("and one more thing");
+    // Two PARENT pipeline runs, ONE thread session.
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.workflowId, wfId));
+      return runs.filter((r) => r.mode === "pipeline" && r.status === "succeeded").length >= 2 ? true : undefined;
+    }, "second parent run done");
     const slackSessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
     expect(slackSessions).toHaveLength(1);
   });
@@ -1094,30 +1175,32 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
 
     await postSlackEvent({ type: "message", channel: "C-dead", channel_type: "channel", user: "U9", text: "still there?", ts: "1720000810.000810", thread_ts: rootTs, team: "T-TEST" });
 
-    // The continuation fails with the PERMANENT code, and the dispatch evicts
-    // the claim: the row closes and releases its slack_thread_key.
+    // The agent step's continuation fails with the PERMANENT code, and the
+    // dispatch evicts the claim: the row closes and releases its
+    // slack_thread_key.
     const evicted = await until(async () => {
       const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, first.id));
       return rows[0]!.status === "closed" ? rows[0] : undefined;
     }, "dead eve session evicted (row closed)");
     expect(evicted.slackThreadKey).toBeNull();
-    // The failing run records the typed, permanent error — never the generic
-    // 502 worker_dispatch_failed, which would read as a transient outage.
-    // The eviction (markSession) lands a beat before the run is marked, so
-    // poll rather than read once.
+    // The failing CHILD run records the typed, permanent error — never the
+    // generic 502 worker_dispatch_failed, which would read as a transient
+    // outage. The eviction (markSession) lands a beat before the run is
+    // marked, so poll rather than read once.
     const failed = await until(async () => {
       const rows = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
       return rows.find((r) => r.status === "failed") ?? undefined;
-    }, "the continuation run failed with the permanent code");
+    }, "the continuation child run failed with the permanent code");
     expect(failed.error ?? "").toContain("can no longer accept messages");
 
-    // RECOVERY: the NEXT message in the same thread mints a fresh session
-    // under the freed key and runs normally.
-    await postSlackEvent({ type: "app_mention", user: "U9", text: "<@U0BOT> try again", ts: "1720000820.000820", thread_ts: rootTs, channel: "C-dead", team: "T-TEST" });
+    // RECOVERY happens INSIDE the same pipeline run: the executor classifies
+    // session_not_active as retryable (the claim is already freed), and the
+    // runner's second attempt mints a fresh session under the freed key —
+    // the user's message is NOT lost.
     const revived = await until(async () => {
       const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
       return rows.find((s) => s.id !== first.id) ?? undefined;
-    }, "fresh session minted after the eve-driven eviction");
+    }, "fresh session minted by the retry after the eve-driven eviction");
     expect(revived.slackThreadKey).toBe(first.slackThreadKey);
     await until(async () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, revived.id));

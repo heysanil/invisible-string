@@ -135,6 +135,37 @@ describe("product enums", () => {
       "preregistered",
     ]);
   });
+
+  test("run mode is agent/pipeline", () => {
+    expect(schema.runMode.enumValues).toEqual(["agent", "pipeline"]);
+  });
+
+  test("run step status covers the full instance lifecycle", () => {
+    expect(schema.runStepStatus.enumValues).toEqual([
+      "pending",
+      "running",
+      "waiting",
+      "succeeded",
+      "failed",
+      "skipped",
+      "canceled",
+    ]);
+  });
+
+  test("run step kinds include the reserved 'script' slot", () => {
+    // `script` ships in the enum day one (inserting mid-enum later is
+    // awkward) but the shared step union does not accept it yet.
+    expect(schema.runStepKind.enumValues).toEqual([
+      "tool",
+      "infer",
+      "agent",
+      "for_each",
+      "branch",
+      "filter",
+      "state",
+      "script",
+    ]);
+  });
 });
 
 describe("run_events", () => {
@@ -412,7 +443,10 @@ describe("workflow delegation", () => {
     expect(schema.workflows.enabled.notNull).toBe(true);
   });
 
-  test("agent deletion is RESTRICTed while a published workflow delegates to it", () => {
+  test("published_agent_id survives as a dead residual (additive rule)", () => {
+    // Nothing writes the column since the pipelines redesign (agents bind per
+    // step; delete protection moved to the agent DELETE path) — the RESTRICT
+    // FK stays in the schema, inert on always-null rows.
     const agentFk = config(schema.workflows).foreignKeys.find(
       (fk) =>
         getTableConfig(fk.reference().foreignTable as PgTable).name ===
@@ -433,5 +467,103 @@ describe("workflow delegation", () => {
     );
     expect(schema.runs.taskMessage.notNull).toBe(false);
     expect(schema.runs.deliveryStatus.notNull).toBe(false);
+  });
+});
+
+describe("pipeline runs (workflow-pipelines redesign)", () => {
+  test("runs.agent_session_id is NULLABLE — the one NOT NULL relaxation", () => {
+    // Pipeline runs have no eve session; every runs ⋈ agent_sessions join
+    // must be LEFT or it silently drops them (cap bypass).
+    expect(schema.runs.agentSessionId.notNull).toBe(false);
+    const sessionFk = config(schema.runs).foreignKeys.find(
+      (fk) =>
+        getTableConfig(fk.reference().foreignTable as PgTable).name ===
+        "agent_sessions",
+    );
+    expect(sessionFk?.onDelete).toBe("cascade");
+  });
+
+  test("runs.mode defaults to agent so pre-column rows read correctly", () => {
+    expect(schema.runs.mode.notNull).toBe(true);
+    expect(schema.runs.mode.default).toBe("agent");
+  });
+
+  test("runs carry denormalized org (nullable, additive) + workflow provenance", () => {
+    expect(schema.runs.organizationId.notNull).toBe(false);
+    expect(schema.runs.workflowId.notNull).toBe(false);
+    const workflowFk = config(schema.runs).foreignKeys.find(
+      (fk) =>
+        getTableConfig(fk.reference().foreignTable as PgTable).name ===
+        "workflows",
+    );
+    // The run record outlives the workflow that spawned it.
+    expect(workflowFk?.onDelete).toBe("set null");
+    const names = config(schema.runs).indexes.map((i) => i.config.name);
+    expect(names).toContain("runs_organization_id_idx");
+    expect(names).toContain("runs_workflow_id_idx");
+  });
+
+  test("run_steps: app-side rs_ text id, cascade from runs, denormalized org", () => {
+    // Prefixed-nanoid PK generated app-side, like connections — not a uuid.
+    expect(schema.runSteps.id.getSQLType()).toBe("text");
+    expect(schema.runSteps.id.primary).toBe(true);
+    const fks = config(schema.runSteps).foreignKeys;
+    const byTable = (name: string) =>
+      fks.filter(
+        (fk) =>
+          getTableConfig(fk.reference().foreignTable as PgTable).name === name,
+      );
+    const runFks = byTable("runs");
+    // Two links into runs: the owning run (cascade) and the child run an
+    // `agent` step spawned (SET NULL — the ledger row outlives the child).
+    expect(runFks).toHaveLength(2);
+    const onDeletes = runFks.map((fk) => fk.onDelete).sort();
+    expect(onDeletes).toEqual(["cascade", "set null"]);
+    expect(byTable("organization")[0]?.onDelete).toBe("cascade");
+    expect(schema.runSteps.organizationId.notNull).toBe(true);
+  });
+
+  test("run_steps: unique (run_id, path) is the recovery claim key", () => {
+    const unique = config(schema.runSteps).indexes.find(
+      (i) => i.config.unique,
+    );
+    expect(unique).toBeDefined();
+    expect(unique!.config.name).toBe("run_steps_run_id_path_uidx");
+    // Leading run_id doubles as the ledger read index — no separate index.
+    expect(
+      unique!.config.columns.map((c) => (c as { name: string }).name),
+    ).toEqual(["run_id", "path"]);
+  });
+
+  test("run_steps lifecycle columns: status/attempt defaults + nullable timings", () => {
+    expect(schema.runSteps.status.default).toBe("pending");
+    expect(schema.runSteps.attempt.default).toBe(1);
+    expect(schema.runSteps.iteration.notNull).toBe(false);
+    expect(schema.runSteps.parentPath.notNull).toBe(false);
+    expect(schema.runSteps.startedAt.notNull).toBe(false);
+    expect(schema.runSteps.completedAt.notNull).toBe(false);
+    // Open error vocabulary: text, not an enum.
+    expect(schema.runSteps.errorClass.getSQLType()).toBe("text");
+  });
+
+  test("workflow_state: composite (workflow_id, key) PK, cascade, run provenance", () => {
+    const { primaryKeys } = config(schema.workflowState);
+    expect(primaryKeys).toHaveLength(1);
+    expect(primaryKeys[0]!.columns.map((c) => c.name)).toEqual([
+      "workflow_id",
+      "key",
+    ]);
+    const fks = config(schema.workflowState).foreignKeys;
+    const find = (name: string) =>
+      fks.find(
+        (fk) =>
+          getTableConfig(fk.reference().foreignTable as PgTable).name === name,
+      );
+    // State dies with the workflow; the provenance run link merely detaches.
+    expect(find("workflows")?.onDelete).toBe("cascade");
+    expect(find("runs")?.onDelete).toBe("set null");
+    expect(find("organization")?.onDelete).toBe("cascade");
+    expect(schema.workflowState.value.notNull).toBe(true);
+    expect(schema.workflowState.updatedByRunId.notNull).toBe(false);
   });
 });

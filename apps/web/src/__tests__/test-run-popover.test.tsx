@@ -8,14 +8,12 @@ import { ensureDomForThisFile } from "../test/setup";
 
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
-import type {
-  CreateSessionResponse,
-  TriggerConfig,
-} from "@invisible-string/shared";
+import type { TriggerConfig } from "@invisible-string/shared";
 
 import {
   collectFormData,
   TestRunPopover,
+  type RunWorkflowResponse,
   type TestRunPopoverProps,
 } from "../components/builder/TestRunPopover";
 import { ToastProvider } from "../components/ui/Toast";
@@ -27,31 +25,21 @@ afterEach(cleanup);
 
 const q = () => within(document.body);
 
-/** The server's real response envelope — `{session, run}` per shared contract. */
-function startedResponse(): CreateSessionResponse {
+/**
+ * The server's real response envelope — `{run}` alone: a pipeline run has no
+ * session, and its step timeline lives in the Runs tab.
+ */
+function startedResponse(): RunWorkflowResponse {
   const at = "2026-07-10T00:00:00.000Z";
   return {
-    session: {
-      id: "session-1",
-      agentId: "agent-1",
-      agentVersionId: "version-1",
-      workflowId: "wf-1",
-      origin: "chat",
-      status: "active",
-      // A just-created session is genuinely untitled: the D9 titler runs in
-      // the background after the first user message, so null is the correct
-      // value here, not a placeholder.
-      title: null,
-      eveSessionId: null,
-      createdAt: at,
-      updatedAt: at,
-    },
     run: {
       id: "run-1",
-      agentSessionId: "session-1",
+      mode: "pipeline",
+      agentSessionId: null,
+      workflowId: "wf-1",
       status: "queued",
       triggerEvent: {
-        agentId: "agent-1",
+        agentId: "00000000-0000-4000-8000-000000000001",
         workflowId: "wf-1",
         triggerType: "manual",
         message: "go",
@@ -109,9 +97,10 @@ function submitForm() {
 
 // ── payload assembly per trigger type ───────────────────────────────────────
 
-test("manual trigger: requires a message, then posts {message} and offers View in Chat", async () => {
+test("manual trigger: requires a message, then posts {message} and offers View run", async () => {
   const runFn = okRunFn();
-  await openPopover(baseProps({ runFn }));
+  const onStarted = mock(() => {});
+  await openPopover(baseProps({ runFn, onStarted }));
 
   // Empty message → inline error, nothing dispatched.
   submitForm();
@@ -128,10 +117,12 @@ test("manual trigger: requires a message, then posts {message} and offers View i
   expect(runFn).toHaveBeenCalledWith("ws-1", "wf-1", {
     message: "Summarize yesterday's tickets",
   });
-  // Deep-links the CREATED session — landing on the bare chat empty state
-  // would make the user hunt for the run they just started.
-  const chatLink = q().getByRole("link", { name: /View in Chat/ });
-  expect(chatLink.getAttribute("href")).toBe("/chat?session=session-1");
+  // The editor overlays the started run on its strip.
+  expect(onStarted).toHaveBeenCalledWith(startedResponse().run);
+  // Deep-links the CREATED run's step timeline — landing on the bare runs
+  // list would make the user hunt for the run they just started.
+  const runLink = q().getByRole("link", { name: /View run/ });
+  expect(runLink.getAttribute("href")).toBe("/workflows/wf-1/runs/run-1");
 });
 
 test("webhook trigger: rejects invalid and non-object JSON, then posts {data}", async () => {

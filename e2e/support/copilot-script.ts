@@ -11,47 +11,47 @@
  * plumbing because each conversation's match string is unique.
  *
  * Placeholders resolve against the inventory in the system prompt at call
- * time (exactly what a real model does): `{{agentId:<name>}}` for the
- * workflow surface's agent inventory (how the scaffold script can select the
- * seeded "General Purpose" agent whose id only exists at runtime), and
- * `{{connectionId:<slug>}}` / `{{skillId:<slug>}}` for the agent surface's
- * context inventory. `{{toolResults}}` in a closing step echoes the
- * accepted/rejected outcomes the model was told — the edit spec asserts on
- * that text to prove a dismissal really reached the model.
+ * time (exactly what a real model does): `{{connectionId:<slug>}}` /
+ * `{{skillId:<slug>}}` / `{{agentId:<name>}}` in tool inputs, and
+ * `{{toolResults}}` in a closing step's text — it echoes the
+ * accepted/rejected outcomes the model was fed, which is how the edit spec
+ * proves a dismissal really reached the model.
+ *
+ * WORKFLOW SURFACE (pipelines redesign): the toolset is `setTrigger` plus the
+ * granular step mutations (`addStep`/`updateStep`/`removeStep`/`moveStep`)
+ * and the two read tools (`searchConnectionTools`/`getConnectionTool`). Step
+ * ids are minted SERVER-SIDE — scripts never carry an `id`, and a script
+ * cannot reference a step it just added (the minted id only exists in the
+ * tool result's text), so multi-step scaffolds insert each proposal at the
+ * HEAD (`position: {after: null}`) in REVERSE execution order.
  */
+
+// ── scaffold-a-pipeline conversation (workflow surface) ──────────────────────
 
 /**
- * The seeded agent every workspace auto-publishes on creation — the scaffold
- * script delegates to it by name.
+ * The custom stub-MCP connection the scaffold's tool step calls. The spec
+ * creates it (support/authoring.ts `addCustomConnection`) and waits for its
+ * probe before opening the copilot, so `{{connectionId:notes}}` resolves in
+ * the prompt inventory and the proposed `save_note` call is verifiable.
  */
-export const SCAFFOLD_AGENT_NAME = "General Purpose";
+export const SCAFFOLD_CONNECTION = "notes";
 
-// ── scaffold-from-one-liner conversation (workflow surface) ──────────────────
+export const SCAFFOLD_PROMPT = "Triage form submissions and save a note";
 
-export const SCAFFOLD_PROMPT = "Triage form submissions and draft replies";
-
-/**
- * References only `@trigger.*` paths — the seeded agent's published context
- * is empty, so `@connection`/`@skill` refs would fail the workflow validator.
- * The todo directive makes the scaffolded workflow's run drive a real
- * streamed tool step under eve's mock model.
- */
-export const SCAFFOLD_INSTRUCTIONS_MARKDOWN = [
-  "Triage each form submission and draft a reply.",
-  "",
-  "1. Read the message from @trigger.message and note the sender @trigger.email.",
-  "2. Make a todo list of the triage steps, then summarize the plan.",
-  "3. Draft a concise, friendly reply for review.",
-].join("\n");
+/** The tool step the scaffold proposes (the stub server's single MCP tool). */
+export const SCAFFOLD_TOOL_STEP_NAME = "Save note";
+/** The state step it proposes (persists the last sender across runs). */
+export const SCAFFOLD_STATE_STEP_NAME = "Remember sender";
 
 export const SCAFFOLD_CLOSING_TEXT =
-  "Your workflow is scaffolded — trigger, agent and instructions are in place. Publish when ready.";
+  "Your pipeline is in place — a form trigger, the save_note call, and a state cursor. Publish when ready.";
 
 const scaffoldScript = {
   match: "Triage form submissions",
   steps: [
+    // 1) the trigger: a form collecting sender + message.
     {
-      text: "Let's scaffold this delegation. First, a form trigger to collect submissions.",
+      text: "Let's build this pipeline. First, a form trigger to collect submissions.",
       toolCalls: [
         {
           toolName: "setTrigger",
@@ -78,13 +78,31 @@ const scaffoldScript = {
         },
       ],
     },
+    // 2) the doctrine's hard rule: search the tool catalog before proposing a
+    //    tool step (server-executed READ tool — no proposal, no park).
     {
       toolCalls: [
         {
-          toolName: "setAgent",
+          toolName: "searchConnectionTools",
+          input: { query: "note" },
+        },
+      ],
+    },
+    // 3+4) the steps, HEAD-inserted in reverse execution order (see module
+    //      doc): final pipeline = [Save note (tool), Remember sender (state)].
+    {
+      toolCalls: [
+        {
+          toolName: "addStep",
           input: {
-            agentId: `{{agentId:${SCAFFOLD_AGENT_NAME}}}`,
-            rationale: "Delegate the triage to the published General Purpose agent.",
+            step: {
+              kind: "state",
+              slug: "remember",
+              name: "Remember sender",
+              set: { last_email: { $ref: "trigger.email" } },
+            },
+            position: { after: null },
+            rationale: "Persist the last sender so later runs can dedupe.",
           },
         },
       ],
@@ -92,10 +110,19 @@ const scaffoldScript = {
     {
       toolCalls: [
         {
-          toolName: "setInstructions",
+          toolName: "addStep",
           input: {
-            markdown: SCAFFOLD_INSTRUCTIONS_MARKDOWN,
-            rationale: "Reference the form fields in the task instructions.",
+            step: {
+              kind: "tool",
+              slug: "save",
+              name: "Save note",
+              connectionId: `{{connectionId:${SCAFFOLD_CONNECTION}}}`,
+              tool: "save_note",
+              args: { note: { $tpl: "Triage @trigger.email: @trigger.message" } },
+              sideEffect: "at_least_once",
+            },
+            position: { after: null },
+            rationale: "Deterministically save the rendered submission as a note.",
           },
         },
       ],
@@ -104,19 +131,13 @@ const scaffoldScript = {
   ],
 };
 
-// ── edit-an-existing-workflow conversation (workflow surface) ────────────────
+// ── edit-an-existing-pipeline conversation (workflow surface) ────────────────
 
 export const EDIT_PROMPT =
-  "Tighten the instructions and gate sends behind approval";
+  "Tighten the pipeline and gate sends behind approval";
 
-export const EDIT_BASE_INSTRUCTIONS =
-  "Reply politely to every customer request.";
-
-export const EDIT_INSTRUCTIONS_MARKDOWN = [
-  EDIT_BASE_INSTRUCTIONS,
-  "",
-  "Always hold outbound sends for an explicit approval before they go out.",
-].join("\n");
+/** The applied proposal: a new state step marking the approval gate. */
+export const EDIT_ADDED_STEP_NAME = "Approval gate";
 
 /** The dismissed proposal: a schedule trigger the user does NOT want. */
 export const EDIT_DISMISSED_CRON = "0 9 * * 1";
@@ -130,10 +151,18 @@ const editScript = {
       text: "Two suggestions for this.",
       toolCalls: [
         {
-          toolName: "setInstructions",
+          toolName: "addStep",
           input: {
-            markdown: EDIT_INSTRUCTIONS_MARKDOWN,
-            rationale: "Make the approval gate explicit in the instructions.",
+            step: {
+              kind: "state",
+              slug: "approval-gate",
+              name: "Approval gate",
+              // A literal write — no references, so it validates against any
+              // trigger (the edit spec's base pipeline keeps Manual).
+              set: { approved_only: true },
+            },
+            position: { after: null },
+            rationale: "Record the approval stance where every run can read it.",
           },
         },
         {

@@ -3,8 +3,10 @@
  * CRUD/publish, sessions, messages, run SSE frames, plus the full resource
  * surface (workflows CRUD + publish, sessions list, run input, MCP
  * connections + registry, skills + attachments, model presets/allowlist,
- * members). Single source of truth imported by apps/control-plane and
- * apps/web — neither side re-declares these.
+ * members) and the pipeline run surface (workflow run history, the
+ * `run_steps` ledger, workflow state, per-step testing). Single source of
+ * truth imported by apps/control-plane and apps/web — neither side
+ * re-declares these.
  *
  * Conventions:
  * - Request bodies get zod schemas (both sides validate). Responses ALSO get
@@ -28,6 +30,8 @@ import {
   type AgentDefinition,
 } from "./agent-definition";
 import type { EveStreamEvent } from "./eve-events";
+import { RUN_STEP_KINDS } from "./pipeline-config";
+import type { PipelineStreamEvent } from "./pipeline-events";
 import { triggerEventSchema, type TriggerEvent } from "./trigger-event";
 import {
   formFieldSchema,
@@ -66,6 +70,35 @@ export const runStatusSchema = z.enum([
   "canceled",
 ]);
 export type RunStatus = z.infer<typeof runStatusSchema>;
+
+/**
+ * Mirrors pgEnum `run_mode` (pipelines redesign). `agent` = one eve session
+ * turn; `pipeline` = the control plane interpreted the workflow's steps
+ * itself — no session, a `run_steps` ledger instead, and any eve work in
+ * CHILD runs spawned by `agent` steps.
+ */
+export const runModeSchema = z.enum(["agent", "pipeline"]);
+export type RunMode = z.infer<typeof runModeSchema>;
+
+/**
+ * Mirrors pgEnum `run_step_status` — one step INSTANCE's lifecycle in the
+ * `run_steps` ledger. `waiting` = parked on a child run that is itself
+ * waiting (HITL); `skipped` = a filter/branch decided against executing it —
+ * terminal non-failure the run can still succeed through.
+ */
+export const runStepStatusSchema = z.enum([
+  "pending",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+  "skipped",
+  "canceled",
+]);
+export type RunStepStatus = z.infer<typeof runStepStatusSchema>;
+
+/** Mirrors pgEnum `run_step_kind` (= the config kinds + reserved `script`). */
+export const runStepKindSchema = z.enum(RUN_STEP_KINDS);
 
 /**
  * Mirrors pgEnum `delivery_status` — outbound reply delivery (Slack today)
@@ -257,17 +290,32 @@ type _SessionDtoLockstep = [
 const _sessionDtoLockstep: _SessionDtoLockstep = [true, true];
 void _sessionDtoLockstep;
 
-/** One run = one inbound message/trigger event within a session. */
+/**
+ * One run = one dispatched execution. Two modes (pipelines redesign):
+ * - `agent`: one inbound message/trigger event within an eve session
+ *   (`agentSessionId` set).
+ * - `pipeline`: the control plane interpreted the workflow's steps itself —
+ *   NO session (`agentSessionId` null), a `run_steps` ledger instead
+ *   ({@link RunStepDto}), and `pipeline.*` events interleaved in the stream.
+ */
 export interface RunDto {
   id: string;
-  agentSessionId: string;
+  mode: RunMode;
+  /** The eve session this run rode; null for pipeline runs (no session). */
+  agentSessionId: string | null;
+  /**
+   * Workflow provenance carried ON THE RUN — always set for pipeline runs
+   * (they have no session to carry it); agent-mode runs keep theirs on the
+   * session and read null here. Survives workflow deletion as null.
+   */
+  workflowId: string | null;
   status: RunStatus;
   /** The provenance envelope that started this run (never sent to agents). */
   triggerEvent: TriggerEvent;
   /**
-   * The rendered task message the agent actually received (`renderTaskMessage`
-   * over the workflow's instructions); null for chat runs (the chat message
-   * goes through verbatim).
+   * The rendered task message the agent actually received (an `agent` step's
+   * rendered instructions); null for chat runs (the chat message goes through
+   * verbatim) and for pipeline parent runs (no single message exists).
    */
   taskMessage: string | null;
   /** Outbound reply delivery state; null when the run has no outbound leg. */
@@ -281,7 +329,9 @@ export interface RunDto {
 
 export const runDtoSchema = z.object({
   id: productId,
-  agentSessionId: productId,
+  mode: runModeSchema,
+  agentSessionId: productId.nullable(),
+  workflowId: productId.nullable(),
   status: runStatusSchema,
   triggerEvent: triggerEventSchema,
   taskMessage: z.string().nullable(),
@@ -584,13 +634,21 @@ export const getSessionResponseSchema = z.object({
 export const RUN_STREAM_EVENT_NAMES = ["run_event", "run_status"] as const;
 export type RunStreamEventName = (typeof RUN_STREAM_EVENT_NAMES)[number];
 
+/**
+ * What one `run_events` row may carry: an eve NDJSON event (frozen shapes,
+ * eve-events.ts) or a `pipeline.*` step-lifecycle event (pipeline-events.ts)
+ * — pipeline runs interleave both under one monotonic `seq`. Consumers MUST
+ * default-ignore unknown event types (old bundles meeting new vocabulary).
+ */
+export type RunStreamEventPayload = EveStreamEvent | PipelineStreamEvent;
+
 /** `data` payload of an `event: run_event` frame (one `run_events` row). */
 export interface RunEventFrame {
   runId: string;
   /** Monotonic per-run sequence — also the SSE frame `id` (resume cursor). */
   seq: number;
-  /** The eve NDJSON event, frozen shapes per eve-events.ts. */
-  event: EveStreamEvent;
+  /** The persisted event — see {@link RunStreamEventPayload}. */
+  event: RunStreamEventPayload;
   /** ISO time the control plane persisted the event. */
   at: string;
   /**
@@ -674,6 +732,12 @@ export type WorkflowDiagnostic = z.infer<typeof workflowDiagnosticSchema>;
 export const workflowDiagnosticsSchema = z.array(workflowDiagnosticSchema);
 export type WorkflowDiagnostics = z.infer<typeof workflowDiagnosticsSchema>;
 
+/**
+ * Cap on {@link workflowSummaryDtoSchema}'s `stepKinds`: the list chip shows
+ * at most this many kind glyphs (plus a count); the server truncates.
+ */
+export const WORKFLOW_SUMMARY_MAX_STEP_KINDS = 5;
+
 /** List-item projection (no draft/published payloads). */
 export const workflowSummaryDtoSchema = z.object({
   id: productId,
@@ -683,8 +747,19 @@ export const workflowSummaryDtoSchema = z.object({
    * no shape-valid trigger yet.
    */
   triggerType: z.string().nullable(),
-  /** Name of the draft's agent; null while the draft names none. */
+  /**
+   * Name of the agent the draft's SOLE agent step delegates to; null for
+   * multi-step pipelines (they render `stepKinds` instead) and while no
+   * agent is bound.
+   */
   agentName: z.string().nullable(),
+  /**
+   * The draft's step kinds in DOCUMENT ORDER (pre-order walk), truncated to
+   * {@link WORKFLOW_SUMMARY_MAX_STEP_KINDS} — the list row's kind-glyph
+   * capsule. Open strings, not the kind enum: an old bundle meeting a future
+   * kind must render an unknown glyph, not fail the whole list.
+   */
+  stepKinds: z.array(z.string().min(1)).max(WORKFLOW_SUMMARY_MAX_STEP_KINDS),
   /** Master switch for trigger dispatch (publish state is `publishedAt`). */
   enabled: z.boolean(),
   publishedAt: isoTimestamp.nullable(),
@@ -1008,11 +1083,18 @@ export const connectionOauthStatusSchema = z.enum([
 ]);
 export type ConnectionOauthStatus = z.infer<typeof connectionOauthStatusSchema>;
 
-/** One cached tool, exactly as persisted on `connections.tools_cache`. */
+/**
+ * One cached tool, exactly as persisted on `connections.tools_cache`.
+ * `inputSchema` is the tool's TRIMMED MCP input JSON Schema, cached by the
+ * probe (pipelines redesign — schema-aware arg forms + the runner's
+ * structural pre-flight). Optional forever: rows probed before the widening
+ * carry only `params`, and consumers must degrade to name-presence checks.
+ */
 export const connectionToolSchema = z.object({
   name: z.string(),
   description: z.string(),
   params: z.array(z.string()),
+  inputSchema: z.record(z.string(), z.unknown()).optional(),
 });
 export type ConnectionTool = z.infer<typeof connectionToolSchema>;
 
@@ -1977,4 +2059,196 @@ export const updateSlackTriggerBindingRequestSchema = z.object({
 });
 export type UpdateSlackTriggerBindingRequest = z.infer<
   typeof updateSlackTriggerBindingRequestSchema
+>;
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIPELINE RUNS — run history, the step ledger, workflow state, step testing
+// (workflow-pipelines redesign; all workspace-scoped + authz-matrix tested)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── GET /workspaces/:workspaceId/workflows/:wfId/runs ───────────────────────
+//
+// The Runs tab list — every run the workflow spawned (both modes: pipeline
+// runs carry `workflowId` on the row; historical agent-mode runs join through
+// their session's provenance). Ordered by createdAt descending.
+
+export const listWorkflowRunsQuerySchema = z.object({
+  status: runStatusSchema.optional(),
+  /** Page size; the server clamps and defaults (query strings coerce). */
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+export type ListWorkflowRunsQuery = z.infer<typeof listWorkflowRunsQuerySchema>;
+
+export const listWorkflowRunsResponseSchema = z.object({
+  runs: z.array(runDtoSchema),
+});
+export type ListWorkflowRunsResponse = z.infer<
+  typeof listWorkflowRunsResponseSchema
+>;
+
+// ── GET /runs/:runId/steps — the run_steps ledger ───────────────────────────
+//
+// One row per step INSTANCE (a for_each body step yields one per iteration,
+// keyed by `path`). Previews only by default; `?full=1` additionally returns
+// the capped `input`/`output` snapshots for the step drawer.
+
+/**
+ * One `run_steps` ledger row. `outputPreview` is the capped JSON preview
+ * (same producer discipline as `pipeline.step.completed` — may be cut
+ * mid-token, for humans and step cards only); the full capped `output` rides
+ * the `?full=1` detail shape ({@link runStepDetailDtoSchema}).
+ */
+export const runStepDtoSchema = z.object({
+  /** `rs_` nanoid. */
+  id: z.string().min(1),
+  runId: productId,
+  /** The config step's stable `st_` id — what strip cards key on. */
+  stepId: z.string().min(1),
+  /** The step's slug as executed (snapshotted — renames don't rewrite history). */
+  slug: z.string(),
+  kind: runStepKindSchema,
+  status: runStepStatusSchema,
+  /** Instance path, e.g. `st_loop/3/st_b` — unique per run. */
+  path: z.string().min(1),
+  /** Enclosing instance path (loop/branch bodies); null at top level. */
+  parentPath: z.string().nullable(),
+  /** `for_each` item index for this instance; null outside loops. */
+  iteration: z.number().int().nonnegative().nullable(),
+  /** 1-based; >1 means retries happened (visible in the timeline). */
+  attempt: z.number().int().min(1),
+  /** Stable machine classification (`tool_error`, `unreachable`, …); null unless failed. */
+  errorClass: z.string().nullable(),
+  /** Human-readable failure message — scrubbed by the producer, never raw. */
+  error: z.string().nullable(),
+  /** The child run an `agent` step spawned; null for every other kind. */
+  childRunId: productId.nullable(),
+  outputPreview: z.string().nullable(),
+  startedAt: isoTimestamp.nullable(),
+  completedAt: isoTimestamp.nullable(),
+  createdAt: isoTimestamp,
+});
+export type RunStepDto = z.infer<typeof runStepDtoSchema>;
+
+/**
+ * `?full=1` detail shape: the ledger row plus its persisted (already
+ * app-capped) `input`/`output` snapshots. The rendered `input` cannot contain
+ * secrets — the template resolver's scope is only {trigger, steps, state,
+ * item, now}.
+ */
+export const runStepDetailDtoSchema = runStepDtoSchema.extend({
+  input: z.unknown().optional(),
+  output: z.record(z.string(), z.unknown()).nullable().optional(),
+});
+export type RunStepDetailDto = z.infer<typeof runStepDetailDtoSchema>;
+
+export const listRunStepsQuerySchema = z.object({
+  /** `?full=1` → rows are {@link runStepDetailDtoSchema}. */
+  full: z.literal("1").optional(),
+});
+export type ListRunStepsQuery = z.infer<typeof listRunStepsQuerySchema>;
+
+/** Ordered by createdAt ascending (ledger claim order = execution order). */
+export const listRunStepsResponseSchema = z.object({
+  steps: z.array(runStepDetailDtoSchema),
+});
+export type ListRunStepsResponse = z.infer<typeof listRunStepsResponseSchema>;
+
+// ── Workflow state (operator cursor surgery) ────────────────────────────────
+//
+//   GET    /workspaces/:workspaceId/workflows/:wfId/state        → GetWorkflowStateResponse
+//   DELETE /workspaces/:workspaceId/workflows/:wfId/state        → DeleteWorkflowStateResponse (clear all)
+//   DELETE /workspaces/:workspaceId/workflows/:wfId/state/:key   → DeleteWorkflowStateResponse
+//
+// The durable per-workflow key-value store `state` steps write and `@state.*`
+// refs read. Values are operator-visible (they are workflow data, never
+// credentials — the template scope cannot reach secrets).
+
+/** App-enforced cap: distinct keys per workflow (`workflow_state` rows). */
+export const WORKFLOW_STATE_MAX_KEYS = 200;
+/** App-enforced cap: serialized bytes per state VALUE. */
+export const WORKFLOW_STATE_MAX_VALUE_BYTES = 64 * 1024;
+
+export const workflowStateEntryDtoSchema = z.object({
+  key: z.string().min(1),
+  /** The stored jsonb value, verbatim. */
+  value: z.unknown(),
+  /** Run whose state write last touched this key; null when that run is gone. */
+  updatedByRunId: productId.nullable(),
+  updatedAt: isoTimestamp,
+});
+export type WorkflowStateEntryDto = z.infer<typeof workflowStateEntryDtoSchema>;
+
+/** Ordered by key ascending (stable operator view). */
+export const getWorkflowStateResponseSchema = z.object({
+  entries: z.array(workflowStateEntryDtoSchema),
+});
+export type GetWorkflowStateResponse = z.infer<
+  typeof getWorkflowStateResponseSchema
+>;
+
+/**
+ * Delete acknowledgement for both forms: the keyed DELETE answers 0 or 1;
+ * the bare DELETE answers however many keys the workflow held. Deleting a
+ * missing key is not an error — the desired state is "gone" either way.
+ */
+export const deleteWorkflowStateResponseSchema = z.object({
+  deletedKeys: z.number().int().nonnegative(),
+});
+export type DeleteWorkflowStateResponse = z.infer<
+  typeof deleteWorkflowStateResponseSchema
+>;
+
+// ── POST /workspaces/:workspaceId/workflows/:wfId/steps/:stepId/test ────────
+//
+// Execute ONE draft step (tool + infer kinds only — 422 `step_not_testable`
+// otherwise) against a caller-supplied partial scope, without a run row. The
+// editor's "Test step" affordance; side effects are REAL (a tool step calls
+// the live MCP server), which the UI copy owns saying.
+
+export const testWorkflowStepRequestSchema = z.object({
+  /**
+   * Partial scope the server completes (`now` is minted server-side; absent
+   * members default empty). `steps` is keyed by SLUG, mirroring
+   * `PipelineScope` — paste an earlier test's output to chain by hand.
+   */
+  scope: z
+    .object({
+      trigger: z.record(z.string(), z.unknown()).optional(),
+      steps: z
+        .record(z.string(), z.record(z.string(), z.unknown()))
+        .optional(),
+      state: z.record(z.string(), z.unknown()).optional(),
+      item: z.unknown().optional(),
+    })
+    .optional(),
+});
+export type TestWorkflowStepRequest = z.infer<
+  typeof testWorkflowStepRequestSchema
+>;
+
+/**
+ * Outcome of a step test — the executor's own outcome shape (`StepOutcome`,
+ * minus `waiting`: neither testable kind parks). A failed EXECUTION is the
+ * 200 payload's `failed` arm, not an HTTP error — only a step that cannot be
+ * attempted (unknown id, untestable kind, invalid draft) fails the request.
+ */
+export const testWorkflowStepResponseSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("succeeded"),
+    /** The rendered input snapshot the executor received (refs resolved). */
+    input: z.unknown().optional(),
+    output: z.record(z.string(), z.unknown()),
+    durationMs: z.number().int().nonnegative(),
+  }),
+  z.object({
+    status: z.literal("failed"),
+    input: z.unknown().optional(),
+    errorClass: z.string().min(1),
+    /** Scrubbed, human-readable — same discipline as `pipeline.step.failed`. */
+    error: z.string(),
+    durationMs: z.number().int().nonnegative(),
+  }),
+]);
+export type TestWorkflowStepResponse = z.infer<
+  typeof testWorkflowStepResponseSchema
 >;

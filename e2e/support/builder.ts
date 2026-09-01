@@ -1,12 +1,15 @@
 /**
- * Agent-editor + workflow-editor + chat driving helpers (agents-first).
+ * Agent-editor + workflow-editor + chat driving helpers.
  *
- * The AGENT is the compile unit now: `openNewAgent` → equip (persona, model,
- * context) → `publishAgentAndWaitReady` (real eve build). Workflows are a
- * standing delegation (trigger → agent → instructions) edited in a single
- * three-section column and published INSTANTLY (`publishWorkflow` — validate
- * + snapshot, no build). Chat targets agents: `startChatAndSend` drives the
- * "New chat" agent picker.
+ * The AGENT is the compile unit: `openNewAgent` → equip (persona, model,
+ * context) → `publishAgentAndWaitReady` (real eve build). A WORKFLOW is a
+ * PIPELINE (pipelines redesign): the editor is two panes — the copilot
+ * conversation left, the pipeline strip right (TriggerCard + step cards with
+ * inline inspectors) — and publishing stays INSTANT (`publishWorkflow` —
+ * validate + snapshot, no build). `addFirstStep`/`configureToolStep`/
+ * `selectWorkflowAgent` drive the direct-manipulation lane; the copilot lane
+ * lives in support/copilot.ts. Chat targets agents: `startChatAndSend`
+ * drives the "New chat" agent picker.
  */
 import { expect, type Locator, type Page } from "@playwright/test";
 
@@ -221,23 +224,41 @@ export async function waitForAgentPublished(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Workflow editor (/workflows/:id) — trigger → agent → instructions
+// Workflow editor (/workflows/:id) — two panes: copilot · pipeline strip
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Create a fresh workflow and open the editor; sets a distinctive name. The
- * editor is a single column with all three sections always expanded — no
- * rail, no pillar switching.
+ * editor is two panes (copilot conversation left, pipeline pane right); at
+ * the default viewport both are visible side by side.
  */
 export async function openNewWorkflow(page: Page, name: string): Promise<void> {
   await gotoSection(page, "Workflows");
   await page.getByRole("button", { name: "New workflow" }).first().click();
   await page.waitForURL(/\/workflows\/[^/]+$/);
-  await expect(page.getByRole("heading", { name: "Trigger", level: 2 })).toBeVisible();
+  await expect(page.getByTestId("pipeline-pane")).toBeVisible();
+  await expect(page.getByTestId("trigger-card")).toBeVisible();
 
   const nameInput = page.getByRole("textbox", { name: "Workflow name" });
   await nameInput.fill(name);
   await nameInput.press("Enter");
+}
+
+/**
+ * Expand the TriggerCard accordion (the trigger's draft editor + live config
+ * render only while expanded; selecting a step collapses it again).
+ */
+export async function expandTrigger(page: Page): Promise<void> {
+  const header = page
+    .getByTestId("trigger-card")
+    .getByRole("button", { name: /^Trigger\b/ });
+  if ((await header.getAttribute("aria-expanded")) !== "true") {
+    await header.click();
+  }
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(
+    page.getByRole("radiogroup", { name: "Trigger type" }),
+  ).toBeVisible();
 }
 
 /** Configure a form trigger with exactly two fields. */
@@ -245,6 +266,7 @@ export async function setFormTriggerWithTwoFields(
   page: Page,
   fields: [{ key: string; label: string }, { key: string; label: string }],
 ): Promise<void> {
+  await expandTrigger(page);
   await page
     .getByRole("radiogroup", { name: "Trigger type" })
     .getByRole("radio", { name: "Form" })
@@ -262,16 +284,18 @@ export async function setFormTriggerWithTwoFields(
   }
 }
 
-/** Select the Webhook trigger type in the Trigger section. */
+/** Select the Webhook trigger type (expands the TriggerCard first). */
 export async function setWebhookTrigger(page: Page): Promise<void> {
+  await expandTrigger(page);
   await page
     .getByRole("radiogroup", { name: "Trigger type" })
     .getByRole("radio", { name: "Webhook" })
     .click();
 }
 
-/** Select the Slack trigger type in the Trigger section. */
+/** Select the Slack trigger type (expands the TriggerCard first). */
 export async function setSlackTrigger(page: Page): Promise<void> {
+  await expandTrigger(page);
   await page
     .getByRole("radiogroup", { name: "Trigger type" })
     .getByRole("radio", { name: "Slack" })
@@ -279,8 +303,27 @@ export async function setSlackTrigger(page: Page): Promise<void> {
 }
 
 /**
- * Pick the agent who does the work — the AGENT section's card radio-group of
- * published agents.
+ * Add the FIRST step to an empty pipeline via the strip's designed empty
+ * state, whose Add-a-step menu is rendered inline (later inserts ride the
+ * connector "+" popovers instead). The new step is auto-selected, so its
+ * inline inspector accordion is open when this resolves.
+ */
+export async function addFirstStep(
+  page: Page,
+  kind: "Tool call" | "Infer" | "Agent" | "For each" | "Branch" | "Filter" | "State",
+): Promise<void> {
+  await page
+    .getByRole("menu", { name: "Add a step" })
+    // The menuitem's accessible name is "<label> <description>" — anchor on
+    // the label prefix (no label is a prefix of another).
+    .getByRole("menuitem", { name: new RegExp(`^${escapeRegExp(kind)}\\b`) })
+    .click();
+  await expect(page.getByTestId("step-card").first()).toBeVisible();
+}
+
+/**
+ * Pick the agent an AGENT STEP delegates to — the step inspector's card
+ * radio-group of published agents (the step must be selected).
  */
 export async function selectWorkflowAgent(
   page: Page,
@@ -294,11 +337,40 @@ export async function selectWorkflowAgent(
 }
 
 /**
+ * Configure a selected TOOL step's inspector: pick the connection (a labeled
+ * select), pick the tool from the cached-tools picker, and fill one argument
+ * field with template text (plain text stays literal; embedded `@refs`
+ * become `$tpl`, a whole-line `@ref` becomes `$ref` — the field codec).
+ * Requires the connection's probe to have cached its tools (see
+ * `waitForConnectionHealthy` in support/authoring.ts).
+ */
+export async function configureToolStep(
+  page: Page,
+  opts: { connectionName: string; tool: string; arg: { name: string; text: string } },
+): Promise<void> {
+  await page
+    .getByLabel("Connection")
+    .selectOption({ label: opts.connectionName });
+  await page
+    .getByRole("listbox", { name: "Tools" })
+    .getByRole("option", { name: new RegExp(`^${escapeRegExp(opts.tool)}\\b`) })
+    .click();
+  // The picked tool collapses to a summary row with a "Change" affordance.
+  await expect(page.getByRole("button", { name: "Change" })).toBeVisible();
+  const argField = page.getByRole("textbox", {
+    name: opts.arg.name,
+    exact: true,
+  });
+  await argField.fill(opts.arg.text);
+}
+
+/**
  * Reveal the ingress token ONCE via the live webhook config (rendered inside
- * the Trigger section for webhook/form drafts) and return the plaintext.
+ * the EXPANDED TriggerCard for webhook/form drafts) and return the plaintext.
  * Asserts the shown-once hash notice.
  */
 export async function revealWebhookToken(page: Page): Promise<string> {
+  await expandTrigger(page);
   await page.getByRole("button", { name: /Generate token|Rotate token/ }).click();
   // The plaintext is shown once with a "we store only a hash" notice.
   await expect(page.getByText(/store only a hash, so it/i)).toBeVisible();
@@ -310,15 +382,16 @@ export async function revealWebhookToken(page: Page): Promise<string> {
 }
 
 /**
- * Write instructions in the rich editor and exercise the real `@` suggestion
- * dropdown: type `@trigger.` → assert the popup → pick a field. Picking an
- * option inserts an atomic reference chip, not loose characters.
+ * Write an AGENT STEP's instructions in its inspector's rich editor and
+ * exercise the real `@` suggestion dropdown: type `@trigger.` → assert the
+ * popup → pick a field. Picking an option inserts an atomic reference chip,
+ * not loose characters.
  */
-export async function writeInstructionsWithTriggerRef(
+export async function writeAgentInstructionsWithTriggerRef(
   page: Page,
   opts: { lead: string; triggerField: string },
 ): Promise<void> {
-  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+  const editor = page.getByRole("textbox", { name: "Agent instructions editor" });
   await expect(editor).toBeVisible();
   await editor.click();
   await typeProse(page, opts.lead);
@@ -335,26 +408,41 @@ export async function writeInstructionsWithTriggerRef(
 }
 
 /**
- * Append text at the very end of the instructions editor. The caret is first
- * moved to the document end (select-all → ArrowRight collapses the selection to
- * its right edge) so this never depends on where the previous edit left it, and
- * the caller's text can safely lead with a space + blank line to break out of
- * any `@ref` token before the newline (an open autocomplete would swallow it).
+ * Append text at the very end of the agent step's instructions editor. The
+ * caret is first moved to the document end so this never depends on where the
+ * previous edit left it, and the caller's text can safely lead with a space +
+ * blank line to break out of any `@ref` token before the newline (an open
+ * autocomplete would swallow it).
  */
-export async function appendInstructions(page: Page, text: string): Promise<void> {
-  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+export async function appendAgentInstructions(
+  page: Page,
+  text: string,
+): Promise<void> {
+  const editor = page.getByRole("textbox", { name: "Agent instructions editor" });
   await expect(editor).toBeVisible();
   await caretToEnd(page, editor);
   await typeProse(page, text);
 }
 
-/** Write plain instructions (no references) — enough to satisfy publish. */
-export async function writePlainInstructions(page: Page, text: string): Promise<void> {
-  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+/** Write plain agent-step instructions (no references). */
+export async function writePlainAgentInstructions(
+  page: Page,
+  text: string,
+): Promise<void> {
+  const editor = page.getByRole("textbox", { name: "Agent instructions editor" });
   await expect(editor).toBeVisible();
   await editor.click();
   await typeProse(page, text);
   await expect(editor).toContainText(text.slice(0, 12));
+}
+
+/** Switch the workflow shell's header segments to the Runs tab. */
+export async function openRunsTab(page: Page): Promise<void> {
+  await page
+    .getByRole("tablist", { name: "Workflow view" })
+    .getByRole("tab", { name: "Runs" })
+    .click();
+  await expect(page.getByRole("heading", { name: "Runs" })).toBeVisible();
 }
 
 /**
@@ -392,8 +480,9 @@ export async function runWorkflowFromHeader(
   }
 
   await popover.getByRole("button", { name: /Start run|Fire now/ }).click();
-  // The POST resolves only after the full dispatch (ensure-agent → eve
-  // session) — a cold agent boot can take a while, so wait generously.
+  // The POST answers once the pipeline run is accepted (the in-process
+  // driver executes it after) — still generous, since a busy stack can sit
+  // on the cap transaction for a while.
   await expect(popover.getByTestId("run-started")).toBeVisible({
     timeout: RUN_TIMEOUT_MS,
   });

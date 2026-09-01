@@ -9,13 +9,22 @@
  * checks mirror the publish-time rules so an applied proposal never produces
  * a draft that publish rejects:
  *
- * workflow surface (workflow publish validator parity):
- * - `setAgent` must name an EXISTING, PUBLISHED agent;
- * - `setInstructions` `@connection`/`@skill.slug` refs must be within the
- *   SELECTED agent's published context (draft agent ∪ setAgent proposals
- *   accepted earlier in the same turn);
- * - `@trigger.*` refs must be non-bare, allowed for the (possibly
- *   turn-updated) trigger type, and match a form field key for form triggers.
+ * workflow surface (pipelines redesign — workflow publish validator parity):
+ * - the draft state IS the pipeline (trigger + step tree); granular
+ *   mutations (addStep/updateStep/removeStep/moveStep/setTrigger) are
+ *   validated by SIMULATING them on a clone and diffing publish-gate
+ *   problems ({@link collectPipelineProblems}) before vs after — a mid-edit
+ *   draft that already carries issues never blocks an unrelated proposal;
+ * - NEW problems inside the proposed/moved subtree REJECT the call (the
+ *   model self-corrects); new problems the mutation causes elsewhere
+ *   (a removed step stranding later @refs, a trigger change breaking
+ *   @trigger paths) are WARNINGS threaded into the tool result;
+ * - step IDS ARE MINTED SERVER-SIDE: addStep strips every model-supplied id
+ *   and mints fresh ones ({@link mintStepIds}) before schema parse;
+ *   updateStep preserves valid nested ids but forces the root id to the
+ *   addressed step — a replacement can rename a slug, never re-identify;
+ * - unknown stepIds bounce with the draft's known-id roster so the model
+ *   can self-correct instead of guessing.
  *
  * agent surface (compiler parity, packages/compiler/src/instructions.ts):
  * - `setPersona` refs must resolve to context ATTACHED to the agent (draft
@@ -35,23 +44,46 @@
 import {
   agentCopilotMutationParamSchemas,
   copilotMutationParamSchemas,
+  findStep,
+  mintStepIds,
   parseReferences,
+  pipelineStepSchema,
   triggerConfigSchema,
   workflowCopilotMutationParamSchemas,
+  workflowCopilotReadParamSchemas,
   type CopilotAgentIdentity,
   type CopilotMutationParams,
   type CopilotMutationTool,
   type CopilotSurface,
+  type PipelineStep,
   type TriggerConfig,
 } from "@invisible-string/shared";
 
-import type { InventoryAgent, WorkspaceInventory } from "./inventory";
+import type { WorkspaceInventory } from "./inventory";
+import {
+  allStepIds,
+  collectPipelineProblems,
+  describeKnownSteps,
+  insertStep,
+  removeStepById,
+  replaceStepById,
+  stripStepIds,
+  subtreeStepIds,
+  type PipelineProblem,
+} from "./pipeline-draft";
 
 export type MutationValidation =
   | {
       ok: true;
       tool: CopilotMutationTool;
       params: CopilotMutationParams[CopilotMutationTool];
+      /**
+       * Warning-grade advisories (never blocking): collateral the mutation
+       * causes OUTSIDE its own subtree, and cache-grade uncertainty (a tool
+       * name the probe cache cannot confirm). The session threads them into
+       * the model's tool result once the proposal is applied.
+       */
+      warnings: string[];
     }
   | { ok: false; message: string };
 
@@ -59,15 +91,20 @@ export type MutationValidation =
  * The draft state a turn validates against — seeded from the client's draft
  * at turn start and updated as the user ACCEPTS proposals mid-turn (see
  * session.ts) so later calls in the same turn validate against what the
- * draft will actually contain (a setInstructions following an accepted
- * setAgent/setTrigger, a setPersona following an accepted addContext).
+ * draft will actually contain (an addStep referencing a step accepted a
+ * moment ago, a setPersona following an accepted addContext).
  */
 export interface WorkflowDraftState {
   surface: "workflow";
   /** null when the draft's trigger doesn't parse (lenient mid-edit drafts). */
   trigger: TriggerConfig | null;
-  /** The selected agent (`workflows.draft.agentId`); null while drafting. */
-  agentId: string | null;
+  /**
+   * The draft PIPELINE. Lenient per element: top-level steps that fail the
+   * shared schema are dropped (they cannot be reasoned about), the rest
+   * survive — a half-broken draft still lets the copilot work on the good
+   * steps.
+   */
+  steps: PipelineStep[];
 }
 
 export interface AgentDraftState {
@@ -111,10 +148,17 @@ export function draftStateFor(
 ): CopilotDraftState {
   if (surface === "workflow") {
     const trigger = triggerConfigSchema.safeParse(draft.trigger);
+    const steps: PipelineStep[] = [];
+    if (Array.isArray(draft.steps)) {
+      for (const raw of draft.steps) {
+        const parsed = pipelineStepSchema.safeParse(raw);
+        if (parsed.success) steps.push(parsed.data);
+      }
+    }
     return {
       surface,
       trigger: trigger.success ? trigger.data : null,
-      agentId: typeof draft.agentId === "string" ? draft.agentId : null,
+      steps,
     };
   }
   const context = (draft.context ?? {}) as Record<string, unknown>;
@@ -138,7 +182,12 @@ export function draftStateFor(
   };
 }
 
-/** Apply an ACCEPTED mutation to the turn's draft state (session bookkeeping). */
+/**
+ * Apply an ACCEPTED mutation to the turn's draft state (session bookkeeping).
+ * Best-effort by design: the params were validated against THIS state a
+ * moment ago, so failures cannot happen in the normal flow, and bookkeeping
+ * must never throw a turn.
+ */
 export function applyAcceptedMutation(
   state: CopilotDraftState,
   tool: CopilotMutationTool,
@@ -149,9 +198,32 @@ export function applyAcceptedMutation(
       case "setTrigger":
         state.trigger = (params as CopilotMutationParams["setTrigger"]).trigger;
         break;
-      case "setAgent":
-        state.agentId = (params as CopilotMutationParams["setAgent"]).agentId;
+      case "addStep": {
+        const { step, position } = params as CopilotMutationParams["addStep"];
+        // Clone so later accepted mutations never alias the params object the
+        // proposal frame carried.
+        insertStep(state.steps, structuredClone(step), position);
         break;
+      }
+      case "updateStep": {
+        const { stepId, step } = params as CopilotMutationParams["updateStep"];
+        replaceStepById(state.steps, stepId, structuredClone(step));
+        break;
+      }
+      case "removeStep": {
+        const { stepId } = params as CopilotMutationParams["removeStep"];
+        removeStepById(state.steps, stepId);
+        break;
+      }
+      case "moveStep": {
+        const { stepId, position } = params as CopilotMutationParams["moveStep"];
+        const removed = removeStepById(state.steps, stepId);
+        if (removed && insertStep(state.steps, removed, position) !== null) {
+          // Unreachable after validation; never lose the subtree regardless.
+          state.steps.push(removed);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -199,62 +271,57 @@ export function isMutationTool(name: string): name is CopilotMutationTool {
   return name in copilotMutationParamSchemas;
 }
 
-/** Trigger types whose dispatch envelope carries `data` for `@trigger.*`. */
-function triggerCarriesData(trigger: TriggerConfig): boolean {
-  return (
-    trigger.type === "form" ||
-    trigger.type === "webhook" ||
-    trigger.type === "slack"
-  );
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
- * Mirror of the workflow publish validator's trigger-path rule — returns a
- * model-facing problem string instead of throwing (null = valid).
+ * Pre-parse id preparation for the step-carrying workflow tools — the
+ * server-side minting the shared contract decrees (`mintStepIds` docs):
+ * - addStep: STRIP every model-supplied id, then mint fresh ones against the
+ *   whole draft's id set — a new step never keeps an id the model wrote;
+ * - updateStep: preserve well-formed nested ids that belong to the replaced
+ *   subtree (so the model can keep children stable), re-mint anything
+ *   missing/malformed/colliding, and force the ROOT id to the addressed
+ *   stepId.
  */
-function triggerRefProblem(
-  trigger: TriggerConfig,
-  path: string,
-  raw: string,
-): string | null {
-  if (path === "") {
-    return `bare "@trigger" reference — name a data path like "@trigger.email"`;
+function prepareWorkflowInput(
+  tool: CopilotMutationTool,
+  input: unknown,
+  state: WorkflowDraftState,
+): unknown {
+  if (!isRecord(input)) return input;
+  if (tool === "addStep") {
+    const existing = allStepIds(state.steps);
+    return { ...input, step: mintStepIds(stripStepIds(input.step), existing) };
   }
-  if (!triggerCarriesData(trigger)) {
-    return `"${raw}" cannot be used with a "${trigger.type}" trigger — it carries no dispatch data (propose setTrigger to a form/webhook/slack trigger first)`;
-  }
-  if (trigger.type === "form") {
-    const head = path.split(".")[0] ?? "";
-    if (!trigger.fields.some((field) => field.key === head)) {
-      return `"${raw}" does not match any form field key (fields: ${trigger.fields
-        .map((field) => field.key)
-        .join(", ")})`;
+  if (tool === "updateStep") {
+    const stepId = typeof input.stepId === "string" ? input.stepId : null;
+    const target = stepId ? findStep(state.steps, stepId) : null;
+    // Seen = every id OUTSIDE the replaced subtree, plus the root id itself
+    // (so a nested reuse of it re-mints and the forced root stays unique).
+    const seen = allStepIds(state.steps);
+    if (target) {
+      for (const id of subtreeStepIds(target)) {
+        if (id !== stepId) seen.delete(id);
+      }
     }
+    const minted = mintStepIds(input.step, seen);
+    if (stepId && isRecord(minted)) {
+      (minted as Record<string, unknown>).id = stepId;
+    }
+    return { ...input, step: minted };
   }
-  return null;
-}
-
-function describePublishedAgents(inventory: WorkspaceInventory): string {
-  const published = inventory.agents
-    .filter((agent) => agent.published)
-    .map((agent) => `${agent.id} (${agent.name})`)
-    .join(", ");
-  return published || "(none)";
-}
-
-/** Context slugs of a published agent, formatted for a model-facing hint. */
-function describeAgentContext(agent: InventoryAgent): string {
-  const slugs = [
-    ...agent.contextConnectionSlugs.map((slug) => `@${slug}`),
-    ...agent.contextSkillSlugs.map((slug) => `@skill.${slug}`),
-  ].join(", ");
-  return slugs || "(none)";
+  return input;
 }
 
 /**
  * Validate a raw model tool call against the turn's surface (carried on
- * `draftState`). Returns parsed params on success or a model-facing error
- * message describing how to fix the call.
+ * `draftState`). Returns parsed params (plus warning advisories) on success
+ * or a model-facing error message describing how to fix the call.
+ *
+ * READ tools never reach this on the workflow surface — the session executes
+ * them inline first; on the agent surface they bounce with a surface hint.
  */
 export function validateMutation(
   toolName: string,
@@ -272,10 +339,19 @@ export function validateMutation(
         `tool "${toolName}" is not available on the ${draftState.surface} surface (available: ${Object.keys(registry).join(", ")})`,
       );
     }
+    if (toolName in workflowCopilotReadParamSchemas) {
+      return invalid(
+        `tool "${toolName}" is a workflow-surface read tool and is not available on the ${draftState.surface} surface`,
+      );
+    }
     return invalid(`unknown tool "${toolName}"`);
   }
   const tool = toolName as CopilotMutationTool;
-  const parsed = copilotMutationParamSchemas[tool].safeParse(input);
+  const effectiveInput =
+    draftState.surface === "workflow"
+      ? prepareWorkflowInput(tool, input, draftState)
+      : input;
+  const parsed = copilotMutationParamSchemas[tool].safeParse(effectiveInput);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
@@ -284,96 +360,123 @@ export function validateMutation(
   }
   const params = parsed.data as CopilotMutationParams[CopilotMutationTool];
 
-  const problem =
-    draftState.surface === "workflow"
-      ? workflowSemanticProblem(tool, params, inventory, draftState)
-      : agentSemanticProblem(tool, params, inventory, draftState);
+  if (draftState.surface === "workflow") {
+    return workflowMutationValidation(tool, params, inventory, draftState);
+  }
+  const problem = agentSemanticProblem(tool, params, inventory, draftState);
   if (problem) return invalid(problem);
-
-  return { ok: true, tool, params };
+  return { ok: true, tool, params, warnings: [] };
 }
 
-// ── workflow-surface semantics ───────────────────────────────────────────────
+// ── workflow-surface semantics (simulate + problem diff) ─────────────────────
 
-function workflowSemanticProblem(
+const problemKey = (p: PipelineProblem): string =>
+  `${p.severity}|${p.stepId}|${p.message}`;
+
+function workflowMutationValidation(
   tool: CopilotMutationTool,
   params: CopilotMutationParams[CopilotMutationTool],
   inventory: WorkspaceInventory,
   draftState: WorkflowDraftState,
-): string | null {
+): MutationValidation {
+  // Simulate the mutation on a clone; structural failures (unknown ids, bad
+  // positions) reject immediately with the draft's id roster.
+  const simulated = structuredClone(draftState.steps);
+  let simulatedTrigger = draftState.trigger;
+  /** Ids whose NEW error-grade problems reject (the proposed subtree). */
+  let affected = new Set<string>();
+
   switch (tool) {
-    case "setAgent": {
-      const { agentId } = params as CopilotMutationParams["setAgent"];
-      const agent = inventory.agents.find(
-        (candidate) => candidate.id === agentId,
-      );
-      if (!agent) {
-        const known = inventory.agents
-          .map((candidate) => `${candidate.id} (${candidate.name})`)
-          .join(", ");
-        return `agent id "${agentId}" does not exist in this workspace — known agents: ${known || "(none)"}`;
-      }
-      // Publish snapshots require a PUBLISHED agent; dispatch resolves its
-      // current published version.
-      if (!agent.published) {
-        return `agent "${agent.name}" has no published version and cannot handle workflow runs yet — published agents: ${describePublishedAgents(inventory)}`;
-      }
-      return null;
+    case "setTrigger": {
+      simulatedTrigger = (params as CopilotMutationParams["setTrigger"]).trigger;
+      break;
     }
-    case "setInstructions": {
-      const { markdown } = params as CopilotMutationParams["setInstructions"];
-      const problems: string[] = [];
-      const selected = draftState.agentId
-        ? inventory.agents.find((agent) => agent.id === draftState.agentId)
-        : undefined;
-      const contextProblem = (raw: string, has: boolean): string | null => {
-        if (!draftState.agentId) {
-          return `"${raw}" references agent context but the draft has no agent — propose setAgent first`;
-        }
-        if (!selected) {
-          return `"${raw}" references agent context but the selected agent no longer exists — propose setAgent to a published agent (${describePublishedAgents(inventory)})`;
-        }
-        if (!selected.published) {
-          return `"${raw}" references agent context but agent "${selected.name}" has no published version — propose setAgent to a published agent (${describePublishedAgents(inventory)})`;
-        }
-        if (!has) {
-          return `"${raw}" is not in agent "${selected.name}"'s published context (available: ${describeAgentContext(selected)})`;
-        }
-        return null;
-      };
-      for (const ref of parseReferences(markdown)) {
-        if (ref.kind === "connection") {
-          const found = contextProblem(
-            ref.raw,
-            selected?.contextConnectionSlugs.includes(ref.name) ?? false,
-          );
-          if (found) problems.push(found);
-        } else if (ref.kind === "skill") {
-          const found = contextProblem(
-            ref.raw,
-            ref.slug !== "" &&
-              (selected?.contextSkillSlugs.includes(ref.slug) ?? false),
-          );
-          if (found) problems.push(found);
-        } else if (draftState.trigger) {
-          const found = triggerRefProblem(draftState.trigger, ref.path, ref.raw);
-          if (found) problems.push(found);
-        }
+    case "addStep": {
+      const { step, position } = params as CopilotMutationParams["addStep"];
+      const error = insertStep(simulated, structuredClone(step), position);
+      if (error) return invalid(error);
+      affected = subtreeStepIds(step);
+      break;
+    }
+    case "updateStep": {
+      const { stepId, step } = params as CopilotMutationParams["updateStep"];
+      if (!findStep(draftState.steps, stepId)) {
+        return invalid(unknownStepMessage(stepId, draftState.steps));
       }
-      if (problems.length > 0) {
-        return (
-          `instructions reference resources that would fail to publish: ${problems.join("; ")}. ` +
-          "Only reference the selected agent's published context and valid @trigger paths."
+      replaceStepById(simulated, stepId, structuredClone(step));
+      affected = subtreeStepIds(step);
+      break;
+    }
+    case "removeStep": {
+      const { stepId } = params as CopilotMutationParams["removeStep"];
+      if (!findStep(draftState.steps, stepId)) {
+        return invalid(unknownStepMessage(stepId, draftState.steps));
+      }
+      removeStepById(simulated, stepId);
+      // Nothing new to reject on: collateral (stranded refs) is warned about.
+      break;
+    }
+    case "moveStep": {
+      const { stepId, position } = params as CopilotMutationParams["moveStep"];
+      const moving = findStep(draftState.steps, stepId);
+      if (!moving) {
+        return invalid(unknownStepMessage(stepId, draftState.steps));
+      }
+      const subtree = subtreeStepIds(moving);
+      if (position.after !== null && subtree.has(position.after)) {
+        return invalid(
+          `cannot move step "${stepId}" relative to itself or into its own subtree ("${position.after}" is inside it)`,
         );
       }
-      return null;
+      if (position.parent && subtree.has(position.parent.stepId)) {
+        return invalid(
+          `cannot move step "${stepId}" into its own subtree ("${position.parent.stepId}" is inside it)`,
+        );
+      }
+      const removed = removeStepById(simulated, stepId);
+      if (!removed) return invalid(unknownStepMessage(stepId, draftState.steps));
+      const error = insertStep(simulated, removed, position);
+      if (error) return invalid(error);
+      affected = subtree;
+      break;
     }
-    case "setTrigger":
-      // Fully covered by the zod schema (shape-validated trigger union).
-      return null;
     default:
-      return null;
+      break;
   }
+
+  // Publish-gate problem diff: only problems the mutation INTRODUCES count —
+  // a mid-edit draft's pre-existing issues never block an unrelated proposal.
+  const before = new Set(
+    collectPipelineProblems(draftState.steps, draftState.trigger, inventory).map(
+      problemKey,
+    ),
+  );
+  const fresh = collectPipelineProblems(
+    simulated,
+    simulatedTrigger,
+    inventory,
+  ).filter((p) => !before.has(problemKey(p)));
+
+  const rejects = fresh.filter(
+    (p) => p.severity === "error" && affected.has(p.stepId),
+  );
+  if (rejects.length > 0) {
+    return invalid(
+      `${tool} would produce steps that fail to publish: ${rejects
+        .map((p) => p.message)
+        .join("; ")}`,
+    );
+  }
+  return {
+    ok: true,
+    tool,
+    params,
+    warnings: fresh.map((p) => p.message),
+  };
+}
+
+function unknownStepMessage(stepId: string, steps: PipelineStep[]): string {
+  return `stepId "${stepId}" does not exist in the draft — known steps: ${describeKnownSteps(steps)}. Never invent step ids; use the ids from the current draft.`;
 }
 
 // ── agent-surface semantics ──────────────────────────────────────────────────
@@ -515,7 +618,12 @@ function agentSemanticProblem(
         if (ref.kind === "trigger") {
           // Compiler parity: TRIGGER_REF_NOT_ALLOWED at agent publish.
           problems.push(
-            `"${ref.raw}" is not allowed in an agent persona — trigger data exists only in workflow instructions`,
+            `"${ref.raw}" is not allowed in an agent persona — trigger data exists only in workflow pipelines`,
+          );
+        } else if (ref.kind === "step" || ref.kind === "state" || ref.kind === "item" || ref.kind === "now") {
+          // Pipeline scope refs have no meaning at agent compile time.
+          problems.push(
+            `"${ref.raw}" is not allowed in an agent persona — pipeline scope (@steps/@state/@item/@now) exists only in workflow pipelines`,
           );
         } else if (ref.kind === "connection") {
           if (!enabledConnections.some((c) => c.slug === ref.name)) {

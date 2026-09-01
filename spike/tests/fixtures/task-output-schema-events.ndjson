@@ -1,0 +1,8 @@
+{"data":{"runtime":{"agentId":"spike-agent","agentName":"spike-agent","eveVersion":"0.31.3","modelId":"deepseek/deepseek-v4-flash"}},"type":"session.started","meta":{"at":"2026-09-01T05:09:04.302Z","id":"evt_01M1DNXWNEY22QJX6VNHKBCHEH"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.started","meta":{"at":"2026-09-01T05:09:04.303Z","id":"evt_01M1DNXWNFWG801NPAND1SYH24"}}
+{"data":{"message":"Produce the structured summary for the pipeline spike.","parts":[{"text":"Produce the structured summary for the pipeline spike.","type":"text"}],"sequence":0,"turnId":"turn_0"},"type":"message.received","meta":{"at":"2026-09-01T05:09:04.303Z","id":"evt_01M1DNXWNFWG801NPAND1SYH25"}}
+{"data":{"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"step.started","meta":{"at":"2026-09-01T05:09:04.304Z","id":"evt_01M1DNXWNGZBE8811QY8C2QT4T"}}
+{"data":{"finishReason":"tool-calls","sequence":0,"stepIndex":0,"turnId":"turn_0","usage":{"inputTokens":672,"outputTokens":10,"cacheReadTokens":0,"cacheWriteTokens":0}},"type":"step.completed","meta":{"at":"2026-09-01T05:09:04.319Z","id":"evt_01M1DNXWNZJT453SKZG8FA3S7Z"}}
+{"data":{"result":{"title":"structured-output","count":1},"sequence":0,"stepIndex":0,"turnId":"turn_0"},"type":"result.completed","meta":{"at":"2026-09-01T05:09:04.332Z","id":"evt_01M1DNXWPCPF0BAH9S26Y89PW0"}}
+{"data":{"sequence":0,"turnId":"turn_0"},"type":"turn.completed","meta":{"at":"2026-09-01T05:09:04.332Z","id":"evt_01M1DNXWPCPF0BAH9S26Y89PW1"}}
+{"type":"session.completed","meta":{"at":"2026-09-01T05:09:04.332Z","id":"evt_01M1DNXWPCPF0BAH9S26Y89PW2"}}

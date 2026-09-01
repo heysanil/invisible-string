@@ -46,12 +46,9 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { and, eq, isNull } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import {
-  SESSION_TITLE_MAX_CHARS,
-  type Logger,
-  type ReasoningEffort,
-} from "@invisible-string/shared";
+import { SESSION_TITLE_MAX_CHARS, type Logger } from "@invisible-string/shared";
 
+import { resolvePresetModel, type PresetModelRef } from "../model/presets";
 import {
   anthropicReasoningEffort,
   openRouterReasoningSettings,
@@ -138,18 +135,15 @@ export function loadSessionTitleConfig(
 
 // ── deps + parameters ────────────────────────────────────────────────────────
 
-/** The provider + model + effort one title round-trip runs against. */
-export interface TitleModelRef {
-  provider: "anthropic" | "openrouter";
-  modelId: string;
-  /**
-   * The preset's reasoning effort. Load-bearing, not decoration: the seeded
-   * `quick` and `balanced` presets are THE SAME MODEL ID and differ only here
-   * (packages/db/src/seed.ts), so dropping it would run titling at balanced's
-   * cost/latency profile under quick's name.
-   */
-  reasoning: ReasoningEffort;
-}
+/**
+ * The provider + model + effort one title round-trip runs against — the
+ * shared preset resolution's shape (model/presets.ts). The reasoning effort
+ * is load-bearing, not decoration: the seeded `quick` and `balanced` presets
+ * are THE SAME MODEL ID and differ only there (packages/db/src/seed.ts), so
+ * dropping it would run titling at balanced's cost/latency profile under
+ * quick's name.
+ */
+export type TitleModelRef = PresetModelRef;
 
 export interface TitleGeneratorInput {
   model: TitleModelRef;
@@ -306,39 +300,18 @@ export async function generateAndPersistSessionTitle(
 }
 
 /**
- * The workspace's `quick` preset as a model reference — provider, model id AND
- * effort, because the preset's identity is all three (a `quick` row that lost
- * its `low` is just `balanced`). Null when the workspace has no such row —
- * titling is skipped rather than falling back to another preset, because
- * "quick" is the only one D9 authorizes to spend the platform key on
+ * The workspace's `quick` preset as a model reference — a thin delegation to
+ * the shared resolver (model/presets.ts, extracted from here when pipeline
+ * `infer` steps became its second caller). Null when the workspace has no
+ * such row — titling is skipped rather than falling back to another preset,
+ * because "quick" is the only one D9 authorizes to spend the platform key on
  * background work.
  */
 export async function resolveQuickPresetModel(
   db: Db,
   organizationId: string,
 ): Promise<TitleModelRef | null> {
-  const rows = await db
-    .select({
-      provider: schema.modelPresets.provider,
-      modelId: schema.modelPresets.modelId,
-      reasoning: schema.modelPresets.reasoning,
-    })
-    .from(schema.modelPresets)
-    .where(
-      and(
-        eq(schema.modelPresets.organizationId, organizationId),
-        eq(schema.modelPresets.slug, "quick"),
-      ),
-    )
-    .limit(1);
-  const row = rows[0];
-  return row
-    ? {
-        provider: row.provider,
-        modelId: row.modelId,
-        reasoning: row.reasoning,
-      }
-    : null;
+  return resolvePresetModel(db, organizationId, "quick");
 }
 
 // ── the model round-trip ─────────────────────────────────────────────────────

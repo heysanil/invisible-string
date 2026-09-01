@@ -10,11 +10,14 @@
  * stubbed: a local MCP server and a local Slack Web API server. NOTHING
  * between the platform API and a live compiled agent is faked.
  *
- * AGENTS-FIRST SHAPE: the AGENT is the compile unit — TWO agents (two hashes,
- * two builds); the workflows all delegate to one of them and compile NOTHING
- * (publish is instant). Dispatch renders each workflow's instructions into
- * the task message; agent env is identical across every path (no per-trigger
- * env — no SLACK_BOT_TOKEN ever reaches an agent).
+ * PIPELINES SHAPE: the AGENT is the compile unit — TWO agents (two hashes,
+ * two builds); every workflow is a v2 PIPELINE holding one `agent` step that
+ * delegates to one of them, and compiles NOTHING (publish is instant). Each
+ * trigger starts a sessionless `mode: 'pipeline'` PARENT run the control
+ * plane interprets; the agent step renders its instructions and dispatches a
+ * `mode: 'agent'` CHILD run (session + eve turn). Agent env is identical
+ * across every path (no per-trigger env — no SLACK_BOT_TOKEN ever reaches an
+ * agent).
  *
  * The proofs (each an assertion polled off real DB/stub state — no sleeps):
  *   1. SPREAD    — sessions land on ≥2 distinct workers
@@ -23,19 +26,24 @@
  *      determinism comes from the real "scheduler only routes to LIVE
  *      workers" rule (park one worker `draining` for the second dispatch —
  *      the same mechanism graceful drain uses).
- *   2. TRIGGERS  — manual "Run now" (`POST /workspaces/:id/workflows/:wfId/run`),
- *      form (`POST /t/:token`) and webhook (`POST /t/:token`) each start a
- *      run whose persisted task message carries the `<workflow-task>` wrapper.
- *   3. SLACK     — an app_mention creates a session AND the CONTROL PLANE
- *      delivers a THREADED chat.postMessage to the stub Slack API off the
- *      run's terminal event (runs.delivery_status settles `delivered` — the
- *      compiled artifact has no Slack code path at all in compiler v3); a
+ *   2. TRIGGERS  — manual "Run now" (`POST /workspaces/:id/workflows/:wfId/run`
+ *      → 201 `{run}`, no session), form (`POST /t/:token`) and webhook
+ *      (`POST /t/:token`) each start a pipeline run whose `run_steps` ledger
+ *      links the agent step to a child run carrying the RENDERED instructions
+ *      as its task message.
+ *   3. SLACK     — an app_mention starts a pipeline run whose `session:
+ *      "thread"` agent step claims a thread session, AND the CONTROL PLANE
+ *      delivers a THREADED chat.postMessage rendered from the PARENT's
+ *      `onComplete.slackReply` template off its terminal status (the parent's
+ *      runs.delivery_status settles `delivered`; child runs never deliver); a
  *      follow-up in the SAME thread_ts continues the SAME agent_session (one
- *      session row, two runs, same eve session id, both replies delivered).
+ *      session row, two child runs, same eve session id, both replies
+ *      delivered).
  *   4. SCHEDULE  — a published cron workflow with a DUE `next_fire_at` is
  *      claimed and dispatched by the control-plane schedule ticker (short
- *      SCHEDULE_TICK_MS): the session's origin is `schedule`, the cursor
- *      advances (no backfill), and disabling the workflow disarms it.
+ *      SCHEDULE_TICK_MS) as a pipeline run: the child session's origin is
+ *      `schedule`, the cursor advances (no backfill), and disabling the
+ *      workflow disarms it.
  *   5. HITL      — an ask_question tool call parks the run (`waiting`);
  *      answering via `POST /runs/:id/input` resumes it to `succeeded`.
  *   6. FAILOVER  — a parked run on worker A survives `SIGKILL A`: the sweeper
@@ -64,6 +72,7 @@ import { SQL } from "bun";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   newId,
+  newStepId,
   parseMasterKey,
   generateMasterKeyBase64,
   SLACK_SIGNATURE_HEADER,
@@ -73,9 +82,9 @@ import {
   type CreateWebhookTokenResponse,
   type PublishAgentResponse,
   type PublishWorkflowResponse,
+  type RunDto,
   type SlackInnerEvent,
   type SlackIntegrationMetadata,
-  type TriggerIngressResponse,
   type WorkflowConfigInput,
 } from "@invisible-string/shared";
 
@@ -570,6 +579,42 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
     return rows[0];
   }
 
+  /** A v2 config holding exactly one `agent` step bound to Alpha. */
+  function singleAgentStepPipeline(
+    trigger: WorkflowConfigInput["trigger"],
+    instructionsMarkdown: string,
+  ): WorkflowConfigInput {
+    return {
+      version: 2,
+      trigger,
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
+          agentId: agentAlphaId,
+          session: "fresh",
+          instructions: { markdown: instructionsMarkdown },
+        },
+      ],
+    };
+  }
+
+  /**
+   * The CHILD `mode: 'agent'` run a parent pipeline run's sole agent step
+   * dispatched (via the run_steps ledger's child link). Undefined until the
+   * step has dispatched.
+   */
+  async function pipelineChildRun(parentRunId: string) {
+    const steps = await db
+      .select({ childRunId: schema.runSteps.childRunId })
+      .from(schema.runSteps)
+      .where(eq(schema.runSteps.runId, parentRunId));
+    const childRunId = steps.find((s) => s.childRunId !== null)?.childRunId;
+    if (!childRunId) return undefined;
+    return runRow(childRunId);
+  }
+
   async function triggerRowOf(workflowId: string) {
     const rows = await db
       .select()
@@ -706,9 +751,8 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
     });
 
     const persona =
-      "You are a helpful assistant. Do exactly what the incoming message asks. " +
-      "The message may be wrapped in <workflow-task> or <trigger-context> blocks; " +
-      "obey the instruction inside them.";
+      "You are a helpful assistant. Do exactly what the incoming message asks — " +
+      "it is either a direct chat message or a workflow step's rendered instructions.";
 
     // TWO agents → two hashes → two eve builds (name feeds the hash via its
     // slug, so even an identical definition compiles to a distinct artifact).
@@ -725,36 +769,59 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
     await publishAgentAndBuild(agentAlphaId);
     await publishAgentAndBuild(agentBetaId);
 
-    // Delegation workflows — all handled by Alpha; publish is instant.
-    const instructions = {
-      markdown:
-        "Do exactly what the incoming request in the trigger context asks.",
-    };
-    manualWorkflowId = await createWorkflow("P3 Manual", {
-      trigger: { type: "manual" },
-      agentId: agentAlphaId,
-      instructions,
-    });
-    formWorkflowId = await createWorkflow("P3 Form", {
-      trigger: {
-        type: "form",
-        fields: [
-          { key: "message", label: "Message", type: "text", required: true },
-          { key: "topic", label: "Topic", type: "text", required: false },
-        ],
-      },
-      agentId: agentAlphaId,
-      instructions,
-    });
-    webhookWorkflowId = await createWorkflow("P3 Webhook", {
-      trigger: { type: "webhook" },
-      agentId: agentAlphaId,
-      instructions,
-    });
+    // Delegation pipelines — each a single `agent` step handled by Alpha;
+    // publish is instant. Manual triggers carry no dispatch data (the
+    // validator rejects @trigger refs on them), so the manual pipeline's
+    // instructions are self-contained; form/webhook/slack render the
+    // incoming request via @trigger.<key>.
+    manualWorkflowId = await createWorkflow(
+      "P3 Manual",
+      singleAgentStepPipeline(
+        { type: "manual" },
+        "Reply with exactly: manual-hello",
+      ),
+    );
+    formWorkflowId = await createWorkflow(
+      "P3 Form",
+      singleAgentStepPipeline(
+        {
+          type: "form",
+          fields: [
+            { key: "message", label: "Message", type: "text", required: true },
+            { key: "topic", label: "Topic", type: "text", required: false },
+          ],
+        },
+        "Do exactly what this asks: @trigger.message",
+      ),
+    );
+    webhookWorkflowId = await createWorkflow(
+      "P3 Webhook",
+      singleAgentStepPipeline(
+        { type: "webhook" },
+        "Do exactly what this asks: @trigger.message",
+      ),
+    );
     slackWorkflowId = await createWorkflow("P3 Slack", {
+      version: 2,
       trigger: { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } },
-      agentId: agentAlphaId,
-      instructions,
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
+          agentId: agentAlphaId,
+          // Thread continuity is the agent STEP's session policy now.
+          session: "thread",
+          instructions: {
+            markdown: "Do exactly what this Slack message asks: @trigger.text",
+          },
+        },
+      ],
+      // Pipelines deliver EXPLICITLY: the parent renders this template
+      // against the final scope and posts it through the DeliveryService.
+      onComplete: {
+        slackReply: { template: { markdown: "@steps.reply.text" } },
+      },
     });
     await publishWorkflow(manualWorkflowId);
     await publishWorkflow(formWorkflowId);
@@ -865,29 +932,36 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
     10 * 60_000,
   );
 
-  // ── 2. TRIGGERS: manual "Run now" + form + webhook each start a run ─────────
+  // ── 2. TRIGGERS: manual "Run now" + form + webhook each start a pipeline run ──
 
   test(
-    'manual "Run now" (POST /workflows/:wfId/run) dispatches the published snapshot',
+    'manual "Run now" (POST /workflows/:wfId/run) starts a pipeline run of the published snapshot',
     async () => {
       const res = await api("POST", `/workspaces/${orgId}/workflows/${manualWorkflowId}/run`, {
-        body: { message: "Reply with exactly: manual-hello" },
+        body: {},
       });
       expect(res.status).toBe(201);
-      const body = (await res.json()) as CreateSessionResponse;
-      // Workflow provenance + the rendered task message ride the rows.
-      expect(body.session.workflowId).toBe(manualWorkflowId);
-      expect(body.run.taskMessage).not.toBeNull();
-      expect(body.run.taskMessage!).toContain("<workflow-task>");
-      expect(body.run.taskMessage!).toContain("Reply with exactly: manual-hello");
+      // No session exists for a pipeline run — the response is `{run}` alone.
+      const body = (await res.json()) as { run: RunDto };
+      expect(body.run.mode).toBe("pipeline");
+      expect(body.run.workflowId).toBe(manualWorkflowId);
+      expect(body.run.agentSessionId).toBeNull();
+      expect(body.run.taskMessage).toBeNull();
       await awaitRunStatus(body.run.id, "succeeded");
-      expect((await runMessages(body.run.id)).some((m) => m.includes("manual-hello"))).toBeTrue();
+
+      // The agent step dispatched a CHILD run carrying the rendered
+      // instructions as its task message; the model turn ran there.
+      const child = await pipelineChildRun(body.run.id);
+      expect(child).toBeDefined();
+      expect(child!.mode).toBe("agent");
+      expect(child!.taskMessage).toContain("Reply with exactly: manual-hello");
+      expect((await runMessages(child!.id)).some((m) => m.includes("manual-hello"))).toBeTrue();
     },
     5 * 60_000,
   );
 
   test(
-    "form trigger (POST /t/:token, form-bound workflow) starts a run",
+    "form trigger (POST /t/:token, form-bound workflow) starts a pipeline run",
     async () => {
       const mint = await api(
         "POST",
@@ -902,18 +976,24 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
         body: JSON.stringify({ values: { message: "Reply with exactly: form-hello", topic: "billing" } }),
       });
       expect(res.status).toBe(202);
-      const body = (await res.json()) as TriggerIngressResponse;
+      // Pipeline ingress acks `{accepted, runId}` — no session exists.
+      const body = (await res.json()) as { accepted: boolean; runId: string };
       expect(body.accepted).toBeTrue();
       await awaitRunStatus(body.runId, "succeeded");
-      expect((await runMessages(body.runId)).some((m) => m.includes("form-hello"))).toBeTrue();
-      const session = await sessionRow(body.sessionId);
+
+      // Rendered @trigger.message reached the child; its session carries the
+      // form origin + workflow provenance.
+      const child = await pipelineChildRun(body.runId);
+      expect(child!.taskMessage).toContain("Reply with exactly: form-hello");
+      expect((await runMessages(child!.id)).some((m) => m.includes("form-hello"))).toBeTrue();
+      const session = await sessionRow(child!.agentSessionId!);
       expect(session).toMatchObject({ origin: "form", workflowId: formWorkflowId });
     },
     5 * 60_000,
   );
 
   test(
-    "webhook trigger (POST /t/:token, raw JSON) starts a run",
+    "webhook trigger (POST /t/:token, raw JSON) starts a pipeline run",
     async () => {
       const mint = await api(
         "POST",
@@ -928,11 +1008,14 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
         body: JSON.stringify({ message: "Reply with exactly: webhook-hello" }),
       });
       expect(res.status).toBe(202);
-      const body = (await res.json()) as TriggerIngressResponse;
+      const body = (await res.json()) as { accepted: boolean; runId: string };
       expect(body.accepted).toBeTrue();
       await awaitRunStatus(body.runId, "succeeded");
-      expect((await runMessages(body.runId)).some((m) => m.includes("webhook-hello"))).toBeTrue();
-      const session = await sessionRow(body.sessionId);
+
+      const child = await pipelineChildRun(body.runId);
+      expect(child!.taskMessage).toContain("Reply with exactly: webhook-hello");
+      expect((await runMessages(child!.id)).some((m) => m.includes("webhook-hello"))).toBeTrue();
+      const session = await sessionRow(child!.agentSessionId!);
       expect(session).toMatchObject({ origin: "webhook", workflowId: webhookWorkflowId });
     },
     5 * 60_000,
@@ -941,7 +1024,7 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
   // ── 3. SLACK: mention → CONTROL-PLANE threaded reply; thread continues session ──
 
   test(
-    "slack mention creates a session AND the control plane delivers a threaded reply (delivery_status ledger)",
+    "slack mention starts a pipeline run whose thread session + onComplete reply are control-plane-delivered (delivery_status ledger)",
     async () => {
       const mentionTs = `${Math.floor(Date.now() / 1000)}.000100`;
       const before = slack.posted.length;
@@ -957,7 +1040,8 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
         "Ev-mention-1",
       );
 
-      // The dispatch is async (Slack is acked fast). A session appears…
+      // The dispatch is async (Slack is acked fast). The pipeline's `session:
+      // "thread"` agent step claims a thread session…
       const slackSession = await until(
         async () => {
           const rows = await db
@@ -975,13 +1059,15 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
           const ready = rows.find((r) => r.eveSessionId);
           return ready ?? undefined;
         },
-        "slack session with an eve session id",
+        "slack thread session with an eve session id",
         4 * 60_000,
       );
 
-      // …and the CONTROL PLANE posts a THREADED reply to the stub Slack API
-      // off the run's terminal event. (Compiler v3 artifacts have no Slack
-      // code path and never see a bot token — runs/delivery.ts owns this.)
+      // …and the CONTROL PLANE posts a THREADED reply to the stub Slack API:
+      // the PARENT pipeline run renders its `onComplete.slackReply` template
+      // (`@steps.reply.text` — the agent step's output) off its terminal
+      // status. (Compiled artifacts have no Slack code path and never see a
+      // bot token — runs/delivery.ts owns this.)
       const reply = await until(
         async () => slack.posted.slice(before).find((m) => m.text.includes("slack-hello")) ?? undefined,
         "threaded chat.postMessage at the stub Slack API",
@@ -991,42 +1077,54 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
       expect(reply.threadTs).toBe(mentionTs); // threaded under the mention
       expect(reply.authorization).toBe(`Bearer ${SLACK_BOT_TOKEN}`);
 
-      // The delivery LEDGER settles: slack-origin runs are born owing a reply
-      // (pending at dispatch) and flip to `delivered` after the post.
-      const mentionRun = await until(
+      // The delivery LEDGER settles on the PARENT: slack-origin pipeline runs
+      // with an onComplete reply are born owing one (pending at creation) and
+      // flip to `delivered` after the post. Child runs NEVER deliver.
+      const mentionParent = await until(
         async () => {
           const rows = await db
             .select({ id: schema.runs.id, deliveryStatus: schema.runs.deliveryStatus })
             .from(schema.runs)
-            .where(eq(schema.runs.agentSessionId, slackSession.id));
+            .where(
+              and(
+                eq(schema.runs.workflowId, slackWorkflowId),
+                eq(schema.runs.mode, "pipeline"),
+              ),
+            );
           return rows.find((r) => r.deliveryStatus === "delivered") ?? undefined;
         },
-        "runs.delivery_status → delivered",
+        "parent runs.delivery_status → delivered",
         60_000,
       );
-      expect(mentionRun.deliveryStatus).toBe("delivered");
-      // The task message (rendered instructions) is provenance on the run.
-      const mentionRunRow = await runRow(mentionRun.id);
-      expect(mentionRunRow!.taskMessage).not.toBeNull();
-      expect(mentionRunRow!.taskMessage!).toContain("<workflow-task>");
+      expect(mentionParent.deliveryStatus).toBe("delivered");
+      // The rendered instructions are provenance on the CHILD run; the child
+      // owes no delivery of its own.
+      const childRuns = await db
+        .select()
+        .from(schema.runs)
+        .where(eq(schema.runs.agentSessionId, slackSession.id));
+      expect(childRuns).toHaveLength(1);
+      expect(childRuns[0]!.taskMessage).not.toBeNull();
+      expect(childRuns[0]!.taskMessage!).toContain("Reply with exactly: slack-hello");
+      expect(childRuns[0]!.deliveryStatus).toBeNull();
 
       // ── follow-up in the SAME thread continues the SAME session ──
-      // Wait for the mention's run to fully finish first: a thread reply that
-      // lands while the first turn is still in flight is rejected by the
-      // PLATFORM's own transient 409 `session_busy` (one run per session) and
-      // dropped by the Slack router. That is a different code from eve's
-      // permanent `session_not_active`, which instead evicts the thread claim.
+      // Wait for the mention's runs (parent + child) to fully finish first: a
+      // thread reply that lands while the parent is still live is DROPPED by
+      // the workflow's `overlap: "skip"` policy, and one that catches the
+      // child mid-turn is rejected by the platform's transient 409
+      // `session_busy` (one run per session) inside the agent step.
       await until(
         async () => {
           const rows = await db
             .select({ status: schema.runs.status })
             .from(schema.runs)
-            .where(eq(schema.runs.agentSessionId, slackSession.id));
+            .where(eq(schema.runs.workflowId, slackWorkflowId));
           return rows.length > 0 && rows.every((r) => r.status === "succeeded" || r.status === "failed")
             ? true
             : undefined;
         },
-        "mention run to finish before the thread reply",
+        "mention runs to finish before the thread reply",
         4 * 60_000,
       );
       const before2 = slack.posted.length;
@@ -1050,9 +1148,10 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
       );
       expect(followReply.threadTs).toBe(mentionTs);
 
-      // Continuity: still exactly ONE slack session for this workflow, now
-      // with TWO runs (same eve session id) — the thread reply rode eve's
-      // native session continuation, no custom channel involved.
+      // Continuity: still exactly ONE slack thread session for this workflow,
+      // now with TWO child runs (same eve session id) — the follow-up's OWN
+      // pipeline run found the claimed thread session and rode eve's native
+      // session continuation, no custom channel involved.
       const sessions = await db
         .select({ id: schema.agentSessions.id, eveSessionId: schema.agentSessions.eveSessionId })
         .from(schema.agentSessions)
@@ -1065,20 +1164,28 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
       expect(sessions).toHaveLength(1);
       expect(sessions[0]!.id).toBe(slackSession.id);
       const runs = await db
-        .select({ id: schema.runs.id, deliveryStatus: schema.runs.deliveryStatus })
+        .select({ id: schema.runs.id })
         .from(schema.runs)
         .where(eq(schema.runs.agentSessionId, slackSession.id));
       expect(runs.length).toBe(2);
-      // Both replies were control-plane-delivered.
+      // Both PARENT pipeline runs delivered their onComplete reply.
       await until(
         async () => {
           const rows = await db
             .select({ deliveryStatus: schema.runs.deliveryStatus })
             .from(schema.runs)
-            .where(eq(schema.runs.agentSessionId, slackSession.id));
-          return rows.every((r) => r.deliveryStatus === "delivered") || undefined;
+            .where(
+              and(
+                eq(schema.runs.workflowId, slackWorkflowId),
+                eq(schema.runs.mode, "pipeline"),
+              ),
+            );
+          return rows.length === 2 &&
+            rows.every((r) => r.deliveryStatus === "delivered")
+            ? true
+            : undefined;
         },
-        "both slack runs delivered",
+        "both slack parent runs delivered",
         60_000,
       );
     },
@@ -1092,13 +1199,16 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
     async () => {
       // Created here (not beforeAll) so the live ticker cannot fire it on a
       // natural minute boundary during earlier proofs.
-      const scheduleWorkflowId = await createWorkflow("P3 Schedule", {
-        trigger: { type: "schedule", cron: "* * * * *" },
-        agentId: agentAlphaId,
-        // Schedules dispatch with an EMPTY ingress message — the instructions
-        // themselves carry the task (mock fixture directive included).
-        instructions: { markdown: "Reply with exactly: schedule-hello" },
-      });
+      const scheduleWorkflowId = await createWorkflow(
+        "P3 Schedule",
+        // Schedules dispatch with no ingress data — the agent step's
+        // instructions themselves carry the task (mock fixture directive
+        // included).
+        singleAgentStepPipeline(
+          { type: "schedule", cron: "* * * * *" },
+          "Reply with exactly: schedule-hello",
+        ),
+      );
       try {
         const beforePublish = Date.now();
         await publishWorkflow(scheduleWorkflowId);
@@ -1118,6 +1228,32 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
           .set({ nextFireAt: forcedDue })
           .where(eq(schema.triggers.id, armed!.id));
 
+        // The ticker starts a PARENT pipeline run; its provenance envelope
+        // carries the fired window.
+        const parent = await until(
+          async () => {
+            const rows = await db
+              .select()
+              .from(schema.runs)
+              .where(
+                and(
+                  eq(schema.runs.workflowId, scheduleWorkflowId),
+                  eq(schema.runs.mode, "pipeline"),
+                ),
+              );
+            return rows[0] ?? undefined;
+          },
+          "schedule-fired pipeline run",
+          60_000,
+        );
+        expect(parent.agentSessionId).toBeNull();
+        const event = parent.triggerEvent as { triggerType?: string; data?: { scheduledFor?: unknown } };
+        expect(event.triggerType).toBe("schedule");
+        expect(typeof event.data?.scheduledFor).toBe("string");
+        await awaitRunStatus(parent.id, "succeeded", 4 * 60_000);
+
+        // The agent step's CHILD session carries the schedule origin; the
+        // child's task message is the rendered instructions.
         const session = await until(
           async () => {
             const rows = await db
@@ -1126,35 +1262,17 @@ describe.skipIf(!GATE)("phase 3 acceptance — worker pool + triggers + delivery
               .where(eq(schema.agentSessions.workflowId, scheduleWorkflowId));
             return rows[0] ?? undefined;
           },
-          "schedule-fired session",
-          60_000,
+          "schedule-fired child session",
+          30_000,
         );
         expect(session.origin).toBe("schedule");
         expect(session.agentId).toBe(agentAlphaId);
 
-        const run = await until(
-          async () => {
-            const rows = await db
-              .select()
-              .from(schema.runs)
-              .where(eq(schema.runs.agentSessionId, session.id));
-            return rows[0] ?? undefined;
-          },
-          "schedule-fired run",
-          30_000,
-        );
-        await awaitRunStatus(run.id, "succeeded", 4 * 60_000);
-        expect((await runMessages(run.id)).some((m) => m.includes("schedule-hello"))).toBeTrue();
-
-        // The rendered task message carried the instructions; the provenance
-        // envelope carries the fired window.
-        const fired = await runRow(run.id);
-        expect(fired!.taskMessage).not.toBeNull();
-        expect(fired!.taskMessage!).toContain("<workflow-task>");
-        expect(fired!.taskMessage!).toContain("Reply with exactly: schedule-hello");
-        const event = fired!.triggerEvent as { triggerType?: string; data?: { scheduledFor?: unknown } };
-        expect(event.triggerType).toBe("schedule");
-        expect(typeof event.data?.scheduledFor).toBe("string");
+        const child = await pipelineChildRun(parent.id);
+        expect(child).toBeDefined();
+        expect(child!.agentSessionId).toBe(session.id);
+        expect(child!.taskMessage).toContain("Reply with exactly: schedule-hello");
+        expect((await runMessages(child!.id)).some((m) => m.includes("schedule-hello"))).toBeTrue();
 
         // Cursor advanced BEFORE dispatch (no backfill): strictly after the
         // forced-due time, into the future relative to the claim.

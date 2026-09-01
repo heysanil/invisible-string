@@ -44,6 +44,7 @@ import {
   installRegistryConnection,
 } from "../support/authoring.ts";
 import {
+  addFirstStep,
   appendPersona,
   attachAgentResource,
   openNewAgent,
@@ -54,16 +55,20 @@ import {
   setAgentModelPreset,
   setFormTriggerWithTwoFields,
   startChatAndSend,
-  waitForAgentPublished,
-  writeInstructionsWithTriggerRef,
+  writeAgentInstructionsWithTriggerRef,
   writePersona,
   RUN_TIMEOUT_MS,
 } from "../support/builder.ts";
 import {
-  SCAFFOLD_AGENT_NAME,
   SCAFFOLD_PROMPT,
+  SCAFFOLD_STATE_STEP_NAME,
+  SCAFFOLD_TOOL_STEP_NAME,
 } from "../support/copilot-script.ts";
-import { agentRailCard, openCopilotAndSend } from "../support/copilot.ts";
+import {
+  agentRailCard,
+  sendWorkflowCopilotMessage,
+  setAutoApply,
+} from "../support/copilot.ts";
 import { signUp, uniqueAccount } from "../support/flows.ts";
 import { REGISTRY_SERVER_TITLE } from "../config.ts";
 
@@ -287,28 +292,29 @@ test("capture the eight product screenshots", async ({ page, browser }) => {
   await expect(sessionsPanel.getByRole("img", { name: "Idle" })).toBeVisible();
   await shoot(page, "chat.png");
 
-  // ── workflow.png — the delegation editor: trigger → agent → instructions ───
+  // ── workflow.png — the pipeline editor: form trigger + one agent step ──────
   await openNewWorkflow(page, WORKFLOW_NAME);
   await setFormTriggerWithTwoFields(page, [
     { key: "email", label: "Customer email" },
     { key: "topic", label: "Topic" },
   ]);
+  await addFirstStep(page, "Agent");
   await selectWorkflowAgent(page, AGENT_NAME);
   // The lead references @notes inline (a real connection ref on the SELECTED
-  // agent's context), then the helper exercises the live `@trigger.`
-  // autocomplete pick for the field ref — two resolved @refs land in the
-  // instructions. Note: no "\n" may be typed right after an `@` word or the
-  // open autocomplete would eat Enter.
-  await writeInstructionsWithTriggerRef(page, {
+  // agent's published context), then the helper exercises the live
+  // `@trigger.` autocomplete pick for the field ref — two resolved @refs
+  // land in the step's instructions. Note: no "\n" may be typed right after
+  // an `@` word or the open autocomplete would eat Enter.
+  await writeAgentInstructionsWithTriggerRef(page, {
     lead:
       "Triage each inbound support request and draft a concise, friendly reply.\n\n" +
       "Check @notes for related history, then note the sender ",
     triggerField: "email",
   });
 
-  // All three sections populated; instant publish flips the header chip to
-  // the green "Published" state for the shot.
-  const editor = page.getByRole("textbox", { name: "Instructions editor" });
+  // Both panes populated; instant publish flips the header chip to the green
+  // "Published" state for the shot.
+  const editor = page.getByRole("textbox", { name: "Agent instructions editor" });
   await expect(editor).toContainText("@trigger.email");
   await expect(editor).toContainText("@notes");
   // The autocomplete tooltip must be gone (the pick closes it).
@@ -321,54 +327,54 @@ test("capture the eight product screenshots", async ({ page, browser }) => {
   await expect(editor).toBeFocused();
   await shoot(page, "workflow.png");
 
-  // ── copilot.png — dock open, un-applied suggestion with a diff preview ─────
+  // ── copilot.png — the composer pane mid-conversation, one pending ghost ────
   // Fresh workflow so the scripted scaffold conversation applies cleanly
-  // (same fake-LLM script as copilot.e2e.ts — its setAgent step targets the
-  // seeded "General Purpose" agent, so wait for its background build first).
-  // Apply the first two proposals; the third (instructions + inline diff)
-  // stays UN-APPLIED for the shot.
-  await waitForAgentPublished(page, SCAFFOLD_AGENT_NAME);
+  // (same fake-LLM script as copilot.e2e.ts — its tool step rides the
+  // workspace's custom "notes" connection added above). Auto-apply OFF so
+  // proposals park; apply the trigger + state step, leave the tool step
+  // UN-APPLIED for the shot: its suggestion card shows the step preview with
+  // the args table while its dashed ghost sits on the strip.
   await openNewWorkflow(page, "Copilot scaffold workflow");
-  await openCopilotAndSend(page, SCAFFOLD_PROMPT);
+  await setAutoApply(page, false);
+  await sendWorkflowCopilotMessage(page, SCAFFOLD_PROMPT);
 
-  const triggerCard = page.getByRole("group", {
+  const triggerSuggestion = page.getByRole("group", {
     name: /^Suggestion: Set trigger: Form/,
   });
-  await expect(triggerCard).toBeVisible();
-  await triggerCard.getByRole("button", { name: "Apply" }).click();
-  await expect(
-    page
-      .getByRole("radiogroup", { name: "Trigger type" })
-      .getByRole("radio", { name: "Form" }),
-  ).toHaveAttribute("aria-checked", "true");
+  await expect(triggerSuggestion).toBeVisible();
+  await triggerSuggestion.getByRole("button", { name: "Apply" }).click();
+  await expect(page.getByTestId("trigger-card")).toContainText("Form");
 
-  const agentCard = page.getByRole("group", {
-    name: `Suggestion: Set agent: ${SCAFFOLD_AGENT_NAME}`,
+  const stateSuggestion = page.getByRole("group", {
+    name: `Suggestion: Add step: ${SCAFFOLD_STATE_STEP_NAME}`,
   });
-  await expect(agentCard).toBeVisible();
-  await agentCard.getByRole("button", { name: "Apply" }).click();
+  await expect(stateSuggestion).toBeVisible();
+  await stateSuggestion.getByRole("button", { name: "Apply" }).click();
   await expect(
-    page
-      .getByRole("radiogroup", { name: "Agent" })
-      .getByRole("radio", { name: new RegExp(`^${SCAFFOLD_AGENT_NAME}\\b`) }),
-  ).toHaveAttribute("aria-checked", "true");
+    page.locator('[data-testid="step-card"][data-step-kind="state"]'),
+  ).toBeVisible();
 
-  const instructionsCard = page.getByRole("group", {
-    name: "Suggestion: Write instructions",
+  const toolSuggestion = page.getByRole("group", {
+    name: `Suggestion: Add step: ${SCAFFOLD_TOOL_STEP_NAME}`,
   });
-  await expect(instructionsCard).toBeVisible();
-  const diff = instructionsCard.getByTestId("diff-view");
-  await expect(diff).toBeVisible();
-  await expect(diff.locator('[data-diff="add"]').first()).toBeVisible();
-  await expect(diff).toContainText("@trigger.email");
-  // Still pending — Apply is live, and no third "Applied" receipt exists.
+  await expect(toolSuggestion).toBeVisible();
+  await expect(toolSuggestion.getByTestId("args-diff")).toContainText(
+    "@trigger.email",
+  );
+  // Still pending — Apply is live, its ghost is on the strip, and only two
+  // "Applied" receipts exist.
   await expect(
-    instructionsCard.getByRole("button", { name: "Apply" }),
+    toolSuggestion.getByRole("button", { name: "Apply" }),
   ).toBeEnabled();
+  await expect(
+    page
+      .getByTestId("ghost-step-card")
+      .filter({ hasText: SCAFFOLD_TOOL_STEP_NAME }),
+  ).toBeVisible();
   await expect(
     page.getByTestId("suggestion-receipt").filter({ hasText: "Applied" }),
   ).toHaveCount(2);
-  await instructionsCard.scrollIntoViewIfNeeded();
+  await toolSuggestion.scrollIntoViewIfNeeded();
   await shoot(page, "copilot.png");
 
   // ── settings.png — /settings → Models: the three preset rows ───────────────

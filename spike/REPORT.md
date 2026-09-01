@@ -582,7 +582,7 @@ mise install node@24
 POSTGRES_PORT=5443 docker compose -p p0spike up -d postgres   # tests also do this on demand
 TEST_DATABASE_URL=postgres://dev:dev@localhost:5443/product bun test spike/tests/
 # keyed suite additionally needs OPENROUTER_API_KEY
-# authorization-events additionally needs SPIKE_EVE_BUILD=1 (real eve build)
+# authorization-events and task-output-schema additionally need SPIKE_EVE_BUILD=1 (real eve build)
 docker compose -p p0spike down                                 # teardown
 ```
 
@@ -623,3 +623,63 @@ processes down. Logs and captured NDJSON land in `spike/.artifacts/`
     provider's effort map is `minimal|low -> low, medium, high, xhigh` — no
     `max` — which is why only the Anthropic branch clamps `max -> xhigh` while
     OpenRouter takes `max` verbatim.
+
+---
+
+## Appended finding — task mode + outputSchema on session create (2026-08-31)
+
+Captured by `spike/tests/task-output-schema.test.ts` (gated `SPIKE_EVE_BUILD=1`
+on top of the DB gate; mocked model — the outputSchema machinery itself runs
+for real, only the LLM is emulated). Committed capture:
+`spike/tests/fixtures/task-output-schema-events.ndjson`. Decision consumer:
+the workflow-pipelines agent step (Amendment A3 — whether to send
+`outputSchema` on session create).
+
+36. **PROVEN — eve 0.31.3's session create ACCEPTS `outputSchema` alongside
+    `mode:"task"`, and the turn emits `result.completed` carrying the
+    schema-shaped payload.** This retires the comment-attested status of
+    `outputSchema` in `packages/shared/src/eve-session-api.ts` and the
+    docs-derived status of `result.completed`: A3's answer is **send it**.
+    Observed on the wire, with the load-bearing mechanics:
+    - Create with `{message, mode:"task", outputSchema}` answers the normal
+      202 `accepted`. The field is PARSED, not tolerated: `parseCreateBody`
+      (`dist/src/public/channels/eve.js`) handles `mode` and `outputSchema`
+      as first-class fields, and a non-object value is its own 400
+      ("Expected 'outputSchema' to be a JSON-serializable object.") — so
+      acceptance is not unknown-key leniency. The follow-up route parses a
+      per-turn `outputSchema` the same way (source-read + the client docs'
+      `send(message, { outputSchema })`; not exercised by the spike).
+    - The schema is enforced through an injected `final_output` tool the
+      model must call (`buildFinalOutputTool`; a task turn that never calls
+      it fails the step `OUTPUT_SCHEMA_NOT_FULFILLED` — source-read,
+      `finishTaskTurn` in `dist/src/harness/tool-loop.js`). The call is
+      consumed INTERNALLY: **no `actions.requested`/`action.result` pair
+      reaches the stream** — the full captured sequence is
+      `session.started · turn.started · message.received · step.started ·
+      step.completed(finishReason:"tool-calls") · result.completed ·
+      turn.completed · session.completed`, with
+      `result.completed.data = {result, sequence, stepIndex, turnId}`. Any
+      consumer waiting for a visible tool call to precede the result would
+      wait forever; `finishReason:"tool-calls"` on the step is the only
+      trace.
+    - Under `EVE_MOCK_AUTHORED_MODELS=1` the mock model calls `final_output`
+      with a schema-derived sample (`createJsonSchemaSample`; the probe's
+      `{title: string, count: integer}` schema yielded
+      `{"title":"structured-output","count":1}`), so the whole path —
+      injection, model call, finalization, `result.completed` — is CI-able
+      keylessly.
+    - Task mode terminates the session: the terminal event is a data-less
+      `session.completed`, never `session.waiting`. A schemaless
+      `mode:"task"` turn is a normal text turn ending `session.completed`
+      with NO `result.completed` — the event is schema-driven, not
+      task-driven.
+    - **TRAP, refining finding 23**: a follow-up send to a COMPLETED task
+      session is NOT the 409 `session_not_active` that finding documents for
+      terminal ids. It answers **202 `accepted` with the SAME session id**,
+      and then nothing ever happens — no `turn.started`, no error event, no
+      stream activity at all (15 s of silence where mocked turns settle in
+      ~200 ms). The message is accepted-and-dropped, so on this route a 202
+      never proves a turn will run; the stream's `session.completed` is the
+      only truth that a task session is over. The pipeline's agent step is
+      single-shot by design and must key its completion on the stream's
+      terminal events, never on a follow-up probe.

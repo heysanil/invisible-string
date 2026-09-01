@@ -26,7 +26,11 @@ export function usePostRunInput(workspaceId: string) {
       }),
     onSuccess: async (data) => {
       await Promise.all([
-        invalidateSession(queryClient, data.run.agentSessionId),
+        // Pipeline runs have NO session (`agentSessionId` null) — only a
+        // session-backed run has a detail cache to refresh.
+        data.run.agentSessionId !== null
+          ? invalidateSession(queryClient, data.run.agentSessionId)
+          : Promise.resolve(),
         invalidateSessionLists(queryClient, workspaceId),
       ]);
     },
@@ -57,7 +61,10 @@ export function useCancelRun(workspaceId: string) {
       }),
     onSuccess: async (data) => {
       await Promise.all([
-        invalidateSession(queryClient, data.run.agentSessionId),
+        // Pipeline runs have NO session — see usePostRunInput.
+        data.run.agentSessionId !== null
+          ? invalidateSession(queryClient, data.run.agentSessionId)
+          : Promise.resolve(),
         invalidateSessionLists(queryClient, workspaceId),
       ]);
     },

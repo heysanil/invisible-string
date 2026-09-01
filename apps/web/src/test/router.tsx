@@ -29,6 +29,17 @@ export function renderWithRouter(ui: ReactNode) {
     path: "/workflows/$workflowId",
     component: () => null,
   });
+  // Runs tab targets (TestRunPopover's receipt, run-overlay banner).
+  const workflowRunsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/workflows/$workflowId/runs",
+    component: () => null,
+  });
+  const workflowRunRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/workflows/$workflowId/runs/$runId",
+    component: () => null,
+  });
   const agentsRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/agents",
@@ -52,6 +63,8 @@ export function renderWithRouter(ui: ReactNode) {
   const routeTree = rootRoute.addChildren([
     indexRoute,
     workflowRoute,
+    workflowRunsRoute,
+    workflowRunRoute,
     agentsRoute,
     agentRoute,
     contextRoute,

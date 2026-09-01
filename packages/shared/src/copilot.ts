@@ -22,7 +22,10 @@
  *   within a turn — see {@link CopilotThoughtFrame}.
  * - Each `user_message` names its `surface` ("workflow" | "agent"); the
  *   server exposes the matching toolset — proposals for the other surface's
- *   tools are a server bug.
+ *   tools are a server bug. The workflow surface additionally exposes a READ
+ *   toolset ({@link workflowCopilotReadParamSchemas}) the server executes
+ *   inline — pure inventory lookups that emit `step` frames only, never
+ *   proposals.
  * - AGENT IDENTITY rides BESIDE the draft, never inside it (spec D7.3/D7.4):
  *   `agents.name`/`agents.description` are row columns, not part of the
  *   `AgentDefinition` a client serializes as `draft`, so the frame carries
@@ -39,6 +42,11 @@ import {
   reasoningEffortSchema,
 } from "./agent-definition";
 import { agentNameSchema, connectionIdSchema } from "./api";
+import {
+  newStepId,
+  pipelineStepSchema,
+  STEP_ID_PATTERN,
+} from "./pipeline-config";
 import { triggerConfigSchema } from "./workflow-config";
 
 // ── surfaces ─────────────────────────────────────────────────────────────────
@@ -55,24 +63,89 @@ export const setTriggerParamsSchema = z.object({
 });
 export type SetTriggerParams = z.infer<typeof setTriggerParamsSchema>;
 
-/** `setAgent` points the workflow at an agent (must exist and be published). */
-export const setAgentParamsSchema = z.object({
-  /** `agents` row id — must exist in the workspace inventory. */
-  agentId: z.uuid(),
-});
-export type SetAgentParams = z.infer<typeof setAgentParamsSchema>;
+/** A minted `st_` step id naming an EXISTING step in the client's draft. */
+const stepIdParamSchema = z
+  .string()
+  .regex(STEP_ID_PATTERN, "expected a minted st_ step id");
 
-/** `setInstructions` replaces the workflow's instructions markdown wholesale. */
-export const setInstructionsParamsSchema = z.object({
-  markdown: z.string().min(1),
+/**
+ * Where a step lands in the tree (addStep/moveStep).
+ *
+ * - `after` — the sibling to insert after; `null` = the head of the target
+ *   list.
+ * - `parent` absent — the top-level `steps` list.
+ * - `parent.slot` — `body` (a for_each's steps), `then` (a branch lane) or
+ *   `else` (its else list). Slots use {@link StepWalkEntry}'s vocabulary. A
+ *   branch may have several `then` lanes; the LANE is resolved from `after`
+ *   (which lane that sibling lives in), and `after: null` with `slot: "then"`
+ *   targets the FIRST lane — validate.ts owns that resolution, plus rejecting
+ *   a slot the parent kind does not have.
+ */
+export const stepPositionSchema = z.object({
+  after: stepIdParamSchema.nullable(),
+  parent: z
+    .object({
+      stepId: stepIdParamSchema,
+      slot: z.enum(["body", "then", "else"]),
+    })
+    .optional(),
 });
-export type SetInstructionsParams = z.infer<typeof setInstructionsParamsSchema>;
+export type StepPosition = z.infer<typeof stepPositionSchema>;
 
-/** Workflow-surface tool schemas — the validation source for its proposals. */
+/**
+ * `addStep` inserts a NEW step at `position`.
+ *
+ * STEP IDS ARE MINTED SERVER-SIDE, NEVER MODEL-SUPPLIED (the model is told
+ * "never invent stepIds"): `pipelineStepSchema` requires a shaped `st_` id on
+ * every node, so validate.ts runs {@link mintStepIds} over the RAW tool-call
+ * args before parsing them against this schema. A proposal that reaches a
+ * client therefore always carries minted, tree-unique ids and is directly
+ * applicable to the draft.
+ */
+export const addStepParamsSchema = z.object({
+  step: pipelineStepSchema,
+  position: stepPositionSchema,
+});
+export type AddStepParams = z.infer<typeof addStepParamsSchema>;
+
+/**
+ * `updateStep` replaces the WHOLE step named by `stepId` (no partial
+ * patches — the model re-emits the step, keeping any nested ids it wants to
+ * preserve). validate.ts forces `step.id === stepId` after minting (see
+ * {@link addStepParamsSchema}) — a replacement can rename a slug but never
+ * re-identify a step.
+ */
+export const updateStepParamsSchema = z.object({
+  stepId: stepIdParamSchema,
+  step: pipelineStepSchema,
+});
+export type UpdateStepParams = z.infer<typeof updateStepParamsSchema>;
+
+/** `removeStep` deletes the step (and, for containers, its whole subtree). */
+export const removeStepParamsSchema = z.object({
+  stepId: stepIdParamSchema,
+});
+export type RemoveStepParams = z.infer<typeof removeStepParamsSchema>;
+
+/** `moveStep` relocates an existing step (subtree and all) to `position`. */
+export const moveStepParamsSchema = z.object({
+  stepId: stepIdParamSchema,
+  position: stepPositionSchema,
+});
+export type MoveStepParams = z.infer<typeof moveStepParamsSchema>;
+
+/**
+ * Workflow-surface tool schemas — the validation source for its proposals.
+ * Granular by design (pipelines redesign): a whole-pipeline `setPipeline`
+ * was rejected as unreviewable, and the memo-era `setAgent`/`setInstructions`
+ * retired with the memo editor — agents now bind per `agent` STEP.
+ */
 export const workflowCopilotMutationParamSchemas = {
   setTrigger: setTriggerParamsSchema,
-  setAgent: setAgentParamsSchema,
-  setInstructions: setInstructionsParamsSchema,
+  addStep: addStepParamsSchema,
+  updateStep: updateStepParamsSchema,
+  removeStep: removeStepParamsSchema,
+  moveStep: moveStepParamsSchema,
 } as const;
 
 export type WorkflowCopilotMutationTool =
@@ -81,6 +154,122 @@ export type WorkflowCopilotMutationTool =
 export const WORKFLOW_COPILOT_MUTATION_TOOLS = Object.keys(
   workflowCopilotMutationParamSchemas,
 ) as WorkflowCopilotMutationTool[];
+
+// ── workflow-surface read tools ──────────────────────────────────────────────
+//
+// Server-executed INLINE (pure inventory lookups over connections +
+// tools_cache): no proposal park, no client round-trip — progress rides the
+// existing `step` frames, whose docstring already covers read tools. The
+// system prompt's hard rule ("call searchConnectionTools before proposing a
+// tool step — never invent tool names") is what these exist to satisfy.
+
+/**
+ * `searchConnectionTools` finds MCP tools across the workspace's enabled
+ * connections (cached `tools_cache` lookup — never a live server call). An
+ * EMPTY query with a `connectionId` browses that connection's whole tool list.
+ */
+export const searchConnectionToolsParamsSchema = z.object({
+  query: z.string().max(200),
+  /** Restrict to one connection; absent = search every enabled connection. */
+  connectionId: connectionIdSchema.optional(),
+});
+export type SearchConnectionToolsParams = z.infer<
+  typeof searchConnectionToolsParamsSchema
+>;
+
+/**
+ * `getConnectionTool` returns one cached tool's detail (description + the
+ * trimmed `inputSchema` when the probe cached one) — what the model needs to
+ * shape a tool step's `args` without guessing parameter names.
+ */
+export const getConnectionToolParamsSchema = z.object({
+  connectionId: connectionIdSchema,
+  toolName: z.string().min(1),
+});
+export type GetConnectionToolParams = z.infer<
+  typeof getConnectionToolParamsSchema
+>;
+
+/** Workflow-surface READ tool schemas (executed inline, no proposals). */
+export const workflowCopilotReadParamSchemas = {
+  searchConnectionTools: searchConnectionToolsParamsSchema,
+  getConnectionTool: getConnectionToolParamsSchema,
+} as const;
+
+export type WorkflowCopilotReadTool =
+  keyof typeof workflowCopilotReadParamSchemas;
+
+export const WORKFLOW_COPILOT_READ_TOOLS = Object.keys(
+  workflowCopilotReadParamSchemas,
+) as WorkflowCopilotReadTool[];
+
+/** Params union for the read tools, keyed by tool (post-parse shapes). */
+export type WorkflowCopilotReadParams = {
+  [T in WorkflowCopilotReadTool]: z.infer<
+    (typeof workflowCopilotReadParamSchemas)[T]
+  >;
+};
+
+// ── step-id minting (the validate.ts pre-parse walk) ─────────────────────────
+
+/**
+ * Deep-copy a RAW candidate step (an addStep/updateStep tool-call arg,
+ * pre-parse), minting an `st_` id on every step-shaped node whose `id` is
+ * missing, malformed, or a duplicate of one already seen in this walk. The
+ * walk mirrors the tree shape exactly — `for_each.steps`, `branch.branches[n]
+ * .steps`, `branch.else` — and touches nothing else (args, conditions, and
+ * unknown keys pass through untouched), so a value that would not parse still
+ * would not: this only ever REPAIRS ids.
+ *
+ * validate.ts calls this before parsing against
+ * {@link workflowCopilotMutationParamSchemas}; ids against the EXISTING draft
+ * (unknown stepId, an id collision with a step outside this subtree) remain
+ * its semantic checks — a pure function over one subtree cannot see the
+ * draft.
+ */
+export function mintStepIds(value: unknown, seen?: Set<string>): unknown {
+  const seenIds = seen ?? new Set<string>();
+  const visit = (node: unknown): unknown => {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) {
+      return node;
+    }
+    const step = node as Record<string, unknown>;
+    const out: Record<string, unknown> = { ...step };
+    const id = out.id;
+    if (
+      typeof id !== "string" ||
+      !STEP_ID_PATTERN.test(id) ||
+      seenIds.has(id)
+    ) {
+      out.id = newStepId();
+    }
+    seenIds.add(out.id as string);
+    if (step.kind === "for_each" && Array.isArray(step.steps)) {
+      out.steps = step.steps.map(visit);
+    } else if (step.kind === "branch") {
+      if (Array.isArray(step.branches)) {
+        out.branches = step.branches.map((branch) => {
+          if (
+            branch === null ||
+            typeof branch !== "object" ||
+            Array.isArray(branch)
+          ) {
+            return branch;
+          }
+          const lane = branch as Record<string, unknown>;
+          return Array.isArray(lane.steps)
+            ? { ...lane, steps: lane.steps.map(visit) }
+            : lane;
+        });
+      }
+      if (Array.isArray(step.else)) {
+        out.else = step.else.map(visit);
+      }
+    }
+    return out;
+  };
+  return visit(value);
+}
 
 // ── agent-surface mutation tools ─────────────────────────────────────────────
 

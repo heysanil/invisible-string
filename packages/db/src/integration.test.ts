@@ -291,16 +291,28 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(orphans?.n).toBe(0);
   });
 
-  test("workflow delegation: publish snapshot, RESTRICT guard, SET NULL provenance", async () => {
+  test("workflow pipeline: publish snapshot + SET NULL session provenance", async () => {
     const { agent, version } = await publishAgent(
       "Delegate",
       `hash-wf-${suffix}`,
     );
 
+    // Minimal v2 pipeline config (workflow-pipelines redesign; the DB treats
+    // it as opaque jsonb — packages/shared owns the schema).
     const config = {
+      version: 2,
       trigger: { type: "webhook" },
-      agentId: agent.id,
-      instructions: { markdown: "Summarize @trigger.payload" },
+      overlap: "skip",
+      steps: [
+        {
+          id: "st_summarize0001",
+          slug: "summarize",
+          kind: "agent",
+          agentId: agent.id,
+          instructions: { markdown: "Summarize @trigger.payload" },
+          session: "fresh",
+        },
+      ],
     };
     const [workflow] = await db
       .insert(schema.workflows)
@@ -309,27 +321,13 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(workflow?.enabled).toBe(true);
     expect(workflow?.published).toBeNull();
 
-    // Publish = snapshot draft → published + denormalized agent binding.
+    // Publish = snapshot draft → published. No published_agent_id write:
+    // agents bind per step now; the column is a dead residual.
     const publishedAt = new Date();
     await db
       .update(schema.workflows)
-      .set({ published: config, publishedAt, publishedAgentId: agent.id })
+      .set({ published: config, publishedAt })
       .where(eq(schema.workflows.id, workflow!.id));
-
-    // Deleting a delegated-to agent is blocked by the RESTRICT FK.
-    await db
-      .update(schema.agents)
-      .set({ publishedVersionId: null })
-      .where(eq(schema.agents.id, agent.id));
-    let restrictError: unknown;
-    try {
-      await db.delete(schema.agents).where(eq(schema.agents.id, agent.id));
-    } catch (error) {
-      restrictError = error;
-    }
-    expect(errorText(restrictError)).toMatch(
-      /violates foreign key|workflows_published_agent_id_agents_id_fk/,
-    );
 
     // Workflow-dispatched session: provenance set, run carries the rendered
     // task message and owes a delivery (slack-origin).
@@ -349,6 +347,7 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       .insert(schema.runs)
       .values({
         agentSessionId: dispatched!.id,
+        organizationId: orgId,
         triggerEvent: {
           workflowId: workflow!.id,
           agentId: agent.id,
@@ -363,6 +362,8 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
       })
       .returning();
     expect(run?.deliveryStatus).toBe("pending");
+    // Unset mode defaults to agent (pre-pipeline rows read correctly too).
+    expect(run?.mode).toBe("agent");
     await db
       .update(schema.runs)
       .set({ deliveryStatus: "delivered" })
@@ -379,8 +380,174 @@ describe.skipIf(!testDatabaseUrl)("db round trip (migrate → seed → query)", 
     expect(orphanSession).toBeDefined();
     expect(orphanSession?.workflowId).toBeNull();
 
-    // With the workflow gone the agent is deletable again (cascades sessions).
+    // Cleanup: unpin the circular published-version FK, then cascade the
+    // agent (sessions + runs go with it).
+    await db
+      .update(schema.agents)
+      .set({ publishedVersionId: null })
+      .where(eq(schema.agents.id, agent.id));
     await db.delete(schema.agents).where(eq(schema.agents.id, agent.id));
+  });
+
+  test("pipeline run: sessionless run + step ledger claim key + workflow state", async () => {
+    const [workflow] = await db
+      .insert(schema.workflows)
+      .values({ organizationId: orgId, name: "It Pipes" })
+      .returning();
+
+    // Pipeline runs have no eve session: agent_session_id stays NULL and the
+    // row carries its own workspace scope + workflow provenance.
+    const [run] = await db
+      .insert(schema.runs)
+      .values({
+        organizationId: orgId,
+        workflowId: workflow!.id,
+        mode: "pipeline",
+        triggerEvent: {
+          workflowId: workflow!.id,
+          triggerType: "schedule",
+          data: {},
+          principal: { workspaceId: orgId, source: "schedule" },
+        },
+        status: "running",
+      })
+      .returning();
+    expect(run?.agentSessionId).toBeNull();
+    expect(run?.mode).toBe("pipeline");
+
+    // Ledger: one row per step INSTANCE — a top-level tool step and a loop
+    // iteration's infer step (path-addressed, iteration recorded).
+    await db.insert(schema.runSteps).values([
+      {
+        id: `rs_search${suffix}`,
+        runId: run!.id,
+        organizationId: orgId,
+        stepId: "st_search0000001",
+        stepSlug: "search",
+        path: "st_search0000001",
+        kind: "tool",
+        status: "succeeded",
+        input: { query: "@team-exec" },
+        output: { result: { messages: [] } },
+        completedAt: new Date(),
+      },
+      {
+        id: `rs_sum${suffix}`,
+        runId: run!.id,
+        organizationId: orgId,
+        stepId: "st_summarize0001",
+        stepSlug: "summarize",
+        path: "st_loop00000001/0/st_summarize0001",
+        parentPath: "st_loop00000001/0",
+        iteration: 0,
+        kind: "infer",
+        status: "running",
+        attempt: 2,
+      },
+    ]);
+
+    // (run_id, path) is the idempotent claim key — a duplicate claim loses.
+    let claimError: unknown;
+    try {
+      await db.insert(schema.runSteps).values({
+        id: `rs_dup${suffix}`,
+        runId: run!.id,
+        organizationId: orgId,
+        stepId: "st_search0000001",
+        stepSlug: "search",
+        path: "st_search0000001",
+        kind: "tool",
+      });
+    } catch (error) {
+      claimError = error;
+    }
+    expect(errorText(claimError)).toMatch(
+      /duplicate key|run_steps_run_id_path_uidx/,
+    );
+
+    // An agent step's child-run link detaches (SET NULL) when the child is
+    // deleted — the ledger row itself survives.
+    const [childRun] = await db
+      .insert(schema.runs)
+      .values({
+        organizationId: orgId,
+        triggerEvent: { triggerType: "manual", data: {} },
+        status: "succeeded",
+      })
+      .returning();
+    await db.insert(schema.runSteps).values({
+      id: `rs_agent${suffix}`,
+      runId: run!.id,
+      organizationId: orgId,
+      stepId: "st_delegate00001",
+      stepSlug: "delegate",
+      path: "st_delegate00001",
+      kind: "agent",
+      status: "succeeded",
+      childRunId: childRun!.id,
+    });
+    await db.delete(schema.runs).where(eq(schema.runs.id, childRun!.id));
+    const [detached] = await db
+      .select()
+      .from(schema.runSteps)
+      .where(eq(schema.runSteps.id, `rs_agent${suffix}`));
+    expect(detached).toBeDefined();
+    expect(detached?.childRunId).toBeNull();
+
+    // Durable state: composite-PK upsert is last-write-wins, with run
+    // provenance on the writer. Values are objects, not bare strings — the
+    // postgres-js driver casts a bare string through jsonb parsing, so a
+    // numeric-looking cursor string would come back as a number.
+    await db.insert(schema.workflowState).values({
+      workflowId: workflow!.id,
+      key: "cursor",
+      value: { ts: "171.001" },
+      organizationId: orgId,
+      updatedByRunId: run!.id,
+    });
+    await db
+      .insert(schema.workflowState)
+      .values({
+        workflowId: workflow!.id,
+        key: "cursor",
+        value: { ts: "172.999" },
+        organizationId: orgId,
+        updatedByRunId: run!.id,
+      })
+      .onConflictDoUpdate({
+        target: [schema.workflowState.workflowId, schema.workflowState.key],
+        set: { value: { ts: "172.999" }, updatedByRunId: run!.id },
+      });
+    const cursorRows = await db
+      .select()
+      .from(schema.workflowState)
+      .where(eq(schema.workflowState.workflowId, workflow!.id));
+    expect(cursorRows).toHaveLength(1);
+    expect(cursorRows[0]?.value).toEqual({ ts: "172.999" });
+
+    // Deleting the workflow cascades its state, while the run survives with
+    // NULL provenance and its ledger intact.
+    await db
+      .delete(schema.workflows)
+      .where(eq(schema.workflows.id, workflow!.id));
+    const [orphanRun] = await db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.id, run!.id));
+    expect(orphanRun?.workflowId).toBeNull();
+    const [stateLeft] = await db
+      .select({ n: count() })
+      .from(schema.workflowState)
+      .where(eq(schema.workflowState.workflowId, workflow!.id));
+    expect(stateLeft?.n).toBe(0);
+
+    // Deleting the run cascades the ledger.
+    await db.delete(schema.runs).where(eq(schema.runs.id, run!.id));
+    const [stepsLeft] = await db
+      .select({ n: count() })
+      .from(schema.runSteps)
+      .where(eq(schema.runSteps.runId, run!.id));
+    expect(stepsLeft?.n).toBe(0);
   });
 
   test("triggers.token_hash is unique; schedule triggers carry cron state", async () => {

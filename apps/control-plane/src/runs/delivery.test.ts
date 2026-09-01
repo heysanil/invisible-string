@@ -1,9 +1,10 @@
 /**
  * DeliveryService unit tests — pure helpers (stop-message extraction, thread
  * key parsing, reply targeting), the settle state machine (pending-only CAS,
- * failed/canceled runs, missing replies/keys/integrations), the Slack
- * chat.postMessage payload, and the boot-time recovery sweep — all against
- * in-memory fakes (no DB, no network, no real Slack).
+ * failed/canceled runs, missing templates/keys/integrations), the Slack
+ * chat.postMessage payload, and the boot-time recovery sweep (which
+ * RE-RENDERS `onComplete.slackReply` from the persisted ledger scope) — all
+ * against in-memory fakes (no DB, no network, no real Slack).
  */
 import { describe, expect, test } from "bun:test";
 
@@ -24,6 +25,7 @@ import {
   type DeliverableRun,
   type DeliveryIntegration,
   type DeliveryReader,
+  type PipelineRenderContext,
 } from "./delivery";
 import {
   generateMasterKeyBase64,
@@ -50,7 +52,8 @@ function stopEvent(message: string | null, finishReason = "stop"): EveStreamEven
 interface FakeWorld {
   reader: DeliveryReader;
   runs: Map<string, DeliverableRun>;
-  events: Map<string, EveStreamEvent[]>;
+  /** Recovery re-render source, keyed by run id (the ledger-scope stand-in). */
+  renderContexts: Map<string, PipelineRenderContext>;
   integrations: Map<string, DeliveryIntegration>;
   deliveries: Array<{ runId: string; status: "delivered" | "failed"; error: string | null }>;
   posts: PostMessageInput[];
@@ -60,13 +63,13 @@ interface FakeWorld {
 
 function fakeWorld(options: { postResult?: PostMessageResult } = {}): FakeWorld {
   const runs = new Map<string, DeliverableRun>();
-  const events = new Map<string, EveStreamEvent[]>();
+  const renderContexts = new Map<string, PipelineRenderContext>();
   const integrations = new Map<string, DeliveryIntegration>();
   const deliveries: FakeWorld["deliveries"] = [];
   const posts: PostMessageInput[] = [];
   return {
     runs,
-    events,
+    renderContexts,
     integrations,
     deliveries,
     posts,
@@ -89,8 +92,8 @@ function fakeWorld(options: { postResult?: PostMessageResult } = {}): FakeWorld 
           )
           .map((r) => ({ id: r.runId, status: r.runStatus }));
       },
-      async listRunEvents(runId) {
-        return events.get(runId) ?? [];
+      async loadPipelineRenderContext(runId) {
+        return renderContexts.get(runId) ?? null;
       },
     },
     slack: {
@@ -105,21 +108,36 @@ function fakeWorld(options: { postResult?: PostMessageResult } = {}): FakeWorld 
   };
 }
 
+/** A slack-origin PIPELINE parent run born owing an onComplete reply. */
 function slackRun(overrides: Partial<DeliverableRun> = {}): DeliverableRun {
   return {
     runId: "run-1",
+    mode: "pipeline",
     runStatus: "succeeded",
     deliveryStatus: "pending",
     organizationId: "org-1",
-    origin: "slack",
     slackThreadKey: `${INTEGRATION_ID}:C-CHAN:1720000100.000100`,
     triggerData: {
       channel: "C-CHAN",
       ts: "1720000100.000100",
       thread_ts: "1720000100.000100",
       text: "hello",
+      slackThreadKey: `${INTEGRATION_ID}:C-CHAN:1720000100.000100`,
     },
     ...overrides,
+  };
+}
+
+/** A render context whose template exercises real scope resolution. */
+function renderContext(text: string): PipelineRenderContext {
+  return {
+    templateMarkdown: "@steps.summarize.text",
+    scope: {
+      trigger: {},
+      steps: { summarize: { text } },
+      state: {},
+      now: new Date().toISOString(),
+    },
   };
 }
 
@@ -242,14 +260,11 @@ describe("DeliveryService.deliver", () => {
     expect(world.outcomes).toEqual(["delivered"]);
   });
 
-  test("recovers the reply from run_events when the hook carried none", async () => {
+  test("re-renders onComplete from the persisted ledger scope when the caller carried no text", async () => {
     const world = fakeWorld();
     world.runs.set("run-1", slackRun());
     world.integrations.set(INTEGRATION_ID, slackIntegration());
-    world.events.set("run-1", [
-      stopEvent("old leftover"),
-      stopEvent("recovered reply"),
-    ]);
+    world.renderContexts.set("run-1", renderContext("recovered reply"));
 
     const outcome = await service(world).deliver({
       runId: "run-1",
@@ -311,9 +326,9 @@ describe("DeliveryService.deliver", () => {
 
   test.each([
     [
-      "no terminal reply anywhere",
+      "no template can be rendered (workflow/template gone)",
       slackRun(),
-      "no terminal assistant reply",
+      "no onComplete.slackReply template",
     ],
     [
       "missing slack thread key",
@@ -332,8 +347,8 @@ describe("DeliveryService.deliver", () => {
     const outcome = await service(world).deliver({
       runId: run.runId,
       status: "succeeded",
-      // Give routing failures a reply so they reach their own check.
-      lastAssistantMessage: expectedError.includes("reply") ? null : "reply",
+      // Give routing failures a rendered reply so they reach their own check.
+      lastAssistantMessage: expectedError.includes("template") ? null : "reply",
     });
     expect(outcome).toBe("failed");
     expect(world.posts).toHaveLength(0);
@@ -447,11 +462,11 @@ describe("DeliveryService.deliver", () => {
 // ── recovery sweep ───────────────────────────────────────────────────────────
 
 describe("DeliveryService.recoverPending", () => {
-  test("delivers succeeded+pending runs from persisted events; leaves others alone", async () => {
+  test("delivers succeeded+pending runs by re-rendering the ledger scope; leaves others alone", async () => {
     const world = fakeWorld();
     world.integrations.set(INTEGRATION_ID, slackIntegration());
     world.runs.set("stuck", slackRun({ runId: "stuck" }));
-    world.events.set("stuck", [stopEvent("late but delivered")]);
+    world.renderContexts.set("stuck", renderContext("late but delivered"));
     // Not in scope: still running, already settled, no delivery owed.
     world.runs.set("running", slackRun({ runId: "running", runStatus: "running" }));
     world.runs.set("settled", slackRun({ runId: "settled", deliveryStatus: "delivered" }));
@@ -466,7 +481,7 @@ describe("DeliveryService.recoverPending", () => {
     expect(world.runs.get("running")!.deliveryStatus).toBe("pending");
   });
 
-  test("a stuck run with no recoverable reply settles failed", async () => {
+  test("a stuck run whose workflow/template is gone settles failed", async () => {
     const world = fakeWorld();
     world.integrations.set(INTEGRATION_ID, slackIntegration());
     world.runs.set("stuck", slackRun({ runId: "stuck" }));

@@ -101,11 +101,27 @@ describe.skipIf(!TEST_DATABASE_URL)(
       const probed = inventory.connections.find((c) => c.id === probedId);
       expect(probed).toBeDefined();
       expect(probed!.health).toBe("ok");
+      expect(probed!.scope).toBe("workspace");
       expect(probed!.tools).toHaveLength(40);
       expect(probed!.tools[0]).toBe("tool_1");
       expect(probed!.tools[39]).toBe("tool_40");
       expect(probed!.tools).not.toContain("tool_41");
       expect(probed!.toolCount).toBe(45);
+    });
+
+    test("cachedTools keeps the FULL entries (descriptions + params) for the read tools", async () => {
+      // The prompt renders only the capped name index; the workflow surface's
+      // searchConnectionTools/getConnectionTool search this full corpus.
+      const load = createInventoryLoader(handle.db);
+      const inventory = await load(orgId, userId);
+
+      const probed = inventory.connections.find((c) => c.id === probedId);
+      expect(probed!.cachedTools).toHaveLength(45);
+      expect(probed!.cachedTools[44]).toMatchObject({
+        name: "tool_45",
+        description: "tool number 45",
+        params: ["note"],
+      });
     });
 
     test("a never-probed connection reads unknown health and an empty tool list", async () => {
@@ -117,6 +133,7 @@ describe.skipIf(!TEST_DATABASE_URL)(
       expect(unprobed!.health).toBe("unknown");
       expect(unprobed!.tools).toEqual([]);
       expect(unprobed!.toolCount).toBe(0);
+      expect(unprobed!.cachedTools).toEqual([]);
     });
 
     test("two agents may share a name (spec D1) and both load as distinct id-addressed rows", async () => {

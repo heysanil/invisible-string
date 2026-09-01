@@ -176,14 +176,16 @@ export function forbiddenEveSessionBodyKey(body: unknown): string | null {
  * eve derives `capabilities` from this when it is not sent explicitly:
  * `capabilities ?? (mode === "task" ? undefined : { requestInput: true })`.
  *
- * THE PLATFORM DELIBERATELY NEVER SENDS THIS. Every dispatch path — chat,
- * webhook, form, Slack, schedule, manual run — lands in a session a user can
- * open in chat and answer, so eve's default (`conversation`, hence
- * `requestInput: true`) is the correct mode for all of them: a budget
+ * WHO SENDS WHAT (workflow-pipelines redesign): every CONVERSATIONAL dispatch
+ * path — chat, and an agent step's `session: "thread"` Slack continuation —
+ * keeps eve's default (`conversation`, hence `requestInput: true`): a budget
  * crossing parks on an answerable `session-limit` request instead of failing
- * the run outright. Modelled here because it is part of eve's request
- * contract, and so a future non-interactive path (an unattended batch job
- * with no chat surface) has the field ready rather than inventing it.
+ * the run outright. A pipeline `agent` step with `session: "fresh"` is the
+ * one non-interactive path: nobody watches its child session in chat, so it
+ * sends `mode: "task"` unconditionally — a budget crossing fails the next
+ * model call (`SESSION_TOKEN_LIMIT_REACHED`) instead of parking forever on a
+ * prompt nobody will answer. Task mode also terminates the session with a
+ * data-less `session.completed` (never `session.waiting`) — spike finding 36.
  */
 export const eveSessionModeSchema = z.enum(["conversation", "task"]);
 export type EveSessionMode = z.infer<typeof eveSessionModeSchema>;
@@ -200,14 +202,26 @@ export type EveSessionCapabilities = z.infer<
  * `POST /eve/v1/session` body. `inputResponses` is a hard 400 here — it is
  * only accepted for an existing session. `message` must be non-empty.
  *
- * (eve also accepts `clientContext`, `outputSchema`, `callback` and
- * `forwardedPrincipal`; the platform sends none of them, and `strictObject`
- * keeps it that way until someone deliberately widens this contract.)
+ * `outputSchema` is LIVE-PROVEN on eve 0.31.3 (spike REPORT finding 36, wire
+ * capture committed): create ACCEPTS it alongside `mode: "task"` (202; the
+ * field is PARSED — a non-object is its own 400), eve enforces it via an
+ * internally-consumed `final_output` tool (no `actions.requested` pair
+ * reaches the stream), and the turn emits `result.completed` with
+ * `data.result` satisfying the schema. It must be a JSON-serializable object
+ * (a JSON-Schema document); the pipeline `agent` step sends it for
+ * `session: "fresh"` steps that declare an output schema, and ALWAYS
+ * re-validates the extracted result locally (belt-and-braces).
+ *
+ * (eve also accepts `clientContext`, `callback` and `forwardedPrincipal`;
+ * the platform sends none of them, and `strictObject` keeps it that way
+ * until someone deliberately widens this contract.)
  */
 export const eveCreateSessionRequestSchema = z.strictObject({
   message: z.string().min(1),
   mode: eveSessionModeSchema.optional(),
   capabilities: eveSessionCapabilitiesSchema.optional(),
+  /** JSON-Schema object eve enforces on the task turn's final output. */
+  outputSchema: z.record(z.string(), z.unknown()).optional(),
 });
 export type EveCreateSessionRequest = z.infer<
   typeof eveCreateSessionRequestSchema

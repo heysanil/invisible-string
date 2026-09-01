@@ -8,9 +8,10 @@
  *
  * Sources are POSITIONAL in a pipeline: a step's markdown surface may only
  * reference steps strictly before it (`stepsBefore` — no forward refs in
- * autocomplete), and `@item` exists only inside a for_each body. Use
- * {@link referenceSourcesForStep} to derive the per-position sources from the
- * live draft.
+ * autocomplete, and a for_each body's slugs are iteration-scoped: after the
+ * loop only the loop step's aggregate is offered), and `@item` exists only
+ * inside a for_each body. Use {@link referenceSourcesForStep} to derive the
+ * per-position sources from the live draft.
  *
  * Tested in __tests__/builder-references.test.ts: every emitted token must
  * parse back to exactly one reference of the intended kind.
@@ -65,7 +66,8 @@ export interface ReferenceSources {
   /**
    * Steps whose output is addressable from the current position —
    * `stepsBefore(currentStepId)` ONLY, never the whole tree (forward refs
-   * would resolve "(not provided)" at run time).
+   * would resolve "(not provided)" at run time, and a for_each body's slugs
+   * die with their iteration — after the loop, only the loop's aggregate).
    */
   steps: readonly StepReferenceSource[];
   /** State keys any `state` step in the config writes (`@state.<key>`). */

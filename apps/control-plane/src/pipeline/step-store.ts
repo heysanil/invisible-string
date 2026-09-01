@@ -63,7 +63,9 @@ export interface RunStepStore {
   claim(input: ClaimStepInput): Promise<{ created: boolean; row: RunStepRow }>;
   /**
    * (Re)mark an instance running: retry bumps `attempt`, crash-resume also
-   * refreshes the re-rendered `input` and `startedAt`.
+   * refreshes `startedAt`. The claimed `input` snapshot is deliberately NOT
+   * re-rendered or overwritten on resume — a retry must repeat the SAME
+   * call the original attempt made (the driver reuses the snapshot).
    */
   markRunning(
     id: string,
@@ -177,6 +179,23 @@ export const WORKFLOW_STATE_MAX_KEYS = 200;
 /** App-enforced cap: serialized bytes per value. */
 export const WORKFLOW_STATE_MAX_VALUE_BYTES = 64 * 1024;
 
+/**
+ * Thrown by {@link WorkflowStateStore.set} when the write would push the
+ * workflow past {@link WORKFLOW_STATE_MAX_KEYS}. The cap is enforced HERE,
+ * transactionally against committed truth — the driver's run-start snapshot
+ * is stale by construction (two overlap:"allow" runs can both observe 199
+ * keys), so a caller-side check cannot be the guard.
+ */
+export class WorkflowStateCapError extends Error {
+  readonly maxKeys: number;
+
+  constructor(maxKeys: number) {
+    super(`workflow state would exceed ${maxKeys} keys`);
+    this.name = "WorkflowStateCapError";
+    this.maxKeys = maxKeys;
+  }
+}
+
 export interface WorkflowStateWrite {
   workflowId: string;
   organizationId: string;
@@ -194,6 +213,12 @@ export interface WorkflowStateWrite {
 export interface WorkflowStateStore {
   snapshot(workflowId: string): Promise<Record<string, unknown>>;
   countKeys(workflowId: string): Promise<number>;
+  /**
+   * Upsert the entries (undefined values skipped). Enforces the
+   * {@link WORKFLOW_STATE_MAX_KEYS} cap atomically against the store's
+   * committed key set and throws {@link WorkflowStateCapError} (writing
+   * nothing) when the write would exceed it.
+   */
   set(write: WorkflowStateWrite): Promise<void>;
 }
 
@@ -226,34 +251,59 @@ export function createDrizzleWorkflowStateStore(db: Db): WorkflowStateStore {
     },
 
     async set(write) {
-      for (const [key, value] of Object.entries(write.entries)) {
-        if (value === undefined) continue;
-        // Bind the value as explicit JSON text: state values are often BARE
-        // scalars (a cursor string like "173.002"), and drizzle+postgres-js
-        // pass a bare string through to a `::jsonb` cast, which re-parses it
-        // as JSON — "2.0" comes back as the NUMBER 2, and a non-JSON string
-        // fails the insert outright. Objects never hit this, which is why no
-        // other jsonb column in the repo needs the guard.
-        const jsonText = JSON.stringify(value);
-        const boundValue = sql`${jsonText}::jsonb`;
-        await db
-          .insert(schema.workflowState)
-          .values({
-            workflowId: write.workflowId,
-            key,
-            value: boundValue,
-            updatedByRunId: write.runId,
-            organizationId: write.organizationId,
-          })
-          .onConflictDoUpdate({
-            target: [schema.workflowState.workflowId, schema.workflowState.key],
-            set: {
+      const entries = Object.entries(write.entries).filter(
+        ([, value]) => value !== undefined,
+      );
+      if (entries.length === 0) return;
+      await db.transaction(async (tx) => {
+        // The key cap must be checked against COMMITTED truth under mutual
+        // exclusion: serialize same-workflow writers on a transaction-scoped
+        // advisory lock (the workspace-run-cap pattern, runtime/caps.ts),
+        // count in-transaction, and only then upsert — two concurrent
+        // overlap:"allow" runs can otherwise both pass at 199 keys.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`workflow-state:${write.workflowId}`})::bigint)`,
+        );
+        const existing = await tx
+          .select({ key: schema.workflowState.key })
+          .from(schema.workflowState)
+          .where(eq(schema.workflowState.workflowId, write.workflowId));
+        const resultingKeys = new Set(existing.map((row) => row.key));
+        for (const [key] of entries) resultingKeys.add(key);
+        if (resultingKeys.size > WORKFLOW_STATE_MAX_KEYS) {
+          throw new WorkflowStateCapError(WORKFLOW_STATE_MAX_KEYS);
+        }
+        for (const [key, value] of entries) {
+          // Bind the value as explicit JSON text: state values are often BARE
+          // scalars (a cursor string like "173.002"), and drizzle+postgres-js
+          // pass a bare string through to a `::jsonb` cast, which re-parses it
+          // as JSON — "2.0" comes back as the NUMBER 2, and a non-JSON string
+          // fails the insert outright. Objects never hit this, which is why no
+          // other jsonb column in the repo needs the guard.
+          const jsonText = JSON.stringify(value);
+          const boundValue = sql`${jsonText}::jsonb`;
+          await tx
+            .insert(schema.workflowState)
+            .values({
+              workflowId: write.workflowId,
+              key,
               value: boundValue,
               updatedByRunId: write.runId,
-              updatedAt: new Date(),
-            },
-          });
-      }
+              organizationId: write.organizationId,
+            })
+            .onConflictDoUpdate({
+              target: [
+                schema.workflowState.workflowId,
+                schema.workflowState.key,
+              ],
+              set: {
+                value: boundValue,
+                updatedByRunId: write.runId,
+                updatedAt: new Date(),
+              },
+            });
+        }
+      });
     },
   };
 }
@@ -359,7 +409,15 @@ export function createMemoryWorkflowStateStore(): MemoryWorkflowStateStore {
     },
     async set(write) {
       const map = forWorkflow(write.workflowId);
-      for (const [key, value] of Object.entries(write.entries)) {
+      const entries = Object.entries(write.entries).filter(
+        ([, value]) => value !== undefined,
+      );
+      const resultingKeys = new Set(map.keys());
+      for (const [key] of entries) resultingKeys.add(key);
+      if (resultingKeys.size > WORKFLOW_STATE_MAX_KEYS) {
+        throw new WorkflowStateCapError(WORKFLOW_STATE_MAX_KEYS);
+      }
+      for (const [key, value] of entries) {
         map.set(key, value);
       }
     },

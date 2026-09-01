@@ -284,16 +284,26 @@ the full scope; the child receives that string as its task message.
   stamps into the parent's `TriggerEvent.data.slackThreadKey` resolves an
   existing thread-keyed session (advisory-locked claim + dead-holder
   eviction, machinery now inside the new dispatch) whose PINNED version takes
-  a follow-up turn; no session yet mints a fresh conversational one. Never
-  `mode: "task"`, never an output schema (publish gate).
+  a follow-up turn; no session yet mints a fresh conversational one. A found
+  holder is reused only when its `agentId` matches the step's — on mismatch
+  the lookup/claim moves to the agent-qualified key
+  `<bareKey>:agent:<agentId>`, so each agent in one thread keeps its own
+  session and cross-run continuity (the session `principal` keeps the BARE
+  key — the true Slack-thread identity — and the qualified form deliberately
+  fails `parseSlackThreadKey`'s 3-segment contract so it can never mis-target
+  a reply). Never `mode: "task"`, never an output schema (publish gate).
 - Output extraction is ALWAYS local belt-and-braces: `result.completed` →
   `output.result` (validated against the declared schema →
   `validation_failed` on miss), else the last stop-message text →
   `output.text`.
-- The executor returns `{status: "waiting", childRunId}` right after
-  dispatch; the RUNNER persists the link, then re-invokes with
-  `ctx.childRunId` — so the ledger carries the child id BEFORE any crash
-  window opens and replay re-attaches instead of double-dispatching. While
+- CHILD LINKING IS PRE-DISPATCH: the executor passes dispatch an
+  `onRunCreated` hook that writes `run_steps.child_run_id` (keyed by the
+  unique `(run_id, path)` claim) INSIDE the transaction that creates the
+  child run row, before any eve call — an unlinked dispatched child cannot
+  exist by construction, so replay always re-attaches instead of
+  double-dispatching. The executor then returns
+  `{status: "waiting", childRunId}` and the runner re-invokes with
+  `ctx.childRunId`. While
   the child runs the executor waits on a RunEventBus subscription plus a
   `PIPELINE_CHILD_POLL_MS` poll; a child parking `waiting` (HITL) parks the
   parent step and run, and `POST /runs/:id/input` on the CHILD resumes the

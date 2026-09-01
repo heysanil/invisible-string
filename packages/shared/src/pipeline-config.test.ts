@@ -313,22 +313,32 @@ describe("findStep", () => {
 describe("stepsBefore", () => {
   test("document-order predecessors, minus the step's own ancestors", () => {
     const steps = tree();
-    // From inside the loop: search precedes; the loop container itself does not.
+    // From inside the loop: search precedes, and earlier steps of the SAME
+    // body (same iteration) are addressable; the loop container itself is not.
     expect(stepsBefore(steps, id(4)).map((s) => s.slug)).toEqual([
       "search",
       "fresh",
     ]);
-    // After the loop closes, its body steps are addressable again.
+    expect(stepsBefore(steps, id(1))).toEqual([]);
+    expect(stepsBefore(steps, "st_ffffffffffffffff")).toEqual([]);
+  });
+
+  test("for_each body slugs are iteration-scoped: invisible after the loop", () => {
+    const steps = tree();
+    // After the loop closes the runner keeps only the loop's AGGREGATE —
+    // body outputs ("fresh", "summarize") died with their iterations, so
+    // they are not addressable from any later position.
     expect(stepsBefore(steps, id(8)).map((s) => s.slug)).toEqual([
       "search",
       "loop",
-      "fresh",
-      "summarize",
       "route",
       "create",
       "log",
     ]);
-    expect(stepsBefore(steps, id(1))).toEqual([]);
-    expect(stepsBefore(steps, "st_ffffffffffffffff")).toEqual([]);
+    // Same rule from inside a later container (a branch lane after the loop).
+    expect(stepsBefore(steps, id(6)).map((s) => s.slug)).toEqual([
+      "search",
+      "loop",
+    ]);
   });
 });

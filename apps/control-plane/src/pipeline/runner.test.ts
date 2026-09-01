@@ -694,6 +694,348 @@ describe("pipeline driver — crash-resume from the ledger", () => {
   });
 });
 
+describe("pipeline driver — resume fidelity (budget, input snapshots, event backfill)", () => {
+  /** Claim + optionally finish one top-level ledger row for `run`. */
+  async function seedRow(
+    h: Harness,
+    run: RunRow,
+    step: PipelineStep,
+    opts: {
+      input?: unknown;
+      finish?: { status: "succeeded" | "failed"; output?: Record<string, unknown>; error?: string; errorClass?: string };
+    } = {},
+  ): Promise<void> {
+    const claimed = await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: step.id,
+      stepSlug: step.slug,
+      path: step.id,
+      parentPath: null,
+      iteration: null,
+      kind: step.kind,
+      status: "running",
+      input: opts.input ?? { args: {} },
+      startedAt: new Date(),
+    });
+    if (opts.finish) {
+      await h.stepStore.finish(claimed.row.id, {
+        status: opts.finish.status,
+        ...(opts.finish.output !== undefined ? { output: opts.finish.output } : {}),
+        ...(opts.finish.error !== undefined ? { error: opts.finish.error } : {}),
+        ...(opts.finish.errorClass !== undefined
+          ? { errorClass: opts.finish.errorClass }
+          : {}),
+        completedAt: new Date(),
+      });
+    }
+  }
+
+  test("an interrupted leaf step retries with its PERSISTED input snapshot, never a re-render", async () => {
+    const step = tool("call", { args: { cursor: { $ref: "state.cursor" } } });
+    const config = cfg([step]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    // The original attempt rendered {cursor: "orig"}; the workflow state has
+    // since MOVED (e.g. a concurrent overlap:"allow" run advanced it), so a
+    // re-render against the rebuilt scope would produce DIFFERENT args.
+    h.stateStore.state.set(run.workflowId!, new Map([["cursor", "moved"]]));
+    await seedRow(h, run, step, { input: { args: { cursor: "orig" } } });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    // The retry executed the ORIGINAL call…
+    expect(toolExec.calls).toHaveLength(1);
+    expect(toolExec.calls[0]!.input).toEqual({ args: { cursor: "orig" } });
+    // …and the persisted snapshot was not overwritten.
+    expect((await h.stepStore.listForRun(run.id))[0]!.input).toEqual({
+      args: { cursor: "orig" },
+    });
+  });
+
+  test("an interrupted state step retries its PERSISTED write, not a re-render", async () => {
+    const write: PipelineStep = {
+      id: newStepId(),
+      slug: "save",
+      kind: "state",
+      set: { prev: { $ref: "state.cursor" } },
+    };
+    const config = cfg([write]);
+    const h = harness({
+      executors: {},
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    // The interrupted attempt's write already landed (cursor now "new"); its
+    // persisted input snapshot recorded the value it was actually writing.
+    h.stateStore.state.set(run.workflowId!, new Map([["cursor", "new"]]));
+    await seedRow(h, run, write, { input: { set: { prev: "old" } } });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    // The retry wrote the SAME values as the original attempt.
+    expect(h.stateStore.state.get(run.workflowId!)!.get("prev")).toBe("old");
+  });
+
+  test("a resumed run keeps the ORIGINAL wall-clock budget — no fresh budget per restart", async () => {
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const step = tool("late");
+    const config = cfg([step]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxWallClockMs: 60_000 },
+      now: () => new Date(t0.getTime() + 61_000),
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: t0 });
+    h.runStore.setStatus(run.id, "running");
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain("wall clock");
+    expect(toolExec.calls).toHaveLength(0);
+    // started_at is preserved: the resume's running mark carries no startedAt.
+    const runningMark = h.runStore.statusLog.find(
+      (entry) => entry.runId === run.id && entry.patch.status === "running",
+    )!;
+    expect(runningMark.patch.startedAt).toBeUndefined();
+  });
+
+  test("a resumed run's scope `now` stays the ORIGINAL start time", async () => {
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const step = tool("stamp");
+    const config = cfg([step]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      now: () => new Date(t0.getTime() + 5_000),
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: t0 });
+    h.runStore.setStatus(run.id, "running");
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    expect(toolExec.calls[0]!.scope.now).toBe(t0.toISOString());
+  });
+
+  test("the executed-step budget survives a restart — seeded from the ledger", async () => {
+    const a = tool("a");
+    const b = tool("b");
+    const c = tool("c");
+    const config = cfg([a, b, c]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxExecutedStepsPerRun: 2 },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 3 },
+    } as never);
+    // The previous incarnation already spent the whole budget on a and b.
+    await seedRow(h, run, a, { finish: { status: "succeeded", output: {} } });
+    await seedRow(h, run, b, { finish: { status: "succeeded", output: {} } });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain("step instances");
+    // The restart granted no fresh budget: c never executed.
+    expect(toolExec.calls).toHaveLength(0);
+  });
+
+  test("the state key cap is enforced against COMMITTED truth, not the run's stale snapshot", async () => {
+    const fill = tool("fill");
+    const write: PipelineStep = {
+      id: newStepId(),
+      slug: "save",
+      kind: "state",
+      set: { extra: "v" },
+    };
+    const wfId = crypto.randomUUID();
+    const h = harness({
+      executors: {
+        tool: async () => {
+          // A concurrent overlap:"allow" run commits 200 keys AFTER this run
+          // snapshotted (empty) — the in-memory snapshot is now stale.
+          const map = new Map<string, unknown>();
+          for (let i = 0; i < 200; i += 1) map.set(`k${i}`, i);
+          h.stateStore.state.set(wfId, map);
+          return { status: "succeeded", output: {} };
+        },
+      },
+    });
+    const config = cfg([fill, write]);
+    const started = await h.start({ config, workflow: { id: wfId, config } });
+    if (!started.started) throw new Error("expected a started run");
+    const terminal = await waitForTerminal(h.runStore, started.run.id);
+    expect(terminal.status).toBe("failed");
+    const row = h.stepStore.rows.find((r) => r.path === write.id)!;
+    expect(row.errorClass).toBe("state_cap_exceeded");
+    expect(row.error).toContain("200");
+    // The over-cap write was refused atomically — nothing landed.
+    expect(h.stateStore.state.get(wfId)!.has("extra")).toBeFalse();
+  });
+
+  test("resume backfills a terminal step event a crash swallowed between persist and emit", async () => {
+    const first = tool("first");
+    const second = tool("second");
+    const config = cfg([first, second]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    // Crash window: `first`'s terminal row landed, its completed event did not.
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 2 },
+    } as never);
+    await h.runStore.appendEvent(run.id, 1, {
+      type: "pipeline.step.started",
+      data: { stepId: first.id, slug: "first", kind: "tool", path: first.id, attempt: 1 },
+    } as never);
+    await seedRow(h, run, first, {
+      finish: { status: "succeeded", output: { v: 1 } },
+    });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    expect(eventTypes(h.runStore, run.id)).toEqual([
+      "pipeline.started",
+      "pipeline.step.started",
+      "pipeline.step.completed", // backfilled for `first` on adoption
+      "pipeline.step.started",
+      "pipeline.step.completed",
+      "pipeline.completed",
+    ]);
+    const completions = eventData(h.runStore, run.id, "pipeline.step.completed");
+    expect(completions[0]).toMatchObject({
+      path: first.id,
+      status: "succeeded",
+      outputPreview: JSON.stringify({ v: 1 }),
+    });
+  });
+
+  test("resume backfills the terminal FAILED event for an adopted failed row", async () => {
+    const bad = tool("bad");
+    const config = cfg([bad]);
+    const h = harness({
+      executors: {},
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    await h.runStore.appendEvent(run.id, 1, {
+      type: "pipeline.step.started",
+      data: { stepId: bad.id, slug: "bad", kind: "tool", path: bad.id, attempt: 1 },
+    } as never);
+    await seedRow(h, run, bad, {
+      finish: { status: "failed", error: "server said no", errorClass: "tool_error" },
+    });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toBe("server said no");
+    const failures = eventData(h.runStore, run.id, "pipeline.step.failed");
+    expect(failures).toEqual([
+      {
+        stepId: bad.id,
+        slug: "bad",
+        kind: "tool",
+        path: bad.id,
+        attempt: 1,
+        errorClass: "tool_error",
+        error: "server said no",
+        willRetry: false,
+      },
+    ]);
+  });
+
+  test("resume does NOT duplicate terminal step events that already landed", async () => {
+    const first = tool("first");
+    const second = tool("second");
+    const config = cfg([first, second]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    // `first` fully settled — row AND event — before the crash.
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 2 },
+    } as never);
+    await h.runStore.appendEvent(run.id, 1, {
+      type: "pipeline.step.started",
+      data: { stepId: first.id, slug: "first", kind: "tool", path: first.id, attempt: 1 },
+    } as never);
+    await h.runStore.appendEvent(run.id, 2, {
+      type: "pipeline.step.completed",
+      data: {
+        stepId: first.id,
+        slug: "first",
+        kind: "tool",
+        path: first.id,
+        status: "succeeded",
+        durationMs: 1,
+      },
+    } as never);
+    await seedRow(h, run, first, {
+      finish: { status: "succeeded", output: { v: 1 } },
+    });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    const completions = eventData(h.runStore, run.id, "pipeline.step.completed");
+    expect(completions.filter((c) => c.path === first.id)).toHaveLength(1);
+  });
+});
+
 describe("pipeline driver — for_each", () => {
   const loopOver = (
     body: PipelineStep[],

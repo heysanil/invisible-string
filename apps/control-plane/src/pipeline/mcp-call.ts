@@ -48,6 +48,7 @@ export type McpCallFailureClass =
   | "timeout"
   | "rate_limited"
   | "server_error"
+  | "endpoint_error"
   | "auth_required"
   | "auth_error"
   | "tool_not_found"
@@ -230,6 +231,12 @@ function classifyCallFailure(
   if (httpStatus === 429) return failure("rate_limited", scrubbed);
   if (httpStatus !== null && httpStatus >= 500) {
     return failure("server_error", scrubbed);
+  }
+  if (httpStatus !== null && httpStatus >= 400) {
+    // The endpoint ANSWERED with a non-auth 4xx at the transport layer (400 on
+    // initialize, 404 no MCP endpoint, 405…) — a misconfigured URL, not an
+    // outage. Retrying a deterministic call against it cannot help.
+    return failure("endpoint_error", scrubbed);
   }
   return failure("unreachable", scrubbed);
 }

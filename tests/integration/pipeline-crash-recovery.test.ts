@@ -32,7 +32,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 
-import { eq } from "drizzle-orm";
+import { and, eq, gte } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   newId,
@@ -342,7 +342,9 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
       await runner1.stopAll();
 
       // ── the crash left honest, recoverable state ──
-      expect((await runRow(runId)).status).toBe("running");
+      const midRun = await runRow(runId);
+      expect(midRun.status).toBe("running");
+      const preCrashStartedAt = midRun.startedAt!;
       const midLedger = await ledgerRows(runId);
       expect(midLedger.get(ids.loop)!.status).toBe("running");
       expect(midLedger.get(`${ids.loop}/0/${ids.record}`)!.status).toBe("succeeded");
@@ -350,6 +352,36 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
       expect(midLedger.get(`${ids.loop}/2/${ids.record}`)!.status).toBe("running");
       expect(midLedger.has(`${ids.loop}/3/${ids.record}`)).toBeFalse();
       expect(midLedger.has(ids.wrap)).toBeFalse();
+
+      // Widen the drill to the persist→emit crash window: the driver
+      // persists a step's terminal row BEFORE emitting its terminal event,
+      // so a crash in between leaves the ledger terminal with the timeline
+      // showing the step running forever. Simulate it for item 1 by dropping
+      // the event SUFFIX from its `pipeline.step.completed` onward (a suffix
+      // keeps seq contiguous — the count IS the resuming appender's base);
+      // recovery must backfill the missing event on adoption.
+      const midEvents = await handle.db
+        .select({ seq: schema.runEvents.seq, event: schema.runEvents.event })
+        .from(schema.runEvents)
+        .where(eq(schema.runEvents.runId, runId))
+        .orderBy(schema.runEvents.seq);
+      const item1Path = `${ids.loop}/1/${ids.record}`;
+      const item1Completed = midEvents.find((row) => {
+        const event = row.event as { type: string; data?: { path?: string } };
+        return (
+          event.type === "pipeline.step.completed" &&
+          event.data?.path === item1Path
+        );
+      });
+      expect(item1Completed).toBeDefined();
+      await handle.db
+        .delete(schema.runEvents)
+        .where(
+          and(
+            eq(schema.runEvents.runId, runId),
+            gte(schema.runEvents.seq, item1Completed!.seq),
+          ),
+        );
 
       // ── the "rebooted" process adopts + replays ──
       const runner2 = makeRunner();
@@ -359,7 +391,11 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
 
       // The run completes: item 2 failed honest, items 3–4 ran, the loop's
       // `onItemError: "continue"` kept the run green.
-      expect((await runRow(runId)).status).toBe("succeeded");
+      const finalRun = await runRow(runId);
+      expect(finalRun.status).toBe("succeeded");
+      // The reboot preserved the ORIGINAL started_at — the wall-clock budget
+      // and the scope's `now` anchor there; a restart re-grants neither.
+      expect(finalRun.startedAt!.getTime()).toBe(preCrashStartedAt.getTime());
       const ledger = await ledgerRows(runId);
       // Exactly one ledger row per instance path — adoption, not duplication.
       expect(ledger.size).toBe(7); // loop + 5 items + state
@@ -417,6 +453,15 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
         errorClass: "interrupted",
         willRetry: false,
       });
+      // The persist→emit crash window healed: item 1's missing terminal
+      // event was backfilled on adoption — exactly once, no duplicates.
+      expect(
+        parsed.filter(
+          (e) =>
+            e.type === "pipeline.step.completed" &&
+            e.data?.["path"] === item1Path,
+        ),
+      ).toHaveLength(1);
     },
     60_000,
   );

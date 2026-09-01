@@ -208,6 +208,17 @@ export interface DispatchRenderedRunInput {
     mode?: EveSessionMode;
     outputSchema?: Record<string, unknown>;
   };
+  /**
+   * Called INSIDE the session/run-creation transaction, after the run row is
+   * inserted and before commit — so a caller can persist its linkage to the
+   * new run ATOMICALLY with the run's creation, strictly before any eve
+   * call. The agent step writes `run_steps.child_run_id` here: without it, a
+   * crash between the eve dispatch and the runner's later `markWaiting`
+   * leaves an agent step with no child link, and replay would re-dispatch —
+   * duplicating the child agent's tool side effects. Throwing aborts the
+   * transaction (no run row survives, nothing was dispatched).
+   */
+  onRunCreated?: (tx: DbClient, run: RunRow) => Promise<void>;
 }
 
 export interface DispatchRenderedRunResult {
@@ -359,7 +370,9 @@ export async function dispatchRenderedRun(
         status: "queued",
       })
       .returning();
-    return { session: sessionRow, run: runRows[0]! };
+    const runRow = runRows[0]!;
+    if (input.onRunCreated) await input.onRunCreated(tx, runRow);
+    return { session: sessionRow, run: runRow };
   });
 
   const isNewSession = input.existingSession === undefined;

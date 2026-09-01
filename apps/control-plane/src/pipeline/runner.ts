@@ -75,6 +75,7 @@ import type {
 import {
   WORKFLOW_STATE_MAX_KEYS,
   WORKFLOW_STATE_MAX_VALUE_BYTES,
+  WorkflowStateCapError,
 } from "./step-store";
 import type {
   PipelineExecutorDeps,
@@ -394,6 +395,14 @@ interface DriveCtx {
   deadlineMs: number;
   /** Executed instance count vs `maxExecutedStepsPerRun`. */
   executed: number;
+  /**
+   * Resume only (null on a fresh run): instance paths whose TERMINAL step
+   * event already reached the persisted stream. Adoption of a terminal
+   * ledger row whose path is absent here backfills the missing event — the
+   * normal path persists the row BEFORE emitting, so a crash in between
+   * otherwise leaves the timeline showing the step running forever.
+   */
+  priorTerminalEventPaths: Set<string> | null;
 }
 
 type StepResult =
@@ -677,10 +686,15 @@ export class PipelineRunner {
         bus: this.deps.bus,
         runId,
       });
-      startedAt = this.now();
+      // The wall-clock budget covers the WHOLE run, restarts included: a
+      // resumed driver keeps the ORIGINAL started_at (set only when null),
+      // and the deadline + the scope's `now` derive from it — a reboot must
+      // never re-grant the budget or shift `@now` under replayed templates.
+      const priorStartedAt = run.startedAt;
+      startedAt = priorStartedAt ?? this.now();
       const live = await this.deps.runStore.markRun(runId, {
         status: "running",
-        startedAt,
+        ...(priorStartedAt ? {} : { startedAt }),
       });
       if (!live) {
         // Already terminal (e.g. canceled while queued) — nothing to drive.
@@ -703,6 +717,19 @@ export class PipelineRunner {
         state: await this.deps.stateStore.snapshot(workflowId),
         now: startedAt.toISOString(),
       };
+      // Resume bookkeeping (baseSeq > 0 ⇔ a previous incarnation got as far
+      // as `pipeline.started`): the executed-step budget is seeded from the
+      // ledger so a crash loop cannot re-grant it (skipped rows never
+      // consumed budget and are excluded; the frontier row re-counts on
+      // re-execution — conservative), and the persisted event stream is
+      // scanned once so adoption can backfill terminal step events a crash
+      // swallowed between persist and emit.
+      const resuming = events.baseSeq > 0;
+      let executedSeed = 0;
+      if (resuming) {
+        const ledger = await this.deps.stepStore.listForRun(runId);
+        executedSeed = ledger.filter((r) => r.status !== "skipped").length;
+      }
       const dctx: DriveCtx = {
         run,
         organizationId,
@@ -712,7 +739,10 @@ export class PipelineRunner {
         events,
         logger,
         deadlineMs: startedAt.getTime() + this.config.maxWallClockMs,
-        executed: 0,
+        executed: executedSeed,
+        priorTerminalEventPaths: resuming
+          ? await this.loadTerminalStepEventPaths(runId)
+          : null,
       };
       const outcome = await this.runSequence(dctx, config.steps, scope, null);
       if (handle.interrupted) {
@@ -917,7 +947,7 @@ export class PipelineRunner {
     for (const step of steps) {
       const path = stepInstancePath(parent, step.id);
       const at = this.now();
-      const { created } = await this.deps.stepStore.claim({
+      const { created, row } = await this.deps.stepStore.claim({
         runId: dctx.run.id,
         organizationId: dctx.organizationId,
         stepId: step.id,
@@ -932,8 +962,12 @@ export class PipelineRunner {
         completedAt: at,
       });
       // Adopted rows (a previous incarnation already skipped/ran it) keep
-      // their history — no duplicate event.
-      if (!created) continue;
+      // their history — no duplicate event, but a terminal event a crash
+      // swallowed is backfilled.
+      if (!created) {
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
+        continue;
+      }
       await dctx.events.emit({
         type: "pipeline.step.completed",
         data: {
@@ -1111,7 +1145,7 @@ export class PipelineRunner {
     const claim = await this.claim(dctx, step, path, parent, null);
     let attempt = 1;
     if (!claim.created) {
-      const adopted = this.adoptTerminal(claim.row, step, scope);
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
       if (adopted) {
         // An adopted filter decision must keep fencing on replay.
         if (adopted.kind === "ok" && claim.row.status === "succeeded") {
@@ -1162,11 +1196,11 @@ export class PipelineRunner {
     scope: PipelineScope,
   ): Promise<StepResult> {
     const startMs = this.now().getTime();
-    const entries = renderTemplateRecord(step.set, scope);
+    let entries = renderTemplateRecord(step.set, scope);
     const claim = await this.claim(dctx, step, path, parent, { set: entries });
     let attempt = 1;
     if (!claim.created) {
-      const adopted = this.adoptTerminal(claim.row, step, scope);
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
       if (adopted) {
         if (adopted.kind === "ok") {
           // The write was durable; fold the persisted values back into the
@@ -1179,10 +1213,21 @@ export class PipelineRunner {
         }
         return adopted;
       }
+      // Interrupted mid-write: retry with the PERSISTED input snapshot, not
+      // a re-render — the first attempt's write may already have landed, so
+      // the replay snapshot can differ and a re-render would write
+      // DIFFERENT values on the second try (the leaf-step stance).
+      const persisted = (claim.row.input as { set?: unknown } | null)?.set;
+      if (
+        persisted &&
+        typeof persisted === "object" &&
+        !Array.isArray(persisted)
+      ) {
+        entries = persisted as Record<string, unknown>;
+      }
       attempt = claim.row.attempt + 1;
       await this.deps.stepStore.markRunning(claim.row.id, {
         attempt,
-        input: { set: entries },
         startedAt: this.now(),
       });
     }
@@ -1203,27 +1248,31 @@ export class PipelineRunner {
         );
       }
     }
-    const resultingKeys = new Set([
-      ...Object.keys(scope.state),
-      ...Object.keys(entries),
-    ]);
-    if (resultingKeys.size > WORKFLOW_STATE_MAX_KEYS) {
-      return this.finishFailed(
-        dctx,
-        step,
-        path,
-        claim.row.id,
-        attempt,
-        "state_cap_exceeded",
-        `workflow state would exceed ${WORKFLOW_STATE_MAX_KEYS} keys`,
-      );
+    // The ≤200-key cap is enforced by the STORE, transactionally at write
+    // time (advisory xact lock + in-transaction count): the run's in-memory
+    // snapshot is stale by construction — two overlap:"allow" runs could
+    // both pass a snapshot check at 199 and exceed the cap together.
+    try {
+      await this.deps.stateStore.set({
+        workflowId: dctx.workflowId,
+        organizationId: dctx.organizationId,
+        runId: dctx.run.id,
+        entries,
+      });
+    } catch (error) {
+      if (error instanceof WorkflowStateCapError) {
+        return this.finishFailed(
+          dctx,
+          step,
+          path,
+          claim.row.id,
+          attempt,
+          "state_cap_exceeded",
+          `workflow state would exceed ${WORKFLOW_STATE_MAX_KEYS} keys`,
+        );
+      }
+      throw error;
     }
-    await this.deps.stateStore.set({
-      workflowId: dctx.workflowId,
-      organizationId: dctx.organizationId,
-      runId: dctx.run.id,
-      entries,
-    });
     Object.assign(scope.state, entries);
     const keys = Object.keys(entries);
     await dctx.events.emit({
@@ -1254,13 +1303,15 @@ export class PipelineRunner {
     let lane: number | "else" | null;
     if (!claim.created && claim.row.status === "succeeded") {
       // The decision is on record — re-descend into the chosen lane (its
-      // children adopt-or-execute idempotently); no duplicate events.
+      // children adopt-or-execute idempotently); no duplicate events, but a
+      // terminal event a crash swallowed is backfilled.
       this.extendScope(scope, step, claim.row.output ?? {});
+      await this.backfillTerminalStepEvent(dctx, claim.row, step, path);
       lane = readBranchLane(claim.row.output, step);
     } else {
       let attempt = 1;
       if (!claim.created) {
-        const adopted = this.adoptTerminal(claim.row, step, scope);
+        const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
         if (adopted) return adopted;
         attempt = claim.row.attempt + 1;
         await this.deps.stepStore.markRunning(claim.row.id, {
@@ -1338,7 +1389,7 @@ export class PipelineRunner {
     });
     let attempt = 1;
     if (!claim.created) {
-      const adopted = this.adoptTerminal(claim.row, step, scope);
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
       if (adopted) return adopted;
       // Interrupted mid-loop: the body claims below adopt every finished
       // item instance, so replay resumes at the frontier — no special case.
@@ -1458,29 +1509,120 @@ export class PipelineRunner {
    * Adoption of a row a previous incarnation of this run already wrote:
    * terminal rows short-circuit (success feeds the scope; failure/cancel
    * propagate as if they just happened); null means "not terminal — the
-   * caller resumes execution" (running/pending/waiting).
+   * caller resumes execution" (running/pending/waiting). Adopted terminal
+   * rows whose terminal event never landed get it backfilled here.
    */
-  private adoptTerminal(
+  private async adoptTerminal(
+    dctx: DriveCtx,
     row: RunStepRow,
     step: PipelineStep,
+    path: string,
     scope: PipelineScope,
-  ): StepResult | null {
+  ): Promise<StepResult | null> {
     switch (row.status) {
       case "succeeded":
         this.extendScope(scope, step, row.output ?? {});
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
         return { kind: "ok" };
       case "skipped":
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
         return { kind: "ok" };
       case "failed":
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
         return {
           kind: "failed",
           error: row.error ?? "step failed",
           errorClass: row.errorClass ?? "failed",
         };
       case "canceled":
+        // Parity with the live path: a canceled step emits no step event
+        // (the run-level status frame carries the cancellation).
         return { kind: "canceled" };
       default:
         return null;
+    }
+  }
+
+  /**
+   * Scan the persisted event stream once (resume only) for the paths whose
+   * terminal step event already landed: any `pipeline.step.completed`, or a
+   * `pipeline.step.failed` with `willRetry: false` (retry failures are not
+   * terminal for the step).
+   */
+  private async loadTerminalStepEventPaths(runId: string): Promise<Set<string>> {
+    const paths = new Set<string>();
+    const stored = await this.deps.runStore.listEventsAfter(runId, -1);
+    for (const record of stored) {
+      const event = record.event as unknown as {
+        type?: unknown;
+        data?: { path?: unknown; willRetry?: unknown };
+      };
+      const path = typeof event.data?.path === "string" ? event.data.path : null;
+      if (!path) continue;
+      if (event.type === "pipeline.step.completed") {
+        paths.add(path);
+      } else if (
+        event.type === "pipeline.step.failed" &&
+        event.data?.willRetry === false
+      ) {
+        paths.add(path);
+      }
+    }
+    return paths;
+  }
+
+  /**
+   * The normal path persists a step's terminal row BEFORE emitting its
+   * terminal event, so a crash in between leaves the ledger terminal while
+   * the event stream shows the step running forever. On adoption, re-emit
+   * the missing terminal event; rows whose event already landed are left
+   * alone (no duplicates). Fresh runs (`priorTerminalEventPaths` null) never
+   * adopt, so this is a no-op there.
+   */
+  private async backfillTerminalStepEvent(
+    dctx: DriveCtx,
+    row: RunStepRow,
+    step: PipelineStep,
+    path: string,
+  ): Promise<void> {
+    const seen = dctx.priorTerminalEventPaths;
+    if (!seen || seen.has(path)) return;
+    seen.add(path);
+    if (row.status === "succeeded" || row.status === "skipped") {
+      const durationMs =
+        row.completedAt && row.startedAt
+          ? Math.max(0, row.completedAt.getTime() - row.startedAt.getTime())
+          : 0;
+      const preview =
+        row.status === "succeeded"
+          ? buildStepOutputPreview(row.output ?? {})
+          : undefined;
+      await dctx.events.emit({
+        type: "pipeline.step.completed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          status: row.status,
+          durationMs,
+          ...(preview !== undefined ? { outputPreview: preview } : {}),
+        },
+      });
+    } else if (row.status === "failed") {
+      await dctx.events.emit({
+        type: "pipeline.step.failed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          attempt: row.attempt,
+          errorClass: row.errorClass ?? "failed",
+          error: row.error ?? "step failed",
+          willRetry: false,
+        },
+      });
     }
   }
 
@@ -1494,13 +1636,19 @@ export class PipelineRunner {
     scope: PipelineScope,
   ): Promise<StepResult> {
     const startMs = this.now().getTime();
-    const input = renderLeafInput(step, scope);
-    const claim = await this.claim(dctx, step, path, parent, input);
+    const renderedInput = renderLeafInput(step, scope);
+    const claim = await this.claim(dctx, step, path, parent, renderedInput);
     const row = claim.row;
+    // A resumed (adopted) row retries with its PERSISTED input snapshot,
+    // verbatim — never a re-render against the rebuilt scope, which can
+    // differ (state moved under overlap "allow", refs resolve differently):
+    // a retried tool call must execute with the SAME args as the original
+    // attempt. The snapshot is never overwritten below for the same reason.
+    const input = claim.created ? renderedInput : (row.input ?? renderedInput);
     let attempt = 1;
     let childRunId: string | undefined;
     if (!claim.created) {
-      const adopted = this.adoptTerminal(row, step, scope);
+      const adopted = await this.adoptTerminal(dctx, row, step, path, scope);
       if (adopted) return adopted;
       if (row.status === "waiting") {
         // Agent step parked on its child when we crashed — re-attach.
@@ -1527,7 +1675,6 @@ export class PipelineRunner {
       }
       await this.deps.stepStore.markRunning(row.id, {
         attempt,
-        input,
         startedAt: this.now(),
       });
     }

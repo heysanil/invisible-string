@@ -17,6 +17,9 @@ import {
   createDrizzleRunStepStore,
   createDrizzleWorkflowStateStore,
   createMemoryRunStepStore,
+  createMemoryWorkflowStateStore,
+  WORKFLOW_STATE_MAX_KEYS,
+  WorkflowStateCapError,
   type RunStepStore,
   type WorkflowStateStore,
 } from "./step-store";
@@ -52,6 +55,33 @@ describe("createMemoryRunStepStore — claim semantics", () => {
     const second = await store.claim(input);
     expect(second.created).toBeFalse();
     expect(second.row.id).toBe(first.row.id);
+  });
+});
+
+describe("createMemoryWorkflowStateStore — key cap", () => {
+  const write = (entries: Record<string, unknown>) => ({
+    workflowId: "wf",
+    organizationId: "org",
+    runId: "r1",
+    entries,
+  });
+
+  test("set refuses a write past WORKFLOW_STATE_MAX_KEYS atomically; overwrites at the cap stay legal", async () => {
+    const store = createMemoryWorkflowStateStore();
+    const full: Record<string, unknown> = {};
+    for (let i = 0; i < WORKFLOW_STATE_MAX_KEYS; i += 1) full[`k${i}`] = i;
+    await store.set(write(full));
+    // Overwriting existing keys AT the cap is fine…
+    await store.set(write({ k0: "updated" }));
+    // …but one new key past it throws — and writes NOTHING, including the
+    // in-cap overwrite riding the same call.
+    await expect(store.set(write({ k0: "clobbered", extra: 1 }))).rejects.toThrow(
+      WorkflowStateCapError,
+    );
+    const snap = await store.snapshot("wf");
+    expect(Object.keys(snap)).toHaveLength(WORKFLOW_STATE_MAX_KEYS);
+    expect(snap["k0"]).toBe("updated");
+    expect("extra" in snap).toBeFalse();
   });
 });
 
@@ -193,5 +223,48 @@ describe.skipIf(!TEST_DATABASE_URL)("drizzle step + state stores", () => {
       seen: ["a"],
     });
     expect(await stateStore.countKeys(workflowId)).toBe(2);
+  });
+
+  test("workflow state: the key cap is enforced transactionally — concurrent writers cannot exceed it together", async () => {
+    // A dedicated workflow at 199 committed keys.
+    const wf = await handle.db
+      .insert(schema.workflows)
+      .values({ organizationId: orgId, name: "wf-cap", draft: {} })
+      .returning({ id: schema.workflows.id });
+    const capWorkflowId = wf[0]!.id;
+    const bulk: Record<string, unknown> = {};
+    for (let i = 0; i < WORKFLOW_STATE_MAX_KEYS - 1; i += 1) bulk[`k${i}`] = i;
+    await stateStore.set({
+      workflowId: capWorkflowId,
+      organizationId: orgId,
+      runId,
+      entries: bulk,
+    });
+
+    // Two writers race, each adding ONE distinct new key. A snapshot-based
+    // check would pass both at 199; the advisory-locked in-transaction count
+    // must admit exactly one and refuse the other.
+    const results = await Promise.allSettled([
+      stateStore.set({
+        workflowId: capWorkflowId,
+        organizationId: orgId,
+        runId,
+        entries: { racerA: 1 },
+      }),
+      stateStore.set({
+        workflowId: capWorkflowId,
+        organizationId: orgId,
+        runId,
+        entries: { racerB: 2 },
+      }),
+    ]);
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toBeInstanceOf(WorkflowStateCapError);
+    expect(await stateStore.countKeys(capWorkflowId)).toBe(
+      WORKFLOW_STATE_MAX_KEYS,
+    );
   });
 });

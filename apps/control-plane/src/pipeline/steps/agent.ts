@@ -17,18 +17,28 @@
  * - `session: "thread"` — Slack thread continuity: the thread key stamped
  *   into the parent run's `TriggerEvent.data.slackThreadKey` resolves an
  *   existing thread-keyed session (`findSlackThreadSession`) whose PINNED
- *   version takes the message as a follow-up turn; no session yet means a
- *   fresh conversational session claimed under the advisory-locked thread-key
- *   machinery. Never `mode: "task"` (a human answers these in Slack) and
- *   never an output schema (the publish gate forbids the combination).
+ *   version takes the message as a follow-up turn — but ONLY when that
+ *   session's agent IS the step's agent. A thread established by a step
+ *   bound to Agent A must not execute a later Agent-B step's instructions on
+ *   A: on mismatch the claim moves to an AGENT-QUALIFIED key
+ *   ({@link agentQualifiedThreadKey}), so each agent in one Slack thread
+ *   gets its own session (with its own cross-run continuity) and the
+ *   `(workflow_id, slack_thread_key)` unique index stays respected. No
+ *   session under the step's key means a fresh conversational session
+ *   claimed under the same advisory-locked thread-key machinery. Never
+ *   `mode: "task"` (a human answers these in Slack) and never an output
+ *   schema (the publish gate forbids the combination).
  *
- * CHILD LINKING WITHOUT LEDGER WRITES: right after a successful dispatch the
- * executor returns `{status: "waiting", childRunId}` — the RUNNER persists
- * the link (`run_steps.child_run_id` via markWaiting), parks, notices the
- * child is not actually parked (queued/running ≠ waiting) and re-invokes this
- * executor with `ctx.childRunId`. That one bounce makes the ledger row carry
- * the child id BEFORE any crash window opens, so replay RE-ATTACHES instead
- * of double-dispatching a second eve session.
+ * CHILD LINKING IS PRE-DISPATCH: the dispatch's run-creation transaction
+ * invokes `onRunCreated`, which persists `run_steps.child_run_id` ATOMICALLY
+ * with the child run row — strictly before any eve call. A crash at ANY
+ * point after eve is reached therefore replays onto a ledger row that
+ * already carries the child id (the runner re-attaches via `ctx.childRunId`,
+ * including from a `running`-status row), never a second dispatch that would
+ * duplicate the child agent's tool side effects. The executor still returns
+ * `{status: "waiting", childRunId}` immediately after dispatch — the RUNNER
+ * owns the status transition (markWaiting) and the park/bounce that
+ * re-invokes this executor with `ctx.childRunId` to watch the child.
  *
  * COMPLETION is keyed on the child RUN ROW's status (which the tailer settles
  * from the stream's terminal events) — NEVER on a follow-up send or a 409
@@ -55,6 +65,7 @@ import {
   type TriggerEvent,
 } from "@invisible-string/shared";
 
+import type { DbClient } from "../../db";
 import {
   dispatchRenderedRun,
   findSlackThreadSession,
@@ -119,6 +130,27 @@ export function slackThreadKeyFromTriggerData(
 ): string | null {
   const value = data["slackThreadKey"];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Thread-claim key for an agent whose Slack thread's BARE key is already
+ * held by a DIFFERENT agent's session: the first `session: "thread"` step to
+ * touch a thread claims the bare ingress key; any later step binding another
+ * agent claims `<bareKey>:agent:<agentId>` instead, so each agent in one
+ * thread gets its own session (own continuity, own pinned version) without
+ * violating the `(workflow_id, slack_thread_key)` unique index.
+ *
+ * The suffix adds colons ON PURPOSE: `parseSlackThreadKey`
+ * (runs/delivery.ts) requires exactly three `:`-segments, so a qualified key
+ * can never silently mis-parse into a reply target (child runs never owe a
+ * delivery anyway — their `delivery_status` stays null), and a qualified key
+ * can never collide with any bare `integrationId:channel:threadTs` key.
+ */
+export function agentQualifiedThreadKey(
+  threadKey: string,
+  agentId: string,
+): string {
+  return `${threadKey}:agent:${agentId}`;
 }
 
 /**
@@ -286,10 +318,46 @@ export async function watchChildRun(
 
 // ── the executor ─────────────────────────────────────────────────────────────
 
+/**
+ * Persist `run_steps.child_run_id` on this step instance's ledger row —
+ * called from the dispatch's `onRunCreated` hook, INSIDE the transaction
+ * that creates the child run row and strictly BEFORE any eve call. That
+ * atomicity is the at-most-once guarantee: there is no instant at which a
+ * dispatched (side-effectful) child exists without its ledger link, so a
+ * crash anywhere in the dispatch/park window replays into a RE-ATTACH
+ * (`ctx.childRunId`), never a second dispatch. Zero rows updated means the
+ * runner's claim contract was violated — throw so the transaction aborts and
+ * nothing is dispatched.
+ */
+export async function linkChildRunToStep(
+  tx: DbClient,
+  parentRunId: string,
+  path: string,
+  childRunId: string,
+): Promise<void> {
+  const updated = await tx
+    .update(schema.runSteps)
+    .set({ childRunId })
+    .where(
+      and(
+        eq(schema.runSteps.runId, parentRunId),
+        eq(schema.runSteps.path, path),
+      ),
+    )
+    .returning({ id: schema.runSteps.id });
+  if (updated.length === 0) {
+    throw new Error(
+      `agent step has no claimed run_steps row to link (run ${parentRunId}, path ${path})`,
+    );
+  }
+}
+
 /** Injectable seams so the lifecycle unit-tests run against fakes. */
 export interface AgentStepExecutorOptions {
   pollMs?: number;
   dispatchImpl?: typeof dispatchRenderedRun;
+  /** In-transaction `run_steps.child_run_id` writer ({@link linkChildRunToStep}). */
+  linkChildRunImpl?: typeof linkChildRunToStep;
   /** Agent → CURRENT published, build-ready version (fresh / new-thread). */
   resolveReadyAgentImpl?: (
     deps: RuntimeDeps,
@@ -365,6 +433,7 @@ export function createAgentStepExecutor(
 ): StepExecutor {
   const pollMs = options.pollMs ?? AGENT_STEP_POLL_MS;
   const dispatch = options.dispatchImpl ?? dispatchRenderedRun;
+  const linkChildRun = options.linkChildRunImpl ?? linkChildRunToStep;
   const resolveAgent = options.resolveReadyAgentImpl ?? resolveReadyAgent;
   const requireReadyVersion =
     options.requireReadyVersionImpl ?? requireReadyAgentVersion;
@@ -414,6 +483,12 @@ export function createAgentStepExecutor(
       source: "pipeline",
     };
 
+    // Persisted INSIDE the dispatch's run-creation transaction (before any
+    // eve call) so a crash can only ever replay into a re-attach — see the
+    // module doc's CHILD LINKING IS PRE-DISPATCH.
+    const onRunCreated = (tx: DbClient, childRun: { id: string }): Promise<void> =>
+      linkChildRun(tx, ctx.run.id, ctx.path, childRun.id);
+
     let result: DispatchRenderedRunResult;
     try {
       if (step.session === "thread") {
@@ -424,12 +499,27 @@ export function createAgentStepExecutor(
             'session: "thread" needs a Slack-triggered run (no slackThreadKey on the trigger data)',
           );
         }
-        const existing = await findThreadSession(
+        // The bare ingress key first (the common one-agent-per-thread case,
+        // and back-compat with sessions claimed before agent qualification).
+        // A holder bound to a DIFFERENT agent is never reused — the step
+        // must run on ITS agent — so the lookup/claim moves to the
+        // agent-qualified key instead (module doc, session shape).
+        let claimKey = threadKey;
+        let existing = await findThreadSession(
           runtimeDeps.db,
           ctx.orgId,
           ctx.run.workflowId,
           threadKey,
         );
+        if (existing && existing.agentId !== step.agentId) {
+          claimKey = agentQualifiedThreadKey(threadKey, step.agentId);
+          existing = await findThreadSession(
+            runtimeDeps.db,
+            ctx.orgId,
+            ctx.run.workflowId,
+            claimKey,
+          );
+        }
         // Continuation runs the SESSION's pinned version (immutable —
         // republishing never migrates a live thread); a new thread claim
         // runs the agent's CURRENT published version.
@@ -444,11 +534,15 @@ export function createAgentStepExecutor(
           triggerType: "pipeline",
           taskMessage: parsedInput.data.instructions,
           triggerEvent: childTriggerEvent(ready, ctx.run, step.id, ctx.path, principal),
+          onRunCreated,
           ...(existing
             ? { existingSession: existing }
             : {
+                // The principal keeps the BARE key — the session's true
+                // Slack-thread identity; the CLAIM column carries the
+                // (possibly agent-qualified) key.
                 sessionPrincipalExtra: { slackThreadKey: threadKey },
-                newSessionSlackThreadKey: threadKey,
+                newSessionSlackThreadKey: claimKey,
               }),
           // Thread sessions stay conversation-mode: a human can answer a
           // session-limit park (or any HITL request) in Slack/chat.
@@ -463,6 +557,7 @@ export function createAgentStepExecutor(
           triggerType: "pipeline",
           taskMessage: parsedInput.data.instructions,
           triggerEvent: childTriggerEvent(ready, ctx.run, step.id, ctx.path, principal),
+          onRunCreated,
           eveCreate: {
             // Unconditional for fresh agent steps (amendment A3): nobody
             // watches this session in chat, so a budget crossing must fail
@@ -498,10 +593,10 @@ export function createAgentStepExecutor(
       );
     }
 
-    // Return `waiting` IMMEDIATELY so the runner persists the child link
-    // (run_steps.child_run_id) before any crash window opens — see the
-    // module doc. The runner notices the child is not actually parked and
-    // re-invokes with `ctx.childRunId` to watch it.
+    // The ledger already carries the child id (pre-dispatch, in-transaction
+    // — see onRunCreated above). Return `waiting` IMMEDIATELY so the RUNNER
+    // owns the status transition (markWaiting), notices the child is not
+    // actually parked, and re-invokes with `ctx.childRunId` to watch it.
     return { status: "waiting", childRunId: result.run.id };
   };
 

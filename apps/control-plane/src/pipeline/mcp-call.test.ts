@@ -266,6 +266,20 @@ describe("callMcpTool", () => {
     }
   }, 15_000);
 
+  test("non-auth HTTP 4xx → endpoint_error, NOT retryable", async () => {
+    const fixture = await serveFixture(statusHandler(404));
+    try {
+      const outcome = await callMcpTool(callInput(fixture.url));
+      expect(outcome).toMatchObject({
+        kind: "error",
+        errorClass: "endpoint_error",
+        retryable: false,
+      });
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
   test("HTTP 500 → server_error, retryable", async () => {
     const fixture = await serveFixture(statusHandler(500));
     try {

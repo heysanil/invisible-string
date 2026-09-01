@@ -490,6 +490,48 @@ describe("collectPipelineProblems", () => {
     expect(item.some((p) => p.message.includes("for_each body"))).toBe(true);
   });
 
+  test("for_each body slugs are iteration-scoped: a post-loop ref to one is an error (only the loop's aggregate survives)", () => {
+    const withLoop = (markdown: string) => [
+      toolStep(ID_A, "search"),
+      step({
+        id: ID_LOOP,
+        slug: "loop",
+        kind: "for_each",
+        items: { $ref: "steps.search.result" },
+        steps: [
+          toolStep(ID_B, "fetch"),
+          step({
+            id: "st_dddddddddddddddd",
+            slug: "summarize",
+            kind: "infer",
+            preset: "quick",
+            // Same-iteration ref to an EARLIER step of the same body: legal.
+            prompt: { markdown: "Summarize @item using @steps.fetch.text" },
+          }),
+        ],
+      }),
+      step({
+        id: ID_C,
+        slug: "report",
+        kind: "infer",
+        preset: "quick",
+        prompt: { markdown },
+      }),
+    ];
+
+    // The loop's aggregate is addressable after the loop (and the
+    // same-iteration body ref above never flags)…
+    expect(problems(withLoop("Report on @steps.loop.items"))).toEqual([]);
+
+    // …a discarded body slug is not, and the offered roster excludes body
+    // slugs (this is the problem that rejects an addStep carrying such a
+    // ref).
+    const found = problems(withLoop("Report on @steps.summarize.text"));
+    const message = found.find((p) => p.stepId === ID_C)?.message ?? "";
+    expect(message).toContain("PRECEDING");
+    expect(message).toContain("available here: @steps.search, @steps.loop");
+  });
+
   test("$ref paths are head-checked in args, conditions and items", () => {
     const badHead = problems([
       toolStep(ID_A, "a", { args: { title: { $ref: "outputs.search.text" } } }),

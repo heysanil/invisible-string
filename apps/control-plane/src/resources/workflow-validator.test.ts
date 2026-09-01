@@ -471,6 +471,41 @@ describe("validateWorkflowConfig — for_each, branch, filter", () => {
     );
   });
 
+  test("for_each body slugs are iteration-scoped: not addressable after the loop (only the aggregate survives)", () => {
+    const diagnostics = validate(
+      config({
+        trigger: { type: "webhook" },
+        steps: [
+          {
+            id: stepId(0),
+            slug: "loop",
+            kind: "for_each",
+            items: { $ref: "trigger.messages" },
+            steps: [inferStep(1, { slug: "summarize" })],
+          },
+          inferStep(2, {
+            slug: "after",
+            prompt: { markdown: "Report @steps.loop.items and @steps.summarize.text" },
+          }),
+          toolStep(3, {
+            slug: "file",
+            args: { title: { $ref: "steps.summarize.text" } },
+          }),
+        ],
+      }),
+    );
+    // The loop's aggregate is legal; the discarded body slug is not — and
+    // the "earlier steps" roster must not offer it either.
+    const markdown = messagesAt(diagnostics, "steps.1.prompt.markdown");
+    expect(markdown).toHaveLength(1);
+    expect(markdown[0]).toContain("@steps.summarize");
+    expect(markdown[0]).toContain("does not name an earlier step");
+    expect(markdown[0]).toContain("earlier steps: loop");
+    expect(messagesAt(diagnostics, "steps.2.args.title")[0]).toContain(
+      "steps.summarize",
+    );
+  });
+
   test("branch lane diagnostics use the branches.<lane> path grammar; condition $refs are validated", () => {
     const diagnostics = validate(
       config({
@@ -524,7 +559,7 @@ describe("validateWorkflowConfig — onComplete.slackReply", () => {
     );
   });
 
-  test("template renders against the FINAL scope: every slug visible, no @item", () => {
+  test("template renders against the FINAL scope: every surviving slug visible, no @item", () => {
     const diagnostics = validate(
       config({
         trigger: { type: "slack", binding: { mentionOnly: true } },
@@ -539,6 +574,33 @@ describe("validateWorkflowConfig — onComplete.slackReply", () => {
     const messages = messagesAt(diagnostics, "onComplete.slackReply.template.markdown");
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain("@item");
+  });
+
+  test("the final scope excludes for_each body slugs (the runner discarded them); the loop's aggregate is legal", () => {
+    const diagnostics = validate(
+      config({
+        trigger: { type: "slack", binding: { mentionOnly: true } },
+        steps: [
+          {
+            id: stepId(0),
+            slug: "loop",
+            kind: "for_each",
+            items: { $ref: "trigger.text" },
+            steps: [inferStep(1, { slug: "summarize" })],
+          },
+        ],
+        onComplete: {
+          slackReply: {
+            template: {
+              markdown: "Done @steps.loop.total — last: @steps.summarize.text",
+            },
+          },
+        },
+      }),
+    );
+    const messages = messagesAt(diagnostics, "onComplete.slackReply.template.markdown");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("@steps.summarize");
   });
 });
 

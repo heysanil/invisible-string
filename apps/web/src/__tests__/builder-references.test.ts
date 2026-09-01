@@ -245,11 +245,38 @@ test("referenceSourcesForStep offers prior steps only (no forward refs)", () => 
   expect(insideLoop.steps.map((s) => s.slug)).toEqual(["a"]);
   expect(insideLoop.item).toBe(true);
 
-  // After the loop: both `a` and the loop's aggregate, plus its inner step
-  // (lexically before), and no @item.
+  // After the loop: `a` and the loop's aggregate only — the runner discards
+  // body outputs when the loop finishes, so `inner` must NOT be offered —
+  // and no @item.
   const afterLoop = referenceSourcesForStep(steps, later.id, base);
-  expect(afterLoop.steps.map((s) => s.slug)).toEqual(["a", "loop", "inner"]);
+  expect(afterLoop.steps.map((s) => s.slug)).toEqual(["a", "loop"]);
   expect(afterLoop.item).toBe(false);
+});
+
+test("for_each body slugs are iteration-scoped: offered to later SAME-body steps, never after the loop", () => {
+  const fetch = step({ slug: "fetch" });
+  const summarize = step({ slug: "summarize" });
+  const loop: PipelineStep = {
+    id: newStepId(),
+    slug: "loop",
+    kind: "for_each",
+    items: { $ref: "trigger.email" },
+    steps: [fetch, summarize],
+    maxItems: 100,
+    onItemError: "halt",
+  };
+  const later = step({ slug: "later" });
+  const steps = [loop, later];
+  const base = { trigger: formTrigger, connections: [], skills: [] };
+
+  // Same iteration: an earlier body step's output is live in the item scope.
+  const sameBody = referenceSourcesForStep(steps, summarize.id, base);
+  expect(sameBody.steps.map((s) => s.slug)).toEqual(["fetch"]);
+
+  // After the loop only the aggregate survives — a body ref here would
+  // always resolve missing at run time, so autocomplete must not offer it.
+  const afterLoop = referenceSourcesForStep(steps, later.id, base);
+  expect(afterLoop.steps.map((s) => s.slug)).toEqual(["loop"]);
 });
 
 test("slugless steps are omitted from sources (no handle to offer)", () => {

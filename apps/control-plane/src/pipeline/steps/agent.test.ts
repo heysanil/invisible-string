@@ -19,8 +19,10 @@ import type {
   TriggerEvent,
 } from "@invisible-string/shared";
 
+import type { DbClient } from "../../db";
 import { createLogger } from "../../log";
 import { RunEventBus } from "../../runs/bus";
+import { parseSlackThreadKey } from "../../runs/delivery";
 import { RuntimeApiError } from "../../runtime/errors";
 import type {
   DispatchRenderedRunInput,
@@ -31,9 +33,11 @@ import { createMemoryRunStore, makeRunRow } from "../test-support";
 import type { PipelineScope } from "../types";
 import type { StepExecuteContext } from "../types";
 import {
+  agentQualifiedThreadKey,
   classifyAgentDispatchError,
   createAgentStepExecutor,
   extractAgentStepOutput,
+  linkChildRunToStep,
   sessionOriginForTriggerType,
   slackThreadKeyFromTriggerData,
   watchChildRun,
@@ -318,6 +322,20 @@ function harness(): Harness {
   };
 }
 
+/**
+ * Chainable drizzle-shaped tx stub, so the DEFAULT `linkChildRunToStep`
+ * survives fake dispatches that mirror the real hook invocation.
+ */
+function fakeTx(returningRows: Array<{ id: string }> = [{ id: "rs_row" }]): DbClient {
+  return {
+    update: () => ({
+      set: () => ({
+        where: () => ({ returning: async () => returningRows }),
+      }),
+    }),
+  } as unknown as DbClient;
+}
+
 function fakeDispatch(
   h: Harness,
   result?: Partial<DispatchRenderedRunResult>,
@@ -331,6 +349,10 @@ function fakeDispatch(
       workflowId: WORKFLOW,
       status: "queued",
     });
+    // Mirror the real dispatch: the run-creation TRANSACTION invokes
+    // onRunCreated after inserting the run row, strictly before any eve
+    // call — the executor's child linkage must ride it.
+    await input.onRunCreated?.(fakeTx(), run);
     h.store.setStatus(run.id, "queued");
     return {
       session: { id: "session-1" } as never,
@@ -475,12 +497,114 @@ describe("agent step executor (fresh sessions)", () => {
   });
 });
 
+// ── F1: pre-dispatch child linkage (crash-window double-dispatch guard) ─────
+
+describe("agent step child linkage (in-transaction, pre-dispatch)", () => {
+  test("dispatch carries onRunCreated, which links the ledger row (run id + path → child id) inside the tx", async () => {
+    const h = harness();
+    const links: Array<{
+      tx: DbClient;
+      parentRunId: string;
+      path: string;
+      childRunId: string;
+    }> = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      linkChildRunImpl: async (tx, parentRunId, path, childRunId) => {
+        links.push({ tx, parentRunId, path, childRunId });
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const step = agentStep();
+    const outcome = await executor(h.ctx(step));
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    // Linked BY the dispatch's transaction hook — before dispatch even
+    // returned, i.e. before any crash window after the eve call can open.
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({
+      parentRunId: "parent-run",
+      path: step.id,
+      childRunId: "child-run-1",
+    });
+  });
+
+  test("thread continuations link the child the same way", async () => {
+    const h = harness();
+    const links: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      linkChildRunImpl: async (_tx, _parentRunId, _path, childRunId) => {
+        links.push(childRunId);
+      },
+      findThreadSessionImpl: async () =>
+        ({ id: "sess-thread", agentId: AGENT_ID, agentVersionId: "pinned-v" }) as never,
+      requireReadyVersionImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () =>
+        parentEvent({ triggerType: "slack", data: { slackThreadKey: "i:c:t" } }),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep({ session: "thread" }), { trigger: { slackThreadKey: "i:c:t" } }),
+    );
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    expect(links).toEqual(["child-run-1"]);
+  });
+
+  test("a linkage failure aborts the dispatch (classified, never a silent unlinked child)", async () => {
+    const h = harness();
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      linkChildRunImpl: async () => {
+        throw new Error("no claimed run_steps row");
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(h.ctx(agentStep()));
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "dispatch_failed",
+      retryable: false,
+    });
+  });
+});
+
+describe("linkChildRunToStep", () => {
+  test("writes childRunId onto the claimed row", async () => {
+    const sets: unknown[] = [];
+    const tx = {
+      update: () => ({
+        set: (patch: unknown) => {
+          sets.push(patch);
+          return { where: () => ({ returning: async () => [{ id: "rs_1" }] }) };
+        },
+      }),
+    } as unknown as DbClient;
+    await linkChildRunToStep(tx, "run-1", "st_a", "child-9");
+    expect(sets).toEqual([{ childRunId: "child-9" }]);
+  });
+
+  test("throws (aborting the dispatch tx) when no ledger row matches the claim key", async () => {
+    await expect(
+      linkChildRunToStep(fakeTx([]), "run-1", "st_a", "child-9"),
+    ).rejects.toThrow(/no claimed run_steps row/);
+  });
+});
+
 describe("agent step executor (thread sessions)", () => {
   const THREAD_KEY = "integ-1:C1:1720.0";
 
   test("continues the EXISTING thread session on its PINNED version, no task mode", async () => {
     const h = harness();
-    const existing = { id: "sess-thread", agentVersionId: "pinned-v" } as never;
+    // The holder's agent matches the step's binding — the reuse condition.
+    const existing = {
+      id: "sess-thread",
+      agentId: AGENT_ID,
+      agentVersionId: "pinned-v",
+    } as never;
     let pinnedAsked = "";
     const executor = createAgentStepExecutor({
       pollMs: 5,
@@ -539,5 +663,98 @@ describe("agent step executor (thread sessions)", () => {
     const outcome = await executor(h.ctx(agentStep({ session: "thread" })));
     expect(outcome).toMatchObject({ status: "failed", errorClass: "thread_key_missing" });
     expect(h.dispatches).toHaveLength(0);
+  });
+
+  // ── F2: a thread claimed by a DIFFERENT agent is never reused ────────────
+
+  test("agent mismatch: the holder's session is NOT reused — the claim moves to the agent-qualified key", async () => {
+    const h = harness();
+    const lookups: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      findThreadSessionImpl: async (_db, _org, _wf, key) => {
+        lookups.push(key);
+        // The bare key is held by ANOTHER agent's session; nothing holds
+        // this agent's qualified key yet.
+        return key === THREAD_KEY
+          ? ({
+              id: "sess-other-agent",
+              agentId: "11111111-2222-3333-4444-555555555555",
+              agentVersionId: "other-pinned-v",
+            } as never)
+          : null;
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      requireReadyVersionImpl: async () => {
+        throw new Error("must never run the mismatched holder's pinned version");
+      },
+      loadParentTriggerEventImpl: async () =>
+        parentEvent({ triggerType: "slack", data: { slackThreadKey: THREAD_KEY } }),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep({ session: "thread" }), {
+        trigger: { slackThreadKey: THREAD_KEY },
+      }),
+    );
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    const qualified = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
+    expect(lookups).toEqual([THREAD_KEY, qualified]);
+    const dispatched = h.dispatches[0]!;
+    // The step runs on ITS agent's CURRENT version, in a fresh session
+    // claimed under the qualified key (unique index respected)…
+    expect(dispatched.existingSession).toBeUndefined();
+    expect(dispatched.newSessionSlackThreadKey).toBe(qualified);
+    // …while the principal keeps the BARE key — the session's true Slack
+    // thread identity.
+    expect(dispatched.sessionPrincipalExtra).toEqual({ slackThreadKey: THREAD_KEY });
+    expect(dispatched.origin).toBe("slack");
+    expect(dispatched.eveCreate).toBeUndefined();
+  });
+
+  test("agent mismatch with an established qualified session: continues IT on its pinned version", async () => {
+    const h = harness();
+    const qualified = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
+    const ownSession = {
+      id: "sess-own-agent",
+      agentId: AGENT_ID,
+      agentVersionId: "own-pinned-v",
+    } as never;
+    let pinnedAsked = "";
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      findThreadSessionImpl: async (_db, _org, _wf, key) =>
+        key === THREAD_KEY
+          ? ({ id: "sess-other-agent", agentId: "not-this-agent" } as never)
+          : key === qualified
+            ? ownSession
+            : null,
+      requireReadyVersionImpl: async (_deps, versionId) => {
+        pinnedAsked = versionId;
+        return readyVersion();
+      },
+      loadParentTriggerEventImpl: async () =>
+        parentEvent({ triggerType: "slack", data: { slackThreadKey: THREAD_KEY } }),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep({ session: "thread" }), {
+        trigger: { slackThreadKey: THREAD_KEY },
+      }),
+    );
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    expect(pinnedAsked).toBe("own-pinned-v");
+    const dispatched = h.dispatches[0]!;
+    expect(dispatched.existingSession).toBe(ownSession);
+    expect(dispatched.newSessionSlackThreadKey).toBeUndefined();
+  });
+
+  test("agentQualifiedThreadKey can never parse as a bare Slack reply key (delivery safety)", () => {
+    const key = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
+    expect(key).toBe(`${THREAD_KEY}:agent:${AGENT_ID}`);
+    // parseSlackThreadKey requires exactly three `:`-segments — a qualified
+    // key must fail loudly rather than silently mis-target a channel/ts.
+    expect(parseSlackThreadKey(key)).toBeNull();
+    expect(parseSlackThreadKey(THREAD_KEY)).not.toBeNull();
   });
 });

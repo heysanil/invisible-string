@@ -722,16 +722,26 @@ export function validateWorkflowConfig(
   }
 
   // Per-step rules, with visibility computed in ONE document-order pass:
-  // a step sees every step strictly before it minus its own ancestors (the
-  // same set `stepsBefore` computes — kept incremental here so validation
-  // stays linear).
-  const seenInOrder: { id: string; slug: string }[] = [];
+  // a step sees every step strictly before it minus its own ancestors, minus
+  // the bodies of loops that do not enclose it — loop bodies are
+  // iteration-scoped (the runner discards item scopes when the loop
+  // completes; only the loop's aggregate output survives). The same set
+  // `stepsBefore` computes — kept incremental here so validation stays
+  // linear.
+  const seenInOrder: { id: string; slug: string; loopIds: string[] }[] = [];
   for (const entry of entries) {
     const basePath = ["steps", ...entry.configPath].join(".");
     const ancestorIds = new Set(entry.ancestors.map((ancestor) => ancestor.id));
     const visibleSlugs = new Set(
       seenInOrder
-        .filter((seen) => !ancestorIds.has(seen.id) && seen.slug !== "")
+        .filter(
+          (seen) =>
+            !ancestorIds.has(seen.id) &&
+            seen.slug !== "" &&
+            // Every for_each enclosing the seen step must also enclose this
+            // one, or its output died with its iteration.
+            seen.loopIds.every((loopId) => ancestorIds.has(loopId)),
+        )
         .map((seen) => seen.slug),
     );
     const position: RefPosition = {
@@ -748,13 +758,21 @@ export function validateWorkflowConfig(
         config.trigger,
       ),
     );
-    seenInOrder.push({ id: entry.step.id, slug: entry.step.slug });
+    seenInOrder.push({
+      id: entry.step.id,
+      slug: entry.step.slug,
+      loopIds: entry.ancestors
+        .filter((ancestor) => ancestor.kind === "for_each")
+        .map((ancestor) => ancestor.id),
+    });
   }
 
-  // onComplete.slackReply: renders against the FINAL scope (every slug
-  // visible, no loop item) and delivers into the triggering Slack thread —
-  // meaningless on any other trigger, so publish blocks it (a config that
-  // silently never delivers is worse than a red diagnostic).
+  // onComplete.slackReply: renders against the FINAL scope (every surviving
+  // slug visible, no loop item — for_each bodies are iteration-scoped, so
+  // only the loop step's aggregate reaches the final scope) and delivers
+  // into the triggering Slack thread — meaningless on any other trigger, so
+  // publish blocks it (a config that silently never delivers is worse than a
+  // red diagnostic).
   if (config.onComplete?.slackReply) {
     if (config.trigger.type !== "slack") {
       diagnostics.push(
@@ -767,7 +785,15 @@ export function validateWorkflowConfig(
     const finalPosition: RefPosition = {
       trigger: config.trigger,
       visibleSlugs: new Set(
-        entries.map((entry) => entry.step.slug).filter((slug) => slug !== ""),
+        entries
+          .filter(
+            (entry) =>
+              entry.step.slug !== "" &&
+              entry.ancestors.every(
+                (ancestor) => ancestor.kind !== "for_each",
+              ),
+          )
+          .map((entry) => entry.step.slug),
       ),
       inForEach: false,
     };

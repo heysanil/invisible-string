@@ -202,7 +202,7 @@ followed by STEPS executed in order. The draft below is the pipeline JSON \
 - tool — a deterministic MCP tool call on a workspace connection ({connectionId, tool, args})
 - infer — a cheap direct model call on a workspace preset ({preset, prompt: {markdown}, output?.schema for structured output})
 - agent — a full session with a PUBLISHED agent, run as a child run ({agentId, instructions: {markdown}, session: "fresh"|"thread"})
-- for_each — run nested steps once per item of an array ({items: {"$ref": …}, steps}); loops cannot nest
+- for_each — run nested steps once per item of an array ({items: {"$ref": …}, steps}); loops cannot nest. Body outputs are per-iteration and discarded when the loop finishes — only the loop step's aggregate ({total, succeeded, failed, skipped, items}) survives it
 - branch — the first lane whose \`when\` condition holds runs; \`else\` when none do
 - filter — a gate ({where}): false at the top level skips the rest of the run; false inside a loop drops the item
 - state — write persistent workflow state ({set}); read it back anywhere with @state.<key>
@@ -230,7 +230,7 @@ ${presets || "(none)"}
 ## References
 Markdown surfaces (infer prompts, agent instructions, {"$tpl": "…"} strings) interpolate inline:
 - \`@trigger.<path>\` — trigger event data (form field keys become @trigger.<key>). Only form/webhook/slack triggers carry dispatch data.
-- \`@steps.<slug>.<path>\` — a PRECEDING step's output (tool: result/text; infer: text or the schema's fields; agent: result/text).
+- \`@steps.<slug>.<path>\` — a PRECEDING step's output (tool: result/text; infer: text or the schema's fields; agent: result/text; for_each: its aggregate). A for_each BODY step's slug is only referable from later steps of the SAME body — after the loop, reference the loop step's slug instead.
 - \`@state.<key>\` — persistent workflow state.
 - \`@item\` / \`@item.<path>\` — the current for_each item (loop bodies only).
 - \`@now\` — the run's ISO timestamp.
@@ -245,7 +245,7 @@ Structured values (tool args, state.set, for_each.items, condition operands) use
 3. NEVER invent MCP tool names: call searchConnectionTools before proposing a tool step (and getConnectionTool for the arg schema). Only use tool names those results — or the inventory above — actually list.
 4. NEVER invent step ids: ids are minted server-side on addStep (an applied addStep's tool result hands you the new id), and you may reference existing steps only by ids present in the current draft or handed back by an applied addStep.
 5. Use only ids from the inventory above: connections must be enabled and workspace-scoped for tool steps; agent steps need a PUBLISHED agent. Agent NAMES are not unique in a workspace — the id is the only way to name one; if the user's wording matches several, ask which they mean instead of picking.
-6. Give every step a short unique slug — it is the @steps handle. @steps refs must name a PRECEDING step, and @item exists only inside for_each bodies.
+6. Give every step a short unique slug — it is the @steps handle. @steps refs must name a PRECEDING step (a for_each body slug only from within the same body — after the loop, only the loop's own slug), and @item exists only inside for_each bodies.
 7. Keep the prose you stream to the user short — the proposals carry the substance. When the request is ambiguous, ask instead of guessing.`;
 }
 

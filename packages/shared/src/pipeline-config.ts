@@ -532,10 +532,16 @@ export function findStep(
 /**
  * Steps whose output is addressable FROM the given step's position: every
  * step strictly before it in document order, minus its own ancestors (a
- * container has no output while you are inside it). Purely lexical — steps in
- * an earlier branch's other lanes are included even though a given run may
- * have skipped them (their refs resolve "(not provided)"). Reference
- * autocomplete and the publish validator both key off this.
+ * container has no output while you are inside it), minus the bodies of any
+ * for_each that does not also enclose the step. Loop bodies are
+ * ITERATION-SCOPED: the runner gives each item a copy of the `steps` scope
+ * and discards it when the item finishes, so a body step's output is
+ * addressable only from later steps of the same body — after the loop, only
+ * the loop step's own aggregate output survives. Branches are purely
+ * lexical — steps in an earlier branch's other lanes are included even
+ * though a given run may have skipped them (their refs resolve
+ * "(not provided)"). Reference autocomplete and the publish validator both
+ * key off this.
  */
 export function stepsBefore(
   steps: readonly PipelineStep[],
@@ -549,6 +555,15 @@ export function stepsBefore(
   const ancestorIds = new Set(target.ancestors.map((ancestor) => ancestor.id));
   return entries
     .slice(0, targetIndex)
-    .filter((entry) => !ancestorIds.has(entry.step.id))
+    .filter(
+      (entry) =>
+        !ancestorIds.has(entry.step.id) &&
+        // Every for_each enclosing the candidate must also enclose the
+        // target — otherwise the candidate's output died with its iteration.
+        entry.ancestors.every(
+          (ancestor) =>
+            ancestor.kind !== "for_each" || ancestorIds.has(ancestor.id),
+        ),
+    )
     .map((entry) => entry.step);
 }

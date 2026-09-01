@@ -19,7 +19,7 @@ The **Add connection** dialog offers three lanes.
 
 **Catalog** renders entirely from a checked-in list — no network call — as a Featured row plus tiles grouped by category (Productivity, Project management, Developer tools, Data, Communication, Commerce, Other). Each tile shows a monogram, a title, a one-line description, and an auth-type hint: `No auth`, `OAuth`, or `API key`. A no-auth recipe installs on one click. A secret-based recipe (bearer token or headers) opens a short credentials form with the note "Stored encrypted and sent to the server on your behalf. You will not see these values again." An OAuth recipe opens the consent popup the instant you click — synchronously, so browsers don't block it as an unsolicited popup.
 
-The catalog grows over time; as of writing it holds ten entries:
+The catalog grows over time; as of writing it holds nine entries:
 
 | Connector | Category | Auth |
 |---|---|---|
@@ -32,7 +32,6 @@ The catalog grows over time; as of writing it holds ten entries:
 | Sentry | Developer tools | OAuth |
 | Neon | Data | OAuth |
 | PayPal | Commerce | OAuth |
-| Vercel | Developer tools | OAuth |
 
 **Community search** replaces the browse view the moment you start typing. Catalog matches pin above a "Community" group of results pulled from a Meilisearch mirror of the official MCP registry, each carrying a "Verified" badge for verified publishers and a lock icon when credentials are required. If Meilisearch is unconfigured or down, the lane degrades in place — "Community search is unavailable right now. Curated connectors and custom servers still work." — rather than blocking the dialog. Whatever you install from this lane is re-verified against the live official registry at install time; the mirror is search convenience only, never the trust source.
 
@@ -54,7 +53,7 @@ Every connection carries one of five health states, shown as a dot plus label:
 | `auth_required` | Auth required | No credentials are configured yet |
 | `auth_error` | Auth error | Credentials are configured, but the server rejected them |
 
-`auth_required` and `auth_error` are easy to conflate but mean opposite things — one is missing credentials, the other is credentials that didn't work. Probes run automatically after you create or install a connection, after OAuth consent completes, and again whenever you open a connection's detail view and its last check is more than 15 minutes old, plus on demand via **Test connection**. A degraded or unhealthy connection never blocks publishing on its own — only a connection you've explicitly disabled, while still attached to an Agent, does that.
+`auth_required` and `auth_error` are easy to conflate but mean opposite things — one is missing credentials, the other is credentials that didn't work. Probes run automatically after you create or install a connection with static credentials, after OAuth consent completes, and again whenever you open a connection's detail view and its last check is more than 15 minutes old, plus on demand via **Test connection**. A degraded or unhealthy connection never blocks publishing on its own — only a connection you've explicitly disabled, while still attached to an Agent, does that.
 
 ## The tool filter and approval policy
 

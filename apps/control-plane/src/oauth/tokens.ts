@@ -263,14 +263,17 @@ export async function getAccessToken(
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
- * Grant is dead: row → `expired`, connection health → `auth_required`.
+ * Grant is dead: row → `expired`, connection health → `auth_error`.
  *
- * `auth_required`, NOT `auth_error`. The two are not decoration — they are the
- * difference between "reconnect this" and "the server rejected your token", and
- * the probe already classifies an unusable grant as `auth_required`
- * (probe/service.ts). Writing `auth_error` here contradicted that between the
- * failed refresh and the next probe, which is the exact confusion that made the
- * original bug so hard to read.
+ * `auth_error`, NOT `auth_required`. The two are not decoration: `auth_required`
+ * means no credential is configured, `auth_error` means one WAS and the server
+ * rejected it. Reaching here means the authorization server disowned a grant the
+ * user really did complete — `invalid_grant`, or a client the AS no longer
+ * honours — so `auth_error` is the honest one, and it is what lets the detail
+ * view say "Authorization expired" and offer Reconnect rather than the
+ * never-connected copy. The probe agrees with this (see `probe/service.ts`,
+ * which reads the grant's status precisely so a pending grant and a retired one
+ * do not collapse into the same badge).
  *
  * `reason` is a vocabulary code (oauth/error-codes.ts), never provider text.
  */
@@ -287,7 +290,7 @@ async function markExpired(
   await tx
     .update(schema.connections)
     .set({
-      health: "auth_required",
+      health: "auth_error",
       lastError: "OAuth grant expired — reconnect the connection",
     })
     .where(eq(schema.connections.id, connectionId));

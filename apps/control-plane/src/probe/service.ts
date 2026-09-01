@@ -123,6 +123,23 @@ async function classifyConnection(
     });
   }
 
+  // The grant's own status FIRST, because `getAccessToken` cannot tell the two
+  // unusable states apart — it answers `oauth_not_connected` both for a grant
+  // nobody ever consented to and for one the authorization server has since
+  // disowned. Those are opposite user-facing facts ("connect this" vs "your
+  // authorization was rejected"), and collapsing them is exactly the confusion
+  // the original bug was made of.
+  const grant = await deps.db
+    .select({ status: schema.connectionOauth.status })
+    .from(schema.connectionOauth)
+    .where(eq(schema.connectionOauth.connectionId, row.id))
+    .limit(1);
+  const grantStatus = grant[0]?.status ?? null;
+  if (grantStatus === null || grantStatus === "pending") {
+    // Never consented. Nothing to present, so nothing to learn from a dial.
+    return { health: "auth_required", tools: null, error: null };
+  }
+
   let token: string;
   try {
     // The ONE reader of a grant's tokens: it refreshes centrally when the
@@ -148,11 +165,13 @@ async function classifyConnection(
 /**
  * A grant that cannot produce a token is not an unhealthy MCP server:
  *
- *  - `oauth_not_connected` — never consented, still `pending`, revoked, or a
- *    refresh the AS answered `invalid_grant`. Re-consent is the only recovery,
- *    so it is `auth_required`; `auth_error` would send a reader hunting for a
- *    server-side rejection that never happened. Nothing dialled, so there is
- *    no error string to report either.
+ *  - `oauth_not_connected` — reached ONLY from a grant that was past `pending`
+ *    (the caller returns `auth_required` before this for one that never
+ *    consented), so it means the authorization server disowned a grant the user
+ *    really did complete: revoked, or a refresh answered `invalid_grant`. A
+ *    credential existed and was rejected, which is `auth_error` — the state the
+ *    detail view explains as "Authorization expired" with a Reconnect button.
+ *    Nothing dialled, so there is no error string to report.
  *  - `oauth_exchange_failed` — the authorization server's token endpoint timed
  *    out, 5xx'd, or was refused by the egress guard. That is a third party we
  *    could not reach, which is what `unreachable` means; the grant itself
@@ -166,7 +185,7 @@ async function classifyConnection(
 function classifyTokenFailure(error: unknown): ProbeOutcome {
   if (isRuntimeApiError(error)) {
     if (error.code === "oauth_not_connected") {
-      return { health: "auth_required", tools: null, error: null };
+      return { health: "auth_error", tools: null, error: null };
     }
     if (error.code === "oauth_exchange_failed") {
       return { health: "unreachable", tools: null, error: error.message };

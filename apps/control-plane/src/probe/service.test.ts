@@ -620,7 +620,7 @@ describe.skipIf(!TEST_DATABASE_URL)("probe service + routes", () => {
     expect(fixture.dials).toBe(dialsBefore);
   }, 30_000);
 
-  test("a dead oauth grant reads auth_required (re-consent), never auth_error", async () => {
+  test("a RETIRED oauth grant reads auth_error — a credential existed and stopped working", async () => {
     fixture.mode = "ok";
     const conn = await createCustom(
       `/workspaces/${orgId}/connections`,
@@ -631,7 +631,10 @@ describe.skipIf(!TEST_DATABASE_URL)("probe service + routes", () => {
 
     // `connected`, but with nothing left to spend: no access token and no
     // refresh token, so `getAccessToken` retires the grant and answers
-    // `oauth_not_connected` — which is a consent problem, not a rejection.
+    // `oauth_not_connected`. This grant WAS consented, so the honest badge is
+    // `auth_error` — a credential existed and no longer works. `auth_required`
+    // belongs to the never-consented case above, and the probe reads the
+    // grant's status precisely so the two do not collapse.
     const grant = await grantOf(conn.id);
     await db
       .update(schema.connectionOauth)
@@ -645,7 +648,7 @@ describe.skipIf(!TEST_DATABASE_URL)("probe service + routes", () => {
 
     const dialsBefore = fixture.dials;
     const probed = await probeVia(conn.id);
-    expect(probed.health).toBe("auth_required");
+    expect(probed.health).toBe("auth_error");
     expect(probed.lastError).toBeNull();
     expect(probed.oauthStatus).toBe("expired");
     expect(probed.hasCredentials).toBeFalse();

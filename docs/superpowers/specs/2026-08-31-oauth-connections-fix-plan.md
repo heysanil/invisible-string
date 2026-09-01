@@ -481,11 +481,23 @@ mistakes inside any single change. All four are fixed on the same branch.
 | H3 | `MCP_OAUTH_<PREFIX>_ISSUER` was optional, and `findOauthClientRegistration` returned a match when the issuer was unknown on either side — so an unpinned, deployment-wide approved client could be handed to any AS a repointed MCP server nominated. | `_ISSUER` is REQUIRED (boot-fatal) and exact-matched, with no null fall-through. Separately, the issuer-only fallback no longer applies to a preset that declares `clientIdentity: "dynamic"` — that entry states DCR works there and must not inherit another provider's credentials because the issuers coincide. | `runtime/config.test.ts` — boot failure names the missing var; a key match with no issuer resolves to nothing |
 | H4 | Only `invalid_grant` was terminal on refresh, so `invalid_client`, `unauthorized_client`, `invalid_scope` and `unsupported_grant_type` were retried forever as transient — a permanently dead grant stayed `connected`, spun under the row lock, and reported the AS as merely `unreachable`. | `TERMINAL_TOKEN_ERROR_CODES` retires the grant. `invalid_request` is deliberately NOT terminal (it indicts our request, and servers return it transiently). | `error-codes.test.ts` pins both sets |
 
-Also corrected while here: `markExpired` wrote `health: "auth_error"`, contradicting
-the probe's own classification of an unusable grant as `auth_required` for the
-window between a failed refresh and the next probe — "your token was rejected"
-about a grant that needs reconnecting. It now writes `auth_required` and records
-the vocabulary code in `last_error_code`.
+Also corrected while here — and worth recording HOW, because the first attempt
+was wrong. `markExpired` and the probe disagreed about a retired grant:
+`markExpired` wrote `auth_error`, the probe classified the same grant
+`auth_required`, so the badge changed on the next probe. The first fix flattened
+both to `auth_required` on the reasoning that "reconnect" is the recovery. **That
+was backwards, and the Playwright lane caught it**: `auth_required` means no
+credential is configured, `auth_error` means one was and the server rejected it,
+and an `invalid_grant` is precisely a rejection — which is what lets the detail
+view say "Authorization expired" and offer Reconnect rather than the
+never-connected copy.
+
+The real defect was that `getAccessToken` answers `oauth_not_connected` for BOTH
+"never consented" and "the AS disowned this", so the probe could not tell them
+apart. It now reads the grant's status first: `pending`/absent → `auth_required`
+with no dial; anything past it → `auth_error` when no token can be produced.
+`markExpired` keeps `auth_error` and additionally records the vocabulary code in
+`last_error_code`. The two writers now agree, and the two states stay distinct.
 
 ### Judged NOT to be defects
 

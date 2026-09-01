@@ -277,6 +277,8 @@ Three properties make that placement the right one:
 
 `null → Viewer`, `Viewer → null`, and `Viewer(a) → Viewer(b)` all count. The same principal resolving again does not, or every refocus would become a full app reload.
 
+**Invariant future work must preserve:** the purge above only stops a stale render because every `["me"]`-scoped consumer today sits under a component that itself observes the viewer query (`WorkspaceGate` → `useWorkspace` → `useViewer`; `useActiveWorkspaceId` in the builder routes) — it does *not* work by parent re-render, since `Outlet`, `Match`, and `MatchInner` are all `React.memo` and `<Outlet/>` takes no props, so an `AppLayout` re-render bails at that boundary before it ever reaches them. A future `["me"]`-scoped consumer that does not transitively observe the viewer would keep painting the previous principal's rows after a purge; there is no runtime guard against this today.
+
 ### 5.3 Sign-out must check its result
 
 Better Auth resolves HTTP failures as `{ error }` rather than throwing. All three current call sites — `CreateWorkspaceScreen.tsx:89`, `settings/WorkspacePanel.tsx:66`, `accept-invitation.$invitationId.tsx:209` — `await signOut()` inside a `try/catch` and then navigate, so a failed sign-out sends the user to `/login` with a still-valid session cookie. `completeSignOut` throws on `{ error }` so the existing `catch` blocks do what they already look like they do.
@@ -381,7 +383,7 @@ A spec that deliberately does **not** call `flows.login()`, because that helper'
 | `apps/web/src/__tests__/viewer-principal.test.tsx` | **new** — §5.2, asserted per rendered frame |
 | `apps/web/src/__tests__/viewer-focus.test.tsx` | **new** — focus/reconnect liveness (§3.2) and the activation re-entry (§4.3) |
 | `apps/web/src/__tests__/workspace-panel.test.tsx` | **new** — rename-refresh partial success, both sign-out outcomes |
-| `e2e/specs/*.e2e.ts` | **new** — the §7.3 spec |
+| `e2e/specs/*.e2e.ts` | **new** — the §7.4 spec |
 | `AGENTS.md` | retire the residual; add the Better Auth hooks rule |
 | `docs/superpowers/specs/2026-07-07-first-run-workspace-design.md` | mark its three superseded technical decisions |
 | `.changeset/*.md` | release note |

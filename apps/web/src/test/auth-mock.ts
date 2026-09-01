@@ -8,7 +8,6 @@
  * role changes) so settings/context screens render without a live API.
  */
 import { mock } from "bun:test";
-import { useSyncExternalStore } from "react";
 
 export interface MockUser {
   id: string;
@@ -63,7 +62,6 @@ export const authMockState = {
 
   // Organization plugin state
   organizations: [] as MockOrganization[],
-  activeOrganization: null as MockOrganization | null,
   orgPending: false,
   inviteResult: ok(),
   updateMemberRoleResult: ok(),
@@ -104,7 +102,6 @@ export function resetAuthMock(): void {
   authMockState.signOutResult = ok();
 
   authMockState.organizations = [];
-  authMockState.activeOrganization = null;
   authMockState.orgPending = false;
   authMockState.inviteResult = ok();
   authMockState.updateMemberRoleResult = ok();
@@ -159,43 +156,18 @@ export function demoWorkspace(): MockOrganization {
 export function signInToDemoWorkspace(): void {
   authMockState.session = demoSession();
   authMockState.organizations = [demoWorkspace()];
-  authMockState.activeOrganization = demoWorkspace();
 }
 
 const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathname;
 
 /**
- * The real better-auth client backs `useListOrganizations`/
- * `useActiveOrganization` with nanostores, so a mutation (create/setActive)
- * re-renders every subscribed component directly — independent of the React
- * tree shape. This mock's hooks must do the same: `authMockState` is a plain
- * mutable object, so without this subscription a consumer only sees fresh
- * data if it happens to re-render for an unrelated reason. Route layouts
- * (e.g. `_app`'s zero-org gate) sit behind a state boundary (`ToastProvider`)
- * that bails out of re-rendering unchanged `children` elements, so they'd
- * otherwise never notice the mutation and the gate would never flip live.
- *
- * Deliberate divergence from the real client: only setActive() notifies
- * subscribers. The real client also refetches the org list on create(),
- * which can race the explicit setActive round-trip and let useWorkspace's
- * first-org self-heal fire a duplicate same-id setActive in production
- * (harmless there). Tests must therefore never assert EXACT setActive call
- * counts — assert on call content instead.
+ * This mock models the SERVER, not a client cache: `getSession` returns
+ * whatever session the "server" holds, `organization.list` 401s without one,
+ * and signIn/signUp establish a session the way the real endpoints do. The
+ * previous version hand-wrote reactive hooks and was, as a result, strictly
+ * more correct than the library it replaced — which is why the suite could
+ * never fail on the double-login bug.
  */
-let orgStoreVersion = 0;
-const orgStoreListeners = new Set<() => void>();
-function notifyOrgStore(): void {
-  orgStoreVersion++;
-  for (const listener of orgStoreListeners) listener();
-}
-function subscribeOrgStore(listener: () => void): () => void {
-  orgStoreListeners.add(listener);
-  return () => orgStoreListeners.delete(listener);
-}
-function getOrgStoreVersion(): number {
-  return orgStoreVersion;
-}
-
 const organizationMock = {
   setActive: async (args: Record<string, unknown>) => {
     authMockState.setActiveCalls.push(args);
@@ -203,22 +175,18 @@ const organizationMock = {
     if (result.error) return result;
     const id = (args["organizationId"] as string | null) ?? null;
     if (!id) {
-      authMockState.activeOrganization = null;
       setSessionActiveOrganization(null);
-      notifyOrgStore();
       return result;
     }
     let org = authMockState.organizations.find((candidate) => candidate.id === id);
     if (!org) {
-      // Unknown id: mirror the real client — the active-org store refetches
-      // from the server, which knows orgs the (stale) list hook does not,
+      // Unknown id: mirror the real client, which fetches this org fresh
+      // from the server even when the (stale) list doesn't have it yet,
       // e.g. right after accepting an invitation.
       org = { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" };
       authMockState.organizations = [...authMockState.organizations, org];
     }
-    authMockState.activeOrganization = org;
     setSessionActiveOrganization(id);
-    notifyOrgStore();
     return result;
   },
   create: async (args: Record<string, unknown>) => {
@@ -229,9 +197,7 @@ const organizationMock = {
       authMockState.organizations = [...authMockState.organizations, org];
       // Better Auth activates a newly created organization server-side
       // (crud-org.mjs), which is why the client sends no setActive.
-      authMockState.activeOrganization = org;
       setSessionActiveOrganization(org.id);
-      notifyOrgStore();
     }
     return result;
   },
@@ -272,12 +238,6 @@ const organizationMock = {
         authMockState.organizations = authMockState.organizations.map((org) =>
           org.id === id ? { ...org, name } : org,
         );
-        if (authMockState.activeOrganization?.id === id)
-          authMockState.activeOrganization = {
-            ...authMockState.activeOrganization,
-            name,
-          };
-        notifyOrgStore();
       }
     }
     return result;
@@ -291,26 +251,6 @@ const organizationMock = {
     authMockState.cancelInvitationCalls.push(args);
     return authMockState.cancelInvitationResult;
   },
-};
-
-const useActiveOrganization = () => {
-  useSyncExternalStore(subscribeOrgStore, getOrgStoreVersion, getOrgStoreVersion);
-  return {
-    data: authMockState.activeOrganization,
-    isPending: authMockState.orgPending,
-    error: null,
-    refetch: () => {},
-  };
-};
-
-const useListOrganizations = () => {
-  useSyncExternalStore(subscribeOrgStore, getOrgStoreVersion, getOrgStoreVersion);
-  return {
-    data: authMockState.organizations,
-    isPending: authMockState.orgPending,
-    error: null,
-    refetch: () => {},
-  };
 };
 
 /**
@@ -338,14 +278,6 @@ const authMockFactory = () => ({
     },
     organization: organizationMock,
   },
-  useSession: () => ({
-    data: authMockState.session,
-    isPending: authMockState.pending,
-    error: null,
-    refetch: () => {},
-  }),
-  useActiveOrganization,
-  useListOrganizations,
   signIn: {
     email: async (args: Record<string, unknown>) => {
       authMockState.signInCalls.push(args);

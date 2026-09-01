@@ -8,6 +8,14 @@ Entries from `v0.3.0` onward are written at merge time as
 reconstruction** from the conventional-commit log between tags, not authored
 release notes.
 
+## v0.7.0 — 2026-09-01
+
+### Features
+- **control-plane** — Make reasoning effort actually reach OpenRouter from the control plane: align the AI SDK pins with the compiler's version matrix (retiring a stale `@openrouter/ai-sdk-provider` alpha that silently dropped every reasoning route), route the effort per provider through the new `model/reasoning.ts`, and add `COPILOT_REASONING_EFFORT` (default off) so the copilot can ask for one too.
+
+### Fixes & maintenance
+- **web** — Fix signing in requiring two attempts and workspace content staying blank until a reload, by moving SPA identity off Better Auth's React hooks onto a viewer query gated in the router; the cached query data of a previous account is now dropped whenever the signed-in principal changes, including from another tab, a session revoked elsewhere is noticed on refocus or reconnect, every auth request behind the gate is bounded so a hung server cannot wedge navigation, and accepting a workspace invitation can no longer strand you on a retry that re-reads the invitation it already consumed.
+
 ## v0.6.0 — 2026-08-12
 
 ### Breaking changes

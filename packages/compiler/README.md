@@ -3,8 +3,10 @@
 Pure agent → eve-project code generation — **the Agent is the compile unit**.
 Input is an `AgentDefinition` (PERSONA · MODEL · CONTEXT from
 `packages/shared`); workflows carry no builds. Triggers and workflow
-instructions are NOT compile-time inputs: the control plane renders them into
-the task message at dispatch (`renderTaskMessage` in `packages/shared`).
+pipelines are NOT compile-time inputs: the control plane's pipeline runner
+interprets a workflow's steps at dispatch, and an `agent` step's rendered
+instructions become the child session's task message (`pipeline-template`
+in `packages/shared`).
 
 ```ts
 import { compile, RUNTIME_VERSIONS } from "@invisible-string/compiler";
@@ -135,10 +137,12 @@ boot — and its first turn would die. With the guard, keyless builds bake
   `@words` parse as connection refs and fail compile unless they name a
   connection; the agent editor mirrors this as a draft warning.
 - **Any `@trigger.*` ref in a persona is a compile error**
-  (`TRIGGER_REF_NOT_ALLOWED`): agents are trigger-agnostic — `@trigger`
-  references belong in workflow instructions, where the control plane
-  resolves them against the trigger event at **dispatch time**
-  (`renderTaskMessage`, packages/shared).
+  (`TRIGGER_REF_NOT_ALLOWED`), and so is any pipeline-scope ref —
+  `@steps.*`, `@state.*`, `@item`, `@now` — (`PIPELINE_REF_NOT_ALLOWED`):
+  agents are trigger- and pipeline-agnostic. Those references belong in
+  workflow step prompts, where the pipeline runner resolves them against
+  the run's scope at **dispatch time** (`pipeline-template`,
+  packages/shared).
 - An empty persona is a compile error (`EMPTY_PERSONA`) — valid as a draft,
   unpublishable.
 

@@ -93,8 +93,11 @@ In the workflow editor, set the workflow's trigger to **Slack** and pick the
 connected integration. The binding offers:
 
 - `channelId` — restrict to one channel (empty = any channel the bot is in);
-- `mentionOnly` (default **true**) — only `@mentions` start new runs; thread
-  replies always continue the run's session either way;
+- `mentionOnly` (default **true**) — only `@mentions` fire the trigger in
+  fresh threads; a reply in a thread that already holds a thread-keyed
+  session fires either way. Every Slack event starts a NEW pipeline run —
+  conversational continuity is the pipeline's `agent` step with
+  `session: "thread"`, which continues that thread's session (per agent);
 - `includeDirectMessages` (default **false**) — DMs to the bot start runs.
 
 The bot only receives events from channels it's a **member** of — `/invite

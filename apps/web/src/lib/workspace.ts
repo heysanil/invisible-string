@@ -1,26 +1,22 @@
 /**
  * Active-workspace resolution + the viewer's role in it.
  *
- * Workspace = Better Auth organization (`session.activeOrganizationId`).
- * `useWorkspace` self-heals a fresh login with no active organization by
- * activating the first one the user belongs to. The role comes from the
- * control-plane members list (`GET /workspaces/:id/members`) so it reflects
- * exactly what the API will authorize — settings screens gate mutations on
- * `canManage` (owner/admin) and the server re-checks everything.
+ * Workspace = Better Auth organization. Both the workspace list and the
+ * active id come from the viewer query (lib/auth/viewer.ts), which is the
+ * SPA's single identity source.
  *
- * `useActiveWorkspaceId` is the light-weight accessor the chat and builder
- * routes use — it rides `useWorkspace` so first-org activation happens there
- * too, and returns just the id + a pending flag.
+ * There is deliberately NO activation effect here any more. Selecting a
+ * workspace for a session that has none is the router gate's job
+ * (routes/_app.tsx `beforeLoad`), where it is awaited and its failure is
+ * visible. The previous fire-and-forget effect latched a ref, ignored the
+ * result, and left `isPending` true forever when activation failed.
+ *
+ * The role comes from the control-plane members list so it reflects exactly
+ * what the API will authorize; the server re-checks everything.
  */
-import { useEffect, useRef } from "react";
 import { WORKSPACE_ROLES, type KnownWorkspaceRole } from "@invisible-string/shared";
 
-import {
-  authClient,
-  useActiveOrganization,
-  useListOrganizations,
-  useSession,
-} from "./auth-client";
+import { activeWorkspace, useViewer } from "./auth/viewer";
 import { useWorkspaceMembers } from "./queries/members";
 
 export interface ActiveWorkspace {
@@ -30,45 +26,23 @@ export interface ActiveWorkspace {
 
 export interface UseWorkspaceResult {
   workspace: ActiveWorkspace | null;
-  /** True while resolution (or first-org activation) is still in flight. */
+  /** True while the viewer is still resolving. */
   isPending: boolean;
+  /** Set when the viewer could NOT be determined — distinct from "none". */
+  error: Error | null;
 }
 
 export function useWorkspace(): UseWorkspaceResult {
-  const active = useActiveOrganization();
-  const list = useListOrganizations();
-  const activationRequested = useRef(false);
-
-  const activeData = active.data ?? null;
-  const organizations = list.data ?? null;
-
-  useEffect(() => {
-    if (active.isPending || list.isPending) return;
-    if (activeData !== null || activationRequested.current) return;
-    const first = organizations?.[0];
-    if (!first) return;
-    activationRequested.current = true;
-    void authClient.organization.setActive({ organizationId: first.id });
-  }, [active.isPending, list.isPending, activeData, organizations]);
-
-  const workspace = activeData
-    ? { id: activeData.id, name: activeData.name }
-    : null;
-
-  // Still pending while: hooks are loading, or activation of the first org
-  // was requested and the active-organization hook hasn't caught up yet.
-  const isPending =
-    active.isPending ||
-    (workspace === null &&
-      (list.isPending || (organizations?.length ?? 0) > 0));
-
-  return { workspace, isPending };
+  const { viewer, isPending, error } = useViewer();
+  const workspace = viewer ? activeWorkspace(viewer) : null;
+  return {
+    workspace: workspace ? { id: workspace.id, name: workspace.name } : null,
+    isPending,
+    error,
+  };
 }
 
-/**
- * The active workspace id + pending flag. Rides {@link useWorkspace} so the
- * self-healing first-org activation applies to the chat/builder routes too.
- */
+/** The active workspace id + pending flag — the chat/builder accessor. */
 export function useActiveWorkspaceId(): {
   workspaceId: string | null;
   isPending: boolean;
@@ -97,12 +71,12 @@ export interface UseWorkspaceRoleResult {
 export function useWorkspaceRole(
   workspaceId: string | undefined,
 ): UseWorkspaceRoleResult {
-  const { data: session } = useSession();
+  const { viewer } = useViewer();
   const members = useWorkspaceMembers(workspaceId ?? "", {
     enabled: workspaceId !== undefined,
   });
 
-  const userId = session?.user.id;
+  const userId = viewer?.user.id;
   const member =
     userId === undefined
       ? undefined

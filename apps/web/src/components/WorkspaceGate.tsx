@@ -1,13 +1,16 @@
 /**
  * Resolves the active workspace and the viewer's role in it, then hands both
  * to `children`. While resolving it shows a titled loading panel; with no
- * workspace it shows a friendly empty panel — screens never flash blank or
- * fire resource fetches before a workspace id exists.
+ * workspace it shows a friendly empty panel; an outage that leaves the
+ * viewer undetermined gets its own error panel — screens never flash blank,
+ * fire resource fetches before a workspace id exists, or misreport an outage
+ * as "you have no workspaces".
  */
-import { Building2 } from "lucide-react";
+import { Building2, TriangleAlert } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { useWorkspace, useWorkspaceRole } from "../lib/workspace";
+import { Button } from "./ui/Button";
 import { EmptyState } from "./ui/EmptyState";
 import { Panel } from "./ui/Panel";
 import { Spinner } from "./ui/Spinner";
@@ -27,8 +30,26 @@ export interface WorkspaceGateProps {
 }
 
 export function WorkspaceGate({ title, children }: WorkspaceGateProps) {
-  const { workspace, isPending } = useWorkspace();
+  const { workspace, isPending, error } = useWorkspace();
   const role = useWorkspaceRole(workspace?.id);
+
+  if (error) {
+    return (
+      <Panel className="panel-enter flex h-full min-w-0 flex-col overflow-hidden">
+        <header className="px-6 pb-4 pt-5">
+          <h1 className="text-[17px]">{title}</h1>
+        </header>
+        <div aria-hidden="true" className="mx-6 h-px bg-black/[0.06]" />
+        <div className="flex-1">
+          <EmptyState
+            icon={TriangleAlert}
+            title="Can't load your workspace"
+            description="Check your connection, then try again."
+          />
+        </div>
+      </Panel>
+    );
+  }
 
   if (isPending) {
     return (

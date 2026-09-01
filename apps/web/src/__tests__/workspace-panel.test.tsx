@@ -63,7 +63,6 @@ let fetchMock: FetchMock;
 beforeEach(() => {
   resetAuthMock();
   fetchMock = installFetchMock();
-  fetchMock.on("GET", "/members", () => jsonResponse(MEMBERS));
   fetchMock.on("GET", /.*/, () => jsonResponse([]));
   fetchMock.on("GET", "/members", () => jsonResponse(MEMBERS));
 });
@@ -137,7 +136,10 @@ test("a rejected rename is reported and the viewer is never refreshed", async ()
   expect(view.queryByText("Workspace renamed.")).toBeNull();
 });
 
-test("signing out clears the cache and leaves for /login", async () => {
+// The cache-clearing half of sign-out is asserted directly, at the
+// `completeSignOut` level, in viewer-principal.test.tsx; this test exercises
+// only the redirect through the real route.
+test("signing out redirects to /login", async () => {
   signInToDemoWorkspace();
   const { router, view } = renderWorkspaceSettings();
 

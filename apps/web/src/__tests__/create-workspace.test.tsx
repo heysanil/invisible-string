@@ -6,7 +6,6 @@ import {
   cleanup,
   fireEvent,
   render,
-  waitFor,
   type RenderResult,
 } from "@testing-library/react";
 import {
@@ -95,7 +94,10 @@ test("empty submit validates inline without calling the API", async () => {
   expect(authMockState.createOrganizationCalls.length).toBe(0);
 });
 
-test("creating a workspace calls create + setActive and reveals the shell", async () => {
+test("creating a workspace reveals the shell without a redundant setActive", async () => {
+  // The server already activates a newly created organization
+  // (better-auth crud-org.mjs) — a second client call is a round trip that
+  // can fail after the workspace exists.
   authMockState.session = zeroOrgSession();
   authMockState.createOrganizationResult = {
     data: {
@@ -112,22 +114,27 @@ test("creating a workspace calls create + setActive and reveals the shell", asyn
     target: { value: "  Acme Inc  " },
   });
   submitForm(view);
-  await waitFor(() => {
-    expect(authMockState.createOrganizationCalls.length).toBe(1);
-  });
+
+  // Wait for the SHELL, not merely for the create call to be recorded: the
+  // component has not finished its post-create work at that point, so
+  // asserting on setActive there could pass against the old code too.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(authMockState.createOrganizationCalls).toHaveLength(1);
   const call = authMockState.createOrganizationCalls[0]!;
   expect(call["name"]).toBe("Acme Inc"); // trimmed
   expect(String(call["slug"])).toMatch(/^acme-inc-[0-9a-f]{8}$/);
-  await waitFor(() => {
-    expect(authMockState.setActiveCalls.length).toBeGreaterThanOrEqual(1);
-  });
-  expect(authMockState.setActiveCalls).toContainEqual({
-    organizationId: "org_new_1",
-  });
-  // $listOrg refetch (mocked as an organizations append) flips the gate.
-  expect(
-    await view.findByRole("navigation", { name: "Primary" }),
-  ).toBeTruthy();
+  expect(authMockState.setActiveCalls).toHaveLength(0);
+  expect(view.queryByText("Create your workspace")).toBeNull();
+});
+
+test("a failed sign-out keeps the user where they are", async () => {
+  authMockState.session = zeroOrgSession();
+  authMockState.signOutResult = { data: null, error: { status: 500 } };
+  const { router, view } = renderApp();
+  await view.findByText("Create your workspace");
+  fireEvent.click(view.getByRole("button", { name: /sign out/i }));
+  expect(await view.findByText("Could not sign out. Try again.")).toBeTruthy();
+  expect(router.state.location.pathname).not.toBe("/login");
 });
 
 test("server rejection shows an inline form error", async () => {

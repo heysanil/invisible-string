@@ -2,7 +2,7 @@ import { ensureDomForThisFile } from "../test/setup";
 import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import {
   createMemoryHistory,
   createRouter,
@@ -92,4 +92,38 @@ test("a fully signed-in viewer renders the shell", async () => {
   // also absent mid-transition, so a negative-only assertion passes vacuously.
   const { view } = renderApp("/chat");
   expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+});
+
+test("clicking Try again on the retry card recovers into the shell", async () => {
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  const { view } = renderApp("/chat");
+  await view.findByText("Can't reach the server");
+
+  // The server is reachable now; the click must be what re-runs the gate —
+  // nothing else in this test drives a refetch.
+  authMockState.getSessionError = null;
+  signInToDemoWorkspace();
+  fireEvent.click(view.getByRole("button", { name: "Try again" }));
+
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+});
+
+test("a non-viewer error under /_app renders the generic error state, never the network copy", async () => {
+  authMockState.session = {
+    user: { id: "u1", email: "demo@example.com", name: "Demo" },
+    session: { activeOrganizationId: null },
+  };
+  authMockState.organizations = [demoWorkspace()];
+  // A malformed setActive response: not the `{error}` shape the mock (and
+  // viewer.ts) expect, so awaiting it rejects with a raw TypeError — not an
+  // ActivateWorkspaceError — from inside beforeLoad's activation branch.
+  // Stands in for I1's concrete scenario (an unrelated render crash under
+  // /_app): both reach the SAME errorComponent boundary, so this exercises
+  // the same discrimination.
+  authMockState.setActiveResult =
+    null as unknown as typeof authMockState.setActiveResult;
+
+  const { view } = renderApp("/chat");
+  expect(await view.findByText("Something went wrong")).toBeTruthy();
+  expect(view.queryByText("Can't reach the server")).toBeNull();
 });

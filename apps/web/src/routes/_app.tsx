@@ -3,17 +3,21 @@ import {
   Navigate,
   Outlet,
   redirect,
+  useRouter,
 } from "@tanstack/react-router";
 
 import { AppShell } from "../components/AppShell";
 import { SessionUnavailableScreen } from "../components/auth/SessionUnavailableScreen";
 import { CreateWorkspaceScreen } from "../components/onboarding/CreateWorkspaceScreen";
+import { ErrorState } from "../components/ui/ErrorState";
 import { Spinner } from "../components/ui/Spinner";
 import { FIXTURE_MODE } from "../lib/chat/fixtures";
 import {
   activateWorkspace,
+  ActivateWorkspaceError,
   activeWorkspace,
   useViewer,
+  ViewerUnavailableError,
   viewerQueryOptions,
 } from "../lib/auth/viewer";
 
@@ -60,9 +64,44 @@ export const Route = createFileRoute("/_app")({
       await activateWorkspace(context.queryClient, viewer.workspaces[0]!.id);
     }
   },
-  errorComponent: SessionUnavailableScreen,
+  // `_app` is the only route in the tree with an `errorComponent`, so its
+  // boundary is the first (and only) one ANY descendant render throw meets
+  // — not just a failure in this route's own `beforeLoad`
+  // (`@tanstack/react-router` resolves every route without its own
+  // `errorComponent` to a no-op boundary, `Match.tsx`). It must therefore
+  // discriminate: only a failure to determine the SESSION is "can't reach
+  // the server" — an unrelated render crash three routes down must not be
+  // misreported as a network outage the user cannot fix by waiting it out.
+  errorComponent: ({ error }) =>
+    error instanceof ViewerUnavailableError ||
+    error instanceof ActivateWorkspaceError ? (
+      <SessionUnavailableScreen />
+    ) : (
+      <AppErrorScreen />
+    ),
   component: AppLayout,
 });
+
+/**
+ * Shown for any `/_app`-subtree error that is NOT about the session itself —
+ * a render crash in a descendant route, say. Deliberately says nothing about
+ * the network: that framing belongs only to `SessionUnavailableScreen`.
+ *
+ * Do NOT call the `reset` prop, same trap as `SessionUnavailableScreen`:
+ * for an error thrown from `beforeLoad`/`loader` the router passes
+ * `reset={undefined as any}` (`Match.tsx:382`).
+ */
+function AppErrorScreen() {
+  const router = useRouter();
+  return (
+    <div className="flex min-h-dvh items-center justify-center p-6">
+      <ErrorState
+        message="This page ran into an unexpected problem. Try again, or reload if it keeps happening."
+        onRetry={() => void router.invalidate()}
+      />
+    </div>
+  );
+}
 
 function AppLayout() {
   // Kept mounted so a focus refetch that resolves null (session revoked or

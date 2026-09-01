@@ -1023,7 +1023,7 @@ describe("agent step stillborn-child recovery", () => {
     expect(h.store.sessionMarks).toEqual([]);
   });
 
-  test("a failed child with a persisted eve session id fails honest too", async () => {
+  test("a failed child with the marker AND a persisted eve session id fails honest too", async () => {
     const h = harness();
     h.store.setStatus("child-y", "failed", "model exploded");
     const executor = createAgentStepExecutor({
@@ -1039,6 +1039,50 @@ describe("agent step stillborn-child recovery", () => {
     const outcome = await executor(h.ctx(agentStep(), { childRunId: "child-y" }));
     expect(outcome).toMatchObject({ status: "failed", errorClass: "agent_run_failed" });
     expect(h.dispatches).toHaveLength(0);
+  });
+
+  test("a stillborn THREAD CONTINUATION (marker null, session's eve id from earlier turns) re-sends the continuation ONCE — session left open", async () => {
+    const THREAD_KEY = "integ-1:C1:1720.0";
+    const h = harness();
+    // Crash between the run insert and the continue-send: boot
+    // reconciliation failed the child (marker null). The session is an
+    // ESTABLISHED thread session — it has an eve id from earlier turns.
+    h.store.setStatus("stillborn-cont", "failed", "control plane restarted before the run's message was sent");
+    const existing = {
+      id: "sess-thread",
+      agentId: AGENT_ID,
+      agentVersionId: "pinned-v",
+      eveSessionId: "eve-established",
+    } as never;
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      loadChildDispatchStateImpl: async () => ({
+        status: "failed",
+        startedAt: null, // the marker was never written — the send never left
+        eveSessionId: "eve-established", // earlier turns', NOT this run's
+        sessionId: "sess-thread",
+      }),
+      findThreadSessionImpl: async (_db, _org, _wf, key) =>
+        key === THREAD_KEY ? existing : null,
+      requireReadyVersionImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () =>
+        parentEvent({ triggerType: "slack", data: { slackThreadKey: THREAD_KEY } }),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep({ session: "thread" }), {
+        childRunId: "stillborn-cont",
+        trigger: { slackThreadKey: THREAD_KEY },
+      }),
+    );
+    // Exactly ONE replacement dispatch, and it CONTINUES the established
+    // session (the message never left, so re-sending cannot double-send).
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    expect(h.dispatches).toHaveLength(1);
+    expect(h.dispatches[0]!.existingSession).toBe(existing);
+    // The continuation's session was NOT closed — closing it would strand
+    // the thread's history (only eveless stillborn sessions are closed).
+    expect(h.store.sessionMarks).toEqual([]);
   });
 
   test("an unknowable dispatch state (no db on the deps graph) fails honest — fail-safe, never re-dispatch", async () => {

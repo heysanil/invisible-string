@@ -1412,38 +1412,66 @@ export class PipelineRunner {
   ): Promise<StepResult> {
     const startMs = this.now().getTime();
     const resolved = resolveScopePath(scope, step.items.$ref);
-    // The RESOLVED items array is snapshotted into the loop row's persisted
-    // input on first claim (the leaf-step persisted-input discipline). It is
-    // bounded like every other input snapshot: `maxItems` ≤ 100 caps the
-    // element count and every source the ref can resolve is already capped
-    // (step outputs by maxStepOutputBytes, state values by the 64KB store
-    // cap, trigger data at ingress). A non-array or over-`maxItems`
-    // resolution fails below without a snapshot — never persist an array the
-    // loop will refuse to iterate.
-    const snapshot =
-      Array.isArray(resolved) && resolved.length <= step.maxItems
-        ? resolved
-        : null;
+    // The resolution VERDICT is snapshotted into the loop row's persisted
+    // input on first claim (the leaf-step persisted-input discipline): the
+    // RESOLVED items array when it is iterable, or the failure CLASS
+    // (`verdict`) when it is not (non-array / over-`maxItems`). A valid
+    // snapshot is bounded like every other input snapshot: `maxItems` ≤ 100
+    // caps the element count and every source the ref can resolve is already
+    // capped (step outputs by maxStepOutputBytes, state values by the 64KB
+    // store cap, trigger data at ingress). Persisting the FAILED verdict
+    // matters as much as the snapshot: a crash after the claim but before
+    // the failure row is written must replay the RECORDED verdict on
+    // recovery — re-resolving against a scope that moved (state shrunk
+    // under overlap "allow") could turn a doomed loop into an executing
+    // one, running body side effects for a run that had already earned
+    // `fan_out_exceeded`.
+    const resolvedArray = Array.isArray(resolved) ? resolved : null;
+    const freshVerdict =
+      resolvedArray === null
+        ? ("items_not_array" as const)
+        : resolvedArray.length > step.maxItems
+          ? ("fan_out_exceeded" as const)
+          : null;
     const claim = await this.claim(dctx, step, path, parent, {
       itemsRef: step.items.$ref,
-      count: Array.isArray(resolved) ? resolved.length : null,
-      ...(snapshot ? { items: snapshot } : {}),
+      count: resolvedArray === null ? null : resolvedArray.length,
+      ...(freshVerdict === null
+        ? { items: resolvedArray }
+        : { verdict: freshVerdict }),
     });
     let itemsRaw: unknown = resolved;
+    let verdict: "items_not_array" | "fan_out_exceeded" | null = freshVerdict;
+    let verdictCount = resolvedArray === null ? null : resolvedArray.length;
     let attempt = 1;
     if (!claim.created) {
       const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
       if (adopted) return adopted;
-      // Interrupted mid-loop: the body claims below adopt every finished
-      // item instance, so replay resumes at the frontier — over the
-      // PERSISTED items snapshot, verbatim. Re-resolving the ref against the
-      // rebuilt scope can differ (state moved under overlap "allow"), and
-      // items already processed from the original array must never be
-      // combined with the remainder of a new one. Rows without a snapshot
-      // (claimed before a failed non-array/overflow resolution) fall back to
-      // the fresh resolution and fail the same way again.
-      const persisted = (claim.row.input as { items?: unknown } | null)?.items;
-      if (Array.isArray(persisted)) itemsRaw = persisted;
+      // Interrupted mid-claim: replay the RECORDED verdict, never a fresh
+      // resolution. A persisted items snapshot resumes at the frontier —
+      // the body claims below adopt every finished item instance, over the
+      // PERSISTED array, verbatim (re-resolving the ref against the rebuilt
+      // scope can differ: state moved under overlap "allow", and items
+      // already processed from the original array must never be combined
+      // with the remainder of a new one). A persisted FAILURE verdict fails
+      // again with the same class below — the loop was doomed before the
+      // crash and must not execute now that the scope moved. Legacy rows
+      // claimed before the verdict existed (no `items`, no `verdict`) fall
+      // back to the fresh resolution and fail the same way again.
+      const persisted = claim.row.input as
+        | { items?: unknown; verdict?: unknown; count?: unknown }
+        | null;
+      if (Array.isArray(persisted?.items)) {
+        itemsRaw = persisted.items;
+        verdict = null;
+      } else if (
+        persisted?.verdict === "items_not_array" ||
+        persisted?.verdict === "fan_out_exceeded"
+      ) {
+        verdict = persisted.verdict;
+        verdictCount =
+          typeof persisted.count === "number" ? persisted.count : null;
+      }
       attempt = claim.row.attempt + 1;
       await this.deps.stepStore.markRunning(claim.row.id, {
         attempt,
@@ -1452,7 +1480,7 @@ export class PipelineRunner {
     }
     dctx.executed += 1;
     await this.emitStarted(dctx, step, path, attempt);
-    if (!Array.isArray(itemsRaw)) {
+    if (verdict === "items_not_array" || !Array.isArray(itemsRaw)) {
       return this.finishFailed(
         dctx,
         step,
@@ -1463,8 +1491,14 @@ export class PipelineRunner {
         `for_each items (${step.items.$ref}) did not resolve to an array`,
       );
     }
-    if (itemsRaw.length > step.maxItems) {
+    if (verdict === "fan_out_exceeded" || itemsRaw.length > step.maxItems) {
       // Silent truncation would corrupt cursor semantics — overflow FAILS.
+      // A replayed verdict reports the RECORDED count (the fresh resolution
+      // may have moved), a fresh one the live length.
+      const overCount =
+        verdict === "fan_out_exceeded"
+          ? (verdictCount ?? itemsRaw.length)
+          : itemsRaw.length;
       return this.finishFailed(
         dctx,
         step,
@@ -1472,7 +1506,7 @@ export class PipelineRunner {
         claim.row.id,
         attempt,
         "fan_out_exceeded",
-        `for_each resolved ${itemsRaw.length} items, over its maxItems of ${step.maxItems}`,
+        `for_each resolved ${overCount} items, over its maxItems of ${step.maxItems}`,
       );
     }
     const records: {

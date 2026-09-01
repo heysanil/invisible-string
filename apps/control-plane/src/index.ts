@@ -765,18 +765,19 @@ if (import.meta.main) {
       delivery: stack.runtime.delivery,
       ...(stack.pipelines ? { pipelines: stack.pipelines } : {}),
     })
-      .then(({ resumed, failed, pipelines, deliveries }) => {
+      .then(({ resumed, failed, sessionsClosed, pipelines, deliveries }) => {
         if (
           resumed > 0 ||
           failed > 0 ||
+          sessionsClosed > 0 ||
           pipelines.resumed > 0 ||
           pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
-            fields: { resumed, failed, pipelines, deliveries },
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            fields: { resumed, failed, sessionsClosed, pipelines, deliveries },
           });
         }
       })

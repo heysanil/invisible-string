@@ -4,23 +4,45 @@
  * cap slots, hanging their SSE streams on heartbeats, and never recording
  * eve's durably-completed turn).
  *
- * On startup, three sweeps:
+ * On startup, four sweeps:
  *
  * 1. INTERRUPTED AGENT RUNS — every queued/running `mode: 'agent'` run:
- *    - session has an eve session AND its affinity worker is still live →
+ *    - the run's dispatch-attempt marker (`runs.started_at`) is set, the
+ *      session has an eve session, AND its affinity worker is still live →
  *      restart the tail (tailRun is crash-safe: seq/startIndex derive from
  *      what is already persisted; the terminal gate handles a mid-turn
  *      resume).
- *    - otherwise → mark the run failed with completedAt so the cap slot frees
- *      and any SSE follower terminates on the persisted status.
+ *    - marker NULL → the run's message PROVABLY never reached eve
+ *      (dispatch.ts CAS-writes the marker strictly before every eve
+ *      create/continue), so there is no turn to tail — even when the
+ *      session carries an eve id from EARLIER turns (a thread continuation
+ *      that crashed between the run insert and the send). Tailing it would
+ *      hang on a turn that was never sent; mark it failed instead, which is
+ *      exactly what the agent step's stillborn recovery
+ *      (isProvablyUndispatched) needs to re-dispatch safely.
+ *    - otherwise (no live worker / no eve session) → mark the run failed
+ *      with completedAt so the cap slot frees and any SSE follower
+ *      terminates on the persisted status.
  *
- * 2. INTERRUPTED PIPELINE RUNS — `mode: 'pipeline'` runs (which have no
+ * 2. ABANDONED EVELESS SESSIONS — non-terminal sessions with NO eve session
+ *    id whose NEWEST run is terminal with the dispatch-attempt marker SET:
+ *    the residue of a dispatch whose eve create raced a Stop or crashed
+ *    between the marker write and the id persist. At boot no create can
+ *    still be in flight (single control-plane instance), so the row is
+ *    provably dead — close it, releasing any Slack thread-key claim the
+ *    thread-claim eviction now deliberately refuses to evict for marker-SET
+ *    holders (see dispatch.ts). Marker-NULL eveless holders are left alone:
+ *    the claim eviction handles theirs lazily, and an eveless CHAT session
+ *    (including a post-reset replacement row, which has no runs at all)
+ *    stays continuable by design.
+ *
+ * 3. INTERRUPTED PIPELINE RUNS — `mode: 'pipeline'` runs (which have no
  *    session or worker to re-tail) are re-driven from their `run_steps`
  *    ledger instead: pipeline/recovery.ts adopts every queued/running/
  *    waiting run whose per-run advisory lock is acquirable. Runs only when
  *    the PipelineRunner is wired.
  *
- * 3. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
+ * 4. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
  *    `delivery_status` is still `pending`: succeeded ones (the process died
  *    between the terminal event and the Slack post) recover the final
  *    stop-message from persisted `run_events` and deliver late
@@ -29,7 +51,7 @@
  *    owed). Runs only when a DeliveryService is wired (the integrations
  *    config may be absent).
  */
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
 import {
@@ -44,6 +66,8 @@ import { isWorkerLive, toSchedulableWorker } from "./scheduler";
 export interface ReconcileOutcome {
   resumed: number;
   failed: number;
+  /** Abandoned eveless sessions closed by sweep 2 (thread claims released). */
+  sessionsClosed: number;
   /** Pipeline-run sweep tally (zeros when no PipelineRunner is wired). */
   pipelines: PipelineRecoveryOutcome;
   /** Stranded-delivery sweep tally (zeros when no DeliveryService is wired). */
@@ -96,6 +120,7 @@ export async function reconcileInterruptedRuns(
   const outcome: ReconcileOutcome = {
     resumed: 0,
     failed: 0,
+    sessionsClosed: 0,
     pipelines: { resumed: 0, locked: 0, failed: 0 },
     deliveries: { delivered: 0, failed: 0, skipped: 0 },
   };
@@ -103,6 +128,15 @@ export async function reconcileInterruptedRuns(
     // A tail already running in THIS process (normal operation) is left
     // alone — reconcile only adopts orphans.
     if (deps.tailers.get(row.run.id)) continue;
+
+    // THE MARKER IS THE AUTHORITY (dispatch.ts module doc): `started_at`
+    // NULL means this run's eve create/continue was provably never issued —
+    // even when the session carries an eve id from EARLIER turns (a thread
+    // continuation interrupted between the run insert and the send).
+    // Tailing such a run would follow a turn that was never sent (a hang,
+    // or the previous turn's leftovers misclassified); fail it instead so
+    // the agent step's stillborn recovery can re-dispatch safely.
+    const markerArmed = row.run.startedAt !== null;
 
     const workerLive =
       row.worker !== null &&
@@ -112,7 +146,7 @@ export async function reconcileInterruptedRuns(
         deps.runtime.workerHeartbeatTtlMs,
       );
 
-    if (workerLive && row.session.eveSessionId) {
+    if (markerArmed && workerLive && row.session.eveSessionId) {
       startTail(
         deps,
         row.worker!.address,
@@ -125,10 +159,47 @@ export async function reconcileInterruptedRuns(
     } else {
       await deps.runStore.markRun(row.run.id, {
         status: "failed",
-        error: "control plane restarted while the run was active (no live worker to resume from)",
+        error: markerArmed
+          ? "control plane restarted while the run was active (no live worker to resume from)"
+          : "control plane restarted before the run's message was sent (dispatch never reached the agent)",
         completedAt: now,
       });
       outcome.failed += 1;
+    }
+  }
+
+  // Sweep 2 — ABANDONED EVELESS SESSIONS (module doc): after sweep 1 has
+  // settled the interrupted runs, a non-terminal session with no eve id
+  // whose newest run is terminal AND marker-set can only be the residue of a
+  // dispatch that died (or was canceled) after arming but before the eve id
+  // persisted — at boot no create is still in flight, so close it and free
+  // its Slack thread-key claim.
+  const evelessCandidates = await deps.db
+    .select({ id: schema.agentSessions.id })
+    .from(schema.agentSessions)
+    .where(
+      and(
+        isNull(schema.agentSessions.eveSessionId),
+        notInArray(schema.agentSessions.status, ["closed", "error"]),
+      ),
+    );
+  for (const candidate of evelessCandidates) {
+    const newest = await deps.db
+      .select({ status: schema.runs.status, startedAt: schema.runs.startedAt })
+      .from(schema.runs)
+      .where(eq(schema.runs.agentSessionId, candidate.id))
+      .orderBy(desc(schema.runs.createdAt))
+      .limit(1);
+    const run = newest[0];
+    if (
+      run &&
+      run.startedAt !== null &&
+      (run.status === "succeeded" ||
+        run.status === "failed" ||
+        run.status === "canceled")
+    ) {
+      await deps.runStore.markSession(candidate.id, "closed");
+      outcome.sessionsClosed += 1;
     }
   }
 

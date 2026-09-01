@@ -1487,7 +1487,10 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .returning();
       return rows[0]!;
     }
-    async function orphanRun(agentSessionId: string) {
+    async function orphanRun(
+      agentSessionId: string,
+      opts: { markerArmed?: boolean } = {},
+    ) {
       const rows = await db
         .insert(schema.runs)
         .values({
@@ -1501,6 +1504,11 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
             principal: { workspaceId: orgId, source: "chat" },
           },
           status: "running",
+          // The dispatch-attempt marker: every dispatch path arms it
+          // strictly before the eve call, so a run that actually reached
+          // eve always carries it — reconciliation treats it as the
+          // authority on whether there is a turn to tail at all.
+          ...(opts.markerArmed === false ? {} : { startedAt: new Date() }),
         })
         .returning();
       return rows[0]!;
@@ -1514,14 +1522,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // clears the global `workers` table in beforeAll, so the counters below
     // describe only what this test seeds. Runs this process is still tailing
     // (the caps test's HOLD tails) are deliberately LEFT interrupted — the
-    // sweep must still skip them on its own.
+    // sweep must still skip them on its own. No `agent_sessions` join: a
+    // pipeline parent run has no session (`runs.agent_session_id` is
+    // nullable) and would slip past an inner join.
     const strays = await db
       .select({ id: schema.runs.id })
       .from(schema.runs)
-      .innerJoin(
-        schema.agentSessions,
-        eq(schema.runs.agentSessionId, schema.agentSessions.id),
-      )
       .where(inArray(schema.runs.status, ["queued", "running"]));
     const orphanedStrays = strays
       .map((row) => row.id)
@@ -1537,14 +1543,24 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .where(inArray(schema.runs.id, orphanedStrays));
     }
 
-    // Orphan A: live worker + real eve session → its tail is re-attached and
-    // drains eve's durable stream to a terminal (crash-safe resume).
+    // Orphan A: marker armed + live worker + real eve session → its tail is
+    // re-attached and drains eve's durable stream to a terminal (crash-safe
+    // resume).
     const liveSession = await orphanSession("eve-sess-1", liveWorkerId);
     const liveRun = await orphanRun(liveSession.id);
     // Orphan B: nothing to resume from → failed with completedAt so the cap
     // slot frees and SSE terminates.
     const deadSession = await orphanSession("eve-gone", null);
     const deadRun = await orphanRun(deadSession.id);
+    // Orphan C: a CONTINUATION that crashed BEFORE its send — the session
+    // carries an eve id from earlier turns and its worker is live, but the
+    // run's dispatch-attempt marker is NULL: nothing was ever sent, so
+    // re-tailing would follow a turn that does not exist. It must be failed,
+    // never resumed.
+    const undispatchedSession = await orphanSession("eve-sess-1", liveWorkerId);
+    const undispatchedRun = await orphanRun(undispatchedSession.id, {
+      markerArmed: false,
+    });
 
     // The two live HOLD tails from the caps test are skipped (still owned by
     // this process's tailer manager) — only true orphans are touched. The
@@ -1563,6 +1579,16 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(dead[0]!.status).toBe("failed");
     expect(dead[0]!.completedAt).not.toBeNull();
     expect(dead[0]!.error).toContain("control plane restarted");
+
+    // Orphan C failed honest — the marker is the authority, and the
+    // session's pre-existing eve id + live worker did not tempt a tail onto
+    // a turn that was never sent.
+    const undispatched = await db
+      .select({ status: schema.runs.status, error: schema.runs.error })
+      .from(schema.runs)
+      .where(eq(schema.runs.id, undispatchedRun.id));
+    expect(undispatched[0]!.status).toBe("failed");
+    expect(undispatched[0]!.error).toContain("never reached the agent");
 
     await until(async () => {
       const rows = await db

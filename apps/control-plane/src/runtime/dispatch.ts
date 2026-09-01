@@ -43,27 +43,39 @@
  * body has no client-supplied id field), so the id cannot be persisted before
  * the create call. What CAN be persisted is the fact that a dispatch attempt
  * is about to reach eve: {@link armDispatchAttempt} CAS-writes `runs.started_at`
- * strictly BEFORE the create/continue call. Recovery then reads three states:
+ * strictly BEFORE the create/continue call. The marker is the AUTHORITY on
+ * whether THIS run's message ever left the platform — the session's
+ * `eve_session_id` is not: a `session: "thread"` CONTINUATION already carries
+ * an eve id from EARLIER turns, which proves nothing about this run's send.
+ * Recovery reads three states:
  *
- *   - `started_at` NULL + session `eve_session_id` NULL → the eve call was
- *     PROVABLY never issued (program order: the marker write is awaited before
- *     the call) — safe to dispatch again ({@link isProvablyUndispatched}; the
- *     agent step's stillborn-child recovery consumes this);
- *   - `started_at` set + `eve_session_id` NULL → the create MAY have been
- *     issued (crash between the marker and the 202 persist) — recovery must
- *     fail honest, never re-dispatch. This narrow window is a DOCUMENTED
+ *   - `started_at` NULL → the eve call was PROVABLY never issued (program
+ *     order: the marker write is awaited before the call), whatever the
+ *     session's — possibly pre-existing — eve id says. Boot reconciliation
+ *     (runtime/reconcile.ts) refuses to tail such a run (there is no turn to
+ *     tail) and fails it instead; the agent step's stillborn-child recovery
+ *     then re-dispatches safely ({@link isProvablyUndispatched}) — a fresh
+ *     child, or a re-sent continuation into the same session;
+ *   - `started_at` set + session `eve_session_id` NULL → the create MAY have
+ *     been issued (crash between the marker and the 202 persist) — recovery
+ *     must fail honest, never re-dispatch. This narrow window is a DOCUMENTED
  *     deliberate residual: if eve did accept the create, that turn runs to
  *     completion unobserved (side effects happen at most once), and the child
  *     run reads `failed` from boot reconciliation;
- *   - `eve_session_id` set → the normal resumable state.
+ *   - `started_at` set + `eve_session_id` set → the normal resumable state.
  *
  * The marker CAS doubles as the PRE-EVE CANCEL FENCE: a run the pipeline
  * cancel route already settled `canceled` fails the CAS, and the dispatch
  * abandons before eve ever sees the message ({@link DispatchRenderedRunResult}
  * `canceledBeforeDispatch`). Callers may also pass an AbortSignal
- * (`input.signal`) that is honored at the same points.
+ * (`input.signal`) that is honored at the same points. A Stop that lands
+ * while the create/continue is ALREADY IN FLIGHT is caught one fence later:
+ * the POST-EVE CANCEL RECHECK re-reads the run after the call returns and,
+ * if it settled terminal, remote-cancels the accepted turn with the
+ * just-obtained session id instead of tailing it (see
+ * {@link abandonCanceledDuringEve}).
  */
-import { and, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   workflowConfigSchema,
@@ -223,11 +235,19 @@ export interface DispatchRenderedRunInput {
    * already knows are dead. eve 0.31 adds a second case — a row that still
    * reads `active` while its eve session is gone — which is released by the
    * 409 `session_not_active` handler in `failEveDispatch` instead. A THIRD
-   * case is evicted here: a live-status holder with NO eve session id and NO
-   * live run — a claim whose one dispatch died between the claim transaction
-   * and the eve create (the marker's W1 crash window). An in-flight dispatch
-   * always counts a queued run inside this same advisory lock, so it is never
-   * mistaken for stale.
+   * case is evicted here: a live-status holder with NO eve session id, NO
+   * live run, and a newest child run that PROVABLY never dispatched
+   * (dispatch-attempt marker NULL) — a claim whose one dispatch died between
+   * the claim transaction and the marker write. An in-flight dispatch always
+   * counts a queued run inside this same advisory lock, so it is never
+   * mistaken for stale — and the marker check closes the residual race: a
+   * Stop can settle the holder's run terminal WHILE its createEveSession is
+   * still in flight (zero live runs, no eve id yet), and evicting THAT claim
+   * would mint a second session for the thread before the first persists its
+   * id. Marker-SET eveless holders are therefore left alone here; they are
+   * closed by the in-flight dispatch's own post-eve cancel recheck, or — for
+   * a crash — by boot reconciliation's eveless-session sweep
+   * (runtime/reconcile.ts; at boot no in-flight create can exist).
    */
   newSessionSlackThreadKey?: string;
   /**
@@ -270,8 +290,11 @@ export interface DispatchRenderedRunResult {
   dispatched: boolean;
   /**
    * True when the run was created but a cancel (the run row already settled
-   * `canceled`, or the caller's `signal` aborted) landed at one of the
-   * pre-eve fences: NOTHING reached eve, the run row is terminal, and a
+   * terminal, or the caller's `signal` aborted) landed at one of the
+   * dispatch's own fences. At a PRE-eve fence, NOTHING reached eve; at the
+   * POST-eve recheck (the cancel raced the in-flight create/continue), the
+   * accepted turn was immediately remote-canceled with the just-obtained
+   * session id — either way no tail starts, the run row is terminal, and a
    * brand-new session was closed (releasing any Slack thread claim).
    */
   canceledBeforeDispatch?: boolean;
@@ -311,26 +334,62 @@ export async function armDispatchAttempt(
 export interface ChildDispatchState {
   status: RunStatus;
   startedAt: Date | null;
+  /**
+   * The child SESSION's eve id — NOT part of the stillborn predicate (a
+   * thread continuation's session carries one from earlier turns, which says
+   * nothing about THIS run's send). The agent step reads it to decide
+   * whether the stillborn's session itself ever reached eve: an eveless
+   * session is closed (releasing any thread claim), a continuation's
+   * session stays open and is simply continued again.
+   */
   eveSessionId: string | null;
 }
 
 /**
  * True iff the child run PROVABLY never reached eve: it is terminally
- * `failed` (boot reconciliation swept it, or a pre-eve failure marked it),
- * the dispatch-attempt marker was never written, and no eve session id was
- * ever persisted. Program order guarantees the implication: the marker write
- * is awaited before the create call, so marker-absent ⇒ create never issued
- * ⇒ dispatching a replacement child cannot double-dispatch. Anything less
- * certain (marker set, eve id present, or a non-failed status) is NOT
- * recoverable by re-dispatch — fail honest.
+ * `failed` (boot reconciliation swept it, or a pre-eve failure marked it)
+ * and the dispatch-attempt marker was never written. Program order
+ * guarantees the implication: the marker write is awaited strictly before
+ * the create/continue call, so marker-absent ⇒ the call was never issued ⇒
+ * dispatching a replacement child cannot double-dispatch — including a
+ * `session: "thread"` CONTINUATION, whose session already carries an eve id
+ * from earlier turns (the id proves those turns, not this run's send; the
+ * message never left, so re-sending it is safe). Anything less certain
+ * (marker set, or a non-failed status) is NOT recoverable by re-dispatch —
+ * fail honest.
  */
 export function isProvablyUndispatched(state: ChildDispatchState): boolean {
-  return (
-    state.status === "failed" &&
-    state.startedAt === null &&
-    state.eveSessionId === null
-  );
+  return state.status === "failed" && state.startedAt === null;
 }
+
+/**
+ * True when the session's NEWEST run carries the dispatch-attempt marker
+ * (`runs.started_at`). Read inside the thread-claim transaction: a
+ * marker-SET newest run on an eveless holder means a dispatch got as far as
+ * arming — its eve call may be in flight this instant — so the claim must
+ * not be evicted. No runs at all reads as unarmed (a dispatch inserts its
+ * run in the same transaction as the session, so a runless holder never
+ * dispatched anything).
+ */
+async function latestRunMarkerArmed(
+  tx: DbClient,
+  agentSessionId: string,
+): Promise<boolean> {
+  const rows = await tx
+    .select({ startedAt: schema.runs.startedAt })
+    .from(schema.runs)
+    .where(eq(schema.runs.agentSessionId, agentSessionId))
+    .orderBy(desc(schema.runs.createdAt))
+    .limit(1);
+  return rows[0]?.startedAt != null;
+}
+
+/** Terminal run statuses (the sticky set markRun's CAS refuses to leave). */
+const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
+  "succeeded",
+  "failed",
+  "canceled",
+]);
 
 /**
  * Dispatch one rendered task message: create (or continue) the session + a
@@ -425,16 +484,23 @@ export async function dispatchRenderedRun(
         if (holder) {
           const holderDead =
             holder.status === "closed" || holder.status === "error";
-          // POISONED claim: a live-status holder with no eve session id AND
-          // no live run — its one dispatch died between the claim
-          // transaction and the eve create (marker window W1; boot
-          // reconciliation failed the run, nothing closed the session). A
-          // dispatch still in flight always counts a queued run under this
-          // same advisory lock, so it can never be mistaken for stale.
+          // POISONED claim: a live-status holder with no eve session id, no
+          // live run, AND a newest run that provably never dispatched
+          // (marker NULL) — its one dispatch died between the claim
+          // transaction and the marker write (boot reconciliation failed the
+          // run, nothing closed the session). A dispatch still in flight
+          // always counts a queued run under this same advisory lock, so it
+          // can never be mistaken for stale; and a marker-SET terminal run
+          // means the holder may be MID-DISPATCH right now (a Stop settled
+          // its run while createEveSession was in flight) — evicting it
+          // would mint a second session for the thread before the first
+          // persists its id, so those holders are treated as live here and
+          // closed by the post-eve recheck / boot reconciliation instead.
           const holderStale =
             !holderDead &&
             holder.eveSessionId === null &&
-            (await countDispatchingRuns(tx, holder.id)) === 0;
+            (await countDispatchingRuns(tx, holder.id)) === 0 &&
+            !(await latestRunMarkerArmed(tx, holder.id));
           if (holderDead || holderStale) {
             // DEAD/POISONED holder: a terminal session can never continue
             // this thread (findSlackThreadSession skips closed/error rows,
@@ -565,6 +631,21 @@ export async function dispatchRenderedRun(
         },
       );
       eveSessionId = created.sessionId;
+      // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal WHILE
+      // the create was in flight — the marker fence has already passed, the
+      // cancel route found no eve id to chase, and the caller's post-fence
+      // cancelChildRun would no-op on the already-terminal row. This is the
+      // only place that holds the just-minted session id, so the remote
+      // cancel happens here, before the id is treated as live.
+      const liveAfterCreate = await deps.runStore.getRunStatus(run.id);
+      if (!liveAfterCreate || TERMINAL_RUN_STATUSES.has(liveAfterCreate.status)) {
+        return await abandonCanceledDuringEve(deps, input, session, run, {
+          workerAddress: worker.address,
+          hash,
+          jwt,
+          eveSessionId,
+        });
+      }
       await db
         .update(schema.agentSessions)
         .set({
@@ -588,6 +669,19 @@ export async function dispatchRenderedRun(
         eveSessionId,
         { message: input.taskMessage },
       );
+      // POST-EVE CANCEL RECHECK (the continuation twin of the create branch
+      // above): a Stop that landed while the continue was in flight means
+      // the accepted turn must be told to stop here — no tail will follow
+      // it, and the caller's cancelChildRun no-ops on the terminal row.
+      const liveAfterSend = await deps.runStore.getRunStatus(run.id);
+      if (!liveAfterSend || TERMINAL_RUN_STATUSES.has(liveAfterSend.status)) {
+        return await abandonCanceledDuringEve(deps, input, session, run, {
+          workerAddress: worker.address,
+          hash,
+          jwt,
+          eveSessionId,
+        });
+      }
       await db
         .update(schema.agentSessions)
         .set({ status: "active", affinityWorkerId: worker.id })
@@ -656,6 +750,71 @@ async function abandonCanceledBeforeEve(
       ...run,
       status: current?.status ?? "canceled",
       error: current?.error ?? reason,
+    },
+    dispatched: false,
+    canceledBeforeDispatch: true,
+  };
+}
+
+/**
+ * Abandon a dispatch whose eve call ALREADY LANDED because the child run
+ * settled terminal while the create/continue was in flight (a Stop racing
+ * the dispatch): the cancel route had no eve id to chase and the caller's
+ * post-dispatch fence no-ops on the terminal row, so the remote leg happens
+ * HERE, with the just-obtained session id — best-effort, like every remote
+ * cancel (an unreachable worker must not turn the Stop into an error). A
+ * brand-NEW session records the eve id it minted and is closed (markSession
+ * releases any Slack thread-key claim — the claim must not outlive the one
+ * dispatch that owned it); a CONTINUATION's session belongs to its thread
+ * and stays untouched. Reported as `canceledBeforeDispatch`: no tail starts,
+ * and the turn eve accepted was told to stop.
+ */
+async function abandonCanceledDuringEve(
+  deps: RuntimeDeps,
+  input: DispatchRenderedRunInput,
+  session: SessionRow,
+  run: RunRow,
+  target: {
+    workerAddress: string;
+    hash: string;
+    jwt: { secret: string; audience: string };
+    eveSessionId: string;
+  },
+): Promise<DispatchRenderedRunResult> {
+  try {
+    await deps.workerClient.cancelEveTurn(
+      target.workerAddress,
+      target.hash,
+      await mintPlatformJwt(target.jwt.secret, { audience: target.jwt.audience }),
+      target.eveSessionId,
+    );
+  } catch (error) {
+    deps.logger.warn("dispatch.post_eve_cancel_failed", {
+      runId: run.id,
+      fields: {
+        sessionId: session.id,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+  if (input.existingSession === undefined) {
+    // Record the id for the audit trail (the session DID reach eve, once),
+    // then close the row — markSession releases the thread-key claim so the
+    // next message in the thread can mint a fresh session.
+    await deps.db
+      .update(schema.agentSessions)
+      .set({ eveSessionId: target.eveSessionId })
+      .where(eq(schema.agentSessions.id, session.id));
+    session.eveSessionId = target.eveSessionId;
+    await deps.runStore.markSession(session.id, "closed");
+  }
+  const current = await deps.runStore.getRunStatus(run.id);
+  return {
+    session,
+    run: {
+      ...run,
+      status: current?.status ?? "canceled",
+      error: current?.error ?? run.error,
     },
     dispatched: false,
     canceledBeforeDispatch: true,

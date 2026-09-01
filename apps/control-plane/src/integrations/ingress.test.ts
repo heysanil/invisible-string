@@ -523,6 +523,28 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     return (await res.json()) as CreateWebhookTokenResponse;
   }
 
+  /**
+   * Wait until NO pipeline run of the workflow is live. The default
+   * `overlap: "skip"` DROPS a trigger event while any run of the workflow is
+   * still in flight — so a test that posts a FOLLOW-UP thread event must
+   * first let the previous PARENT run settle. Waiting on the CHILD run alone
+   * leaves a small window where the parent is still finishing its step
+   * bookkeeping (extract → finish → run_finished), and an event posted
+   * inside it is overlap-dropped by design — a race, not a product bug.
+   */
+  async function awaitWorkflowQuiet(workflowId: string): Promise<void> {
+    await until(async () => {
+      const rows = await db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.workflowId, workflowId));
+      const live = rows.some(
+        (r) => r.status === "queued" || r.status === "running" || r.status === "waiting",
+      );
+      return live ? undefined : true;
+    }, `workflow ${workflowId} runs settled`);
+  }
+
   beforeAll(async () => {
     await runMigrations(TEST_DATABASE_URL!);
     worker.start();
@@ -1188,6 +1210,8 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
       return runs.some((r) => r.status === "succeeded") ? true : undefined;
     }, "recovery first run done");
+    // The PARENT must settle too — overlap "skip" would drop the next event.
+    await awaitWorkflowQuiet(wfId);
 
     // Poison the session the way a failed first dispatch used to: terminal
     // status with the thread key STILL SET (legacy pre-fix shape — the
@@ -1249,6 +1273,8 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, first.id));
       return runs.some((r) => r.status === "succeeded") ? true : undefined;
     }, "dead-eve first run done");
+    // The PARENT must settle too — overlap "skip" would drop the next event.
+    await awaitWorkflowQuiet(wfId);
 
     // Kill it INSIDE eve only. The platform row stays `active` and keeps its
     // thread key — exactly the divergence 0.31 introduces.
@@ -1320,6 +1346,9 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       return rows.find((s) => s.eveSessionId && s.slackThreadKey === bareKey) ?? undefined;
     }, "agent A's bare-key session");
     expect(sessionA.agentId).toBe(agentId);
+    // A's PARENT pipeline run must settle before the next thread event —
+    // overlap "skip" drops an event while any run of the workflow is live.
+    await awaitWorkflowQuiet(wfId);
 
     // Republish the workflow with the step bound to agent B.
     const wfRow = (await db.select().from(schema.workflows).where(eq(schema.workflows.id, wfId)))[0]!;
@@ -1340,6 +1369,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, sessionB.id));
       return runs.some((r) => r.status === "succeeded") ? true : undefined;
     }, "agent B's first run done");
+    await awaitWorkflowQuiet(wfId);
 
     // Agent A's session terminates — its bare-key claim is released.
     await stack.runtime!.runStore.markSession(sessionA.id, "closed");

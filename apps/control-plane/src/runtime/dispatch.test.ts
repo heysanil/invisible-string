@@ -90,7 +90,7 @@ describe("armDispatchAttempt (marker + pre-eve cancel fence)", () => {
 describe("isProvablyUndispatched (stillborn-child classification)", () => {
   const base = { status: "failed" as const, startedAt: null, eveSessionId: null };
 
-  test("failed + no marker + no eve session id → provably undispatched (safe to re-dispatch)", () => {
+  test("failed + no marker → provably undispatched (safe to re-dispatch)", () => {
     expect(isProvablyUndispatched(base)).toBe(true);
   });
 
@@ -98,8 +98,16 @@ describe("isProvablyUndispatched (stillborn-child classification)", () => {
     expect(isProvablyUndispatched({ ...base, startedAt: new Date() })).toBe(false);
   });
 
-  test("a persisted eve session id flips it — eve definitely saw the create", () => {
-    expect(isProvablyUndispatched({ ...base, eveSessionId: "eve-1" })).toBe(false);
+  test("a PRE-EXISTING eve session id does NOT flip it — a thread continuation's session carries one from earlier turns; the MARKER is the authority on this run's send", () => {
+    expect(isProvablyUndispatched({ ...base, eveSessionId: "eve-1" })).toBe(true);
+    // Marker set + eve id: undecidable-or-later — never re-dispatch.
+    expect(
+      isProvablyUndispatched({
+        ...base,
+        startedAt: new Date(),
+        eveSessionId: "eve-1",
+      }),
+    ).toBe(false);
   });
 
   test("non-failed statuses are never stillborn (canceled stays canceled; live runs are watched)", () => {

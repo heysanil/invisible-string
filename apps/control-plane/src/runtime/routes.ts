@@ -93,6 +93,7 @@ import {
 } from "./compile-service";
 import type { RuntimeConfig } from "./config";
 import {
+  armDispatchAttempt,
   publishedPipelineConfigOf,
   PIPELINE_TRIGGER_AGENT_ID,
 } from "./dispatch";
@@ -668,8 +669,13 @@ async function cancelEveTurnBestEffort(
  * racing the Stop (pipeline/steps/agent.ts). Mirrors the cancel route's
  * no-tail branch: settle the row first, then chase eve best-effort.
  * Idempotent (terminal children are left alone), so the route's snapshot and
- * the executor's fence may both call it. Ownership is the caller's problem
- * (the parent run was ownership-checked, and run_steps rows are
+ * the executor's fence may both call it. The terminal no-op is safe even for
+ * the cancel-during-create race — a child whose run settled terminal while
+ * its dispatch's createEveSession was still in flight has no eve id HERE to
+ * chase, but the dispatch's own post-eve recheck re-reads the run when the
+ * create returns and remote-cancels with the just-minted id
+ * (dispatch.ts `abandonCanceledDuringEve`). Ownership is the caller's
+ * problem (the parent run was ownership-checked, and run_steps rows are
  * org-denormalized).
  */
 export async function cancelChildRun(
@@ -1239,6 +1245,26 @@ export function runtimePlugin(deps: RuntimeDeps) {
         let created;
         try {
           await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
+          // DISPATCH-ATTEMPT MARKER (dispatch.ts module doc): CAS-write
+          // `runs.started_at` strictly before the eve call, so boot
+          // reconciliation can read "marker absent ⇒ the create was never
+          // issued" — it refuses to tail marker-null runs. The CAS doubles
+          // as a pre-eve cancel fence: a run settled terminal during the
+          // (possibly long) agent boot above abandons instead of opening an
+          // eve session nobody will follow.
+          if ((await armDispatchAttempt(deps.runStore, run.id)) !== "armed") {
+            await deps.runStore.markSession(session.id, "closed");
+            const current = await deps.runStore.getRunStatus(run.id);
+            set.status = 201;
+            return {
+              session: sessionDto({ ...session, status: "closed" }),
+              run: runDto({
+                ...run,
+                status: current?.status ?? "canceled",
+                error: current?.error ?? run.error,
+              }),
+            };
+          }
           created = await deps.workerClient.createEveSession(
             worker.address,
             hash,
@@ -1420,6 +1446,24 @@ export function runtimePlugin(deps: RuntimeDeps) {
         let eveSessionId: string;
         try {
           await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
+          // DISPATCH-ATTEMPT MARKER (dispatch.ts module doc): armed strictly
+          // before the eve call. Matters MOST here — this session already
+          // carries an eve id from earlier turns, so without the marker a
+          // crash between the run insert and the send would leave boot
+          // reconciliation tailing a turn that was never sent. The CAS also
+          // fences a run settled terminal during the agent boot; the session
+          // belongs to the user's thread and stays open.
+          if ((await armDispatchAttempt(deps.runStore, run.id)) !== "armed") {
+            const current = await deps.runStore.getRunStatus(run.id);
+            set.status = 201;
+            return {
+              run: runDto({
+                ...run,
+                status: current?.status ?? "canceled",
+                error: current?.error ?? run.error,
+              }),
+            };
+          }
           if (session.eveSessionId) {
             // "send" form — `{message}` alone. eve rejects a body carrying
             // BOTH message and inputResponses, and 400s on a

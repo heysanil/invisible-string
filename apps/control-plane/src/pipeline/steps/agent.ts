@@ -47,17 +47,22 @@
  * re-invokes this executor with `ctx.childRunId` to watch the child.
  *
  * STILLBORN-CHILD RECOVERY (the marker's flip side, dispatch.ts module doc):
- * a crash AFTER the link transaction but BEFORE the eve create leaves a
- * linked child with no eve session — boot reconciliation marks it `failed`,
- * and blindly surfacing that would fail the whole workflow for a message eve
- * never saw. On re-attach, a child that watched to `failed` is probed
- * ({@link isProvablyUndispatched}: `failed` + no dispatch-attempt marker +
- * no eve session id) and, ONLY when provably undispatched, the executor
- * closes the stillborn's session (releasing any thread claim) and falls
- * through to phase 1 to dispatch a replacement child — the link hook
- * overwrites `child_run_id`. Anything less certain (marker set, eve id
- * present) fails honest: that is the documented deliberate residual — a
- * crash between the marker write and the 202 persist may leave an eve turn
+ * a crash AFTER the link transaction but BEFORE the eve send leaves a linked
+ * child whose message never left the platform — boot reconciliation marks it
+ * `failed` (it refuses to tail a marker-null run), and blindly surfacing
+ * that would fail the whole workflow for a message eve never saw. On
+ * re-attach, a child that watched to `failed` is probed
+ * ({@link isProvablyUndispatched}: `failed` + no dispatch-attempt marker —
+ * the MARKER is the authority, not the session's eve id, which a
+ * `session: "thread"` CONTINUATION carries from earlier turns) and, ONLY
+ * when provably undispatched, the executor falls through to phase 1 to
+ * dispatch a replacement child — the link hook overwrites `child_run_id`.
+ * A stillborn whose session never reached eve (no eve id) has that session
+ * closed first (releasing any thread claim); a continuation's session stays
+ * OPEN — the qualified-first lookup finds it again and the replacement
+ * child re-sends the continuation into it. Anything less certain (marker
+ * set) fails honest: that is the documented deliberate residual — a crash
+ * between the marker write and the 202 persist may leave an eve turn
  * running unobserved exactly once, and the step reports `agent_run_failed`.
  *
  * CANCEL FENCES (Stop racing the dispatch): (a) the link hook re-reads the
@@ -589,15 +594,19 @@ export function createAgentStepExecutor(
       }
       // STILLBORN-CHILD RECOVERY (module doc): a `failed` child is probed
       // for the dispatch-attempt marker; only a PROVABLY undispatched child
-      // (no marker, no eve session) is replaced by a fresh dispatch — the
-      // link hook overwrites `child_run_id`. Anything less certain fails
-      // honest (the documented residual).
+      // (marker null — the message never left the platform) is replaced by
+      // a fresh dispatch — the link hook overwrites `child_run_id`.
+      // Anything less certain fails honest (the documented residual).
       const state = await loadChildState(runtimeDeps, ctx.childRunId);
       if (!state || !isProvablyUndispatched(state)) return watched;
-      if (state.sessionId) {
+      if (state.sessionId && state.eveSessionId === null) {
         // The stillborn's session never reached eve; close it so an
         // `active` eveless row cannot hold a Slack thread-key claim against
-        // the replacement dispatch (markSession releases the key).
+        // the replacement dispatch (markSession releases the key). A
+        // THREAD CONTINUATION's session (eve id from earlier turns) stays
+        // OPEN on purpose: the session is healthy, only THIS run's message
+        // never left, and phase 1's qualified-first lookup finds and
+        // CONTINUES it — closing it would strand the thread's history.
         await runtimeDeps.runStore.markSession(state.sessionId, "error");
       }
       // Fall through to phase 1: dispatch the replacement child.
@@ -751,9 +760,11 @@ export function createAgentStepExecutor(
       return classified;
     }
     if (result.canceledBeforeDispatch) {
-      // A Stop landed at one of the dispatch's pre-eve fences: nothing
-      // reached eve, the child row is already canceled. The runner discards
-      // this outcome on its own cancel path anyway.
+      // A Stop landed at one of the dispatch's own fences: either nothing
+      // reached eve (pre-eve fence), or the dispatch's post-eve recheck
+      // already remote-canceled the accepted turn with the fresh session id
+      // — the child row is terminal either way and nothing needs chasing.
+      // The runner discards this outcome on its own cancel path anyway.
       return failed(
         "canceled",
         "the run was canceled before the agent was dispatched",

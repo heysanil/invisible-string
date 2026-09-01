@@ -1313,8 +1313,14 @@ describe("pipeline driver — for_each", () => {
     const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
     expect(loopRow.errorClass).toBe("fan_out_exceeded");
     expect(h.stepStore.rows).toHaveLength(1); // no item ever ran
-    // An array the loop refuses to iterate is never snapshotted.
-    expect(loopRow.input).toEqual({ itemsRef: "trigger.items", count: 3 });
+    // An array the loop refuses to iterate is never snapshotted — the
+    // failure VERDICT is persisted instead, so a crash before the failure
+    // row lands replays the verdict rather than re-resolving.
+    expect(loopRow.input).toEqual({
+      itemsRef: "trigger.items",
+      count: 3,
+      verdict: "fan_out_exceeded",
+    });
   });
 
   test("non-array items fail `items_not_array`", async () => {
@@ -1326,9 +1332,14 @@ describe("pipeline driver — for_each", () => {
     });
     if (!started.started) throw new Error("expected a started run");
     await waitForTerminal(h.runStore, started.run.id);
-    expect(
-      h.stepStore.rows.find((r) => r.path === loop.id)!.errorClass,
-    ).toBe("items_not_array");
+    const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
+    expect(loopRow.errorClass).toBe("items_not_array");
+    // The failed verdict is persisted at claim (crash-replay fidelity).
+    expect(loopRow.input).toEqual({
+      itemsRef: "trigger.items",
+      count: null,
+      verdict: "items_not_array",
+    });
   });
 
   test("a resumed for_each replays its PERSISTED items snapshot — never the moved collection", async () => {
@@ -1407,6 +1418,144 @@ describe("pipeline driver — for_each", () => {
       count: 2,
       items: ["old-a", "old-b"],
     });
+  });
+
+  test("a crashed DOOMED for_each replays its RECORDED verdict — fan_out_exceeded even after the collection shrank, zero body executions", async () => {
+    const body = tool("body");
+    const loop = loopOver([body], { items: { $ref: "state.items" }, maxItems: 100 });
+    const config = cfg([loop]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    // First incarnation: resolved a 101-item array from @state.items (over
+    // maxItems 100), CLAIMED the loop row with the failure verdict — exactly
+    // what executeForEach persists for an over-cap resolution — and crashed
+    // BEFORE the failure row/event could be written.
+    await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: loop.id,
+      stepSlug: "loop",
+      path: loop.id,
+      parentPath: null,
+      iteration: null,
+      kind: "for_each",
+      status: "running",
+      input: { itemsRef: "state.items", count: 101, verdict: "fan_out_exceeded" },
+      startedAt: new Date(),
+    });
+    // The state collection SHRANK between crash and recovery (a concurrent
+    // overlap:"allow" run, an operator edit): a re-resolve would now see ONE
+    // item, and the doomed loop would EXECUTE — side effects from a run that
+    // had already earned fan_out_exceeded.
+    h.stateStore.state.set(run.workflowId!, new Map([["items", ["only-one"]]]));
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    // The RECORDED verdict replayed: same class, the RECORDED count — and
+    // not a single body execution.
+    expect(toolExec.calls).toHaveLength(0);
+    const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
+    expect(loopRow.status).toBe("failed");
+    expect(loopRow.errorClass).toBe("fan_out_exceeded");
+    expect(loopRow.error).toContain("101");
+    expect(h.stepStore.rows).toHaveLength(1); // no item instance ever claimed
+  });
+
+  test("a crashed doomed for_each replays a recorded items_not_array verdict even after the ref became an array", async () => {
+    const body = tool("body");
+    const loop = loopOver([body], { items: { $ref: "state.items" } });
+    const config = cfg([loop]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: loop.id,
+      stepSlug: "loop",
+      path: loop.id,
+      parentPath: null,
+      iteration: null,
+      kind: "for_each",
+      status: "running",
+      input: { itemsRef: "state.items", count: null, verdict: "items_not_array" },
+      startedAt: new Date(),
+    });
+    h.stateStore.state.set(run.workflowId!, new Map([["items", ["now-an-array"]]]));
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    expect(toolExec.calls).toHaveLength(0);
+    const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
+    expect(loopRow.errorClass).toBe("items_not_array");
+  });
+
+  test("LEGACY fallback: a pre-verdict crashed row (no items, no verdict) still re-resolves on recovery", async () => {
+    const body = tool("body", { args: { item: { $ref: "item" } } });
+    const loop = loopOver([body], { items: { $ref: "state.items" }, maxItems: 100 });
+    const config = cfg([loop]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    // A row claimed BEFORE the verdict existed: input carries neither
+    // `items` nor `verdict` (the old shape for a failed resolution).
+    await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: loop.id,
+      stepSlug: "loop",
+      path: loop.id,
+      parentPath: null,
+      iteration: null,
+      kind: "for_each",
+      status: "running",
+      input: { itemsRef: "state.items", count: 101 },
+      startedAt: new Date(),
+    });
+    h.stateStore.state.set(run.workflowId!, new Map([["items", ["legacy-item"]]]));
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    // Documented legacy behavior: fall back to the fresh resolution.
+    expect(terminal.status).toBe("succeeded");
+    expect(toolExec.calls).toHaveLength(1);
+    expect(toolExec.calls[0]!.scope.item).toBe("legacy-item");
   });
 });
 

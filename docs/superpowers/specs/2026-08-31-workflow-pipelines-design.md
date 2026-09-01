@@ -284,14 +284,18 @@ the full scope; the child receives that string as its task message.
   stamps into the parent's `TriggerEvent.data.slackThreadKey` resolves an
   existing thread-keyed session (advisory-locked claim + dead-holder
   eviction, machinery now inside the new dispatch) whose PINNED version takes
-  a follow-up turn; no session yet mints a fresh conversational one. A found
-  holder is reused only when its `agentId` matches the step's — on mismatch
-  the lookup/claim moves to the agent-qualified key
-  `<bareKey>:agent:<agentId>`, so each agent in one thread keeps its own
-  session and cross-run continuity (the session `principal` keeps the BARE
-  key — the true Slack-thread identity — and the qualified form deliberately
-  fails `parseSlackThreadKey`'s 3-segment contract so it can never mis-target
-  a reply). Never `mode: "task"`, never an output schema (publish gate).
+  a follow-up turn; no session yet mints a fresh conversational one. The
+  lookup is QUALIFIED-FIRST: the step probes its own agent-qualified key
+  `<bareKey>:agent:<agentId>` before the bare key, reuses a bare holder only
+  when its `agentId` matches, and on mismatch claims the qualified key — so
+  each agent in one thread keeps its own session and cross-run continuity
+  even after the bare holder terminates and releases its key. The ingress
+  known-thread gate (`isKnownSlackThread`) matches the bare key OR any
+  `:agent:` derivative, so unmentioned replies keep flowing under
+  `mentionOnly`. The session `principal` keeps the BARE key — the true
+  Slack-thread identity — and the qualified form deliberately fails
+  `parseSlackThreadKey`'s 3-segment contract so it can never mis-target a
+  reply. Never `mode: "task"`, never an output schema (publish gate).
 - Output extraction is ALWAYS local belt-and-braces: `result.completed` →
   `output.result` (validated against the declared schema →
   `validation_failed` on miss), else the last stop-message text →
@@ -301,9 +305,15 @@ the full scope; the child receives that string as its task message.
   unique `(run_id, path)` claim) INSIDE the transaction that creates the
   child run row, before any eve call — an unlinked dispatched child cannot
   exist by construction, so replay always re-attaches instead of
-  double-dispatching. The executor then returns
-  `{status: "waiting", childRunId}` and the runner re-invokes with
-  `ctx.childRunId`. While
+  double-dispatching. The hook also fences cancellation (aborts the
+  transaction when the attempt's signal fired or the parent run is already
+  terminal), and dispatch CAS-writes a dispatch-attempt marker
+  (`runs.started_at`) strictly before the eve call: a crash before the
+  marker is provably undispatched (stillborn recovery re-dispatches fresh);
+  a crash between marker and eve-session-id persist is undecidable and
+  fails honest (`agent_run_failed`) — at-most-once, never a double
+  dispatch. The executor then returns `{status: "waiting", childRunId}` and
+  the runner re-invokes with `ctx.childRunId`. While
   the child runs the executor waits on a RunEventBus subscription plus a
   `PIPELINE_CHILD_POLL_MS` poll; a child parking `waiting` (HITL) parks the
   parent step and run, and `POST /runs/:id/input` on the CHILD resumes the

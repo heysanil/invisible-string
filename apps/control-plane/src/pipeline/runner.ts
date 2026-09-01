@@ -396,6 +396,16 @@ interface DriveCtx {
   /** Executed instance count vs `maxExecutedStepsPerRun`. */
   executed: number;
   /**
+   * Resume only (null on a fresh run): every instance path a previous
+   * incarnation claimed. The pre-execution budget check in `runSequence`
+   * waves these paths through — an adopted terminal row executes nothing
+   * (no increment), and a resumed frontier row's budget slot is the one the
+   * seed deliberately left uncounted, charged at its re-execution instead.
+   * Without the bypass, a seed that exactly consumed the budget would fail
+   * recovery `step_budget_exceeded` before replaying rows that owe nothing.
+   */
+  priorLedgerPaths: Set<string> | null;
+  /**
    * Resume only (null on a fresh run): instance paths whose TERMINAL step
    * event already reached the persisted stream. Adoption of a terminal
    * ledger row whose path is absent here backfills the missing event — the
@@ -719,16 +729,26 @@ export class PipelineRunner {
       };
       // Resume bookkeeping (baseSeq > 0 ⇔ a previous incarnation got as far
       // as `pipeline.started`): the executed-step budget is seeded from the
-      // ledger so a crash loop cannot re-grant it (skipped rows never
-      // consumed budget and are excluded; the frontier row re-counts on
-      // re-execution — conservative), and the persisted event stream is
-      // scanned once so adoption can backfill terminal step events a crash
-      // swallowed between persist and emit.
+      // ledger's TERMINAL non-skipped rows so a crash loop cannot re-grant
+      // it — skipped rows never consumed budget, and a non-terminal frontier
+      // row (running/pending/waiting) is charged exactly once, at its
+      // re-execution, never in the seed as well (seeding it too would double
+      // count the same instance). The ledger's path set rides along so the
+      // pre-execution budget check can wave replayed rows through, and the
+      // persisted event stream is scanned once so adoption can backfill
+      // terminal step events a crash swallowed between persist and emit.
       const resuming = events.baseSeq > 0;
       let executedSeed = 0;
+      let priorLedgerPaths: Set<string> | null = null;
       if (resuming) {
         const ledger = await this.deps.stepStore.listForRun(runId);
-        executedSeed = ledger.filter((r) => r.status !== "skipped").length;
+        executedSeed = ledger.filter(
+          (r) =>
+            r.status === "succeeded" ||
+            r.status === "failed" ||
+            r.status === "canceled",
+        ).length;
+        priorLedgerPaths = new Set(ledger.map((r) => r.path));
       }
       const dctx: DriveCtx = {
         run,
@@ -740,6 +760,7 @@ export class PipelineRunner {
         logger,
         deadlineMs: startedAt.getTime() + this.config.maxWallClockMs,
         executed: executedSeed,
+        priorLedgerPaths,
         priorTerminalEventPaths: resuming
           ? await this.loadTerminalStepEventPaths(runId)
           : null,
@@ -903,14 +924,22 @@ export class PipelineRunner {
           error: `pipeline exceeded its wall clock (${this.config.maxWallClockMs}ms)`,
         };
       }
-      if (dctx.executed >= this.config.maxExecutedStepsPerRun) {
+      const path = stepInstancePath(parent, step.id);
+      // The budget gates NEW instances only. A path already in the ledger is
+      // replay: adoption executes nothing, and a resumed frontier row's
+      // budget charge is its re-execution's increment — the seed deliberately
+      // did not count it, so rejecting it here would starve the very
+      // instance the budget already admitted before the crash.
+      if (
+        dctx.executed >= this.config.maxExecutedStepsPerRun &&
+        !dctx.priorLedgerPaths?.has(path)
+      ) {
         return {
           kind: "halted",
           errorClass: "step_budget_exceeded",
           error: `pipeline exceeded ${this.config.maxExecutedStepsPerRun} executed step instances`,
         };
       }
-      const path = stepInstancePath(parent, step.id);
       const result = await this.executeStep(dctx, step, path, parent, scope);
       switch (result.kind) {
         case "ok":
@@ -1382,17 +1411,39 @@ export class PipelineRunner {
     scope: PipelineScope,
   ): Promise<StepResult> {
     const startMs = this.now().getTime();
-    const itemsRaw = resolveScopePath(scope, step.items.$ref);
+    const resolved = resolveScopePath(scope, step.items.$ref);
+    // The RESOLVED items array is snapshotted into the loop row's persisted
+    // input on first claim (the leaf-step persisted-input discipline). It is
+    // bounded like every other input snapshot: `maxItems` ≤ 100 caps the
+    // element count and every source the ref can resolve is already capped
+    // (step outputs by maxStepOutputBytes, state values by the 64KB store
+    // cap, trigger data at ingress). A non-array or over-`maxItems`
+    // resolution fails below without a snapshot — never persist an array the
+    // loop will refuse to iterate.
+    const snapshot =
+      Array.isArray(resolved) && resolved.length <= step.maxItems
+        ? resolved
+        : null;
     const claim = await this.claim(dctx, step, path, parent, {
       itemsRef: step.items.$ref,
-      count: Array.isArray(itemsRaw) ? itemsRaw.length : null,
+      count: Array.isArray(resolved) ? resolved.length : null,
+      ...(snapshot ? { items: snapshot } : {}),
     });
+    let itemsRaw: unknown = resolved;
     let attempt = 1;
     if (!claim.created) {
       const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
       if (adopted) return adopted;
       // Interrupted mid-loop: the body claims below adopt every finished
-      // item instance, so replay resumes at the frontier — no special case.
+      // item instance, so replay resumes at the frontier — over the
+      // PERSISTED items snapshot, verbatim. Re-resolving the ref against the
+      // rebuilt scope can differ (state moved under overlap "allow"), and
+      // items already processed from the original array must never be
+      // combined with the remainder of a new one. Rows without a snapshot
+      // (claimed before a failed non-array/overflow resolution) fall back to
+      // the fresh resolution and fail the same way again.
+      const persisted = (claim.row.input as { items?: unknown } | null)?.items;
+      if (Array.isArray(persisted)) itemsRaw = persisted;
       attempt = claim.row.attempt + 1;
       await this.deps.stepStore.markRunning(claim.row.id, {
         attempt,

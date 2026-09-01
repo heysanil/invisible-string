@@ -23,11 +23,17 @@
  *   A: on mismatch the claim moves to an AGENT-QUALIFIED key
  *   ({@link agentQualifiedThreadKey}), so each agent in one Slack thread
  *   gets its own session (with its own cross-run continuity) and the
- *   `(workflow_id, slack_thread_key)` unique index stays respected. No
- *   session under the step's key means a fresh conversational session
- *   claimed under the same advisory-locked thread-key machinery. Never
- *   `mode: "task"` (a human answers these in Slack) and never an output
- *   schema (the publish gate forbids the combination).
+ *   `(workflow_id, slack_thread_key)` unique index stays respected. The
+ *   lookup is QUALIFIED-FIRST: the step checks its own
+ *   `<bareKey>:agent:<agentId>` claim before the bare key — a bare-key
+ *   holder can terminate and release its claim, and finding "no bare
+ *   session" must not strand an established qualified session's history by
+ *   minting a fresh bare one. The bare key is reused only on agent match,
+ *   and claimed fresh only when NOTHING holds it. No session under either
+ *   key means a fresh conversational session claimed under the same
+ *   advisory-locked thread-key machinery. Never `mode: "task"` (a human
+ *   answers these in Slack) and never an output schema (the publish gate
+ *   forbids the combination).
  *
  * CHILD LINKING IS PRE-DISPATCH: the dispatch's run-creation transaction
  * invokes `onRunCreated`, which persists `run_steps.child_run_id` ATOMICALLY
@@ -39,6 +45,31 @@
  * `{status: "waiting", childRunId}` immediately after dispatch — the RUNNER
  * owns the status transition (markWaiting) and the park/bounce that
  * re-invokes this executor with `ctx.childRunId` to watch the child.
+ *
+ * STILLBORN-CHILD RECOVERY (the marker's flip side, dispatch.ts module doc):
+ * a crash AFTER the link transaction but BEFORE the eve create leaves a
+ * linked child with no eve session — boot reconciliation marks it `failed`,
+ * and blindly surfacing that would fail the whole workflow for a message eve
+ * never saw. On re-attach, a child that watched to `failed` is probed
+ * ({@link isProvablyUndispatched}: `failed` + no dispatch-attempt marker +
+ * no eve session id) and, ONLY when provably undispatched, the executor
+ * closes the stillborn's session (releasing any thread claim) and falls
+ * through to phase 1 to dispatch a replacement child — the link hook
+ * overwrites `child_run_id`. Anything less certain (marker set, eve id
+ * present) fails honest: that is the documented deliberate residual — a
+ * crash between the marker write and the 202 persist may leave an eve turn
+ * running unobserved exactly once, and the step reports `agent_run_failed`.
+ *
+ * CANCEL FENCES (Stop racing the dispatch): (a) the link hook re-reads the
+ * PARENT run's status inside the dispatch transaction and checks the
+ * attempt's AbortSignal — a canceled/terminal parent (or an aborted signal)
+ * throws, aborting the transaction: no child row, no dispatch. (b) after
+ * `dispatchRenderedRun` returns, the signal and the parent's status are
+ * re-checked; if the run was stopped, the just-dispatched child is canceled
+ * immediately through the ordinary cancel path (`cancelChildRun` — row CAS +
+ * best-effort remote eve cancel), so an abandoned executor promise can never
+ * leave a live child running under a canceled parent. The signal also rides
+ * the dispatch input, which honors it at its own pre-eve fences.
  *
  * COMPLETION is keyed on the child RUN ROW's status (which the tailer settles
  * from the stream's terminal events) — NEVER on a follow-up send or a 409
@@ -67,12 +98,16 @@ import {
 
 import type { DbClient } from "../../db";
 import {
+  agentQualifiedThreadKeyPrefix,
   dispatchRenderedRun,
   findSlackThreadSession,
+  isProvablyUndispatched,
+  type ChildDispatchState,
   type DispatchRenderedRunResult,
 } from "../../runtime/dispatch";
 import { isRuntimeApiError } from "../../runtime/errors";
 import {
+  cancelChildRun,
   requireReadyAgentVersion,
   type ReadyAgentVersion,
   type RuntimeDeps,
@@ -138,7 +173,10 @@ export function slackThreadKeyFromTriggerData(
  * touch a thread claims the bare ingress key; any later step binding another
  * agent claims `<bareKey>:agent:<agentId>` instead, so each agent in one
  * thread gets its own session (own continuity, own pinned version) without
- * violating the `(workflow_id, slack_thread_key)` unique index.
+ * violating the `(workflow_id, slack_thread_key)` unique index. Built on the
+ * SHARED prefix (`agentQualifiedThreadKeyPrefix`, runtime/dispatch.ts) so
+ * the ingress's known-thread prefix match and this claim shape can never
+ * drift.
  *
  * The suffix adds colons ON PURPOSE: `parseSlackThreadKey`
  * (runs/delivery.ts) requires exactly three `:`-segments, so a qualified key
@@ -150,7 +188,7 @@ export function agentQualifiedThreadKey(
   threadKey: string,
   agentId: string,
 ): string {
-  return `${threadKey}:agent:${agentId}`;
+  return `${agentQualifiedThreadKeyPrefix(threadKey)}${agentId}`;
 }
 
 /**
@@ -375,6 +413,74 @@ export interface AgentStepExecutorOptions {
     deps: RuntimeDeps,
     runId: string,
   ) => Promise<TriggerEvent | null>;
+  /**
+   * In-transaction parent-status read for the link hook's cancel fence
+   * (module doc, CANCEL FENCES a).
+   */
+  readParentRunStatusImpl?: (
+    tx: DbClient,
+    runId: string,
+  ) => Promise<RunStatus | null>;
+  /** Post-dispatch cancel path (module doc, CANCEL FENCES b). */
+  cancelChildRunImpl?: typeof cancelChildRun;
+  /** Child dispatch-state probe for the stillborn recovery (module doc). */
+  loadChildDispatchStateImpl?: (
+    deps: RuntimeDeps,
+    childRunId: string,
+  ) => Promise<StillbornProbeState | null>;
+}
+
+/** What the stillborn probe reads: the marker slice + the child's session. */
+export type StillbornProbeState = ChildDispatchState & {
+  sessionId: string | null;
+};
+
+/** Drizzle default for {@link AgentStepExecutorOptions.readParentRunStatusImpl}. */
+async function readParentRunStatus(
+  tx: DbClient,
+  runId: string,
+): Promise<RunStatus | null> {
+  const rows = await tx
+    .select({ status: schema.runs.status })
+    .from(schema.runs)
+    .where(eq(schema.runs.id, runId))
+    .limit(1);
+  return rows[0]?.status ?? null;
+}
+
+/**
+ * Drizzle default for {@link AgentStepExecutorOptions.loadChildDispatchStateImpl}.
+ * Fixtures without a `db` on the deps graph get `null` — "unknowable", which
+ * the caller treats as NOT provably undispatched (fail-safe: when in doubt,
+ * never re-dispatch).
+ */
+async function loadChildDispatchState(
+  deps: RuntimeDeps,
+  childRunId: string,
+): Promise<StillbornProbeState | null> {
+  if (!deps.db) return null;
+  const rows = await deps.db
+    .select({
+      status: schema.runs.status,
+      startedAt: schema.runs.startedAt,
+      sessionId: schema.runs.agentSessionId,
+      eveSessionId: schema.agentSessions.eveSessionId,
+    })
+    .from(schema.runs)
+    .leftJoin(
+      schema.agentSessions,
+      eq(schema.runs.agentSessionId, schema.agentSessions.id),
+    )
+    .where(eq(schema.runs.id, childRunId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    status: row.status,
+    startedAt: row.startedAt,
+    eveSessionId: row.eveSessionId ?? null,
+    sessionId: row.sessionId,
+  };
 }
 
 /**
@@ -441,6 +547,11 @@ export function createAgentStepExecutor(
     options.findThreadSessionImpl ?? findSlackThreadSession;
   const loadParentEvent =
     options.loadParentTriggerEventImpl ?? loadParentTriggerEvent;
+  const readParentStatus =
+    options.readParentRunStatusImpl ?? readParentRunStatus;
+  const cancelChild = options.cancelChildRunImpl ?? cancelChildRun;
+  const loadChildState =
+    options.loadChildDispatchStateImpl ?? loadChildDispatchState;
 
   return async (ctx): Promise<StepOutcome> => {
     const { deps, step } = ctx;
@@ -464,13 +575,41 @@ export function createAgentStepExecutor(
 
     // ── phase 2: re-attached to an already-dispatched child ────────────────
     if (ctx.childRunId) {
-      return watchAndExtract(runtimeDeps, ctx.childRunId, step.output?.schema, {
-        pollMs,
-        signal: ctx.signal,
-      });
+      const watched = await watchAndExtract(
+        runtimeDeps,
+        ctx.childRunId,
+        step.output?.schema,
+        { pollMs, signal: ctx.signal },
+      );
+      if (
+        watched.status !== "failed" ||
+        watched.errorClass !== "agent_run_failed"
+      ) {
+        return watched;
+      }
+      // STILLBORN-CHILD RECOVERY (module doc): a `failed` child is probed
+      // for the dispatch-attempt marker; only a PROVABLY undispatched child
+      // (no marker, no eve session) is replaced by a fresh dispatch — the
+      // link hook overwrites `child_run_id`. Anything less certain fails
+      // honest (the documented residual).
+      const state = await loadChildState(runtimeDeps, ctx.childRunId);
+      if (!state || !isProvablyUndispatched(state)) return watched;
+      if (state.sessionId) {
+        // The stillborn's session never reached eve; close it so an
+        // `active` eveless row cannot hold a Slack thread-key claim against
+        // the replacement dispatch (markSession releases the key).
+        await runtimeDeps.runStore.markSession(state.sessionId, "error");
+      }
+      // Fall through to phase 1: dispatch the replacement child.
     }
 
     // ── phase 1: dispatch the child run ────────────────────────────────────
+    if (ctx.signal.aborted) {
+      // A Stop landed before the dispatch — the runner discards this
+      // outcome, but returning early keeps a canceled parent from paying for
+      // agent resolution.
+      return failed("canceled", "the run was canceled before the agent step dispatched");
+    }
     if (!step.agentId) {
       return failed(
         "agent_not_bound",
@@ -485,9 +624,25 @@ export function createAgentStepExecutor(
 
     // Persisted INSIDE the dispatch's run-creation transaction (before any
     // eve call) so a crash can only ever replay into a re-attach — see the
-    // module doc's CHILD LINKING IS PRE-DISPATCH.
-    const onRunCreated = (tx: DbClient, childRun: { id: string }): Promise<void> =>
-      linkChildRun(tx, ctx.run.id, ctx.path, childRun.id);
+    // module doc's CHILD LINKING IS PRE-DISPATCH. The hook is ALSO cancel
+    // fence (a): a Stop that raced this dispatch aborts the transaction —
+    // no child row survives and nothing is dispatched.
+    const onRunCreated = async (
+      tx: DbClient,
+      childRun: { id: string },
+    ): Promise<void> => {
+      if (ctx.signal.aborted) throw stepCanceledMidDispatchError();
+      const parentStatus = await readParentStatus(tx, ctx.run.id);
+      if (
+        parentStatus === null ||
+        parentStatus === "canceled" ||
+        parentStatus === "failed" ||
+        parentStatus === "succeeded"
+      ) {
+        throw stepCanceledMidDispatchError();
+      }
+      await linkChildRun(tx, ctx.run.id, ctx.path, childRun.id);
+    };
 
     let result: DispatchRenderedRunResult;
     try {
@@ -499,26 +654,34 @@ export function createAgentStepExecutor(
             'session: "thread" needs a Slack-triggered run (no slackThreadKey on the trigger data)',
           );
         }
-        // The bare ingress key first (the common one-agent-per-thread case,
-        // and back-compat with sessions claimed before agent qualification).
-        // A holder bound to a DIFFERENT agent is never reused — the step
-        // must run on ITS agent — so the lookup/claim moves to the
-        // agent-qualified key instead (module doc, session shape).
+        // QUALIFIED-FIRST lookup (module doc, session shape): the step's own
+        // `<bareKey>:agent:<agentId>` session outlives the bare holder — a
+        // terminated bare claim must not strand it. The bare key is
+        // consulted second, reused only on agent match, and claimed fresh
+        // only when NOTHING holds it; a mismatched bare holder moves the
+        // claim to the qualified key.
+        const qualifiedKey = agentQualifiedThreadKey(threadKey, step.agentId);
         let claimKey = threadKey;
         let existing = await findThreadSession(
           runtimeDeps.db,
           ctx.orgId,
           ctx.run.workflowId,
-          threadKey,
+          qualifiedKey,
         );
-        if (existing && existing.agentId !== step.agentId) {
-          claimKey = agentQualifiedThreadKey(threadKey, step.agentId);
-          existing = await findThreadSession(
+        if (existing) {
+          claimKey = qualifiedKey;
+        } else {
+          const bare = await findThreadSession(
             runtimeDeps.db,
             ctx.orgId,
             ctx.run.workflowId,
-            claimKey,
+            threadKey,
           );
+          if (bare && bare.agentId === step.agentId) {
+            existing = bare;
+          } else if (bare) {
+            claimKey = qualifiedKey;
+          }
         }
         // Continuation runs the SESSION's pinned version (immutable —
         // republishing never migrates a live thread); a new thread claim
@@ -535,6 +698,7 @@ export function createAgentStepExecutor(
           taskMessage: parsedInput.data.instructions,
           triggerEvent: childTriggerEvent(ready, ctx.run, step.id, ctx.path, principal),
           onRunCreated,
+          signal: ctx.signal,
           ...(existing
             ? { existingSession: existing }
             : {
@@ -558,6 +722,7 @@ export function createAgentStepExecutor(
           taskMessage: parsedInput.data.instructions,
           triggerEvent: childTriggerEvent(ready, ctx.run, step.id, ctx.path, principal),
           onRunCreated,
+          signal: ctx.signal,
           eveCreate: {
             // Unconditional for fresh agent steps (amendment A3): nobody
             // watches this session in chat, so a budget crossing must fail
@@ -585,11 +750,44 @@ export function createAgentStepExecutor(
       }
       return classified;
     }
+    if (result.canceledBeforeDispatch) {
+      // A Stop landed at one of the dispatch's pre-eve fences: nothing
+      // reached eve, the child row is already canceled. The runner discards
+      // this outcome on its own cancel path anyway.
+      return failed(
+        "canceled",
+        "the run was canceled before the agent was dispatched",
+      );
+    }
     if (!result.dispatched) {
       // Run row exists and is already failed (dispatch-time allowlist).
       return failed(
         "model_disallowed_at_dispatch",
         result.run.error ?? "the agent's model is no longer allowlisted",
+      );
+    }
+
+    // CANCEL FENCE (b): the dispatch reached eve, but a Stop may have landed
+    // while it was in flight — after the link hook's in-transaction check
+    // and after the dispatch's own pre-eve fences. The runner has abandoned
+    // this executor promise in that case (the cancel route's child snapshot
+    // may also have missed the just-linked child), so the CHILD must be
+    // chased from here: cancel it through the ordinary cancel path (row CAS
+    // + best-effort remote eve cancel). Idempotent against the route's own
+    // cancelChildRun.
+    const stopped =
+      ctx.signal.aborted ||
+      (await runtimeDeps.runStore.getRunStatus(ctx.run.id))?.status ===
+        "canceled";
+    if (stopped) {
+      await cancelChild(
+        runtimeDeps,
+        result.run.id,
+        "parent pipeline run canceled: stopped during the agent dispatch",
+      );
+      return failed(
+        "canceled",
+        "the run was canceled while the agent step dispatched",
       );
     }
 
@@ -669,6 +867,22 @@ function childTriggerEvent(
     data: { parentRunId: run.id, stepId, path },
     principal,
   };
+}
+
+/**
+ * Thrown from the link hook INSIDE the dispatch transaction when a Stop
+ * raced the dispatch (cancel fence a) — aborting the transaction, so no
+ * child row survives and nothing is dispatched. Tagged so the executor's
+ * catch classifies it `canceled` (the runner discards the outcome on its own
+ * cancel path anyway).
+ */
+function stepCanceledMidDispatchError(): Error {
+  return Object.assign(
+    new Error(
+      "the parent pipeline run was canceled before the agent step could dispatch",
+    ),
+    { stepErrorClass: "canceled" },
+  );
 }
 
 function failed(errorClass: string, error: string): StepOutcome {

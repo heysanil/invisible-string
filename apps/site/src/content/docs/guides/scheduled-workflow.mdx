@@ -52,7 +52,7 @@ Ticks missed while the platform is down are skipped, not queued up and replayed.
 
 ## Test without waiting
 
-Open the header's **Run** popover and press **Fire now** to dispatch immediately, exactly as the ticker would — with no payload, since a schedule trigger carries none. The pipeline pane overlays live per-step progress, and **View run** opens the full timeline in the Runs tab: each step's rendered input and output, per-iteration instances under the loop, and the state write at the end.
+Open the header's **Run** popover and press **Fire now** to dispatch immediately through the same pipeline path the ticker uses. One small difference: a real tick stamps `trigger.scheduledFor` (the fired window) into the trigger data, while a manual fire carries an empty payload — so a pipeline that references `@trigger.scheduledFor` sees "(not provided)" on manual runs. The pipeline pane overlays live per-step progress, and **View run** opens the full timeline in the Runs tab: each step's rendered input and output, per-iteration instances under the loop, and the state write at the end.
 
 ## If it doesn't work
 

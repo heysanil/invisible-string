@@ -63,7 +63,7 @@ import { resolveWorkspace, workspacePlugin } from "../workspace";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { startPipelineRun } from "../pipeline/runner";
 import {
-  findSlackThreadSession,
+  isKnownSlackThread,
   PIPELINE_TRIGGER_AGENT_ID,
   resolveEnabledPipeline,
   slackThreadKey,
@@ -785,15 +785,20 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       // thread that already has a claimed session (an `agent` step's
       // `session: "thread"` child) dispatches REGARDLESS of the binding
       // (thread replies continue conversations); a fresh thread must pass
-      // the binding gate. The agent step, not this router, resolves the
-      // session and continues the eve thread.
-      const existingSession = await findSlackThreadSession(
+      // the binding gate. "Known" means ANY continuable session under the
+      // bare key OR an agent-qualified derivative (`<bareKey>:agent:<id>`)
+      // — once a bare holder terminates and releases its claim, a qualified
+      // session may still carry the conversation, and a bare-key-only check
+      // would silently drop every unmentioned reply in that thread. The
+      // agent step, not this router, resolves the exact session and
+      // continues the eve thread.
+      const threadKnown = await isKnownSlackThread(
         db,
         workflow.organizationId,
         workflow.id,
         threadKey,
       );
-      if (!existingSession && !shouldStartNewSlackSession(event, binding)) {
+      if (!threadKnown && !shouldStartNewSlackSession(event, binding)) {
         continue; // new thread that this binding does not start on
       }
 
@@ -823,7 +828,7 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       logger.info("trigger.received", {
         workspaceId: workflow.organizationId,
         workflowId: workflow.id,
-        fields: { source: "slack", threadContinuation: existingSession != null },
+        fields: { source: "slack", threadContinuation: threadKnown },
       });
       runtime.metrics.recordTrigger("slack", "received");
       try {

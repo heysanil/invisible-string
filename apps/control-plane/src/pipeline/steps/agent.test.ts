@@ -323,11 +323,23 @@ function harness(): Harness {
 }
 
 /**
- * Chainable drizzle-shaped tx stub, so the DEFAULT `linkChildRunToStep`
- * survives fake dispatches that mirror the real hook invocation.
+ * Chainable drizzle-shaped tx stub, so the DEFAULT `linkChildRunToStep` and
+ * the link hook's DEFAULT parent-status re-read both survive fake dispatches
+ * that mirror the real hook invocation. The select chain answers the parent
+ * run's status (`"running"` unless overridden — the live-parent case).
  */
-function fakeTx(returningRows: Array<{ id: string }> = [{ id: "rs_row" }]): DbClient {
+function fakeTx(
+  returningRows: Array<{ id: string }> = [{ id: "rs_row" }],
+  parentStatus: string | null = "running",
+): DbClient {
   return {
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          limit: async () => (parentStatus === null ? [] : [{ status: parentStatus }]),
+        }),
+      }),
+    }),
     update: () => ({
       set: () => ({
         where: () => ({ returning: async () => returningRows }),
@@ -339,6 +351,7 @@ function fakeTx(returningRows: Array<{ id: string }> = [{ id: "rs_row" }]): DbCl
 function fakeDispatch(
   h: Harness,
   result?: Partial<DispatchRenderedRunResult>,
+  opts: { tx?: DbClient; beforeHook?: () => void; afterHook?: () => void } = {},
 ): (deps: RuntimeDeps, input: DispatchRenderedRunInput) => Promise<DispatchRenderedRunResult> {
   return async (_deps, input) => {
     h.dispatches.push(input);
@@ -352,7 +365,9 @@ function fakeDispatch(
     // Mirror the real dispatch: the run-creation TRANSACTION invokes
     // onRunCreated after inserting the run row, strictly before any eve
     // call — the executor's child linkage must ride it.
-    await input.onRunCreated?.(fakeTx(), run);
+    opts.beforeHook?.();
+    await input.onRunCreated?.(opts.tx ?? fakeTx(), run);
+    opts.afterHook?.();
     h.store.setStatus(run.id, "queued");
     return {
       session: { id: "session-1" } as never,
@@ -597,19 +612,25 @@ describe("linkChildRunToStep", () => {
 describe("agent step executor (thread sessions)", () => {
   const THREAD_KEY = "integ-1:C1:1720.0";
 
-  test("continues the EXISTING thread session on its PINNED version, no task mode", async () => {
+  test("continues the EXISTING bare-key thread session on its PINNED version (agent match), no task mode", async () => {
     const h = harness();
     // The holder's agent matches the step's binding — the reuse condition.
+    // Key-aware fake: the session holds the BARE key only, so the executor's
+    // qualified-first probe misses and the bare fallback reuses it.
     const existing = {
       id: "sess-thread",
       agentId: AGENT_ID,
       agentVersionId: "pinned-v",
     } as never;
+    const lookups: string[] = [];
     let pinnedAsked = "";
     const executor = createAgentStepExecutor({
       pollMs: 5,
       dispatchImpl: fakeDispatch(h),
-      findThreadSessionImpl: async () => existing,
+      findThreadSessionImpl: async (_db, _org, _wf, key) => {
+        lookups.push(key);
+        return key === THREAD_KEY ? existing : null;
+      },
       requireReadyVersionImpl: async (_deps, versionId) => {
         pinnedAsked = versionId;
         return readyVersion();
@@ -624,6 +645,10 @@ describe("agent step executor (thread sessions)", () => {
     );
     expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
     expect(pinnedAsked).toBe("pinned-v");
+    expect(lookups).toEqual([
+      agentQualifiedThreadKey(THREAD_KEY, AGENT_ID),
+      THREAD_KEY,
+    ]);
     const dispatched = h.dispatches[0]!;
     expect(dispatched.existingSession).toBe(existing);
     expect(dispatched.eveCreate).toBeUndefined();
@@ -699,7 +724,9 @@ describe("agent step executor (thread sessions)", () => {
     );
     expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
     const qualified = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
-    expect(lookups).toEqual([THREAD_KEY, qualified]);
+    // QUALIFIED-FIRST: the step's own derivative claim is probed before the
+    // bare ingress key.
+    expect(lookups).toEqual([qualified, THREAD_KEY]);
     const dispatched = h.dispatches[0]!;
     // The step runs on ITS agent's CURRENT version, in a fresh session
     // claimed under the qualified key (unique index respected)…
@@ -749,6 +776,52 @@ describe("agent step executor (thread sessions)", () => {
     expect(dispatched.newSessionSlackThreadKey).toBeUndefined();
   });
 
+  // ── F2: a terminated bare holder must not strand the qualified session ───
+
+  test("terminated bare holder: the step's own QUALIFIED session is found FIRST and continued (no fresh bare session)", async () => {
+    const h = harness();
+    const qualified = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
+    const ownSession = {
+      id: "sess-own-agent",
+      agentId: AGENT_ID,
+      agentVersionId: "own-pinned-v",
+    } as never;
+    const lookups: string[] = [];
+    let pinnedAsked = "";
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      findThreadSessionImpl: async (_db, _org, _wf, key) => {
+        lookups.push(key);
+        // The bare holder TERMINATED and released its claim (returns null);
+        // only the qualified session survives. The old bare-key-first
+        // lookup found nothing and minted a NEW bare session, stranding the
+        // qualified session's history.
+        return key === qualified ? ownSession : null;
+      },
+      requireReadyVersionImpl: async (_deps, versionId) => {
+        pinnedAsked = versionId;
+        return readyVersion();
+      },
+      resolveReadyAgentImpl: async () => {
+        throw new Error("must continue the qualified session, not mint a new one");
+      },
+      loadParentTriggerEventImpl: async () =>
+        parentEvent({ triggerType: "slack", data: { slackThreadKey: THREAD_KEY } }),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep({ session: "thread" }), {
+        trigger: { slackThreadKey: THREAD_KEY },
+      }),
+    );
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    expect(lookups).toEqual([qualified]); // qualified hit — bare never consulted
+    expect(pinnedAsked).toBe("own-pinned-v");
+    const dispatched = h.dispatches[0]!;
+    expect(dispatched.existingSession).toBe(ownSession);
+    expect(dispatched.newSessionSlackThreadKey).toBeUndefined();
+  });
+
   test("agentQualifiedThreadKey can never parse as a bare Slack reply key (delivery safety)", () => {
     const key = agentQualifiedThreadKey(THREAD_KEY, AGENT_ID);
     expect(key).toBe(`${THREAD_KEY}:agent:${AGENT_ID}`);
@@ -756,5 +829,247 @@ describe("agent step executor (thread sessions)", () => {
     // key must fail loudly rather than silently mis-target a channel/ts.
     expect(parseSlackThreadKey(key)).toBeNull();
     expect(parseSlackThreadKey(THREAD_KEY)).not.toBeNull();
+  });
+});
+
+// ── NEW-1: Stop racing the dispatch (both fences) ───────────────────────────
+
+describe("agent step cancel fences", () => {
+  test("fence (a): signal aborted before the link hook → transaction aborted, NO child linked, NO dispatch survives", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const links: string[] = [];
+    const cancels: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      // The Stop lands while the dispatch transaction is open, before the
+      // hook runs — the hook must throw, aborting the transaction.
+      dispatchImpl: fakeDispatch(h, undefined, {
+        beforeHook: () => controller.abort(),
+      }),
+      linkChildRunImpl: async (_tx, _run, _path, childRunId) => {
+        links.push(childRunId);
+      },
+      cancelChildRunImpl: async (_deps, childRunId) => {
+        cancels.push(childRunId);
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep(), { signal: controller.signal }),
+    );
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "canceled",
+      retryable: false,
+    });
+    expect(links).toEqual([]); // the transaction aborted — no link, no child
+    expect(cancels).toEqual([]); // nothing dispatched — nothing to chase
+  });
+
+  test("fence (a): a parent already settled canceled aborts the link hook the same way", async () => {
+    const h = harness();
+    const links: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      // The route's direct CAS (no live driver) settled the parent before
+      // the hook's in-transaction re-read.
+      dispatchImpl: fakeDispatch(h, undefined, {
+        tx: fakeTx([{ id: "rs_row" }], "canceled"),
+      }),
+      linkChildRunImpl: async (_tx, _run, _path, childRunId) => {
+        links.push(childRunId);
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(h.ctx(agentStep()));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "canceled" });
+    expect(links).toEqual([]);
+  });
+
+  test("fence (b): Stop lands AFTER the link — the just-dispatched child is canceled through the cancel path", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const links: string[] = [];
+    const cancels: Array<{ childRunId: string; reason: string }> = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      // The link committed and the eve call went out; the Stop lands before
+      // the dispatch returns (the runner has abandoned this promise — the
+      // executor itself must chase the child).
+      dispatchImpl: fakeDispatch(h, undefined, {
+        afterHook: () => controller.abort(),
+      }),
+      linkChildRunImpl: async (_tx, _run, _path, childRunId) => {
+        links.push(childRunId);
+      },
+      cancelChildRunImpl: async (_deps, childRunId, reason) => {
+        cancels.push({ childRunId, reason });
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep(), { signal: controller.signal }),
+    );
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "canceled" });
+    expect(links).toEqual(["child-run-1"]); // linked before the Stop
+    expect(cancels).toHaveLength(1); // …so the child is chased, not orphaned
+    expect(cancels[0]!.childRunId).toBe("child-run-1");
+  });
+
+  test("fence (b): a parent row settled canceled mid-dispatch is caught by the status re-check too", async () => {
+    const h = harness();
+    const cancels: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h, undefined, {
+        // The cancel route CAS'd the parent while the eve call was in
+        // flight — no signal abort reached this executor (no live driver).
+        afterHook: () => h.store.setStatus("parent-run", "canceled"),
+      }),
+      cancelChildRunImpl: async (_deps, childRunId) => {
+        cancels.push(childRunId);
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(h.ctx(agentStep()));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "canceled" });
+    expect(cancels).toEqual(["child-run-1"]);
+  });
+
+  test("the dispatch's own pre-eve fence (canceledBeforeDispatch) classifies canceled and chases nothing", async () => {
+    const h = harness();
+    const cancels: string[] = [];
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: async (_deps, input) => {
+        h.dispatches.push(input);
+        return {
+          session: { id: "session-1" } as never,
+          run: makeRunRow({ id: "child-run-1", status: "canceled" }),
+          dispatched: false,
+          canceledBeforeDispatch: true,
+        };
+      },
+      cancelChildRunImpl: async (_deps, childRunId) => {
+        cancels.push(childRunId);
+      },
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(h.ctx(agentStep()));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "canceled" });
+    expect(cancels).toEqual([]); // nothing reached eve — nothing to cancel
+  });
+});
+
+// ── F1: stillborn-child recovery (crash before the eve create) ──────────────
+
+describe("agent step stillborn-child recovery", () => {
+  test("a failed child that PROVABLY never dispatched (no marker, no eve id) is replaced by a fresh dispatch", async () => {
+    const h = harness();
+    // Boot reconciliation swept the crashed child to `failed`; the
+    // dispatch-attempt marker was never written and no eve session exists.
+    h.store.setStatus("stillborn-child", "failed", "control plane restarted");
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      loadChildDispatchStateImpl: async () => ({
+        status: "failed",
+        startedAt: null,
+        eveSessionId: null,
+        sessionId: "stillborn-session",
+      }),
+      resolveReadyAgentImpl: async () => readyVersion(),
+      loadParentTriggerEventImpl: async () => parentEvent(),
+    });
+    const outcome = await executor(
+      h.ctx(agentStep(), { childRunId: "stillborn-child" }),
+    );
+    // Phase 1 ran again: a REPLACEMENT child was dispatched and the step
+    // parks on it (the link hook overwrote child_run_id).
+    expect(outcome).toEqual({ status: "waiting", childRunId: "child-run-1" });
+    expect(h.dispatches).toHaveLength(1);
+    // The stillborn's session was closed (releases any thread-key claim).
+    expect(h.store.sessionMarks).toEqual([
+      { sessionId: "stillborn-session", status: "error" },
+    ]);
+  });
+
+  test("a failed child WITH the dispatch-attempt marker fails honest (may have reached eve — never re-dispatch)", async () => {
+    const h = harness();
+    h.store.setStatus("child-x", "failed", "control plane restarted");
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      loadChildDispatchStateImpl: async () => ({
+        status: "failed",
+        startedAt: new Date(), // marker written — the create MAY have been issued
+        eveSessionId: null,
+        sessionId: "sess-x",
+      }),
+    });
+    const outcome = await executor(h.ctx(agentStep(), { childRunId: "child-x" }));
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "agent_run_failed",
+      retryable: false,
+    });
+    expect(h.dispatches).toHaveLength(0); // NEVER a second dispatch
+    expect(h.store.sessionMarks).toEqual([]);
+  });
+
+  test("a failed child with a persisted eve session id fails honest too", async () => {
+    const h = harness();
+    h.store.setStatus("child-y", "failed", "model exploded");
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      loadChildDispatchStateImpl: async () => ({
+        status: "failed",
+        startedAt: new Date(),
+        eveSessionId: "eve-123",
+        sessionId: "sess-y",
+      }),
+    });
+    const outcome = await executor(h.ctx(agentStep(), { childRunId: "child-y" }));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "agent_run_failed" });
+    expect(h.dispatches).toHaveLength(0);
+  });
+
+  test("an unknowable dispatch state (no db on the deps graph) fails honest — fail-safe, never re-dispatch", async () => {
+    const h = harness();
+    h.store.setStatus("child-z", "failed", "restarted");
+    // DEFAULT loader: the harness deps carry no db → null → not provably
+    // undispatched.
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+    });
+    const outcome = await executor(h.ctx(agentStep(), { childRunId: "child-z" }));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "agent_run_failed" });
+    expect(h.dispatches).toHaveLength(0);
+  });
+
+  test("a CANCELED child is never resurrected by the stillborn probe", async () => {
+    const h = harness();
+    h.store.setStatus("child-c", "canceled", "user stopped it");
+    const executor = createAgentStepExecutor({
+      pollMs: 5,
+      dispatchImpl: fakeDispatch(h),
+      loadChildDispatchStateImpl: async () => ({
+        status: "canceled",
+        startedAt: null,
+        eveSessionId: null,
+        sessionId: "sess-c",
+      }),
+    });
+    const outcome = await executor(h.ctx(agentStep(), { childRunId: "child-c" }));
+    expect(outcome).toMatchObject({ status: "failed", errorClass: "agent_run_canceled" });
+    expect(h.dispatches).toHaveLength(0);
   });
 });

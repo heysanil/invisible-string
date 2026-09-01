@@ -55,9 +55,13 @@ retried by default, so its side effect can land twice across a crash — the
 same at-least-once stance as Slack reply delivery. A tool step configured
 as at-most-once fails as *interrupted* instead of risking the double fire —
 the honest option for a side effect that must not repeat. An interrupted
-agent step doesn't re-dispatch at all: its child run was linked before
-anything was sent, so recovery re-attaches to the child and keeps waiting on
-it.
+agent step re-attaches rather than re-dispatching: its child run was linked
+before anything was sent, so recovery finds the child and keeps waiting on
+it. When the crash provably landed *before* the dispatch ever left the
+platform, recovery replaces the stillborn child with a fresh dispatch; in
+the one narrow window where that can't be proven, the step fails honestly
+instead of risking a duplicate agent turn — at-most-once, the same stance
+as an at-most-once tool step.
 
 ## A failover, narrated
 

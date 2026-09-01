@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  agentQualifiedThreadKeyPrefix,
+  armDispatchAttempt,
   isModelAllowlisted,
+  isProvablyUndispatched,
   publishedPipelineConfigOf,
   resolveEnabledPipeline,
   slackThreadKey,
 } from "./dispatch";
 import { mapIngressBody, shouldStartNewSlackSession } from "../integrations/routes";
 import { isRuntimeApiError } from "./errors";
+import { createMemoryRunStore } from "../pipeline/test-support";
 import {
   newStepId,
   type SlackInnerEvent,
@@ -43,6 +47,65 @@ describe("slackThreadKey", () => {
   test("namespaces thread_ts by integration + channel", () => {
     expect(slackThreadKey("int-1", "C1", "1.0")).toBe("int-1:C1:1.0");
     expect(slackThreadKey("int-1", "C2", "1.0")).not.toBe(slackThreadKey("int-1", "C1", "1.0"));
+  });
+
+  test("agentQualifiedThreadKeyPrefix derives the per-agent claim namespace (never a bare-key collision)", () => {
+    const bare = slackThreadKey("int-1", "C1", "1.0");
+    expect(agentQualifiedThreadKeyPrefix(bare)).toBe("int-1:C1:1.0:agent:");
+    // A qualified derivative can never equal any bare key: bare keys have
+    // exactly two colons, derivatives at least four.
+    expect(agentQualifiedThreadKeyPrefix(bare).split(":").length).toBeGreaterThan(3);
+  });
+});
+
+// ── F1: dispatch-attempt marker + stillborn classification ──────────────────
+
+describe("armDispatchAttempt (marker + pre-eve cancel fence)", () => {
+  test("arms a queued run: startedAt is CAS-written while the status stays queued", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "queued");
+    const at = new Date("2026-09-01T00:00:00Z");
+    expect(await armDispatchAttempt(store, "run-1", at)).toBe("armed");
+    expect(store.statusLog).toHaveLength(1);
+    expect(store.statusLog[0]).toMatchObject({
+      runId: "run-1",
+      patch: { status: "queued", startedAt: at },
+    });
+  });
+
+  test("a run the cancel route already settled refuses the marker → 'canceled' (the dispatch abandons)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "canceled", "canceled by user");
+    expect(await armDispatchAttempt(store, "run-1")).toBe("canceled");
+    expect(store.statusLog).toHaveLength(0); // the CAS never wrote
+  });
+
+  test("any other terminal status reads 'terminal' (equally not dispatchable)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "failed", "swept");
+    expect(await armDispatchAttempt(store, "run-1")).toBe("terminal");
+  });
+});
+
+describe("isProvablyUndispatched (stillborn-child classification)", () => {
+  const base = { status: "failed" as const, startedAt: null, eveSessionId: null };
+
+  test("failed + no marker + no eve session id → provably undispatched (safe to re-dispatch)", () => {
+    expect(isProvablyUndispatched(base)).toBe(true);
+  });
+
+  test("the marker alone flips it — the create MAY have been issued (fail honest)", () => {
+    expect(isProvablyUndispatched({ ...base, startedAt: new Date() })).toBe(false);
+  });
+
+  test("a persisted eve session id flips it — eve definitely saw the create", () => {
+    expect(isProvablyUndispatched({ ...base, eveSessionId: "eve-1" })).toBe(false);
+  });
+
+  test("non-failed statuses are never stillborn (canceled stays canceled; live runs are watched)", () => {
+    for (const status of ["queued", "running", "waiting", "succeeded", "canceled"] as const) {
+      expect(isProvablyUndispatched({ ...base, status })).toBe(false);
+    }
   });
 });
 

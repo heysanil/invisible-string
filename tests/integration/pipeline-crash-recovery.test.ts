@@ -22,6 +22,14 @@
  *   5. the contrast case: an interrupted `at_least_once` tool step RETRIES on
  *      recovery (call count 2, ledger attempt 2) and the run fully succeeds —
  *      the runs/delivery.ts at-least-once stance.
+ *   6. snapshot fidelity: a for_each over `@state.items` whose collection is
+ *      MUTATED between crash and recovery still finishes on the ORIGINAL
+ *      items — the loop row's persisted input snapshot is replayed verbatim,
+ *      never a re-resolve (no mixed-array processing).
+ *   7. budget fidelity: rebooting under an exactly-consumed
+ *      `maxExecutedStepsPerRun` completes — the seed counts only TERMINAL
+ *      non-skipped rows, and each interrupted instance is charged once, at
+ *      its re-execution (no double count, no spurious `step_budget_exceeded`).
  *
  * Gated on TEST_DATABASE_URL (the AGENTS.md DB-gated lane). Shares the plain
  * test database like the other control-plane DB-gated suites: rows live
@@ -32,7 +40,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 
-import { and, eq, gte } from "drizzle-orm";
+import { and, eq, gte, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   newId,
@@ -53,6 +61,7 @@ import {
   createPipelineRunner,
   startPipelineRun,
   type PipelineRunner,
+  type PipelineRunnerConfig,
 } from "../../apps/control-plane/src/pipeline/runner";
 import { recoverPipelineRuns } from "../../apps/control-plane/src/pipeline/recovery";
 import {
@@ -154,8 +163,15 @@ function startStubMcp(tools: Record<string, BlockingTool>): { url: string; stop(
 describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps ledger", () => {
   const atMostOnceTool = blockingTool(2);
   const atLeastOnceTool = blockingTool(1);
+  const snapshotTool = blockingTool(11); // blocks on item VALUE idx 11
+  const budgetTool = blockingTool(2);
   const mcp = GATE
-    ? startStubMcp({ record_amo: atMostOnceTool, record_alo: atLeastOnceTool })
+    ? startStubMcp({
+        record_amo: atMostOnceTool,
+        record_alo: atLeastOnceTool,
+        record_snap: snapshotTool,
+        record_budget: budgetTool,
+      })
     : null!;
 
   let handle: DbHandle;
@@ -163,7 +179,9 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
   let connectionId: string;
   const bus = new RunEventBus();
 
-  function makeRunner(): PipelineRunner {
+  function makeRunner(
+    configOver: Partial<PipelineRunnerConfig> = {},
+  ): PipelineRunner {
     return createPipelineRunner({
       db: handle.db,
       runStore: createDrizzleRunStore(handle.db),
@@ -183,16 +201,18 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
         maxExecutedStepsPerRun: 200,
         maxStepOutputBytes: 262_144,
         childPollMs: 100,
+        ...configOver,
       },
       workspaceRunCap: 10,
     });
   }
 
-  /** A for_each(record tool) → state pipeline over `@trigger.items`. */
+  /** A for_each(record tool) → state pipeline over `itemsRef`. */
   function crashConfig(
     tool: string,
     sideEffect: "at_least_once" | "at_most_once",
     ids: { loop: string; record: string; wrap: string },
+    itemsRef = "trigger.items",
   ): WorkflowConfig {
     return workflowConfigSchema.parse({
       version: 2,
@@ -202,7 +222,7 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
           id: ids.loop,
           slug: "fanout",
           kind: "for_each",
-          items: { $ref: "trigger.items" },
+          items: { $ref: itemsRef },
           maxItems: 10,
           onItemError: "continue",
           steps: [
@@ -311,6 +331,8 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
     // Unblock any still-hung stub handler, then cascade the suite's rows away.
     atMostOnceTool.gate.resolve();
     atLeastOnceTool.gate.resolve();
+    snapshotTool.gate.resolve();
+    budgetTool.gate.resolve();
     mcp?.stop();
     await handle?.db
       .delete(schema.organization)
@@ -513,6 +535,165 @@ describe.skipIf(!GATE)("pipeline crash recovery — resume from the run_steps le
         [4, 1],
       ]);
 
+      const state = await handle.db
+        .select()
+        .from(schema.workflowState)
+        .where(eq(schema.workflowState.workflowId, workflowId));
+      expect(state[0]).toMatchObject({ key: "succeeded", value: 5 });
+    },
+    60_000,
+  );
+
+  test(
+    "a resumed for_each replays its PERSISTED items snapshot even after the state collection MOVED",
+    async () => {
+      const ids = { loop: newStepId(), record: newStepId(), wrap: newStepId() };
+      const config = crashConfig("record_snap", "at_least_once", ids, "state.items");
+      const workflowId = await insertWorkflow(config);
+      // The collection lives in WORKFLOW STATE — the one scope source that
+      // can move underneath a crashed run (trigger data is frozen on the
+      // run row; step outputs replay from the ledger).
+      const originalItems = [{ idx: 10 }, { idx: 11 }, { idx: 12 }];
+      await handle.db.insert(schema.workflowState).values({
+        workflowId,
+        key: "items",
+        value: sql`${JSON.stringify(originalItems)}::jsonb`,
+        organizationId: orgId,
+      });
+
+      const runner1 = makeRunner();
+      const started = await startPipelineRun(runner1, {
+        organizationId: orgId,
+        workflow: { id: workflowId, config },
+        triggerEvent: triggerEventFor(workflowId),
+        origin: "webhook",
+      });
+      expect(started.started).toBeTrue();
+      const runId = (started as { run: { id: string } }).run.id;
+
+      await snapshotTool.entered.promise; // item idx 11 blocked mid-call
+      await runner1.stopAll();
+
+      // The crash left the loop row holding the RESOLVED items snapshot.
+      const midLedger = await ledgerRows(runId);
+      expect(midLedger.get(ids.loop)!.status).toBe("running");
+      expect(midLedger.get(ids.loop)!.input).toEqual({
+        itemsRef: "state.items",
+        count: 3,
+        items: originalItems,
+      });
+
+      // The state array MOVES between crash and recovery (a concurrent
+      // overlap:"allow" run, an operator edit): a re-resolve on reboot would
+      // combine item 0 of the OLD array with the tail of the NEW one.
+      const movedItems = [{ idx: 90 }, { idx: 91 }, { idx: 92 }, { idx: 93 }];
+      await handle.db
+        .update(schema.workflowState)
+        .set({ value: sql`${JSON.stringify(movedItems)}::jsonb` })
+        .where(
+          and(
+            eq(schema.workflowState.workflowId, workflowId),
+            eq(schema.workflowState.key, "items"),
+          ),
+        );
+
+      const runner2 = makeRunner();
+      const outcome = await recoverRun(runner2, runId);
+      expect(outcome).toEqual({ resumed: 1, locked: 0, failed: 0 });
+      await runner2.handles.get(runId)?.done;
+
+      // The loop finished on the ORIGINAL items: idx 10 adopted (1 call),
+      // idx 11 retried (the at-least-once crash window, 2 calls), idx 12
+      // fresh (1 call) — and NO call ever saw the moved array's values.
+      expect((await runRow(runId)).status).toBe("succeeded");
+      expect(
+        [...snapshotTool.counts.entries()].sort((a, b) => a[0] - b[0]),
+      ).toEqual([
+        [10, 1],
+        [11, 2],
+        [12, 1],
+      ]);
+      const ledger = await ledgerRows(runId);
+      expect(ledger.size).toBe(5); // loop + the snapshot's 3 items + state
+      expect(ledger.get(ids.loop)!.output).toMatchObject({
+        total: 3,
+        succeeded: 3,
+        failed: 0,
+        skipped: 0,
+      });
+      // The snapshot survived the resume untouched.
+      expect(ledger.get(ids.loop)!.input).toEqual({
+        itemsRef: "state.items",
+        count: 3,
+        items: originalItems,
+      });
+      const state = await handle.db
+        .select()
+        .from(schema.workflowState)
+        .where(
+          and(
+            eq(schema.workflowState.workflowId, workflowId),
+            eq(schema.workflowState.key, "succeeded"),
+          ),
+        );
+      expect(state[0]).toMatchObject({ key: "succeeded", value: 3 });
+    },
+    60_000,
+  );
+
+  test(
+    "recovery under an EXACTLY-consumed step budget: terminal rows seed it once, the interrupted instance re-counts only at its retry",
+    async () => {
+      const ids = { loop: newStepId(), record: newStepId(), wrap: newStepId() };
+      const config = crashConfig("record_budget", "at_least_once", ids);
+      const workflowId = await insertWorkflow(config);
+
+      const runner1 = makeRunner();
+      const started = await startPipelineRun(runner1, {
+        organizationId: orgId,
+        workflow: { id: workflowId, config },
+        triggerEvent: triggerEventFor(workflowId),
+        origin: "webhook",
+      });
+      expect(started.started).toBeTrue();
+      const runId = (started as { run: { id: string } }).run.id;
+
+      await budgetTool.entered.promise; // item 2 blocked mid-call
+      await runner1.stopAll();
+
+      // The whole pipeline is exactly 7 instances (loop + 5 items + state).
+      // Rebooting with that exact budget must still complete: the seed
+      // counts only the 2 TERMINAL rows (items 0–1), the interrupted loop
+      // and item-2 rows are charged once each at their re-execution, and
+      // the fresh frontier (items 3–4, state) fills the rest — a seed that
+      // also counted the two interrupted rows would burst the budget and
+      // fail recovery `step_budget_exceeded` spuriously.
+      const runner2 = makeRunner({ maxExecutedStepsPerRun: 7 });
+      const outcome = await recoverRun(runner2, runId);
+      expect(outcome).toEqual({ resumed: 1, locked: 0, failed: 0 });
+      await runner2.handles.get(runId)?.done;
+
+      const finalRun = await runRow(runId);
+      expect(finalRun.status).toBe("succeeded");
+      expect(finalRun.error).toBeNull();
+      const ledger = await ledgerRows(runId);
+      expect(ledger.size).toBe(7);
+      expect(ledger.get(ids.loop)!.output).toMatchObject({
+        total: 5,
+        succeeded: 5,
+        failed: 0,
+        skipped: 0,
+      });
+      // Item 2 retried (at-least-once), everything else ran exactly once.
+      expect(
+        [...budgetTool.counts.entries()].sort((a, b) => a[0] - b[0]),
+      ).toEqual([
+        [0, 1],
+        [1, 1],
+        [2, 2],
+        [3, 1],
+        [4, 1],
+      ]);
       const state = await handle.db
         .select()
         .from(schema.workflowState)

@@ -79,7 +79,12 @@ export interface RunStore {
    * session can never continue its Slack thread (findSlackThreadSession skips
    * it), so keeping the key would permanently block the partial unique index
    * slot — every later message in that thread would 409 `session_busy` and be
-   * silently dropped, with no recovery path.
+   * silently dropped, with no recovery path. The release covers BOTH key
+   * shapes — the bare ingress key and an agent-qualified derivative
+   * (`<bareKey>:agent:<agentId>`, pipeline/steps/agent.ts) — the column is
+   * simply nulled either way. Note the thread stays KNOWN to the Slack
+   * ingress while any OTHER continuable session (bare or qualified) survives
+   * (`isKnownSlackThread`, runtime/dispatch.ts).
    *
    * Under eve 0.31 that status-driven release is NO LONGER SUFFICIENT on its
    * own: eve's truth can diverge from this column indefinitely (a 30-day

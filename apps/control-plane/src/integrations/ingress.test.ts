@@ -118,6 +118,12 @@ class FakeWorker {
   readonly ensureCalls: EnsureCall[] = [];
   /** Every task message that opened or continued an eve session. */
   readonly sessionMessages: SessionMessage[] = [];
+  /**
+   * When set, ensure-agent records its call and then PARKS until the gate
+   * resolves — a deterministic window for a cancel to race the dispatch
+   * (the marker fence test). Cleared between tests.
+   */
+  ensureGate: Promise<void> | null = null;
   private server: ReturnType<typeof Bun.serve> | null = null;
   private counter = 0;
 
@@ -211,6 +217,9 @@ class FakeWorker {
       }
       const body = (await req.json()) as { versionHash: string; env: Record<string, string> };
       this.ensureCalls.push({ hash: body.versionHash, env: body.env });
+      // Recorded FIRST so a test can observe "the dispatch reached ensure",
+      // then parked while the gate is held (a cold agent boot in miniature).
+      if (this.ensureGate) await this.ensureGate;
       return Response.json({ ok: true });
     }
 
@@ -461,6 +470,8 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       instructions?: string;
       session?: AgentStepSession;
       onCompleteTemplate?: string;
+      /** Bind the step to a different published agent (default: the suite's). */
+      agentId?: string;
     } = {},
   ): Promise<string> {
     const session: AgentStepSession =
@@ -473,7 +484,7 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
           id: newStepId(),
           slug: "reply",
           kind: "agent",
-          agentId,
+          agentId: options.agentId ?? agentId,
           instructions: {
             markdown: options.instructions ?? "Be helpful. @trigger.repo",
           },
@@ -788,6 +799,76 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
     const again = await api("POST", `/runs/${ack.runId}/cancel`, { cookie: ownerCookie, body: {} });
     expect(((await again.json()) as { run: RunDto }).run.status).toBe("canceled");
   });
+
+  test("run cancel racing the dispatch: a Stop during the agent boot is fenced at the marker — NOTHING reaches eve", async () => {
+    // The dispatch parks on a gated ensure-agent (a cold boot in miniature);
+    // the Stop lands while it is parked. The cancel route's post-cancel
+    // child sweep cancels the just-linked child, and when the boot releases,
+    // the dispatch's marker CAS refuses (run already canceled) — no eve
+    // session is ever created for a canceled parent, and the eveless child
+    // session is closed rather than left holding state.
+    const wfId = await createWorkflow(
+      "Cancel Race WF",
+      { type: "webhook" },
+      { instructions: "CANCELRACE @trigger.repo" },
+    );
+    const minted = await mintToken(wfId);
+    let release!: () => void;
+    worker.ensureGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let ack: { runId: string };
+    let childId: string;
+    try {
+      const beforeEnsures = worker.ensureCalls.length;
+      const res = await api("POST", `/t/${minted.token}`, {
+        rawBody: JSON.stringify({ repo: "race" }),
+      });
+      expect(res.status).toBe(202);
+      ack = (await res.json()) as { runId: string };
+
+      // The child link commits BEFORE any eve interaction; then the dispatch
+      // parks on the gated ensure — a deterministic cancel window.
+      childId = await until(async () => {
+        const steps = await db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, ack.runId));
+        return steps[0]?.childRunId ?? undefined;
+      }, "child linked pre-dispatch");
+      await until(
+        async () => (worker.ensureCalls.length > beforeEnsures ? true : undefined),
+        "dispatch parked on ensure",
+      );
+
+      const cancel = await api("POST", `/runs/${ack.runId}/cancel`, {
+        cookie: ownerCookie,
+        body: { reason: "stop the race" },
+      });
+      expect(cancel.status).toBe(200);
+
+      // The route's post-cancel sweep (all linked children) cancels the
+      // child immediately — it does not wait for the parked dispatch.
+      await until(async () => {
+        const r = await db.select().from(schema.runs).where(eq(schema.runs.id, childId));
+        return r[0]?.status === "canceled" ? r[0] : undefined;
+      }, "child canceled while the dispatch is still parked");
+    } finally {
+      worker.ensureGate = null;
+      release();
+    }
+
+    // The released dispatch hits the marker fence and abandons: the child's
+    // session never gets an eve session and is CLOSED (releasing any claim).
+    const session = await until(async () => {
+      const rows = await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId));
+      return rows.find((s) => s.status === "closed") ?? undefined;
+    }, "abandoned dispatch closed the eveless child session");
+    expect(session.eveSessionId).toBeNull();
+    // NOTHING reached eve for this workflow — the fence held.
+    expect(worker.sessionMessages.some((m) => m.message.includes("CANCELRACE"))).toBe(false);
+    await until(async () => {
+      const r = await db.select().from(schema.runs).where(eq(schema.runs.id, ack.runId));
+      return r[0]?.status === "canceled" ? r[0] : undefined;
+    }, "parent canceled");
+  }, 30_000);
 
   // ── Slack OAuth install + callback ─────────────────────────────────────────
 
@@ -1207,6 +1288,128 @@ describe.skipIf(!TEST_DATABASE_URL)("trigger ingress + integrations", () => {
       return runs.some((r) => r.status === "succeeded") ? true : undefined;
     }, "recovered session run succeeded");
   });
+
+  // ── F2: agent-qualified thread sessions outlive the bare-key holder ────────
+
+  test("Slack: after the bare-key holder terminates, the agent-qualified session still continues AND unmentioned replies still dispatch", async () => {
+    // Two agents share one thread: agent A claimed the BARE key; the
+    // workflow was then republished binding agent B, whose step claimed the
+    // QUALIFIED key. Once A's session terminates (bare key released), the
+    // thread must remain KNOWN to the ingress (unmentioned replies dispatch
+    // under a mention-only binding) and B's step must find ITS qualified
+    // session first — never mint a fresh bare session that strands B's
+    // history.
+    const agentBId = await createPublishedAgent();
+    const wfId = await createWorkflow(
+      "Slack Two-Agent WF",
+      { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } },
+      { instructions: "Continue kindly. @trigger.text" },
+    );
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    // Agent A claims the bare key.
+    const rootTs = "1720000900.000900";
+    const bareKey = `${integration.id}:C-multi:${rootTs}`;
+    await postSlackEvent({ type: "app_mention", user: "U2A", text: "<@U0BOT> hello A", ts: rootTs, channel: "C-multi", team: "T-TEST" });
+    const sessionA = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+      return rows.find((s) => s.eveSessionId && s.slackThreadKey === bareKey) ?? undefined;
+    }, "agent A's bare-key session");
+    expect(sessionA.agentId).toBe(agentId);
+
+    // Republish the workflow with the step bound to agent B.
+    const wfRow = (await db.select().from(schema.workflows).where(eq(schema.workflows.id, wfId)))[0]!;
+    const published = wfRow.published as { steps: Array<Record<string, unknown>> };
+    published.steps[0]!.agentId = agentBId;
+    await db.update(schema.workflows).set({ published }).where(eq(schema.workflows.id, wfId));
+
+    // A mentioned thread reply now runs agent B: the bare holder (A)
+    // mismatches, so B claims the QUALIFIED key.
+    await postSlackEvent({ type: "app_mention", user: "U2A", text: "<@U0BOT> hello B", ts: "1720000901.000901", thread_ts: rootTs, channel: "C-multi", team: "T-TEST" });
+    const sessionB = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+      return rows.find((s) => s.eveSessionId && s.id !== sessionA.id) ?? undefined;
+    }, "agent B's qualified session");
+    expect(sessionB.agentId).toBe(agentBId);
+    expect(sessionB.slackThreadKey).toBe(`${bareKey}:agent:${agentBId}`);
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, sessionB.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "agent B's first run done");
+
+    // Agent A's session terminates — its bare-key claim is released.
+    await stack.runtime!.runStore.markSession(sessionA.id, "closed");
+
+    // An UNMENTIONED thread reply under a mention-only binding: the thread
+    // is still known (the qualified session lives), so the ingress
+    // dispatches, and B's step continues ITS qualified session.
+    await postSlackEvent({ type: "message", channel: "C-multi", channel_type: "channel", user: "U2A", text: "one more from the quiet user", ts: "1720000902.000902", thread_ts: rootTs, team: "T-TEST" });
+    const continued = await until(
+      async () =>
+        worker.sessionMessages.find(
+          (m) => m.kind === "continue" && m.sessionId === sessionB.eveSessionId && m.message.includes("one more from the quiet user"),
+        ),
+      "unmentioned reply continued agent B's qualified session",
+    );
+    expect(continued.hash).toBeTruthy();
+    // No THIRD session was minted — B's history was never stranded.
+    const sessions = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack");
+    expect(sessions).toHaveLength(2);
+  }, 30_000);
+
+  test("Slack: a claim poisoned by a crash BEFORE the eve create (active, eveless, no live run) is evicted — the thread recovers", async () => {
+    // W1's aftermath, simulated directly: the claim transaction committed
+    // (session row + thread key), the process died before the eve create,
+    // and boot reconciliation failed the child run — leaving an ACTIVE
+    // eveless holder with zero live runs. Without the stale-claim eviction
+    // every later message in the thread would 409 session_busy forever.
+    const wfId = await createWorkflow("Slack Poisoned Claim WF", { type: "slack", binding: { mentionOnly: true, includeDirectMessages: false } });
+    const integration = (await db.select().from(schema.integrations).where(eq(schema.integrations.organizationId, orgId))).find((r) => r.type === "slack")!;
+    await api("PUT", `/workspaces/${orgId}/workflows/${wfId}/triggers/slack`, {
+      cookie: ownerCookie,
+      body: { integrationId: integration.id, binding: { mentionOnly: true, includeDirectMessages: false } },
+    });
+
+    const agentRow = (await db.select().from(schema.agents).where(eq(schema.agents.id, agentId)))[0]!;
+    const rootTs = "1720000903.000903";
+    const threadKey = `${integration.id}:C-poison:${rootTs}`;
+    const poisoned = (
+      await db
+        .insert(schema.agentSessions)
+        .values({
+          organizationId: orgId,
+          agentId,
+          agentVersionId: agentRow.publishedVersionId!,
+          workflowId: wfId,
+          eveSessionId: null, // the create never happened
+          origin: "slack",
+          principal: { workspaceId: orgId, source: "slack:U-poison" },
+          slackThreadKey: threadKey,
+          status: "active", // nothing ever closed it
+        })
+        .returning()
+    )[0]!;
+
+    await postSlackEvent({ type: "app_mention", user: "U-poison", text: "<@U0BOT> hello again", ts: "1720000904.000904", thread_ts: rootTs, channel: "C-poison", team: "T-TEST" });
+
+    // A fresh session claims the key (the poisoned holder was evicted, not
+    // treated as busy) and the message dispatches.
+    const fresh = await until(async () => {
+      const rows = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.workflowId, wfId))).filter((s) => s.origin === "slack" && s.id !== poisoned.id);
+      return rows.find((s) => s.eveSessionId) ?? undefined;
+    }, "fresh session for the poisoned thread");
+    expect(fresh.slackThreadKey).toBe(threadKey);
+    await until(async () => {
+      const runs = await db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, fresh.id));
+      return runs.some((r) => r.status === "succeeded") ? true : undefined;
+    }, "poisoned-thread recovery run succeeded");
+    const stale = (await db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, poisoned.id)))[0]!;
+    expect(stale.slackThreadKey).toBeNull();
+  }, 30_000);
 
   // ── disconnect ─────────────────────────────────────────────────────────────
 

@@ -871,6 +871,133 @@ describe("pipeline driver — resume fidelity (budget, input snapshots, event ba
     expect(toolExec.calls).toHaveLength(0);
   });
 
+  test("budget 1: an interrupted instance is counted ONCE — recovery retries it and succeeds", async () => {
+    const step = tool("only");
+    const config = cfg([step]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxExecutedStepsPerRun: 1 },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    // The interrupted attempt already holds the run's single budget slot; a
+    // seed that counted this non-terminal row would charge it twice and
+    // reject its own retry outright.
+    await seedRow(h, run, step);
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    expect(toolExec.calls).toHaveLength(1);
+    expect(toolExec.calls[0]!.attempt).toBe(2);
+  });
+
+  test("budget 3: two adopted terminal rows + one interrupted retry complete without step_budget_exceeded", async () => {
+    const a = tool("a");
+    const b = tool("b");
+    const c = tool("c");
+    const config = cfg([a, b, c]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxExecutedStepsPerRun: 3 },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 3 },
+    } as never);
+    await seedRow(h, run, a, { finish: { status: "succeeded", output: {} } });
+    await seedRow(h, run, b, { finish: { status: "succeeded", output: {} } });
+    await seedRow(h, run, c); // interrupted mid-attempt
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    // Seed 2 (the terminal rows) + c's retry = exactly the budget of 3.
+    expect(terminal.status).toBe("succeeded");
+    expect(toolExec.calls).toHaveLength(1);
+    expect(toolExec.calls[0]!.step.id).toBe(c.id);
+    expect(toolExec.calls[0]!.attempt).toBe(2);
+  });
+
+  test("an interrupted instance never burns TWO budget slots — the fresh step after it still runs", async () => {
+    const a = tool("a");
+    const b = tool("b");
+    const c = tool("c");
+    const config = cfg([a, b, c]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxExecutedStepsPerRun: 3 },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 3 },
+    } as never);
+    // a consumed one slot for good; b holds its slot as the interrupted
+    // frontier; c never ran. A seed that counted b would charge it AGAIN at
+    // its retry — leaving no slot for c and failing `step_budget_exceeded`.
+    await seedRow(h, run, a, { finish: { status: "succeeded", output: {} } });
+    await seedRow(h, run, b); // interrupted mid-attempt
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    // b retried, then c executed fresh: 1 (seed) + 1 (b) + 1 (c) = budget.
+    expect(toolExec.calls.map((call) => call.step.id)).toEqual([b.id, c.id]);
+  });
+
+  test("a ledger that exactly consumed the budget still replays terminal rows to completion", async () => {
+    const a = tool("a");
+    const b = tool("b");
+    const config = cfg([a, b]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      config: { maxExecutedStepsPerRun: 2 },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 2 },
+    } as never);
+    // Every step finished before the crash — only the run settle is owed.
+    await seedRow(h, run, a, { finish: { status: "succeeded", output: {} } });
+    await seedRow(h, run, b, { finish: { status: "succeeded", output: {} } });
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    // Adoption executes nothing — the exhausted budget must not fail a run
+    // whose remaining work is pure replay.
+    expect(terminal.status).toBe("succeeded");
+    expect(toolExec.calls).toHaveLength(0);
+  });
+
   test("the state key cap is enforced against COMMITTED truth, not the run's stale snapshot", async () => {
     const fill = tool("fill");
     const write: PipelineStep = {
@@ -1089,6 +1216,13 @@ describe("pipeline driver — for_each", () => {
 
     const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
     expect(loopRow.status).toBe("succeeded");
+    // The RESOLVED items are snapshotted into the persisted input — crash
+    // recovery replays this snapshot verbatim, never a re-resolve.
+    expect(loopRow.input).toEqual({
+      itemsRef: "trigger.items",
+      count: 2,
+      items: ["a", "b"],
+    });
     expect(loopRow.output).toEqual({
       total: 2,
       succeeded: 2,
@@ -1179,6 +1313,8 @@ describe("pipeline driver — for_each", () => {
     const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
     expect(loopRow.errorClass).toBe("fan_out_exceeded");
     expect(h.stepStore.rows).toHaveLength(1); // no item ever ran
+    // An array the loop refuses to iterate is never snapshotted.
+    expect(loopRow.input).toEqual({ itemsRef: "trigger.items", count: 3 });
   });
 
   test("non-array items fail `items_not_array`", async () => {
@@ -1193,6 +1329,84 @@ describe("pipeline driver — for_each", () => {
     expect(
       h.stepStore.rows.find((r) => r.path === loop.id)!.errorClass,
     ).toBe("items_not_array");
+  });
+
+  test("a resumed for_each replays its PERSISTED items snapshot — never the moved collection", async () => {
+    const body = tool("body", { args: { item: { $ref: "item" } } });
+    const loop = loopOver([body], { items: { $ref: "state.items" } });
+    const config = cfg([loop]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    // First incarnation: resolved ["old-a", "old-b"] from @state.items and
+    // snapshotted them into the loop row, finished item 0, crashed on item 1.
+    await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: loop.id,
+      stepSlug: "loop",
+      path: loop.id,
+      parentPath: null,
+      iteration: null,
+      kind: "for_each",
+      status: "running",
+      input: { itemsRef: "state.items", count: 2, items: ["old-a", "old-b"] },
+      startedAt: new Date(),
+    });
+    const item0 = await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: body.id,
+      stepSlug: "body",
+      path: `${loop.id}/0/${body.id}`,
+      parentPath: loop.id,
+      iteration: 0,
+      kind: "tool",
+      status: "running",
+      input: { args: { item: "old-a" } },
+      startedAt: new Date(),
+    });
+    await h.stepStore.finish(item0.row.id, {
+      status: "succeeded",
+      output: {},
+      completedAt: new Date(),
+    });
+    // The state array MOVED between crash and recovery (say a concurrent
+    // overlap:"allow" run rewrote it): a re-resolve would combine item 0 of
+    // the OLD array with items 1–2 of the NEW one — mixed-array processing.
+    h.stateStore.state.set(
+      run.workflowId!,
+      new Map([["items", ["new-1", "new-2", "new-3"]]]),
+    );
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("succeeded");
+    // Item 0 was adopted; ONLY item 1 executed, with the ORIGINAL item value.
+    expect(toolExec.calls).toHaveLength(1);
+    expect(toolExec.calls[0]!.input).toEqual({ args: { item: "old-b" } });
+    expect(toolExec.calls[0]!.scope.item).toBe("old-b");
+    // The loop closed over the snapshot's 2 items, not the new array's 3.
+    const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
+    expect(loopRow.status).toBe("succeeded");
+    expect(loopRow.output).toMatchObject({ total: 2, succeeded: 2 });
+    // The persisted snapshot was never overwritten by the re-resolution.
+    expect(loopRow.input).toEqual({
+      itemsRef: "state.items",
+      count: 2,
+      items: ["old-a", "old-b"],
+    });
   });
 });
 

@@ -35,7 +35,7 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
@@ -663,12 +663,16 @@ async function cancelEveTurnBestEffort(
 /**
  * Cancel one AGENT-mode run by id without a live tail requirement — the
  * pipeline cancel path uses this on the parent's linked CHILD runs (an
- * agent step's eve turn must not outlive the user's Stop). Mirrors the cancel
- * route's no-tail branch: settle the row first, then chase eve best-effort.
- * Ownership is the caller's problem (the parent run was ownership-checked,
- * and run_steps rows are org-denormalized).
+ * agent step's eve turn must not outlive the user's Stop), and the agent
+ * step's post-dispatch cancel fence uses it on a child whose dispatch was
+ * racing the Stop (pipeline/steps/agent.ts). Mirrors the cancel route's
+ * no-tail branch: settle the row first, then chase eve best-effort.
+ * Idempotent (terminal children are left alone), so the route's snapshot and
+ * the executor's fence may both call it. Ownership is the caller's problem
+ * (the parent run was ownership-checked, and run_steps rows are
+ * org-denormalized).
  */
-async function cancelChildRun(
+export async function cancelChildRun(
   deps: RuntimeDeps,
   childRunId: string,
   reason: string,
@@ -1664,23 +1668,6 @@ export function runtimePlugin(deps: RuntimeDeps) {
           const hadDriver = deps.pipelines
             ? cancelPipelineRun(deps.pipelines, run.id)
             : false;
-          const children = await db
-            .select({ childRunId: schema.runSteps.childRunId })
-            .from(schema.runSteps)
-            .where(
-              and(
-                eq(schema.runSteps.runId, run.id),
-                inArray(schema.runSteps.status, ["running", "waiting"]),
-              ),
-            );
-          for (const child of children) {
-            if (!child.childRunId) continue;
-            await cancelChildRun(
-              deps,
-              child.childRunId,
-              `parent pipeline run canceled: ${reason}`,
-            );
-          }
           if (!hadDriver) {
             await deps.runStore.markRun(run.id, {
               status: "canceled",
@@ -1699,6 +1686,33 @@ export function runtimePlugin(deps: RuntimeDeps) {
               kind: "status",
               frame: { runId: run.id, status: "canceled", error: reason },
             });
+          }
+          // Children are snapshotted AFTER the cancel is in force (the
+          // driver's flag/abort above, or the direct row CAS): a child whose
+          // link transaction committed before this point is seen here, and
+          // one that commits after is refused by the agent step's link-hook
+          // fence (aborted signal / canceled parent) or chased by its
+          // post-dispatch fence — never orphaned. ALL linked children are
+          // swept, not just running/waiting step rows: an abandoned executor
+          // can land the link after the runner already finished the step row
+          // `canceled`. cancelChildRun no-ops on terminal children, so the
+          // wide sweep is idempotent and cheap (steps per run are bounded).
+          const children = await db
+            .select({ childRunId: schema.runSteps.childRunId })
+            .from(schema.runSteps)
+            .where(
+              and(
+                eq(schema.runSteps.runId, run.id),
+                isNotNull(schema.runSteps.childRunId),
+              ),
+            );
+          for (const child of children) {
+            if (!child.childRunId) continue;
+            await cancelChildRun(
+              deps,
+              child.childRunId,
+              `parent pipeline run canceled: ${reason}`,
+            );
           }
           const updatedPipeline = await db
             .select()

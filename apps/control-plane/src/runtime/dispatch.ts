@@ -37,19 +37,46 @@
  * running we re-check the version's COMPILED (stored) provider+model against
  * the CURRENT allowlist; if it is now disallowed we FAIL the run with a clear
  * error and never dispatch it. {@link assertModelAllowlistedAtDispatch}.
+ *
+ * DISPATCH-ATTEMPT MARKER (crash-window bookkeeping). eve session ids are
+ * SERVER-minted (the 202 create response carries the id; the strict create
+ * body has no client-supplied id field), so the id cannot be persisted before
+ * the create call. What CAN be persisted is the fact that a dispatch attempt
+ * is about to reach eve: {@link armDispatchAttempt} CAS-writes `runs.started_at`
+ * strictly BEFORE the create/continue call. Recovery then reads three states:
+ *
+ *   - `started_at` NULL + session `eve_session_id` NULL → the eve call was
+ *     PROVABLY never issued (program order: the marker write is awaited before
+ *     the call) — safe to dispatch again ({@link isProvablyUndispatched}; the
+ *     agent step's stillborn-child recovery consumes this);
+ *   - `started_at` set + `eve_session_id` NULL → the create MAY have been
+ *     issued (crash between the marker and the 202 persist) — recovery must
+ *     fail honest, never re-dispatch. This narrow window is a DOCUMENTED
+ *     deliberate residual: if eve did accept the create, that turn runs to
+ *     completion unobserved (side effects happen at most once), and the child
+ *     run reads `failed` from boot reconciliation;
+ *   - `eve_session_id` set → the normal resumable state.
+ *
+ * The marker CAS doubles as the PRE-EVE CANCEL FENCE: a run the pipeline
+ * cancel route already settled `canceled` fails the CAS, and the dispatch
+ * abandons before eve ever sees the message ({@link DispatchRenderedRunResult}
+ * `canceledBeforeDispatch`). Callers may also pass an AbortSignal
+ * (`input.signal`) that is honored at the same points.
  */
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   workflowConfigSchema,
   type EveSessionMode,
   type ModelProvider,
+  type RunStatus,
   type SessionOrigin,
   type TriggerEvent,
   type WorkflowConfig,
 } from "@invisible-string/shared";
 
 import type { Db, DbClient } from "../db";
+import type { RunStore } from "../runs/store";
 import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
 import { errors, isRuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
@@ -195,9 +222,24 @@ export interface DispatchRenderedRunInput {
    * That eviction is STATUS-driven and therefore only sees rows the platform
    * already knows are dead. eve 0.31 adds a second case — a row that still
    * reads `active` while its eve session is gone — which is released by the
-   * 409 `session_not_active` handler in `failEveDispatch` instead.
+   * 409 `session_not_active` handler in `failEveDispatch` instead. A THIRD
+   * case is evicted here: a live-status holder with NO eve session id and NO
+   * live run — a claim whose one dispatch died between the claim transaction
+   * and the eve create (the marker's W1 crash window). An in-flight dispatch
+   * always counts a queued run inside this same advisory lock, so it is never
+   * mistaken for stale.
    */
   newSessionSlackThreadKey?: string;
+  /**
+   * Cooperative cancellation from the caller (the agent step's attempt
+   * signal). Honored at the pre-eve fences only — before the claim
+   * transaction and again at the dispatch-attempt marker, strictly before the
+   * eve call — never mid-flight: once the create/continue is issued the
+   * caller's post-dispatch fence (cancel the child through the ordinary
+   * cancel path) is the recovery. Aborting never throws; it yields
+   * `canceledBeforeDispatch`.
+   */
+  signal?: AbortSignal;
   /**
    * eve create options for a NEW session (ignored for continuations): the
    * pipeline agent step sends `mode: "task"` for `session: "fresh"` children
@@ -226,6 +268,68 @@ export interface DispatchRenderedRunResult {
   run: RunRow;
   /** False when the run was created but failed pre-flight (allowlist). */
   dispatched: boolean;
+  /**
+   * True when the run was created but a cancel (the run row already settled
+   * `canceled`, or the caller's `signal` aborted) landed at one of the
+   * pre-eve fences: NOTHING reached eve, the run row is terminal, and a
+   * brand-new session was closed (releasing any Slack thread claim).
+   */
+  canceledBeforeDispatch?: boolean;
+}
+
+// ── Dispatch-attempt marker (F1 crash-window bookkeeping) ────────────────────
+
+export type DispatchArmResult = "armed" | "canceled" | "terminal";
+
+/**
+ * CAS-write the dispatch-attempt marker (`runs.started_at`) — MUST be awaited
+ * strictly before the eve create/continue call, so that recovery can read
+ * "marker absent ⇒ the eve call was never issued" (see the module doc). The
+ * CAS doubles as the pre-eve cancel fence: a run already settled terminal
+ * (the pipeline cancel route's `cancelChildRun` on a queued child) refuses
+ * the write and the caller abandons instead of dispatching.
+ */
+export async function armDispatchAttempt(
+  runStore: RunStore,
+  runId: string,
+  now: Date = new Date(),
+): Promise<DispatchArmResult> {
+  const marked = await runStore.markRun(runId, {
+    // Status stays `queued` — the tailer owns the queued→running flip; only
+    // the startedAt marker matters here (and is overwritten by the tailer's
+    // own first-event stamp, by which point eve_session_id is persisted and
+    // the marker's job is done).
+    status: "queued",
+    startedAt: now,
+  });
+  if (marked) return "armed";
+  const current = await runStore.getRunStatus(runId);
+  return current?.status === "canceled" ? "canceled" : "terminal";
+}
+
+/** The child-run slice the stillborn probe reads (agent step, F1 recovery). */
+export interface ChildDispatchState {
+  status: RunStatus;
+  startedAt: Date | null;
+  eveSessionId: string | null;
+}
+
+/**
+ * True iff the child run PROVABLY never reached eve: it is terminally
+ * `failed` (boot reconciliation swept it, or a pre-eve failure marked it),
+ * the dispatch-attempt marker was never written, and no eve session id was
+ * ever persisted. Program order guarantees the implication: the marker write
+ * is awaited before the create call, so marker-absent ⇒ create never issued
+ * ⇒ dispatching a replacement child cannot double-dispatch. Anything less
+ * certain (marker set, eve id present, or a non-failed status) is NOT
+ * recoverable by re-dispatch — fail honest.
+ */
+export function isProvablyUndispatched(state: ChildDispatchState): boolean {
+  return (
+    state.status === "failed" &&
+    state.startedAt === null &&
+    state.eveSessionId === null
+  );
 }
 
 /**
@@ -304,6 +408,7 @@ export async function dispatchRenderedRun(
           .select({
             id: schema.agentSessions.id,
             status: schema.agentSessions.status,
+            eveSessionId: schema.agentSessions.eveSessionId,
           })
           .from(schema.agentSessions)
           .where(
@@ -318,14 +423,27 @@ export async function dispatchRenderedRun(
           .limit(1);
         const holder = existing[0];
         if (holder) {
-          if (holder.status === "closed" || holder.status === "error") {
-            // DEAD holder: a terminal session can never continue this thread
-            // (findSlackThreadSession skips closed/error rows), so treating
-            // it as busy would silently brick the thread forever. Evict its
+          const holderDead =
+            holder.status === "closed" || holder.status === "error";
+          // POISONED claim: a live-status holder with no eve session id AND
+          // no live run — its one dispatch died between the claim
+          // transaction and the eve create (marker window W1; boot
+          // reconciliation failed the run, nothing closed the session). A
+          // dispatch still in flight always counts a queued run under this
+          // same advisory lock, so it can never be mistaken for stale.
+          const holderStale =
+            !holderDead &&
+            holder.eveSessionId === null &&
+            (await countDispatchingRuns(tx, holder.id)) === 0;
+          if (holderDead || holderStale) {
+            // DEAD/POISONED holder: a terminal session can never continue
+            // this thread (findSlackThreadSession skips closed/error rows,
+            // and an eveless holder has nothing to continue), so treating it
+            // as busy would silently brick the thread forever. Evict its
             // claim (markSession also releases the key on terminal
             // transitions; this covers rows poisoned before that, e.g. by a
-            // failed first dispatch) and mint a fresh session under the
-            // advisory lock.
+            // failed or crashed first dispatch) and mint a fresh session
+            // under the advisory lock.
             await tx
               .update(schema.agentSessions)
               .set({ slackThreadKey: null })
@@ -377,6 +495,13 @@ export async function dispatchRenderedRun(
 
   const isNewSession = input.existingSession === undefined;
 
+  // EARLY CANCEL FENCE: a Stop that raced the claim transaction (the abort
+  // fired after the link hook's own in-transaction check passed) must not pay
+  // for the allowlist read + agent boot only to be fenced at the marker.
+  if (input.signal?.aborted) {
+    return abandonCanceledBeforeEve(deps, input, session, run);
+  }
+
   // DISPATCH-TIME ALLOWLIST RE-VALIDATION: fail the run (do not execute) when
   // the version's compiled model is no longer allowlisted.
   try {
@@ -411,6 +536,15 @@ export async function dispatchRenderedRun(
       input.agent,
       input.organizationId,
     );
+    // DISPATCH-ATTEMPT MARKER + PRE-EVE CANCEL FENCE (module doc): the
+    // marker write is awaited STRICTLY before the eve call — recovery reads
+    // its absence as proof the call was never issued — and its CAS refuses a
+    // run the cancel route already settled (a Stop landing during the long
+    // ensure boot above aborts here instead of dispatching a canceled run).
+    const armed = await armDispatchAttempt(deps.runStore, run.id);
+    if (armed !== "armed" || input.signal?.aborted) {
+      return await abandonCanceledBeforeEve(deps, input, session, run);
+    }
     // 0.31: a session is continuable iff it HAS an eve session id and this
     // dispatch is a continuation — the old continuation-token term must not
     // come back (the column is never written; see routes.ts).
@@ -484,6 +618,50 @@ export async function dispatchRenderedRun(
   return { session, run, dispatched: true };
 }
 
+/**
+ * Abandon a dispatch at a pre-eve fence: settle the run `canceled` (CAS —
+ * the cancel route may already have), close a brand-NEW session so an
+ * `active` eveless row cannot hold a Slack thread-key claim forever
+ * (markSession releases the key), and report `canceledBeforeDispatch`.
+ * Cancellation is a user decision, never an error — no trigger "failed"
+ * metric, no throw.
+ */
+async function abandonCanceledBeforeEve(
+  deps: RuntimeDeps,
+  input: DispatchRenderedRunInput,
+  session: SessionRow,
+  run: RunRow,
+): Promise<DispatchRenderedRunResult> {
+  const reason = "canceled before the agent was dispatched";
+  const marked = await deps.runStore.markRun(run.id, {
+    status: "canceled",
+    error: reason,
+    completedAt: new Date(),
+  });
+  if (marked) {
+    deps.bus.publish(run.id, {
+      kind: "status",
+      frame: { runId: run.id, status: "canceled", error: reason },
+    });
+  }
+  if (input.existingSession === undefined) {
+    // The session was born in this dispatch and never reached eve; a
+    // CONTINUATION's session belongs to its thread and stays untouched.
+    await deps.runStore.markSession(session.id, "closed");
+  }
+  const current = await deps.runStore.getRunStatus(run.id);
+  return {
+    session,
+    run: {
+      ...run,
+      status: current?.status ?? "canceled",
+      error: current?.error ?? reason,
+    },
+    dispatched: false,
+    canceledBeforeDispatch: true,
+  };
+}
+
 // ── Slack thread ↔ session mapping ───────────────────────────────────────────
 
 /**
@@ -543,4 +721,56 @@ export async function findSlackThreadSession(
     return row;
   }
   return null;
+}
+
+/**
+ * Prefix under which per-agent DERIVATIVE claims of one Slack thread live:
+ * `<bareKey>:agent:<agentId>` (the agent step's `agentQualifiedThreadKey`,
+ * pipeline/steps/agent.ts, builds on this). Defined here so the ingress's
+ * known-thread check and the step's claim logic share ONE shape — the extra
+ * colons are load-bearing: `parseSlackThreadKey` (runs/delivery.ts) requires
+ * exactly three `:`-segments, so a qualified key can never mis-parse into a
+ * Slack reply target or collide with a bare key.
+ */
+export function agentQualifiedThreadKeyPrefix(threadKey: string): string {
+  return `${threadKey}:agent:`;
+}
+
+/**
+ * Is this Slack thread KNOWN to the workflow — i.e. does ANY continuable
+ * session claim its bare key OR an agent-qualified derivative
+ * (`<bareKey>:agent:<agentId>`)? The ingress gate uses this: a reply in a
+ * known thread dispatches regardless of the binding (thread replies continue
+ * conversations), and checking only the bare key would DROP unmentioned
+ * replies the moment the bare holder terminates and releases its claim while
+ * an agent-qualified session still carries the conversation. Same
+ * continuability predicate as {@link findSlackThreadSession} (non-terminal +
+ * eve session id), pushed into SQL because several derivative rows may
+ * exist. `starts_with` (not LIKE) on purpose — thread keys carry arbitrary
+ * Slack-provided characters and must never be read as a pattern.
+ */
+export async function isKnownSlackThread(
+  db: Db,
+  organizationId: string,
+  workflowId: string,
+  threadKey: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: schema.agentSessions.id })
+    .from(schema.agentSessions)
+    .where(
+      and(
+        eq(schema.agentSessions.organizationId, organizationId),
+        eq(schema.agentSessions.workflowId, workflowId),
+        eq(schema.agentSessions.origin, "slack"),
+        isNotNull(schema.agentSessions.eveSessionId),
+        notInArray(schema.agentSessions.status, ["closed", "error"]),
+        or(
+          eq(schema.agentSessions.slackThreadKey, threadKey),
+          sql`starts_with(${schema.agentSessions.slackThreadKey}, ${agentQualifiedThreadKeyPrefix(threadKey)})`,
+        ),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
 }

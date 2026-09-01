@@ -99,12 +99,16 @@ connected integration. The binding offers:
 
 The bot only receives events from channels it's a **member** of — `/invite
 @YourBot` in each channel that should fire the trigger. When the run
-completes, the **control plane** posts the agent's final reply back to the
-originating thread via `chat.postMessage` with the per-team bot token
-(DeliveryService, `apps/control-plane/src/runs/delivery.ts`) — the token is
-decrypted at delivery time and never enters agent env or a worker. Delivery
-is at-least-once: a control-plane crash between the run's terminal event and
-the Slack post re-delivers the reply on the next boot's recovery sweep.
+completes, the **control plane** posts the rendered `onComplete.slackReply`
+reply back to the originating thread via `chat.postMessage` with the per-team
+bot token (DeliveryService, `apps/control-plane/src/runs/delivery.ts`) — a
+pipeline has no single "final assistant message," so the reply is that
+declared template rendered against the run's final scope, and nothing is
+posted when the workflow declares none. The token is decrypted at delivery
+time and never enters agent env or a worker. Delivery is at-least-once: a
+control-plane crash between the run's terminal event and the Slack post
+re-delivers the reply on the next boot's recovery sweep, re-rendered from
+the persisted `run_steps` ledger.
 
 ## Local development
 

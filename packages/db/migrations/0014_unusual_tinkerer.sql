@@ -1,0 +1,1 @@
+ALTER TABLE "connection_oauth" ADD COLUMN "pending_flow" jsonb;

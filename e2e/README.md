@@ -17,8 +17,11 @@ The global setup (in order):
    control-plane origin.
 4. Managed processes with readiness gates: **stub server** (a real MCP server
    on the official SDK + the MCP-registry REST API + an OAuth-protected MCP
-   endpoint at `/mcp-oauth` whose `tools/call` demands a bearer the stub AS
-   issued), **stub OAuth AS** (`scripts/stub-as.ts` — RFC 8414 metadata, an
+   endpoint at `/mcp-oauth` where EVERY request — the `initialize`/`tools/list`
+   handshake included — demands a bearer the stub AS issued, answering
+   anything else with a 401 and the RFC 9728 `WWW-Authenticate` challenge
+   (PRM pointer + scope), exactly as Vercel/Linear/Notion/Sentry do), **stub
+   OAuth AS** (`scripts/stub-as.ts` — RFC 8414 metadata, an
    interstitial-Approve `/authorize`, PKCE-validating `/token` with a
    refresh grant and deliberately short 30 s access tokens, RFC 7591 DCR, and
    the `__expire`/`__mode`/`__introspect`/`__stats` test hooks),
@@ -70,12 +73,21 @@ the stub MCP server twice over (loopback address, plain http).
 - **oauth-connection** — the FULL OAuth broker spine: a custom connection on
   the stub's `/mcp-oauth` is created with `auth:{type:"oauth"}` (via the
   unified create API — the custom-URL dialog has no OAuth lane; catalog
-  recipes own the UI entry point), then everything else is UI: Connect from
-  the detail runs real discovery (401 → PRM pointer → stub AS metadata) →
-  DCR → PKCE consent in a popup (the spec clicks the stub AS's Approve
-  interstitial) → the callback closes the popup and the panel flips to
-  Connected; the post-connect probe lands `ok` with the discovered tool;
-  attach → publish → chat drives the `connection_search` choreography and a
+  recipes own the UI entry point), then everything else is UI: before consent
+  the row reads **Auth required** and NOTHING dials the server — not the
+  create, not the detail (its stale re-probe is suppressed without a grant),
+  not even an explicit Test connection, which answers `auth_required` with no
+  round trip; Connect from the detail runs real discovery (401 → PRM pointer +
+  challenge scope → stub AS metadata) → DCR → PKCE consent in a popup (the
+  spec clicks the stub AS's Approve interstitial) → the callback closes the
+  popup and the panel flips to Connected. The post-connect probe then lands
+  `ok` **only because it carried the broker's token** — against a fixture
+  that 401s an unauthenticated handshake, which is what makes the green badge
+  mean something (the stub used to leave the handshake open, so the same
+  assertion certified a probe that never read the token at all) — and the
+  cached tools it discovers fill the tool picker, which no OAuth connection
+  could ever do before. Then attach → publish → chat drives the
+  `connection_search` choreography and a
   `securenotes__save_note` call whose bearer the stub MCP server validates
   against the stub AS — proving compiled-agent `getToken` →
   `POST /internal/connections/token` → central refresh end to end (the AS

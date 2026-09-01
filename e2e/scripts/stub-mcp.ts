@@ -16,21 +16,31 @@
  *     entry→action mapping ingests it, and its remote declares a secret
  *     header so the add-connection dialog's credential form is exercised.
  *  3. An OAUTH-PROTECTED MCP endpoint at /mcp-oauth (oauth-connection spec):
- *     `tools/call` demands `Authorization: Bearer <token>` validated against
- *     the stub AS (scripts/stub-as.ts, POST /__introspect) — 401 with the
- *     RFC 9728 `WWW-Authenticate` `resource_metadata` pointer otherwise. The
- *     PRM at the path-aware well-known names the stub AS, so the control
- *     plane's real discovery → DCR → consent → token chain runs against it.
- *     MCP HANDSHAKE methods (initialize/tools/list) stay open: the control
- *     plane's probe dials with static headers only (OAuth probes carry no
- *     broker token — plan-2 probe semantics), and the empirical gate is
- *     `tools/call`, which only the compiled agent's broker-delivered bearer
- *     can pass.
+ *     EVERY request — the handshake included — demands `Authorization:
+ *     Bearer <token>` validated against the stub AS (scripts/stub-as.ts,
+ *     POST /__introspect); anything else gets a 401 carrying the RFC 9728
+ *     `WWW-Authenticate` challenge (the `resource_metadata` pointer plus the
+ *     `scope` this request lacked). The PRM at the path-aware well-known
+ *     names the stub AS, so the control plane's real discovery → DCR →
+ *     consent → token chain runs against it.
+ *
+ *     THIS GATE IS THE POINT (2026-08-31 OAuth fix plan F1/P1.3). The fixture
+ *     used to leave `initialize`/`tools/list` OPEN and said so in this
+ *     comment, to accommodate a probe that dialled with static headers only —
+ *     so the spec's post-consent `ok` was certifying the bug: the health
+ *     probe never read the broker's token, every real OAuth MCP server
+ *     (Vercel, Linear, Notion, Sentry — all verified live) 401s an
+ *     unauthenticated handshake, and no OAuth connection anywhere ever
+ *     populated `tools_cache`. Closing the handshake makes the fixture behave
+ *     like the servers it stands in for: post-consent health can only reach
+ *     `ok`, and the tool picker can only fill, if the probe presents a
+ *     broker-delivered bearer the AS says is active. Never reopen it.
  *
  * Bound to 127.0.0.1 so the agent process (localhost worker) reaches it while
  * nothing external can. GET /__calls reports tool invocations (plus the
- * /mcp-oauth request log — rpc method and whether a VALID bearer was carried;
- * token values never appear in any response or log line) for assertions.
+ * /mcp-oauth request log — http method, rpc method, and whether a VALID
+ * bearer was carried; token values never appear in any response or log line)
+ * for assertions.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -49,8 +59,16 @@ import {
 const callLog: { name: string; args: unknown }[] = [];
 /** Tool invocations that arrived through the OAuth-gated /mcp-oauth. */
 const oauthCallLog: { name: string; args: unknown }[] = [];
-/** Every /mcp-oauth rpc request: method + bearer validity (never values). */
-const oauthRequestLog: { rpcMethod: string; authValid: boolean }[] = [];
+/**
+ * Every /mcp-oauth request: HTTP method, rpc method (`?` when there is no
+ * JSON-RPC body — the discovery GET), and whether it carried a bearer the AS
+ * says is active. Token VALUES never appear here or in any log line.
+ */
+const oauthRequestLog: {
+  httpMethod: string;
+  rpcMethod: string;
+  authValid: boolean;
+}[] = [];
 
 /** Canned registry server (remote points back at this stub's MCP endpoint). */
 const REGISTRY_SERVER = {
@@ -103,19 +121,49 @@ function buildMcpServer(log: { name: string; args: unknown }[] = callLog): McpSe
 /** RFC 9728 challenge for the OAuth-protected endpoint. */
 const OAUTH_PRM_URL = `http://127.0.0.1:${PORTS.stubMcp}/.well-known/oauth-protected-resource/mcp-oauth`;
 
-function sendUnauthorized(res: ServerResponse): void {
+/**
+ * The `scope` the 401 challenge names — authoritative for the broker's
+ * consent request (MCP authorization: the server is saying what THIS request
+ * lacked), and deliberately WIDER than the PRM's `scopes_supported` below so
+ * that challenge-over-PRM precedence is a real, observable difference here
+ * rather than a distinction the fixture flattens.
+ */
+const OAUTH_CHALLENGE_SCOPE = "notes.read notes.write";
+/** The resource's own advertised list — narrower; the fallback, not the rule. */
+const OAUTH_PRM_SCOPES = ["notes.read"];
+
+/**
+ * RFC 6750 §3: a request that presented no credentials gets a bare challenge;
+ * `error="invalid_token"` is reserved for a token that was presented and
+ * rejected. Both carry the RFC 9728 `resource_metadata` pointer (what
+ * discovery reads first) and the scope.
+ */
+function sendUnauthorized(res: ServerResponse, presentedToken: boolean): void {
+  const params = [
+    `resource_metadata="${OAUTH_PRM_URL}"`,
+    `scope="${OAUTH_CHALLENGE_SCOPE}"`,
+    ...(presentedToken ? [`error="invalid_token"`] : []),
+  ];
   res.statusCode = 401;
-  res.setHeader(
-    "WWW-Authenticate",
-    `Bearer resource_metadata="${OAUTH_PRM_URL}", error="invalid_token"`,
-  );
+  res.setHeader("WWW-Authenticate", `Bearer ${params.join(", ")}`);
   sendJson(res, { error: "invalid_token" });
 }
 
-/** Validate a bearer against the stub AS. Unreachable AS ⇒ invalid. */
-async function introspectBearer(authorization: string | undefined): Promise<boolean> {
+/**
+ * Validate a bearer against the stub AS. Unreachable AS ⇒ invalid. Reports
+ * whether a token was PRESENTED separately from whether it was accepted, so
+ * the challenge can follow RFC 6750 (see {@link sendUnauthorized}); the token
+ * itself never leaves this function.
+ */
+async function introspectBearer(
+  authorization: string | undefined,
+): Promise<{ presented: boolean; valid: boolean }> {
   const token = /^Bearer\s+(.+)$/i.exec(authorization ?? "")?.[1];
-  if (token === undefined) return false;
+  if (token === undefined) return { presented: false, valid: false };
+  return { presented: true, valid: await isActive(token) };
+}
+
+async function isActive(token: string): Promise<boolean> {
   try {
     const res = await fetch(`${STUB_AS_URL}/__introspect`, {
       method: "POST",
@@ -160,6 +208,7 @@ const httpServer = createServer(async (req, res) => {
     sendJson(res, {
       resource: STUB_OAUTH_MCP_URL,
       authorization_servers: [STUB_AS_URL],
+      scopes_supported: OAUTH_PRM_SCOPES,
     });
     return;
   }
@@ -173,22 +222,18 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // The OAuth-protected MCP endpoint. Auth gate BEFORE any transport work:
-  //  - a non-SSE GET is the control plane's unauthenticated discovery probe →
-  //    401 + the WWW-Authenticate PRM pointer (what discoverOauth reads);
-  //  - `tools/call` demands a bearer the stub AS says is active — the
-  //    compiled agent's broker-delivered token — else the same 401 challenge
-  //    (eve surfaces it as a failed tool call; spike finding 34);
-  //  - handshake methods pass without auth so plan-2 probes classify `ok`
-  //    (the probe never carries broker tokens).
+  // The OAuth-protected MCP endpoint. ONE auth gate, before any transport
+  // work, covering every request the way a real OAuth MCP server does:
+  //  - the control plane's unauthenticated discovery GET → 401 + the
+  //    WWW-Authenticate challenge (the PRM pointer + scope discoverOauth
+  //    reads);
+  //  - `initialize` / `tools/list` — the HEALTH PROBE's dial and the compiled
+  //    agent's connection dial → 401 unless a broker-delivered bearer the AS
+  //    says is active rides along. This is what makes post-consent `health:
+  //    "ok"` and a populated `tools_cache` mean something (fix plan F1);
+  //  - `tools/call` → the same gate (eve surfaces a refusal as a failed tool
+  //    call, never a hang; spike finding 34).
   if (url.pathname === "/mcp-oauth") {
-    if (
-      req.method === "GET" &&
-      !(req.headers.accept ?? "").includes("text/event-stream")
-    ) {
-      sendUnauthorized(res);
-      return;
-    }
     let body: unknown;
     try {
       body = req.method === "POST" ? await readJsonBody(req) : undefined;
@@ -199,11 +244,17 @@ const httpServer = createServer(async (req, res) => {
       body && typeof body === "object" && "method" in body
         ? ((body as { method?: string }).method ?? "?")
         : "?";
-    const authValid = await introspectBearer(req.headers.authorization);
-    oauthRequestLog.push({ rpcMethod, authValid });
-    console.log(`[e2e:stub-mcp] ${req.method} /mcp-oauth ${rpcMethod} authValid=${authValid}`);
-    if (rpcMethod === "tools/call" && !authValid) {
-      sendUnauthorized(res);
+    const { presented, valid } = await introspectBearer(req.headers.authorization);
+    oauthRequestLog.push({
+      httpMethod: req.method ?? "?",
+      rpcMethod,
+      authValid: valid,
+    });
+    console.log(
+      `[e2e:stub-mcp] ${req.method} /mcp-oauth ${rpcMethod} authValid=${valid}`,
+    );
+    if (!valid) {
+      sendUnauthorized(res, presented);
       return;
     }
     const server = buildMcpServer(oauthCallLog);

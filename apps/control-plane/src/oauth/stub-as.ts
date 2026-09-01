@@ -5,10 +5,12 @@
  *
  * Surface:
  * - `GET  /.well-known/oauth-authorization-server` — RFC 8414 metadata
- *   (advertises S256, DCR, revocation; scopes/CIMD support via options)
+ *   (advertises its own `issuer`, S256, DCR, revocation; scopes/CIMD support
+ *   and RFC 9207 `iss` capability via options/fields)
  * - `GET  /authorize` — auto-approves: records the request, mints a
  *   single-use code bound to the PKCE challenge + client + redirect_uri +
- *   `resource`, and 302s back to `redirect_uri` with `code` + `state`
+ *   `resource`, and 302s back to `redirect_uri` with `code` + `state` (+ the
+ *   RFC 9207 `iss`, per {@link StubAuthorizationServer.issMode})
  * - `POST /token` — `authorization_code` grant validating PKCE (S256),
  *   single-use codes, `redirect_uri`, `client_id`, and the RFC 8707
  *   `resource`; `refresh_token` grant with rotation (the presented token
@@ -17,7 +19,11 @@
  *   scenarios.
  * - `POST /register` — RFC 7591 DCR (public client, no secret unless
  *   `issueClientSecret`); the broker registers here whenever the platform
- *   base URL is not public https (CIMD unusable)
+ *   base URL is not public https (CIMD unusable).
+ *   `registrationMode = "forbidden"` replays the failure that forced
+ *   pre-registered clients into existence: Vercel's registration endpoint
+ *   answers `400 invalid_redirect_uri` to any client it has not approved
+ *   (2026-08-31 fix plan §3), which no request body can talk it out of.
  * - `POST /revoke` — RFC 7009; records revocations for Task 6 assertions
  *
  * Every request's parameters are recorded so tests can assert exact wire
@@ -44,9 +50,36 @@ export interface StubAsOptions {
   issueClientSecret?: boolean;
 }
 
+/**
+ * A foreign issuer for the authorization-server mix-up scenario: never
+ * dialed, only compared, so it needs no server behind it.
+ */
+export const FOREIGN_ISSUER = "https://mixup.attacker.example";
+
 export class StubAuthorizationServer {
   /** "ok" issues tokens; "invalid_grant" 400s every token request. */
   tokenMode: "ok" | "invalid_grant" = "ok";
+
+  /**
+   * What the authorization response carries as its RFC 9207 `iss`:
+   * - `correct` — this server's own issuer (the conformant default);
+   * - `foreign` — {@link FOREIGN_ISSUER}, i.e. a response minted somewhere
+   *   else, which the broker must refuse to exchange;
+   * - `omit` — no `iss` at all. Only a failure when the metadata claims
+   *   `authorization_response_iss_parameter_supported`, which is exactly why
+   *   that flag is separately settable below.
+   */
+  issMode: "correct" | "foreign" | "omit" = "correct";
+
+  /** Advertise `authorization_response_iss_parameter_supported` (RFC 9207). */
+  issParameterSupported = true;
+
+  /**
+   * "ok" registers a client; "forbidden" refuses every DCR body with the
+   * redirect-URI allowlist rejection real gated servers send — the failure a
+   * pre-registered client exists to route around.
+   */
+  registrationMode: "ok" | "forbidden" = "ok";
 
   readonly authorizeRequests: URLSearchParams[] = [];
   readonly tokenRequests: URLSearchParams[] = [];
@@ -119,6 +152,9 @@ export class StubAuthorizationServer {
       ...(this.options.scopesSupported
         ? { scopes_supported: this.options.scopesSupported }
         : {}),
+      ...(this.issParameterSupported
+        ? { authorization_response_iss_parameter_supported: true }
+        : {}),
       ...(this.options.clientIdMetadataDocumentSupported !== undefined
         ? {
             client_id_metadata_document_supported:
@@ -155,6 +191,14 @@ export class StubAuthorizationServer {
     back.searchParams.set("code", code);
     const state = params.get("state");
     if (state !== null) back.searchParams.set("state", state);
+    // RFC 9207: name the issuer that produced this response, so the client can
+    // tell it apart from one minted by a different authorization server.
+    if (this.issMode !== "omit") {
+      back.searchParams.set(
+        "iss",
+        this.issMode === "foreign" ? FOREIGN_ISSUER : this.issuer,
+      );
+    }
     return new Response(null, { status: 302, headers: { location: back.href } });
   }
 
@@ -216,6 +260,18 @@ export class StubAuthorizationServer {
   private async register(req: Request): Promise<Response> {
     const body: unknown = await req.json().catch(() => null);
     this.registerRequests.push(body);
+    if (this.registrationMode === "forbidden") {
+      // Byte-compatible with the live rejection in fix plan §3 — the machine
+      // code is all the broker surfaces, and it is not negotiable by any body.
+      return Response.json(
+        {
+          error: "invalid_redirect_uri",
+          error_description:
+            "The provided redirect URIs are not approved for use by this authorization server.",
+        },
+        { status: 400 },
+      );
+    }
     return Response.json(
       {
         client_id: `dcr-client-${++this.counter}`,

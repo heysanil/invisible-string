@@ -75,16 +75,44 @@ test(
     // wins and renders github-light's full-saturation palette. That is dead
     // config plus an E1 rule-5 violation (color only as meaning), and it is
     // invisible without an assertion on the emitted colors.
+    //
+    // Assert the theme by the block's own bg/fg, NOT by which token got which
+    // scope. `@streamdown/code` builds its shiki engine with
+    // `createJavaScriptRegexEngine({ forgiving: true })`, which silently SKIPS
+    // any pattern whose `exec` throws on a given call — and dual-theme
+    // highlighting tokenizes once PER THEME (`codeToTokensWithThemes` maps
+    // `codeToTokensBase` over both, then re-aligns the boundaries). So one
+    // pass can degrade while the other stays sharp: seen in a loaded CI lane
+    // as `const` still min-light red while everything after it flattened to
+    // min-light's default foreground, carrying min-DARK's per-scope colors on
+    // the same spans. Per-token colors are therefore not a stable property of
+    // "the min themes are configured"; `result.bg`/`result.fg` are read
+    // straight off the loaded theme objects and are immune to tokenization.
     const view = render(<Markdown text={"```ts\nconst x = 1;\n```"} />);
-    // Shiki highlights asynchronously; until it lands every token carries the
-    // placeholder `--sdm-c: inherit`.
-    await waitFor(
-      () => expect(view.container.innerHTML).toContain("--sdm-c: #"),
+    // Shiki highlights asynchronously; until it lands streamdown renders the
+    // placeholder result, whose `--sdm-bg` is the literal `transparent`.
+    const pre = await waitFor(
+      () => {
+        const el = view.container.querySelector("pre");
+        expect(el?.style.getPropertyValue("--sdm-bg") ?? "").toMatch(/^#/);
+        return el as HTMLElement;
+      },
       { timeout: 10_000, interval: 50 },
     );
-    const html = view.container.innerHTML;
-    expect(html).toContain("#1976D2"); // min-light's keyword blue
-    expect(html).not.toContain("#D73A49"); // github-light's keyword red
+    // Both halves of the pair, exactly — shiki packs the dark theme's value
+    // into the same declaration as the light one, so one assertion pins both.
+    // github-light/github-dark would read `#fff;--shiki-dark-bg:#24292e` and
+    // `#24292e;--shiki-dark:#e1e4e8`.
+    expect(pre.style.getPropertyValue("--sdm-bg")).toBe(
+      "#ffffff;--shiki-dark-bg:#1f1f1f",
+    );
+    expect(pre.style.getPropertyValue("--sdm-fg")).toBe(
+      "#24292eff;--shiki-dark:#b392f0",
+    );
+    // Belt and braces on the token palette: github-light's keyword red is the
+    // one color the stock plugin emits that no min pass can produce, degraded
+    // or not.
+    expect(view.container.innerHTML).not.toContain("#D73A49");
   },
   15_000,
 );

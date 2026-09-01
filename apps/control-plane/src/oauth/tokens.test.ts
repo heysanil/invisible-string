@@ -6,11 +6,19 @@
  * Exercises `getAccessToken` directly against rows the REAL consent flow
  * produced (stub AS + stub OAuth-protected resource, exactly the broker
  * suite's rig): expiry-margin logic, refresh with rotation persisted,
- * `invalid_grant` landing `expired` + connection `auth_error`, transactional
- * single-flight (two concurrent calls → ONE refresh), and the mutation
- * transitions on the HTTP surface (auth-type change off oauth revokes +
- * deletes the grant row; custom URL change revokes + resets to `pending`;
- * connection delete revokes best-effort).
+ * TRANSIENT refresh failures leaving the grant `connected` and retryable
+ * (fix plan F4), `invalid_grant` landing `expired` + connection `auth_error`,
+ * transactional single-flight (two concurrent calls → ONE refresh), and the
+ * mutation transitions on the HTTP surface (auth-type change off oauth
+ * revokes + deletes the grant row; custom URL change revokes + resets to
+ * `pending`; connection delete revokes best-effort).
+ *
+ * RIG NOTE — the consent callback leaves a background writer behind. The
+ * broker fires the post-connect probe with `void` and answers the popup
+ * immediately (broker.ts, spec §7), so `connectFlow` below waits for that task
+ * to LAND before returning: it writes `connections.health`/`last_checked_at`
+ * and it is itself a `getAccessToken` caller, so anything left in flight races
+ * both the health assertions and the stub AS's request counters here.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -44,6 +52,13 @@ const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 const MASTER_KEY = parseMasterKey(MASTER_KEY_B64);
+/**
+ * How long `connectFlow` waits for the post-connect probe to commit. The probe
+ * dials 127.0.0.1 and is answered instantly, so this is pure headroom; it sits
+ * under bun's 5 s per-test default deliberately, so a probe that never fires
+ * surfaces as this file's explanatory error rather than a bare test timeout.
+ */
+const PROBE_SETTLE_TIMEOUT_MS = 4_000;
 
 // ── stub OAuth-protected MCP resource (broker.test.ts idiom) ─────────────────
 
@@ -218,7 +233,53 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
     expect(await callback.text()).toContain('"ok":true');
     const row = (await oauthRow(body.connection.id))!;
     expect(row.status).toBe("connected");
+    await awaitPostConnectProbe(body.connection.id);
     return body.connection.id;
+  }
+
+  /**
+   * Block until the broker's fire-and-forget post-connect probe has finished
+   * writing, so nothing this suite asserts can be moved by it afterwards.
+   *
+   * `last_checked_at` is the honest witness: an oauth row is created WITHOUT a
+   * probe (resources/connections.ts skips oauth at create — fix plan F10/F11),
+   * so the column is null until `probeAndPersist` writes it, and it writes it
+   * on EVERY outcome. Its arrival therefore means "the probe committed", which
+   * is the only moment after which `connections.health` is stable and the
+   * probe's own `getAccessToken` call can no longer spend a refresh at the
+   * stub AS.
+   *
+   * A timeout here is a real failure — the probe not firing at all is a
+   * regression this rig should shout about, not silently tolerate — so it
+   * throws rather than falling through.
+   */
+  async function awaitPostConnectProbe(connectionId: string): Promise<void> {
+    const deadline = Date.now() + PROBE_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      if ((await connectionRow(connectionId))?.lastCheckedAt) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `post-connect probe never landed for ${connectionId} — last_checked_at still null after ${PROBE_SETTLE_TIMEOUT_MS}ms`,
+        );
+      }
+      await Bun.sleep(5);
+    }
+  }
+
+  /**
+   * Force the connection's probe-derived health, the way {@link setExpiry}
+   * forces the stored expiry: it arranges a precondition the rig cannot reach
+   * honestly. Safe only AFTER the post-connect probe settled (see above) —
+   * before that the probe would overwrite it.
+   */
+  async function setHealth(
+    connectionId: string,
+    health: (typeof schema.connections.$inferSelect)["health"],
+  ) {
+    await db
+      .update(schema.connections)
+      .set({ health, lastError: null })
+      .where(eq(schema.connections.id, connectionId));
   }
 
   /** Force the stored access token's expiry to `msFromNow`. */
@@ -230,6 +291,47 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
           msFromNow === null ? null : new Date(Date.now() + msFromNow),
       })
       .where(eq(schema.connectionOauth.connectionId, connectionId));
+  }
+
+  /**
+   * Wrap the guarded egress fetch so the first `failures` POSTs to the stub
+   * AS's token endpoint fail the way a real blip does. The request never
+   * reaches the AS, so the stored refresh token is NOT consumed and stays
+   * perfectly usable — which is exactly what makes these failures transient
+   * and `invalid_grant` the only terminal one. `mode` covers both shapes the
+   * refresh path types as `oauth_exchange_failed`: an AS 5xx and a dead
+   * socket (what the egress timeout looks like to the caller).
+   *
+   * The stub AS itself is left alone: it has no transient mode, and this rig
+   * needs the failure to happen strictly BEFORE the AS sees the grant.
+   */
+  function flakyTokenEndpoint(
+    failures: number,
+    mode: "http_503" | "network",
+  ): { fetchImpl: typeof fetch; attempts: () => number } {
+    const inner = deps.fetchImpl;
+    const tokenEndpoint = `${as.issuer}/token`;
+    let attempts = 0;
+    const impl = async (
+      ...args: Parameters<typeof fetch>
+    ): Promise<Response> => {
+      const [input] = args;
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url === tokenEndpoint && attempts++ < failures) {
+        if (mode === "network") throw new Error("socket hang up");
+        return Response.json(
+          { error: "temporarily_unavailable" },
+          { status: 503 },
+        );
+      }
+      return inner(...args);
+    };
+    return { fetchImpl: impl as typeof fetch, attempts: () => attempts };
   }
 
   beforeAll(async () => {
@@ -410,8 +512,131 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
     expect(again.token).toBe(as.issuedAccessTokens.at(-1)!);
   });
 
+  test("a transient refresh failure leaves the grant connected — the next demand refreshes for real", async () => {
+    const id = await connectFlow("Transient Blip");
+    const before = (await oauthRow(id))!;
+    const refreshToken = decryptEnvelope(
+      before.refreshTokenEncrypted!,
+      "refresh_token",
+      before.id,
+    );
+    // Arrange a health a terminal failure would visibly destroy. The settled
+    // post-connect probe left `auth_error` (the stub resource 401s every MCP
+    // dial), which is the exact value `markExpired` writes — snapshotting THAT
+    // would make the assertion below unfalsifiable. `ok` is also the case that
+    // actually matters in production: a 30 s blip at the authorization server
+    // must not flip a working connector's badge to "reconnect".
+    await setHealth(id, "ok");
+    const asHitsBefore = as.tokenRequests.length;
+    await setExpiry(id, -1_000);
+
+    // A 503 at the AS is NOT the AS disowning the grant.
+    const flaky = flakyTokenEndpoint(1, "http_503");
+    let message = "";
+    try {
+      await getAccessToken({ ...deps, fetchImpl: flaky.fetchImpl }, id);
+      throw new Error("expected the transient refresh to reject");
+    } catch (error) {
+      expect(isRuntimeApiError(error)).toBe(true);
+      const api = error as { code: string; status: number; message: string };
+      expect({ code: api.code, status: api.status }).toEqual({
+        code: "oauth_exchange_failed",
+        status: 502,
+      });
+      message = api.message;
+    }
+    expect(flaky.attempts()).toBe(1);
+    expect(as.tokenRequests.length).toBe(asHitsBefore); // never reached the AS
+    // Secrets discipline: the typed error carries a status, never a token.
+    expect(message).not.toContain(refreshToken);
+
+    // The grant is untouched — status, both envelopes, and the connection's
+    // health. Nothing here requires a re-consent.
+    const after = (await oauthRow(id))!;
+    expect(after.status).toBe("connected");
+    expect(after.accessTokenEncrypted).toBe(before.accessTokenEncrypted);
+    expect(after.refreshTokenEncrypted).toBe(before.refreshTokenEncrypted);
+    const conn = (await connectionRow(id))!;
+    expect(conn.health).toBe("ok");
+    expect(conn.lastError).toBeNull();
+
+    // The very next demand refreshes with the still-valid material and
+    // persists the rotation.
+    const result = await getAccessToken(deps, id);
+    expect(result.token).toBe(as.issuedAccessTokens.at(-1)!);
+    expect(as.tokenRequests.length).toBe(asHitsBefore + 1);
+    expect(as.tokenRequests.at(-1)!.get("refresh_token")).toBe(refreshToken);
+    const recovered = (await oauthRow(id))!;
+    expect(recovered.status).toBe("connected");
+    expect(
+      decryptEnvelope(recovered.accessTokenEncrypted!, "access_token", recovered.id),
+    ).toBe(result.token);
+    expect(
+      decryptEnvelope(
+        recovered.refreshTokenEncrypted!,
+        "refresh_token",
+        recovered.id,
+      ),
+    ).toBe(as.issuedRefreshTokens.at(-1)!);
+  });
+
+  test("an unreachable token endpoint is transient too — no status write, retry succeeds", async () => {
+    const id = await connectFlow("Transient Timeout");
+    const before = (await oauthRow(id))!;
+    await setExpiry(id, -1_000);
+
+    const flaky = flakyTokenEndpoint(1, "network");
+    expect(
+      await apiErrorOf(
+        getAccessToken({ ...deps, fetchImpl: flaky.fetchImpl }, id),
+      ),
+    ).toEqual({ code: "oauth_exchange_failed", status: 502 });
+    const after = (await oauthRow(id))!;
+    expect(after.status).toBe("connected");
+    expect(after.refreshTokenEncrypted).toBe(before.refreshTokenEncrypted);
+
+    const result = await getAccessToken(deps, id);
+    expect(result.token).toBe(as.issuedAccessTokens.at(-1)!);
+  });
+
+  test("a sustained outage fails every concurrent caller without disturbing the grant", async () => {
+    const id = await connectFlow("Sustained Outage");
+    const before = (await oauthRow(id))!;
+    const asHitsBefore = as.tokenRequests.length;
+    await setExpiry(id, -1_000);
+
+    // Nothing dedupes a FAILED refresh — the winner of the row lock writes no
+    // token for the loser to re-read — so both callers legitimately try, and
+    // both must fail without spending the grant.
+    const flaky = flakyTokenEndpoint(Number.MAX_SAFE_INTEGER, "http_503");
+    const outageDeps = { ...deps, fetchImpl: flaky.fetchImpl };
+    const results = await Promise.all([
+      apiErrorOf(getAccessToken(outageDeps, id)),
+      apiErrorOf(getAccessToken(outageDeps, id)),
+    ]);
+    expect(results).toEqual([
+      { code: "oauth_exchange_failed", status: 502 },
+      { code: "oauth_exchange_failed", status: 502 },
+    ]);
+    expect(as.tokenRequests.length).toBe(asHitsBefore);
+
+    const after = (await oauthRow(id))!;
+    expect(after.status).toBe("connected");
+    expect(after.accessTokenEncrypted).toBe(before.accessTokenEncrypted);
+    expect(after.refreshTokenEncrypted).toBe(before.refreshTokenEncrypted);
+
+    // The AS recovers; the grant needed no re-consent.
+    const result = await getAccessToken(deps, id);
+    expect(result.token).toBe(as.issuedAccessTokens.at(-1)!);
+    expect(as.tokenRequests.length).toBe(asHitsBefore + 1);
+  });
+
   test("invalid_grant on refresh lands expired + auth_error and throws oauth_not_connected", async () => {
     const id = await connectFlow("Invalid Grant");
+    // Same sentinel discipline as the transient case: start from `ok` so the
+    // `auth_error` below is the REFRESH's write and not the post-connect
+    // probe's, which lands the same value against this always-401 stub.
+    await setHealth(id, "ok");
     await setExpiry(id, -1_000);
 
     as.tokenMode = "invalid_grant";
@@ -428,6 +653,8 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
     expect(row.status).toBe("expired");
     const conn = (await connectionRow(id))!;
     expect(conn.health).toBe("auth_error");
+    // The reader is told to re-consent — not that some MCP dial 401'd.
+    expect(conn.lastError).toContain("reconnect");
 
     // The grant is dead even now that the AS recovered: still 409.
     expect(await apiErrorOf(getAccessToken(deps, id))).toEqual({

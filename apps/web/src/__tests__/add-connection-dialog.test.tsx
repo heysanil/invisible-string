@@ -4,6 +4,11 @@
  * validate locally and send the typed secret exactly once; community search
  * installs via `{source:"registry"}`; and `search_unavailable` degrades to a
  * catalog-only state without ever blocking the curated tiles.
+ *
+ * The oauth lane also carries the 2026-08-31 fix plan's F9: a failed consent
+ * has no inline surface here (the dialog is a browse step, not a settings
+ * page), so its toast must name what actually went wrong AND where to finish
+ * — never one generic "authorization failed" for every cause.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -411,4 +416,63 @@ test("oauth catalog tile chains create → oauth start → popup consent → clo
     (call) => call.method === "POST" && call.path.endsWith("/oauth/start"),
   );
   expect(starts).toHaveLength(1);
+});
+
+test("a failed oauth consent toasts the reason and where to finish it", async () => {
+  const OAUTH_ID = "cn_a1b2c3d4e5f6a7b8";
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  fetchMock
+    .on("POST", "/connections", () =>
+      jsonResponse(
+        {
+          connection: connectionDto({
+            id: OAUTH_ID,
+            name: "Linear",
+            catalogSlug: "linear",
+            url: "https://mcp.linear.app/mcp",
+            authType: "oauth",
+            hasCredentials: false,
+            oauthStatus: "pending",
+          }),
+          oauthStartPath: `/workspaces/org_1/connections/${OAUTH_ID}/oauth/start`,
+        },
+        201,
+      ),
+    )
+    .on("POST", "/oauth/start", () =>
+      jsonResponse({ authorizeUrl: "https://as.example.com/authorize?state=s1" }),
+    );
+
+  const onClose = mock(() => {});
+  const view = renderWithProviders(
+    <AddConnectionDialog open onClose={onClose} scope={SCOPE} scopeLabel="workspace" />,
+  );
+
+  const tile = await view.findByText("Linear");
+  fireEvent.click(tile.closest("button")!);
+  await waitFor(() => {
+    expect(popup.href).toBe("https://as.example.com/authorize?state=s1");
+  });
+
+  // The authorization server said no (declined consent, or a token endpoint
+  // that would not mint) — the row exists and is reconnectable.
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: {
+        type: "mcp-oauth",
+        ok: false,
+        connectionId: OAUTH_ID,
+        reason: "oauth_exchange_failed",
+      },
+      origin: new URL(API_BASE_URL).origin,
+    }),
+  );
+
+  expect(await view.findByText(/did not issue a token/i)).toBeTruthy();
+  expect(view.getByText(/Linear was added/i)).toBeTruthy();
+  // A failure keeps the dialog open — closing it would strand the user with
+  // no way back to the half-finished connection.
+  expect(onClose).not.toHaveBeenCalled();
 });

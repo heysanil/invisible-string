@@ -282,13 +282,20 @@ export function integrationsPlugin(deps: IntegrationDeps) {
               ...(typeof query.code === "string" ? { code: query.code } : {}),
               ...(typeof query.state === "string" ? { state: query.state } : {}),
               ...(typeof query.error === "string" ? { error: query.error } : {}),
+              // RFC 9207 — validated against the armed flow's expected issuer
+              // before the code is exchanged (fix plan F13).
+              ...(typeof query.iss === "string" ? { iss: query.iss } : {}),
             },
             request.headers,
           );
           set.headers["content-type"] = "text/html; charset=utf-8";
           set.headers["cache-control"] = "no-store";
           set.headers["content-security-policy"] = OAUTH_CALLBACK_CSP;
-          return renderCallbackPage(outcome, config.publicAppUrl);
+          // The postMessage target is the SPA's origin, NOT this server's
+          // (fix plan F8): the popup's opener is the app, which in local dev
+          // is a different origin, and a mismatched targetOrigin is dropped
+          // by the browser in complete silence.
+          return renderCallbackPage(outcome, deps.oauthBroker.publicWebUrl);
         },
       )
 

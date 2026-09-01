@@ -5,6 +5,14 @@
  * and keeps the field editable; auth rotation sends the secret exactly once
  * (one-shot form). The delete-in-use blocker lives in
  * mcp-delete-blocker.test.tsx.
+ *
+ * The OAuth panel additionally carries the 2026-08-31 fix plan's SPA half:
+ * F3 (a server-supplied authorization URL that is not https is refused, never
+ * navigated to), F9 (the callback's sanitized `reason` — and a start route's
+ * `ApiError.code` — become specific, actionable copy instead of one generic
+ * "authorization failed"), and the grant/health PAIRING: `oauthStatus` and
+ * `health` are two different columns, and a reader must never be left with
+ * "Connected" beside a 401 and no sentence reconciling them.
  */
 import { ensureDomForThisFile } from "../test/setup";
 
@@ -97,15 +105,20 @@ function fakePopup() {
 }
 
 /** A catalog oauth connection in the given grant state. */
-function oauthDto(status: NonNullable<ConnectionDto["oauthStatus"]>): ConnectionDto {
+function oauthDto(
+  status: NonNullable<ConnectionDto["oauthStatus"]>,
+  over: Partial<ConnectionDto> = {},
+): ConnectionDto {
   return connectionDto({
     source: "catalog",
     catalogSlug: "linear",
     name: "Linear",
     url: "https://mcp.linear.app/mcp",
     authType: "oauth",
-    hasCredentials: true,
+    // Only a `connected` grant can present a credential (fix plan F10).
+    hasCredentials: status === "connected",
     oauthStatus: status,
+    ...over,
   });
 }
 
@@ -323,4 +336,156 @@ test("oauth expired shows the reconnect affordance", async () => {
 
   expect(await view.findByRole("button", { name: "Reconnect" })).toBeTruthy();
   expect(view.getByText(/expired/i)).toBeTruthy();
+});
+
+test("a non-https authorize URL is refused, never navigated to (F3)", async () => {
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  fetchMock
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: oauthDto("pending") }))
+    // `startOauthResponseSchema` is `z.url()`, which happily accepts
+    // `javascript:` — the wire contract is no defence here, the SPA is.
+    .on("POST", `/connections/${ID}/oauth/start`, () =>
+      jsonResponse({ authorizeUrl: "javascript:fetch('/steal')" }),
+    );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  fireEvent.click(await view.findByRole("button", { name: "Connect" }));
+
+  expect(await view.findByText(/unsafe sign-in address/i)).toBeTruthy();
+  // The popup inherits this origin — it must never have been navigated.
+  expect(popup.href).toBe("");
+  expect(popup.closed).toBe(true);
+});
+
+test("a failed callback renders the reason's own copy, not a generic failure (F9)", async () => {
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  fetchMock
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: oauthDto("pending") }))
+    .on("POST", `/connections/${ID}/oauth/start`, () =>
+      jsonResponse({ authorizeUrl: "https://as.example.com/authorize?state=s1" }),
+    );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  fireEvent.click(await view.findByRole("button", { name: "Connect" }));
+  await waitFor(() => {
+    expect(popup.href).toBe("https://as.example.com/authorize?state=s1");
+  });
+
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: {
+        type: "mcp-oauth",
+        ok: false,
+        connectionId: ID,
+        reason: "oauth_state_invalid",
+      },
+      origin: new URL(API_BASE_URL).origin,
+    }),
+  );
+
+  expect(await view.findByText(/expired or was already used/i)).toBeTruthy();
+  // The raw machine code never reaches the reader.
+  expect(view.queryByText(/oauth_state_invalid/)).toBeNull();
+});
+
+test("a start failure explains a refused client registration (F9)", async () => {
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  fetchMock
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: oauthDto("pending") }))
+    .on("POST", `/connections/${ID}/oauth/start`, () =>
+      jsonResponse(
+        {
+          error: {
+            code: "oauth_registration_failed",
+            message: "dynamic client registration failed (HTTP 400: invalid_redirect_uri)",
+          },
+        },
+        502,
+      ),
+    );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  fireEvent.click(await view.findByRole("button", { name: "Connect" }));
+
+  expect(await view.findByText(/only accepts pre-approved clients/i)).toBeTruthy();
+  expect(popup.closed).toBe(true);
+});
+
+test("a connected grant with auth_required health asks for re-authorization", async () => {
+  fetchMock.on("GET", `/connections/${ID}`, () =>
+    jsonResponse({
+      connection: oauthDto("connected", { health: "auth_required", lastError: null }),
+    }),
+  );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  // Both columns are told honestly, and one sentence reconciles them.
+  expect(await view.findByText(/no longer accepting this authorization/i)).toBeTruthy();
+  expect(view.getByRole("button", { name: "Reconnect" })).toBeTruthy();
+  // "Connected" beside a 401 with nothing else said is the bug; a bare
+  // "Authorization failed" is the opposite error — neither may appear.
+  expect(view.queryByText("Authorization failed. Reconnect to try again.")).toBeNull();
+});
+
+test("a pending grant reads as awaiting authorization and is not probed", async () => {
+  fetchMock.on("GET", `/connections/${ID}`, () =>
+    jsonResponse({
+      // What P1.2 leaves behind: created, never probed, no grant yet.
+      connection: oauthDto("pending", { health: "unknown", lastCheckedAt: null }),
+    }),
+  );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  expect(await view.findByText(/first health check runs once/i)).toBeTruthy();
+  // A grant with no token cannot be probed into anything but `auth_required`,
+  // so opening the detail must not spend a write to re-learn that.
+  await waitFor(() => {
+    expect(view.getByRole("button", { name: "Connect" })).toBeTruthy();
+  });
+  expect(probeCalls()).toHaveLength(0);
+});
+
+test("a loopback http authorize URL is still allowed (local stacks, e2e)", async () => {
+  const popup = fakePopup();
+  window.open = mock(() => popup as unknown as Window) as unknown as typeof window.open;
+
+  fetchMock
+    .on("GET", `/connections/${ID}`, () => jsonResponse({ connection: oauthDto("pending") }))
+    .on("POST", `/connections/${ID}/oauth/start`, () =>
+      jsonResponse({ authorizeUrl: "http://127.0.0.1:9411/authorize?state=s1" }),
+    );
+
+  const view = renderWithProviders(
+    <ConnectionDetail scope={SCOPE} connectionId={ID} readOnly={false} onClose={() => {}} />,
+  );
+
+  fireEvent.click(await view.findByRole("button", { name: "Connect" }));
+
+  // The scheme guard draws the browser's own secure-context line: tightening
+  // it to https-only would silently break every local stack and the e2e stub
+  // authorization server, which speaks http on loopback.
+  await waitFor(() => {
+    expect(popup.href).toBe("http://127.0.0.1:9411/authorize?state=s1");
+  });
 });

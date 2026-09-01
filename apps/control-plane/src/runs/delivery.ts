@@ -273,6 +273,19 @@ export interface DeliveryServiceDeps {
 export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryService {
   const { reader, runStore, slackClient, masterKey, logger } = deps;
 
+  /**
+   * Settle the ledger as `failed` and say why. EVERY call site inside
+   * {@link deliver} must `return await` this — a bare `return settleFailed(…)`
+   * inside the try block adopts the promise only AFTER the block exits, so
+   * deliver's own catch never sees a rejected settle write and the failure
+   * escapes the function that documents "never throws". The tailer hook fires
+   * delivery as `void delivery.deliver(info)` (index.ts), so what escapes is
+   * an unhandled rejection in the process — and the settle write is exactly
+   * the call that rejects in practice: `close()` awaits `tailers.stopAll()`
+   * (which finishes the live runs and starts their deliveries) and then ends
+   * the pool underneath the in-flight update, which surfaced intermittently
+   * as `Failed query: update "runs" set "delivery_status" … CONNECTION_ENDED`.
+   */
   async function settleFailed(
     runId: string,
     organizationId: string | undefined,
@@ -313,7 +326,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
       if (run.runStatus !== "succeeded") {
         // A failed/canceled run owes no reply — settle the ledger so the
         // recovery sweep never reconsiders it.
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           `run ${run.runStatus} — no reply delivered`,
@@ -324,7 +337,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
         input.lastAssistantMessage ??
         lastStopMessageFrom(await reader.listRunEvents(run.runId));
       if (text === null || text.length === 0) {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "run produced no terminal assistant reply (finishReason stop)",
@@ -332,7 +345,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
       }
 
       if (run.slackThreadKey === null) {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "session has no slack thread key — cannot route the reply",
@@ -340,7 +353,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
       }
       const key = parseSlackThreadKey(run.slackThreadKey);
       if (!key) {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "malformed slack thread key",
@@ -349,14 +362,14 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
 
       const integration = await reader.loadIntegration(key.integrationId);
       if (!integration || integration.type !== "slack") {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "slack integration disconnected — reply undeliverable",
         );
       }
       if (masterKey === undefined) {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "encryption master key unavailable — cannot decrypt the bot token",
@@ -373,7 +386,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
         );
         botToken = (JSON.parse(plaintext) as SlackStoredCredentials).botToken;
       } catch {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           "failed to decrypt slack credentials",
@@ -393,7 +406,7 @@ export function createDeliveryService(deps: DeliveryServiceDeps): DeliveryServic
         threadTs,
       });
       if (!posted.ok) {
-        return settleFailed(
+        return await settleFailed(
           run.runId,
           run.organizationId,
           `chat.postMessage failed: ${posted.error}`,

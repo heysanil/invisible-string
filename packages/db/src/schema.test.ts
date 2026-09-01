@@ -127,6 +127,14 @@ describe("product enums", () => {
       "failed",
     ]);
   });
+
+  test("oauth client identity modes are cimd/dcr/preregistered", () => {
+    expect(schema.connectionOauthClientMode.enumValues).toEqual([
+      "cimd",
+      "dcr",
+      "preregistered",
+    ]);
+  });
 });
 
 describe("run_events", () => {
@@ -234,6 +242,81 @@ describe("indexes and uniques", () => {
     expect(
       unique!.config.columns.map((c) => (c as { name: string }).name),
     ).toEqual(["agent_id", "content_hash"]);
+  });
+});
+
+describe("connection_oauth", () => {
+  test("a pending flow is bound to the user who armed it (SET NULL on delete)", () => {
+    expect(schema.connectionOauth.pendingStartedBy.getSQLType()).toBe("text");
+    expect(schema.connectionOauth.pendingStartedBy.notNull).toBe(false);
+    const fk = config(schema.connectionOauth).foreignKeys.find((f) =>
+      f
+        .reference()
+        .columns.some(
+          (c) => (c as { name: string }).name === "pending_started_by",
+        ),
+    );
+    expect(fk).toBeDefined();
+    expect(
+      getTableConfig(fk!.reference().foreignTable as PgTable).name,
+    ).toBe("user");
+    expect(fk!.onDelete).toBe("set null");
+  });
+
+  test("the armed flow records the issuer it expects and the AS's iss capability", () => {
+    expect(schema.connectionOauth.expectedIssuer.getSQLType()).toBe("text");
+    expect(schema.connectionOauth.expectedIssuer.notNull).toBe(false);
+    expect(schema.connectionOauth.issParameterSupported.getSQLType()).toBe(
+      "boolean",
+    );
+    expect(schema.connectionOauth.issParameterSupported.notNull).toBe(false);
+  });
+
+  test("an armed flow stages its discovery apart from the live grant", () => {
+    // The endpoint columns are where oauth/tokens.ts replays a live refresh
+    // token; a start that never completes must not be able to choose them, so
+    // discovery lands here first and is promoted only by a successful
+    // exchange (2026-08-31 fix plan, adversarial review).
+    expect(schema.connectionOauth.pendingFlow.getSQLType()).toBe("jsonb");
+    expect(schema.connectionOauth.pendingFlow.notNull).toBe(false);
+    expect(columnNames(schema.connectionOauth)).toEqual(
+      expect.arrayContaining([
+        "pending_flow",
+        "token_endpoint",
+        "revocation_endpoint",
+      ]),
+    );
+  });
+
+  test("stored client credentials are keyed by the issuer that minted them", () => {
+    expect(schema.connectionOauth.clientRegistrationIssuer.getSQLType()).toBe(
+      "text",
+    );
+    expect(schema.connectionOauth.clientRegistrationIssuer.notNull).toBe(false);
+  });
+
+  test("client identity mode is the enum, nullable (pre-broker rows are unknown)", () => {
+    expect(schema.connectionOauth.clientIdentityMode.notNull).toBe(false);
+    expect(schema.connectionOauth.clientIdentityMode.enumValues).toEqual([
+      "cimd",
+      "dcr",
+      "preregistered",
+    ]);
+  });
+
+  test("a pre-registered client reuses client_id/client_secret_encrypted", () => {
+    expect(columnNames(schema.connectionOauth)).toEqual(
+      expect.arrayContaining(["client_id", "client_secret_encrypted"]),
+    );
+    // No parallel operator-credential columns: one home per credential.
+    expect(columnNames(schema.connectionOauth)).not.toContain(
+      "preregistered_client_id",
+    );
+  });
+
+  test("last_error_code is a sanitized typed code, distinct from any message", () => {
+    expect(schema.connectionOauth.lastErrorCode.getSQLType()).toBe("text");
+    expect(schema.connectionOauth.lastErrorCode.notNull).toBe(false);
   });
 });
 

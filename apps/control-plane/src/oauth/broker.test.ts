@@ -1,15 +1,34 @@
 /**
- * OAuth consent broker integration tests (connectors redesign Plan 3 Task 5)
- * — gated on TEST_DATABASE_URL (skip cleanly when unset; the compose
- * integration stage provides it).
+ * OAuth consent broker integration tests (connectors redesign Plan 3 Task 5,
+ * as reworked by the 2026-08-31 OAuth fix plan) — gated on TEST_DATABASE_URL
+ * (skip cleanly when unset; the compose integration stage provides it).
  *
  * Drives the full HTTP surface against an in-process stub authorization
- * server (stub-as.ts) and a stub OAuth-protected MCP resource:
- * start → consent → callback happy path (encrypted tokens, `connected`,
- * post-connect probe), single-use/expired/superseded `state`, exchange
- * rejection landing `status: error`, oauth-enabled creates (custom + catalog
- * recipe), and the authz matrix on the start routes + the session-bound
- * callback.
+ * server (stub-as.ts) and a stub OAuth-protected MCP resource that BEHAVES
+ * LIKE ONE: start → consent → callback happy path ending in a probe that
+ * authenticates and caches tools, the grant state machine (arm-to-`pending`,
+ * a live grant surviving a failed re-consent, sanitized error codes),
+ * single-use/expired/superseded `state`, RFC 9207 issuer validation,
+ * initiator binding, pre-registered client identity, oauth-enabled creates
+ * (custom + catalog recipe), and the authz matrix on the start routes + the
+ * session-bound callback.
+ *
+ * Two of the cases below run against a SECOND stub authorization server the
+ * MCP resource can be made to nominate mid-life (`otherAs`), because "a live
+ * grant survives a failed re-consent" is only true if the row survives it
+ * WHOLE: the endpoint and client columns are what the central refresh replays
+ * a still-valid refresh token against, so a start that discovers a different
+ * authorization server and then never completes must move none of them.
+ *
+ * WHAT THIS SUITE USED TO GET WRONG, because it is the reason the shipped
+ * product was broken (fix plan §2 "why the tests did not catch it"): the MCP
+ * fixture answered 401 to EVERYTHING, and the happy-path test asserted only
+ * that a probe had FIRED — never its outcome. The health it actually
+ * persisted after that passing test was `auth_error`, which is precisely the
+ * "connected but 401" users saw. The fixture below now requires the bearer
+ * token like every real OAuth MCP server, and the assertions are on the
+ * persisted health, the tool cache, and the Authorization header the server
+ * received.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -34,43 +53,91 @@ import type { BuildSteps } from "../build/steps";
 import { createAppStack, type AppStack } from "../index";
 import { runMigrations } from "../migrate";
 import { connectionOauthAad } from "./client-identity";
-import { StubAuthorizationServer } from "./stub-as";
+import { FOREIGN_ISSUER, StubAuthorizationServer } from "./stub-as";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+/** The CONTROL-PLANE origin: redirect URI + CIMD client id come from it. */
 const BASE_URL = "http://localhost:3000";
+/**
+ * The SPA origin, deliberately DIFFERENT from the API's — the split-origin
+ * deployment (local dev) whose silent postMessage drop is fix plan F8. Every
+ * callback page rendered by this suite must target this one.
+ */
+const WEB_URL = "http://localhost:5173";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
 const MASTER_KEY = parseMasterKey(MASTER_KEY_B64);
+/** Operator-supplied client for the `preregistered` preset (fix plan P2b). */
+const PREREGISTERED_CLIENT_ID = "preapproved-client-id";
+const PREREGISTERED_ENV_PREFIX = "STUB_PREREG";
 
 // ── stub OAuth-protected MCP resource ────────────────────────────────────────
 //
-// `GET /mcp` answers 401 with the RFC 9728 `WWW-Authenticate`
-// `resource_metadata` pointer (exercising discovery's pointer-first path);
-// the PRM lives at the path-aware well-known and names the stub AS. Every
-// /mcp hit is counted so tests can observe the post-connect probe firing.
+// A real OAuth-protected MCP server, because a permissive one cannot prove
+// the thing that matters (fix plan F1/P1.3): EVERY /mcp request needs a
+// bearer the stub AS issued, exactly like Linear, Notion or Sentry.
+//
+//  - unauthenticated (discovery's GET; any token-less probe) → 401 carrying
+//    the RFC 9728 `resource_metadata` pointer AND the `scope` the request
+//    lacked. That challenge scope is authoritative per the MCP spec and is
+//    deliberately WIDER than the PRM's, so which one reaches the
+//    authorization request is observable (fix plan F6);
+//  - authenticated GET → 405, the spec's "no standalone SSE stream here",
+//    which the SDK client accepts and moves on from;
+//  - authenticated POST → streamable-HTTP JSON-RPC: `initialize`, the
+//    `notifications/initialized` 202, and `tools/list`.
+
+/** The one tool advertised — `tools_cache` stores exactly this, trimmed. */
+const STUB_TOOL = {
+  name: "echo",
+  description: "Echo a message back.",
+  inputSchema: {
+    type: "object",
+    properties: { message: { type: "string" } },
+    required: ["message"],
+  },
+};
+
+interface JsonRpcMessage {
+  method?: unknown;
+  id?: unknown;
+  params?: { protocolVersion?: unknown } | undefined;
+}
 
 class StubResource {
+  /** Every /mcp request, authenticated or not — probe-fired assertions. */
   mcpHits = 0;
+  /** `Authorization` of every /mcp request, in order (null when absent). */
+  readonly authorizationHeaders: (string | null)[] = [];
+  /** Bearer values the server ACCEPTED, in order. */
+  readonly acceptedTokens: string[] = [];
+  /** `WWW-Authenticate` scope — authoritative over the PRM's (fix plan F6). */
+  challengeScope = "mcp.read mcp.write";
+  /** PRM `scopes_supported`, deliberately NARROWER than the challenge's. */
+  prmScopes: string[] = ["mcp.read"];
+  /**
+   * The authorization server this resource NOMINATES. Mutable because it is
+   * the MCP server's choice — a hostile or compromised one repoints it, which
+   * is the AS mix-up the broker's staging has to survive.
+   */
+  asIssuer = "";
+
+  private isLiveToken: (token: string) => boolean = () => false;
   private server: ReturnType<typeof Bun.serve> | null = null;
 
-  start(asIssuer: string): void {
+  start(asIssuer: string, isLiveToken: (token: string) => boolean): void {
+    this.asIssuer = asIssuer;
+    this.isLiveToken = isLiveToken;
     this.server = Bun.serve({
       port: 0,
       idleTimeout: 0,
-      fetch: (req) => {
+      fetch: async (req) => {
         const url = new URL(req.url);
-        if (url.pathname === "/mcp") {
-          this.mcpHits += 1;
-          return new Response("unauthorized", {
-            status: 401,
-            headers: {
-              "www-authenticate": `Bearer resource_metadata="${this.origin}/.well-known/oauth-protected-resource/mcp"`,
-            },
-          });
-        }
+        if (url.pathname === "/mcp") return await this.mcp(req);
         if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
           return Response.json({
             resource: this.mcpUrl,
-            authorization_servers: [asIssuer],
+            authorization_servers: [this.asIssuer],
+            scopes_supported: this.prmScopes,
           });
         }
         return new Response("not found", { status: 404 });
@@ -90,6 +157,58 @@ class StubResource {
 
   get mcpUrl(): string {
     return `${this.origin}/mcp`;
+  }
+
+  /** A URL on this host that is NOT an MCP server — discovery finds nothing. */
+  get notMcpUrl(): string {
+    return `${this.origin}/not-mcp`;
+  }
+
+  private async mcp(req: Request): Promise<Response> {
+    this.mcpHits += 1;
+    const header = req.headers.get("authorization");
+    this.authorizationHeaders.push(header);
+    const token = header?.startsWith("Bearer ")
+      ? header.slice("Bearer ".length)
+      : null;
+    if (token === null || !this.isLiveToken(token)) return this.challenge();
+    this.acceptedTokens.push(token);
+    // No standalone SSE stream: the SDK opens one after `initialized` and
+    // treats 405 as "not offered" without erroring the session.
+    if (req.method !== "POST") return new Response(null, { status: 405 });
+
+    const message = (await req.json().catch(() => null)) as JsonRpcMessage | null;
+    if (message === null || typeof message.method !== "string") {
+      return new Response("bad json-rpc", { status: 400 });
+    }
+    // Notifications carry no id and get an empty 202.
+    if (message.id === undefined) return new Response(null, { status: 202 });
+    const reply = (result: unknown) =>
+      Response.json({ jsonrpc: "2.0", id: message.id, result });
+    if (message.method === "initialize") {
+      return reply({
+        // Echo what the client asked for: the SDK rejects a version outside
+        // its supported set, and the client's own request is always inside it.
+        protocolVersion: message.params?.protocolVersion ?? "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "stub-oauth-mcp", version: "1.0.0" },
+      });
+    }
+    if (message.method === "tools/list") return reply({ tools: [STUB_TOOL] });
+    return Response.json({
+      jsonrpc: "2.0",
+      id: message.id,
+      error: { code: -32601, message: "method not found" },
+    });
+  }
+
+  private challenge(): Response {
+    return new Response("unauthorized", {
+      status: 401,
+      headers: {
+        "www-authenticate": `Bearer resource_metadata="${this.origin}/.well-known/oauth-protected-resource/mcp", scope="${this.challengeScope}"`,
+      },
+    });
   }
 }
 
@@ -154,6 +273,14 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
   const as = new StubAuthorizationServer({
     scopesSupported: ["mcp.read", "mcp.write"],
   });
+  /**
+   * A SECOND, fully functional authorization server the resource can be made
+   * to nominate instead — the endpoint an AS mix-up would repoint a live
+   * grant at. It registers clients and issues tokens like any other, which is
+   * the point: nothing about it is malformed, so only WHEN its endpoints are
+   * allowed to reach the grant row keeps a refresh token away from it.
+   */
+  const otherAs = new StubAuthorizationServer();
   const resource = new StubResource();
   let stack: AppStack;
   let db: AppStack["dbHandle"]["db"];
@@ -212,15 +339,11 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
   /** Create a workspace-scoped custom OAuth connection; returns id + start path. */
   async function createOauthConnection(
     name: string,
+    url = resource.mcpUrl,
   ): Promise<{ id: string; startPath: string }> {
     const res = await api("POST", `/workspaces/${orgId}/connections`, {
       cookie: ownerCookie,
-      body: {
-        source: "custom",
-        name,
-        url: resource.mcpUrl,
-        auth: { type: "oauth" },
-      },
+      body: { source: "custom", name, url, auth: { type: "oauth" } },
     });
     expect(res.status).toBe(201);
     const body = (await res.json()) as CreateConnectionResponse;
@@ -235,6 +358,46 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
       .where(eq(schema.connectionOauth.connectionId, connectionId))
       .limit(1);
     return rows[0];
+  }
+
+  async function connectionRow(connectionId: string) {
+    const rows = await db
+      .select()
+      .from(schema.connections)
+      .where(eq(schema.connections.id, connectionId))
+      .limit(1);
+    return rows[0];
+  }
+
+  /**
+   * Block until the fire-and-forget post-connect probe has committed.
+   * `last_checked_at` is the honest witness: an oauth row is created WITHOUT
+   * a probe (fix plan P1.2), so the column is null until `probeAndPersist`
+   * writes it, and it writes it on every outcome.
+   */
+  async function awaitPostConnectProbe(connectionId: string): Promise<void> {
+    await until(
+      async () => ((await connectionRow(connectionId))?.lastCheckedAt ?? null) !== null,
+      "the post-connect probe to persist a health classification",
+    );
+  }
+
+  /** The stored access token, decrypted — what the probe must present. */
+  async function storedAccessToken(connectionId: string): Promise<string> {
+    const row = (await oauthRow(connectionId))!;
+    return decryptEnvelope(row.accessTokenEncrypted!, "access_token", row.id);
+  }
+
+  /** Create → start → consent → callback, asserting only that it connected. */
+  async function connectFlow(
+    name: string,
+  ): Promise<{ id: string; startPath: string }> {
+    const created = await createOauthConnection(name);
+    const url = await startFlow(created.startPath);
+    const callback = await approveConsent(url);
+    const res = await api("GET", callback, { cookie: ownerCookie });
+    expect(await res.text()).toContain('"ok":true');
+    return created;
   }
 
   /** POST the start route and return the parsed authorize URL. */
@@ -257,7 +420,12 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
   beforeAll(async () => {
     await runMigrations(TEST_DATABASE_URL!);
     as.start();
-    resource.start(as.issuer);
+    otherAs.start();
+    // The resource trusts exactly the tokens this AS minted — so "the probe
+    // presented the broker's token" is checkable, not assumed. `otherAs`
+    // deliberately does NOT appear here: a token it issued is worthless at
+    // the resource, which is what a mix-up costs the user.
+    resource.start(as.issuer, (token) => as.issuedAccessTokens.includes(token));
     const catalogEntry: ConnectorCatalogEntry = {
       slug: "stub-oauth",
       title: "Stub OAuth",
@@ -269,6 +437,19 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
       url: resource.mcpUrl,
       transport: "streamable-http",
       auth: { type: "oauth" },
+    };
+    // The Phase-2 option (b) preset: an authorization server this broker
+    // cannot register with, whose client identity therefore comes from
+    // operator config under the prefix the entry itself names.
+    const preregisteredEntry: ConnectorCatalogEntry = {
+      ...catalogEntry,
+      slug: "stub-oauth-preregistered",
+      title: "Stub OAuth (pre-registered)",
+      auth: {
+        type: "oauth",
+        clientIdentity: "preregistered",
+        clientEnvPrefix: PREREGISTERED_ENV_PREFIX,
+      },
     };
     stack = createAppStack(
       {
@@ -288,12 +469,23 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
         // The stub AS + resource live on 127.0.0.1 over http — the guarded
         // egress fetch must admit them (same var the probe lane documents).
         MCP_PROBE_ALLOW_PRIVATE: "1",
+        // Split-origin deployment: the SPA is NOT this API's origin, which is
+        // the configuration F8 was invisible under.
+        PUBLIC_WEB_URL: WEB_URL,
+        // Operator-supplied client for the pre-registered preset.
+        [`MCP_OAUTH_${PREREGISTERED_ENV_PREFIX}_CLIENT_ID`]:
+          PREREGISTERED_CLIENT_ID,
+        [`MCP_OAUTH_${PREREGISTERED_ENV_PREFIX}_CLIENT_SECRET`]:
+          "preapproved-client-secret",
       },
       {
         compile: stubCompile,
         buildSteps: fakeBuildSteps(),
         artifacts: createMemoryArtifactStore(),
-        catalog: new Map([[catalogEntry.slug, catalogEntry]]),
+        catalog: new Map([
+          [catalogEntry.slug, catalogEntry],
+          [preregisteredEntry.slug, preregisteredEntry],
+        ]),
       },
     );
     db = stack.dbHandle.db;
@@ -307,21 +499,36 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
   afterAll(async () => {
     await stack?.close();
     as.stop();
+    otherAs.stop();
     resource.stop();
   }, 30_000);
 
   // ── oauth-enabled creates ─────────────────────────────────────────────────
 
   test("custom create with oauth auth yields a pending grant row and a start path", async () => {
+    const hitsBefore = resource.mcpHits;
     const { id, startPath } = await createOauthConnection("Custom OAuth");
     expect(startPath).toBe(`/workspaces/${orgId}/connections/${id}/oauth/start`);
+    // No create-time probe for an OAuth row (fix plan P1.2): consent has not
+    // happened, so a dial could only collect a 401 — and, once the
+    // post-callback probe carries a token, that late-landing failure could
+    // overwrite a healthy result. Not dialling removes the race outright.
+    expect(resource.mcpHits).toBe(hitsBefore);
 
     const get = await api("GET", `/workspaces/${orgId}/connections/${id}`, {
       cookie: ownerCookie,
     });
     const dto = ((await get.json()) as CreateConnectionResponse).connection;
     expect(dto.authType).toBe("oauth");
-    expect(dto.hasCredentials).toBeTrue();
+    // A pending grant holds NO token, so it is not credentialed (fix plan
+    // F10). This assertion used to read `toBeTrue()`, and that hardcoding is
+    // what dressed "I have nothing to send" up as "your token was rejected".
+    expect(dto.hasCredentials).toBeFalse();
+    // …and nothing dialled the server on the way in (fix plan P1.2), so the
+    // honest opening health is `auth_required`, not a 401 collected from a
+    // request that carried no credential.
+    expect(dto.health).toBe("auth_required");
+    expect(dto.lastError).toBeNull();
 
     const row = await oauthRow(id);
     expect(row).toBeDefined();
@@ -372,6 +579,8 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
       `${BASE_URL}/integrations/mcp-oauth/callback`,
     );
     expect(params.get("resource")).toBe(resource.mcpUrl);
+    // The CHALLENGE's scope, not the PRM's (`mcp.read`) and not the AS-wide
+    // advertisement — the MCP spec's authoritative source (fix plan F6).
     expect(params.get("scope")).toBe("mcp.read mcp.write");
     expect(params.get("code_challenge_method")).toBe("S256");
     expect(params.get("code_challenge")).toBeTruthy();
@@ -383,16 +592,39 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(as.registerRequests.length).toBe(registrationsBefore + 1);
     expect(params.get("client_id")).toMatch(/^dcr-client-/);
 
-    // Discovery results + the pending flow persisted on the row; the stored
-    // verifier hashes to the code_challenge in the URL (S256).
+    // Discovery landed on the STAGED flow, not on the grant: everything the
+    // MCP server nominated is held there until an exchange succeeds, because
+    // `token_endpoint`/`revocation_endpoint` are where a live refresh token
+    // gets replayed (adversarial review of F5/F12).
     const pending = (await oauthRow(id))!;
-    expect(pending.authorizationServer).toBe(as.issuer);
-    expect(pending.authorizationEndpoint).toBe(`${as.issuer}/authorize`);
-    expect(pending.tokenEndpoint).toBe(`${as.issuer}/token`);
-    expect(pending.resource).toBe(resource.mcpUrl);
-    expect(pending.revocationEndpoint).toBe(`${as.issuer}/revoke`);
+    expect(pending.pendingFlow).not.toBeNull();
+    expect(pending.pendingFlow!.authorizationServer).toBe(as.issuer);
+    expect(pending.pendingFlow!.authorizationEndpoint).toBe(
+      `${as.issuer}/authorize`,
+    );
+    expect(pending.pendingFlow!.tokenEndpoint).toBe(`${as.issuer}/token`);
+    expect(pending.pendingFlow!.resource).toBe(resource.mcpUrl);
+    expect(pending.pendingFlow!.revocationEndpoint).toBe(`${as.issuer}/revoke`);
+    expect(pending.pendingFlow!.clientIdentityMode).toBe("dcr");
+    expect(pending.pendingFlow!.clientRegistrationIssuer).toBe(as.issuer);
+    // …and the grant columns are still blank — this connection has authorized
+    // nothing yet, so it has no endpoints and no client of its own.
+    expect(pending.authorizationServer).toBeNull();
+    expect(pending.tokenEndpoint).toBeNull();
+    expect(pending.revocationEndpoint).toBeNull();
+    expect(pending.resource).toBeNull();
+    expect(pending.clientId).toBeNull();
+    expect(pending.clientIdentityMode).toBeNull();
+    expect(pending.clientRegistrationIssuer).toBeNull();
     expect(pending.pendingState).toBe(state);
     expect(pending.pendingExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+    // The armed flow records who started it and what it expects to hear back
+    // from (fix plan F13/F15), and clears any prior verdict (F12).
+    expect(pending.status).toBe("pending");
+    expect(pending.pendingStartedBy).toBe(ownerUserId);
+    expect(pending.expectedIssuer).toBe(as.issuer);
+    expect(pending.issParameterSupported).toBeTrue();
+    expect(pending.lastErrorCode).toBeNull();
     const verifier = decryptEnvelope(
       pending.pendingCodeVerifierEncrypted!,
       "pending_code_verifier",
@@ -402,8 +634,12 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
       params.get("code_challenge")!,
     );
 
-    const probeHitsBefore = resource.mcpHits;
     const callbackPath = await approveConsent(authorizeUrl);
+    // The authorization response names its issuer (RFC 9207) and the broker
+    // checked it before exchanging anything (fix plan F13).
+    expect(new URLSearchParams(callbackPath.split("?")[1]).get("iss")).toBe(
+      as.issuer,
+    );
     const callback = await api("GET", callbackPath, { cookie: ownerCookie });
     expect(callback.status).toBe(200);
     expect(callback.headers.get("content-type")).toContain("text/html");
@@ -414,7 +650,11 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(page).toContain('"type":"mcp-oauth"');
     expect(page).toContain('"ok":true');
     expect(page).toContain(id);
-    expect(page).toContain(JSON.stringify(BASE_URL));
+    expect(page).toContain('"reason":null');
+    // The postMessage targets the SPA, not this API (fix plan F8) — a page
+    // pinned to the API origin is dropped by the browser in silence.
+    expect(page).toContain(JSON.stringify(WEB_URL));
+    expect(page).not.toContain(JSON.stringify(BASE_URL));
 
     const connected = (await oauthRow(id))!;
     expect(connected.status).toBe("connected");
@@ -422,6 +662,20 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(connected.pendingState).toBeNull();
     expect(connected.pendingCodeVerifierEncrypted).toBeNull();
     expect(connected.pendingExpiresAt).toBeNull();
+    expect(connected.pendingStartedBy).toBeNull();
+    expect(connected.pendingFlow).toBeNull();
+    expect(connected.lastErrorCode).toBeNull();
+    // The exchange PROMOTED the staged flow: the grant now records the
+    // endpoints and the client its own tokens were minted through, and those
+    // are the ones refresh and revocation will replay against.
+    expect(connected.authorizationServer).toBe(as.issuer);
+    expect(connected.authorizationEndpoint).toBe(`${as.issuer}/authorize`);
+    expect(connected.tokenEndpoint).toBe(`${as.issuer}/token`);
+    expect(connected.revocationEndpoint).toBe(`${as.issuer}/revoke`);
+    expect(connected.resource).toBe(resource.mcpUrl);
+    expect(connected.clientIdentityMode).toBe("dcr");
+    expect(connected.clientId).toBe(params.get("client_id"));
+    expect(connected.clientRegistrationIssuer).toBe(as.issuer);
     expect(connected.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
     const accessToken = decryptEnvelope(
       connected.accessTokenEncrypted!,
@@ -445,11 +699,46 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(exchange.get("code_verifier")).toBe(verifier);
     expect(exchange.get("resource")).toBe(resource.mcpUrl);
 
-    // The post-connect probe fired (fire-and-forget — poll for the hit).
-    await until(
-      async () => resource.mcpHits > probeHitsBefore,
-      "post-connect probe to hit the stub resource",
-    );
+    // ── THE assertion the old suite was missing (fix plan F1/P1.3) ─────────
+    //
+    // The post-connect probe is fire-and-forget, so poll — but poll for the
+    // OUTCOME, not for a hit count. Asserting only that a probe fired is what
+    // let "connected but 401" ship: the probe dialled with no Authorization
+    // header, the server correctly refused it, and the row was persisted
+    // `auth_error` while this test passed.
+    const health = await until(async () => {
+      const row = (await connectionRow(id))!;
+      // `last_checked_at` is what proves a probe RAN — the row was born
+      // `auth_required` without one (fix plan P1.2), so health alone cannot
+      // tell "not probed yet" from "probed and unauthorized".
+      return row.lastCheckedAt === null ? false : row;
+    }, "post-connect probe to persist a health classification");
+    expect(health.health).toBe("ok");
+    expect(health.lastError).toBeNull();
+    // The tool cache populates, which is what feeds the tool picker,
+    // per-tool approvals, the agent-version tool directory and the copilot
+    // inventory — none of which any OAuth connection could reach before.
+    expect(health.toolsCache).toEqual([
+      { name: "echo", description: "Echo a message back.", params: ["message"] },
+    ]);
+    expect(health.toolsCachedAt).not.toBeNull();
+    // And it authenticated with the broker's own token — not merely with
+    // "some" credential.
+    expect(resource.authorizationHeaders).toContain(`Bearer ${accessToken}`);
+    expect(resource.acceptedTokens).toContain(accessToken);
+    // …and the fixture really is gated: discovery's own unauthenticated GET
+    // was refused (that 401 is what carries the challenge), so an `ok` here
+    // can only have come from a request that presented the token.
+    expect(resource.authorizationHeaders).toContain(null);
+
+    // The DTO agrees: a connected grant IS credentialed.
+    const dto = await api("GET", `/workspaces/${orgId}/connections/${id}`, {
+      cookie: ownerCookie,
+    });
+    const body = ((await dto.json()) as CreateConnectionResponse).connection;
+    expect(body.hasCredentials).toBeTrue();
+    expect(body.oauthStatus).toBe("connected");
+    expect(body.health).toBe("ok");
   });
 
   // ── state discipline ──────────────────────────────────────────────────────
@@ -468,6 +757,10 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(res.status).toBe(200);
     const page = await res.text();
     expect(page).toContain('"ok":false');
+    // The failure carries its machine code, so the SPA can say WHICH failure
+    // this was rather than "something went wrong" (fix plan F9).
+    expect(page).toContain('"reason":"oauth_state_invalid"');
+    expect(page).toContain(JSON.stringify(WEB_URL));
     expect(as.tokenRequests.length).toBe(exchangesBefore);
 
     // The real pending flow survives untouched; no tokens were written.
@@ -525,8 +818,15 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(secondUrl.searchParams.get("state")).not.toBe(
       firstUrl.searchParams.get("state"),
     );
-    // The DCR registration is reused, not repeated, on a re-start.
-    expect(as.registerRequests.length).toBe(registrationsAfterFirst);
+    // A registration made for a consent that never completed is NOT a
+    // credential this connection holds — it was staged with the superseded
+    // flow and died with it — so this start mints its own. The reuse that
+    // matters is a re-consent of a LIVE grant (see "re-consent keeps a live
+    // grant connected"), where the registration promoted alongside the
+    // tokens is right there on the row and is reused untouched. Paying one
+    // dynamic registration per abandoned first attempt is the price of the
+    // start route never writing a credential column at all.
+    expect(as.registerRequests.length).toBe(registrationsAfterFirst + 1);
 
     // The superseded state is dead — and the live one still works.
     const stale = await api("GET", firstCallback, { cookie: ownerCookie });
@@ -549,15 +849,396 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     as.tokenMode = "invalid_grant";
     try {
       const res = await api("GET", callbackPath, { cookie: ownerCookie });
+      const page = await res.text();
+      expect(page).toContain('"ok":false');
+      expect(page).toContain('"reason":"oauth_exchange_failed"');
+    } finally {
+      as.tokenMode = "ok";
+    }
+
+    // Nothing to lose (a first consent), so `error` is the honest landing —
+    // and the reason is recorded for the connection surface (fix plan F12).
+    const row = (await oauthRow(id))!;
+    expect(row.status).toBe("error");
+    expect(row.lastErrorCode).toBe("oauth_exchange_failed");
+    expect(row.accessTokenEncrypted).toBeNull();
+    expect(row.pendingState).toBeNull();
+
+    // …and a fresh start re-arms it: `error` is a verdict on one attempt, not
+    // a dead end (fix plan F12).
+    await startFlow(startPath);
+    const rearmed = (await oauthRow(id))!;
+    expect(rearmed.status).toBe("pending");
+    expect(rearmed.lastErrorCode).toBeNull();
+    expect(rearmed.pendingState).not.toBeNull();
+  });
+
+  // ── the grant state machine (fix plan F5/F12) ─────────────────────────────
+
+  test("a start failure records a sanitized code and leaves the grant alone", async () => {
+    // An endpoint that is not an MCP server at all: no challenge, no PRM, no
+    // authorization-server metadata anywhere discovery looks.
+    const { id, startPath } = await createOauthConnection(
+      "Discovery Fails",
+      resource.notMcpUrl,
+    );
+    const before = (await oauthRow(id))!;
+
+    const res = await api("POST", startPath, { cookie: ownerCookie });
+    expect(res.status).toBe(502);
+    expect(
+      ((await res.json()) as { error: { code: string } }).error.code,
+    ).toBe("oauth_discovery_failed");
+
+    const row = (await oauthRow(id))!;
+    // The typed code is persisted — the old behaviour left NOTHING behind, so
+    // a user watching a popup fail had no way to learn why.
+    expect(row.lastErrorCode).toBe("oauth_discovery_failed");
+    // Nothing armed, so nothing about the grant changed: no state, and the
+    // status is exactly what it was (inventing `error` here would be the F5
+    // mistake one step early).
+    expect(row.status).toBe(before.status);
+    expect(row.pendingState).toBeNull();
+    expect(row.pendingStartedBy).toBeNull();
+  });
+
+  test("re-consent keeps a live grant connected, and a failed one does not break it", async () => {
+    const { id, startPath } = await connectFlow("Re-Consent");
+    const live = (await oauthRow(id))!;
+    expect(live.status).toBe("connected");
+
+    // Arming a re-consent must NOT downgrade the row to `pending`:
+    // getAccessToken gates on `connected`, so every agent tool call and every
+    // probe would start failing the moment the popup opened.
+    const registrationsBefore = as.registerRequests.length;
+    const authorizeUrl = await startFlow(startPath);
+    const armed = (await oauthRow(id))!;
+    expect(armed.status).toBe("connected");
+    expect(armed.pendingState).toBe(authorizeUrl.searchParams.get("state"));
+    expect(armed.accessTokenEncrypted).toBe(live.accessTokenEncrypted);
+    // Re-consent at the SAME issuer reuses the registration promoted with the
+    // live tokens — no new client, and nothing to stage over it.
+    expect(as.registerRequests.length).toBe(registrationsBefore);
+    expect(authorizeUrl.searchParams.get("client_id")).toBe(live.clientId);
+
+    // Now fail the re-consent the way a user does — by declining. The grant
+    // that was already working must survive it (fix plan F5).
+    const callbackPath = await approveConsent(authorizeUrl);
+    as.tokenMode = "invalid_grant";
+    try {
+      const res = await api("GET", callbackPath, { cookie: ownerCookie });
       expect(await res.text()).toContain('"ok":false');
     } finally {
       as.tokenMode = "ok";
     }
 
+    const after = (await oauthRow(id))!;
+    expect(after.status).toBe("connected");
+    expect(after.accessTokenEncrypted).toBe(live.accessTokenEncrypted);
+    expect(after.refreshTokenEncrypted).toBe(live.refreshTokenEncrypted);
+    // The failure is still reported — retained, not hidden.
+    expect(after.lastErrorCode).toBe("oauth_exchange_failed");
+
+    // Proof it is not merely a status string: the connection still probes
+    // healthy, which needs a decryptable token the server accepts.
+    const probe = await api(
+      "POST",
+      `/workspaces/${orgId}/connections/${id}/probe`,
+      { cookie: ownerCookie },
+    );
+    expect(probe.status).toBe(200);
+    const dto = ((await probe.json()) as CreateConnectionResponse).connection;
+    expect(dto.health).toBe("ok");
+    expect(resource.acceptedTokens).toContain(await storedAccessToken(id));
+  });
+
+  test("a re-consent that never completes cannot repoint a live grant", async () => {
+    const { id, startPath } = await connectFlow("AS Repoint");
+    // The post-connect probe is fire-and-forget AND a `getAccessToken`
+    // caller, so let it land before this test starts counting token requests
+    // and forcing expiries under it.
+    await awaitPostConnectProbe(id);
+    const live = (await oauthRow(id))!;
+    expect(live.status).toBe("connected");
+    expect(live.tokenEndpoint).toBe(`${as.issuer}/token`);
+
+    // The MCP server now nominates a DIFFERENT authorization server. That is
+    // the whole attack: the server picks its own AS, so a compromised (or
+    // merely hijacked) one can name anything, and the only thing standing
+    // between it and a live refresh token is WHEN discovery is allowed to
+    // reach the grant row.
+    resource.asIssuer = otherAs.issuer;
+    try {
+      const authorizeUrl = await startFlow(startPath);
+      expect(authorizeUrl.origin).toBe(otherAs.issuer);
+      // …and the user closes the popup. No callback ever arrives.
+
+      const armed = (await oauthRow(id))!;
+      // The grant is still live (F5) — and now that is safe, because nothing
+      // the start discovered reached it. Every column the refresh and the
+      // revocation read is byte-identical.
+      expect(armed.status).toBe("connected");
+      expect(armed.authorizationServer).toBe(live.authorizationServer);
+      expect(armed.authorizationEndpoint).toBe(live.authorizationEndpoint);
+      expect(armed.tokenEndpoint).toBe(live.tokenEndpoint);
+      expect(armed.revocationEndpoint).toBe(live.revocationEndpoint);
+      expect(armed.resource).toBe(live.resource);
+      expect(armed.scopes).toEqual(live.scopes);
+      expect(armed.clientId).toBe(live.clientId);
+      expect(armed.clientIdentityMode).toBe(live.clientIdentityMode);
+      expect(armed.clientSecretEncrypted).toBe(live.clientSecretEncrypted);
+      expect(armed.clientRegistrationIssuer).toBe(live.clientRegistrationIssuer);
+      expect(armed.accessTokenEncrypted).toBe(live.accessTokenEncrypted);
+      expect(armed.refreshTokenEncrypted).toBe(live.refreshTokenEncrypted);
+      // The other server's endpoints exist ONLY as staged flow state.
+      expect(armed.pendingFlow!.tokenEndpoint).toBe(`${otherAs.issuer}/token`);
+      expect(armed.pendingFlow!.authorizationServer).toBe(otherAs.issuer);
+
+      // Now force the refresh that any agent tool call or health probe
+      // triggers once the stored token reaches its expiry margin — the moment
+      // the repointed endpoint would have been dialled.
+      await db
+        .update(schema.connectionOauth)
+        .set({ accessTokenExpiresAt: new Date(Date.now() - 1_000) })
+        .where(eq(schema.connectionOauth.id, live.id));
+      const strayTokenHits = otherAs.tokenRequests.length;
+      const homeTokenHits = as.tokenRequests.length;
+
+      const probe = await api(
+        "POST",
+        `/workspaces/${orgId}/connections/${id}/probe`,
+        { cookie: ownerCookie },
+      );
+      expect(probe.status).toBe(200);
+
+      // THE assertion: the refresh went home. A refresh token minted by one
+      // authorization server was never presented to another — which is what a
+      // start-time endpoint write turns every abandoned re-consent into.
+      expect(otherAs.tokenRequests.length).toBe(strayTokenHits);
+      expect(as.tokenRequests.length).toBe(homeTokenHits + 1);
+      expect(as.tokenRequests.at(-1)!.get("grant_type")).toBe("refresh_token");
+      // And the connection kept working across all of it.
+      const dto = ((await probe.json()) as CreateConnectionResponse).connection;
+      expect(dto.health).toBe("ok");
+      expect(resource.acceptedTokens).toContain(await storedAccessToken(id));
+    } finally {
+      resource.asIssuer = as.issuer;
+    }
+  });
+
+  test("a re-consent that succeeds does move the grant to the new server", async () => {
+    // The positive control for the test above: staging is "not yet", never
+    // "never". A user who actually completes consent at the newly advertised
+    // authorization server gets a grant that points there.
+    const { id, startPath } = await connectFlow("AS Migration");
+    const before = (await oauthRow(id))!;
+
+    resource.asIssuer = otherAs.issuer;
+    try {
+      const authorizeUrl = await startFlow(startPath);
+      const callbackPath = await approveConsent(authorizeUrl);
+      const res = await api("GET", callbackPath, { cookie: ownerCookie });
+      expect(await res.text()).toContain('"ok":true');
+    } finally {
+      resource.asIssuer = as.issuer;
+    }
+
+    const after = (await oauthRow(id))!;
+    expect(after.status).toBe("connected");
+    expect(after.pendingFlow).toBeNull();
+    expect(after.authorizationServer).toBe(otherAs.issuer);
+    expect(after.tokenEndpoint).toBe(`${otherAs.issuer}/token`);
+    expect(after.revocationEndpoint).toBe(`${otherAs.issuer}/revoke`);
+    // Promoted TOGETHER with the tokens: the client that authorized there and
+    // the issuer it was registered at, never a mix of two registrations.
+    expect(after.clientRegistrationIssuer).toBe(otherAs.issuer);
+    expect(after.clientId).not.toBe(before.clientId);
+    expect(after.accessTokenEncrypted).not.toBe(before.accessTokenEncrypted);
+    const accessToken = decryptEnvelope(
+      after.accessTokenEncrypted!,
+      "access_token",
+      after.id,
+    );
+    expect(otherAs.issuedAccessTokens).toContain(accessToken);
+  });
+
+  test("a declined consent leaves a first-time grant in error, not connected", async () => {
+    const { id, startPath } = await createOauthConnection("Declined");
+    const authorizeUrl = await startFlow(startPath);
+    const state = authorizeUrl.searchParams.get("state")!;
+
+    // The AS redirects back with an RFC 6749 error instead of a code.
+    const res = await api(
+      "GET",
+      `/integrations/mcp-oauth/callback?error=access_denied&iss=${encodeURIComponent(as.issuer)}&state=${encodeURIComponent(state)}`,
+      { cookie: ownerCookie },
+    );
+    const page = await res.text();
+    expect(page).toContain('"ok":false');
+    expect(page).toContain('"reason":"oauth_exchange_failed"');
+
+    const row = (await oauthRow(id))!;
+    expect(row.status).toBe("error");
+    expect(row.lastErrorCode).toBe("oauth_exchange_failed");
+    expect(row.accessTokenEncrypted).toBeNull();
+  });
+
+  // ── RFC 9207 issuer validation (fix plan F13) ─────────────────────────────
+
+  test("an authorization response from a different issuer is never exchanged", async () => {
+    const { id, startPath } = await createOauthConnection("Issuer Mixup");
+    const authorizeUrl = await startFlow(startPath);
+
+    as.issMode = "foreign";
+    let callbackPath: string;
+    try {
+      callbackPath = await approveConsent(authorizeUrl);
+    } finally {
+      as.issMode = "correct";
+    }
+    expect(new URLSearchParams(callbackPath.split("?")[1]).get("iss")).toBe(
+      FOREIGN_ISSUER,
+    );
+
+    const exchangesBefore = as.tokenRequests.length;
+    const res = await api("GET", callbackPath, { cookie: ownerCookie });
+    const page = await res.text();
+    expect(page).toContain('"ok":false');
+    expect(page).toContain('"reason":"oauth_exchange_failed"');
+    // The decisive part: the code never reached the token endpoint.
+    expect(as.tokenRequests.length).toBe(exchangesBefore);
+    // Nor does the failure page echo the attacker-supplied issuer.
+    expect(page).not.toContain(FOREIGN_ISSUER);
+
     const row = (await oauthRow(id))!;
     expect(row.status).toBe("error");
     expect(row.accessTokenEncrypted).toBeNull();
-    expect(row.pendingState).toBeNull();
+  });
+
+  test("a missing iss fails only when the server advertises it sends one", async () => {
+    // Advertised and omitted → refused: an attacker must not defeat the check
+    // by simply stripping the parameter.
+    const promised = await createOauthConnection("Iss Omitted");
+    const promisedUrl = await startFlow(promised.startPath);
+    as.issMode = "omit";
+    try {
+      const callbackPath = await approveConsent(promisedUrl);
+      expect(callbackPath).not.toContain("iss=");
+      const exchangesBefore = as.tokenRequests.length;
+      const res = await api("GET", callbackPath, { cookie: ownerCookie });
+      expect(await res.text()).toContain('"ok":false');
+      expect(as.tokenRequests.length).toBe(exchangesBefore);
+      expect((await oauthRow(promised.id))!.status).toBe("error");
+
+      // Not advertised and omitted → fine. Most conformant servers send no
+      // `iss` at all, and requiring one unconditionally would break them.
+      as.issParameterSupported = false;
+      const quiet = await createOauthConnection("Iss Not Advertised");
+      const quietUrl = await startFlow(quiet.startPath);
+      // Not advertised reads as NULL — "unknown", which is the same
+      // permissive branch as an explicit false and is why the column is
+      // nullable rather than defaulting.
+      expect((await oauthRow(quiet.id))!.issParameterSupported).toBeNull();
+      const quietCallback = await approveConsent(quietUrl);
+      const ok = await api("GET", quietCallback, { cookie: ownerCookie });
+      expect(await ok.text()).toContain('"ok":true');
+      expect((await oauthRow(quiet.id))!.status).toBe("connected");
+    } finally {
+      as.issMode = "correct";
+      as.issParameterSupported = true;
+    }
+  });
+
+  // ── initiator binding (fix plan F15) ──────────────────────────────────────
+
+  test("only the admin who started a flow can complete it", async () => {
+    const { id, startPath } = await createOauthConnection("Initiator Bound");
+    const authorizeUrl = await startFlow(startPath);
+    const state = authorizeUrl.searchParams.get("state")!;
+    const callbackPath = await approveConsent(authorizeUrl);
+
+    // A SECOND admin of the same workspace: authorized to manage the
+    // connection, and still not the person this consent belongs to.
+    const other = await signUpWithOrg("Second Admin");
+    await db.insert(schema.member).values({
+      id: randomUUID(),
+      organizationId: orgId,
+      userId: other.userId,
+      role: "admin",
+      createdAt: new Date(),
+    });
+
+    const exchangesBefore = as.tokenRequests.length;
+    const foreign = await api("GET", callbackPath, { cookie: other.cookie });
+    const page = await foreign.text();
+    expect(page).toContain('"ok":false');
+    expect(page).toContain('"reason":"not_initiator"');
+    expect(as.tokenRequests.length).toBe(exchangesBefore);
+    // Rejected BEFORE the claim, so the initiator's single-use state is intact.
+    expect((await oauthRow(id))!.pendingState).toBe(state);
+
+    const legit = await api("GET", callbackPath, { cookie: ownerCookie });
+    expect(await legit.text()).toContain('"ok":true');
+    const row = (await oauthRow(id))!;
+    expect(row.status).toBe("connected");
+    expect(row.connectedBy).toBe(ownerUserId);
+  });
+
+  // ── pre-registered client identity (fix plan P2 option b) ─────────────────
+
+  test("a preregistered preset authorizes with the operator's client and never registers", async () => {
+    const create = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "catalog", slug: "stub-oauth-preregistered" },
+    });
+    expect(create.status).toBe(201);
+    const created = (await create.json()) as CreateConnectionResponse;
+    const id = created.connection.id;
+
+    // The authorization server refuses DCR outright, exactly as the provider
+    // that forced this feature does — so any attempt to register is fatal,
+    // and a start that succeeds proves none was made.
+    const registrationsBefore = as.registerRequests.length;
+    as.registrationMode = "forbidden";
+    let authorizeUrl: URL;
+    try {
+      authorizeUrl = await startFlow(created.oauthStartPath!);
+    } finally {
+      as.registrationMode = "ok";
+    }
+    expect(authorizeUrl.searchParams.get("client_id")).toBe(
+      PREREGISTERED_CLIENT_ID,
+    );
+    expect(as.registerRequests.length).toBe(registrationsBefore);
+
+    // Staged with the flow, like every other identity — the grant's own
+    // client columns stay blank until an exchange succeeds.
+    const armed = (await oauthRow(id))!;
+    expect(armed.pendingFlow!.clientIdentityMode).toBe("preregistered");
+    expect(armed.pendingFlow!.clientId).toBe(PREREGISTERED_CLIENT_ID);
+    expect(armed.pendingFlow!.clientRegistrationIssuer).toBe(as.issuer);
+    expect(armed.clientId).toBeNull();
+    // The operator's secret is at rest as an envelope, never in the clear.
+    expect(armed.pendingFlow!.clientSecretEncrypted).not.toBeNull();
+    expect(armed.pendingFlow!.clientSecretEncrypted).not.toContain(
+      "preapproved-client-secret",
+    );
+
+    // And the flow completes end to end on that identity, promoting it.
+    const callbackPath = await approveConsent(authorizeUrl);
+    const res = await api("GET", callbackPath, { cookie: ownerCookie });
+    expect(await res.text()).toContain('"ok":true');
+    const connected = (await oauthRow(id))!;
+    expect(connected.status).toBe("connected");
+    expect(connected.clientIdentityMode).toBe("preregistered");
+    expect(connected.clientId).toBe(PREREGISTERED_CLIENT_ID);
+    expect(connected.clientRegistrationIssuer).toBe(as.issuer);
+    expect(connected.clientSecretEncrypted).not.toContain(
+      "preapproved-client-secret",
+    );
+    expect(as.tokenRequests.at(-1)!.get("client_id")).toBe(
+      PREREGISTERED_CLIENT_ID,
+    );
   });
 
   // ── authz ─────────────────────────────────────────────────────────────────

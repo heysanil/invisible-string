@@ -257,11 +257,12 @@ search** over a Meilisearch mirror of the official MCP registry
 (typo-tolerant, verified publishers ranked first; installs re-verify the
 remote against the live registry), or a **custom server URL** — with
 write-once encrypted secrets throughout. Connectors that speak MCP OAuth
-(Linear, Notion, Sentry, Neon, PayPal, Vercel) connect in one click: the
+(Linear, Notion, Sentry, Neon, PayPal) connect in one click: the
 platform brokers the consent popup and keeps the tokens — encrypted at rest,
-refreshed centrally, handed to a running agent only at tool-call time, never
-stored in agent env. Every connection carries a live
-**health state** (probed automatically after install, re-probed when a stale
+refreshed centrally, presented by the health probe and handed to a running
+agent only at tool-call time, never stored in agent env. Every connection
+carries a live **health state** (probed automatically after install for
+static credentials, after consent for OAuth, re-probed when a stale
 detail panel opens or from its **Test connection** button) and a cached list
 of the tools its server actually exposes — the connection detail panel and
 the agent editor turn that cache into a **checkbox tool picker** for

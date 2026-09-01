@@ -67,7 +67,12 @@ import {
   type MeiliClient,
 } from "./search/meili";
 import { createRegistrySync, type RegistrySync } from "./search/registry-sync";
-import { tryLoadRuntimeConfig, type RuntimeConfig } from "./runtime/config";
+import {
+  loadOauthClientRegistrations,
+  publicWebUrlFromEnv,
+  tryLoadRuntimeConfig,
+  type RuntimeConfig,
+} from "./runtime/config";
 import { reconcileInterruptedRuns } from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
 import { createScheduleTicker, type ScheduleTicker } from "./runtime/schedule-ticker";
@@ -470,15 +475,30 @@ export function createAppStack(
   // MCP OAuth consent broker (oauth/broker.ts): the start routes ride the
   // resources plugin, the callback rides the integrations plugin — both run
   // on this one deps object. `probeConnection` closes over `resourceDeps`
-  // (declared below) — it only runs after assembly, on post-connect probes.
+  // (declared below) — it only runs after assembly, on post-connect probes,
+  // and that probe now reads the grant's access token through the same deps
+  // (probe/service.ts uses `ResourceDeps.oauthBroker` as its token lifecycle,
+  // which is why teaching the probe about OAuth needed no new wiring here).
   const oauthBroker: OauthBrokerDeps = {
     db: dbHandle.db,
     masterKey: config.encryptionMasterKey,
     publicAppUrl: publicAppUrlFromEnv(env),
+    // The SPA origin the consent popup posts its result to — the same value
+    // as publicAppUrl in a single-origin deployment, and the whole point of
+    // the setting when it is not (fix plan F8).
+    publicWebUrl: publicWebUrlFromEnv(env),
     fetchImpl: mcpEgressFetch,
     logger,
     workspaceDeps,
+    // Operator-supplied OAuth clients (MCP_OAUTH_<PREFIX>_*), for providers
+    // whose authorization server refuses dynamic registration. Parsed at boot
+    // so a typo'd credential var fails fast instead of surfacing as a 502 in
+    // the middle of a consent flow.
+    preregisteredClients: loadOauthClientRegistrations(env),
     probeConnection: (connection) => probeAndPersist(resourceDeps, connection),
+    // Same catalog the resource routes install from — the broker reads a
+    // preset's declared client-identity strategy from it.
+    ...(runtimeOverrides?.catalog ? { catalog: runtimeOverrides.catalog } : {}),
   };
   // The runtime plugin's agent-facing token route (POST /internal/connections/
   // token) refreshes through the SAME lifecycle deps the broker runs on — one

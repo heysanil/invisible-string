@@ -11,9 +11,17 @@
  *
  * Stale re-probe (spec §7): opening the detail with `lastCheckedAt` null or
  * older than 15 minutes fires one automatic probe — guarded by a per-open ref
- * so invalidation-driven re-renders never loop it.
+ * so invalidation-driven re-renders never loop it, and skipped entirely for an
+ * OAuth row with no live grant (see {@link isProbeable}).
+ *
+ * TWO COLUMNS, ONE STORY (2026-08-31 fix plan): `oauthStatus` (the grant) and
+ * `health` (the last probe) are independent, and this surface renders both. It
+ * used to render them side by side and leave the reader to reconcile
+ * "Connected" with a 401; the auth panel and {@link HealthSection} now carry
+ * the sentence that joins them, and a failed consent names its own cause (F9)
+ * instead of one generic "authorization failed" for every possible reason.
  */
-import { ShieldCheck } from "lucide-react";
+import { ShieldAlert, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   ConnectionDto,
@@ -27,6 +35,8 @@ import { cn } from "../../lib/cn";
 import { formatRelativeTime } from "../../lib/format";
 import { errorMessage } from "../../lib/forms";
 import {
+  oauthErrorCopy,
+  oauthFailureCopy,
   openOauthPopup,
   useConnectOauth,
   useConnection,
@@ -68,6 +78,38 @@ const APPROVAL_OPTIONS: { value: McpApprovalDecision; label: string }[] = [
   { value: "always", label: "Always ask" },
 ];
 
+/**
+ * Is a probe of this connection worth running unprompted?
+ *
+ * For an OAuth row with no live grant the answer is no, and not as an
+ * optimisation: the probe deliberately refuses to dial without a token and
+ * persists `auth_required` (fix plan P1.1), so an automatic probe on open
+ * would spend a request and a write to re-state what `oauthStatus` already
+ * says — and, on a freshly created connection, would stamp a health verdict
+ * on a connection nobody has had the chance to authorize yet. The post-consent
+ * probe is the meaningful one; "Test connection" stays available for anyone
+ * who wants to ask anyway.
+ */
+function isProbeable(connection: ConnectionDto): boolean {
+  return connection.authType !== "oauth" || connection.oauthStatus === "connected";
+}
+
+/**
+ * An OAuth grant whose last probe says the server will not accept it, keyed by
+ * WHICH refusal it was. The grant column and the health column disagree, and
+ * the reader is owed the sentence that reconciles them: this is not "your
+ * connection failed", it is "the stored authorization is no longer being
+ * honoured — grant it again". Null when they agree, or when there is no grant.
+ */
+function reauthorizationCase(
+  connection: ConnectionDto,
+): "auth_required" | "auth_error" | null {
+  if (connection.oauthStatus !== "connected") return null;
+  return connection.health === "auth_required" || connection.health === "auth_error"
+    ? connection.health
+    : null;
+}
+
 export interface ConnectionDetailProps {
   scope: ScopeRef;
   connectionId: string;
@@ -95,6 +137,7 @@ export function ConnectionDetail({
     const dto = connection.data;
     if (!dto) return;
     autoProbedRef.current = true;
+    if (!isProbeable(dto)) return;
     const stale =
       dto.lastCheckedAt === null ||
       Date.now() - Date.parse(dto.lastCheckedAt) > STALE_PROBE_MS;
@@ -453,11 +496,48 @@ function AuthSection({
 }
 
 /**
- * OAuth grant states (spec §6/§10): `pending` offers Connect, `connected`
- * renders the authorized shield, and `expired`/`revoked`/`error` explain the
- * dead grant and offer Reconnect. Both buttons run the same popup consent
- * flow ({@link useConnectOauth}); credential material never reaches the SPA,
- * so there is nothing to rotate here — re-consent replaces the grant.
+ * A short block of explanatory copy inside a section, coloured by MEANING
+ * (E1): `warn` = attention, something needs doing; `err` = an attempt failed.
+ * The two never mean the same thing here — a stale grant is amber ("reconnect
+ * when you get a chance"), a refused sign-in is red ("this just failed, and
+ * here is why") — so they are one primitive with one prop rather than three
+ * hand-rolled paragraphs.
+ */
+function Note({
+  tone,
+  children,
+}: {
+  tone: "warn" | "err";
+  children: ReactNode;
+}) {
+  return (
+    <p
+      // `err` notes appear in response to something the reader just did, so
+      // they are announced; a `warn` note is part of the panel's steady state
+      // (it renders with the section) and a live region there would announce
+      // page furniture on every open.
+      {...(tone === "err" ? { role: "alert" as const } : {})}
+      className={cn(
+        "rounded-card border px-3 py-2 text-[12.5px] leading-relaxed text-ink-2",
+        tone === "warn"
+          ? "border-warn/25 bg-warn/[0.06]"
+          : "border-err/25 bg-err/[0.05]",
+      )}
+    >
+      {children}
+    </p>
+  );
+}
+
+/**
+ * OAuth grant states (spec §6/§10): `pending` offers Connect; `connected`
+ * renders the authorized shield, or — when the last probe says the server
+ * will not honour that grant — a "Reconnect needed" chip with the sentence
+ * explaining why (see {@link reauthorizationCase}); `expired`/`revoked`/
+ * `error` explain the dead grant and offer Reconnect. Every button runs the
+ * same popup consent flow ({@link useConnectOauth}); credential material
+ * never reaches the SPA, so there is nothing to rotate here — re-consent
+ * replaces the grant.
  */
 const OAUTH_STATUS_NOTE: Record<
   Exclude<NonNullable<ConnectionDto["oauthStatus"]>, "pending" | "connected">,
@@ -469,6 +549,20 @@ const OAUTH_STATUS_NOTE: Record<
     "Authorization was revoked. Reconnect to grant access again.",
   error:
     "Authorization failed. Reconnect to try again.",
+};
+
+/**
+ * The `connected` grant + unhealthy probe pairing, said out loud. A reader who
+ * sees the connected shield beside an amber health badge is looking at a real,
+ * stored grant that the server will not honour — which is a re-authorization,
+ * not a failure, and certainly not a reason to go hunting through the server
+ * URL or the tool policy.
+ */
+const REAUTHORIZE_NOTE: Record<"auth_required" | "auth_error", string> = {
+  auth_required:
+    "Authorized, but the server is no longer accepting this authorization. Reconnect to restore access.",
+  auth_error:
+    "The server rejected the stored authorization. Reconnect to grant access again.",
 };
 
 function OauthPanel({
@@ -483,8 +577,18 @@ function OauthPanel({
   const connectOauth = useConnectOauth(scope);
   const { toast } = useToast();
   const status = connection.oauthStatus ?? "pending";
+  /**
+   * Why the LAST attempt from this browser failed (F9). It is deliberately
+   * local state and not a DTO field: the callback's `reason` reaches the SPA
+   * over `postMessage` and describes one attempt, not the connection. It
+   * clears the moment another attempt starts, so a stale explanation can
+   * never sit under a button the user has since clicked again.
+   */
+  const [failure, setFailure] = useState<string | null>(null);
+  const reauthorize = reauthorizationCase(connection);
 
   function connect() {
+    setFailure(null);
     // Popup opened synchronously with the click (popup blockers).
     const popup = openOauthPopup();
     connectOauth
@@ -493,49 +597,71 @@ function OauthPanel({
         if (outcome.ok) {
           toast({ variant: "success", message: "Connection authorized." });
         } else if (!outcome.dismissed) {
-          toast({
-            variant: "error",
-            message: "Authorization failed. Try connecting again.",
-          });
+          // Inline, not a toast: this copy tells the reader what to DO, and a
+          // toast that clears itself after five seconds is the wrong home for
+          // an instruction. The button that produced it is right above.
+          setFailure(oauthFailureCopy(outcome.reason));
         }
       })
       .catch((error: unknown) => {
         popup?.close();
-        toast({ variant: "error", message: errorMessage(error) });
+        setFailure(oauthErrorCopy(error));
       });
   }
 
+  const action = readOnly ? null : (
+    <Button
+      size="sm"
+      className="shrink-0"
+      loading={connectOauth.isPending}
+      onClick={connect}
+    >
+      {status === "pending" ? "Connect" : "Reconnect"}
+    </Button>
+  );
+  const failureNote = failure === null ? null : <Note tone="err">{failure}</Note>;
+
   if (status === "connected") {
     return (
-      <div className="flex items-center gap-2">
-        <span className="text-[13px] font-medium text-ink">OAuth</span>
-        <span className="inline-flex items-center gap-1 text-[12px] font-medium text-ok">
-          <ShieldCheck size={13} aria-hidden="true" />
-          Connected
-        </span>
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="text-[13px] font-medium text-ink">OAuth</span>
+            {reauthorize === null ? (
+              <span className="inline-flex items-center gap-1 text-[12px] font-medium text-ok">
+                <ShieldCheck size={13} aria-hidden="true" />
+                Connected
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-[12px] font-medium text-warn">
+                <ShieldAlert size={13} aria-hidden="true" />
+                Reconnect needed
+              </span>
+            )}
+          </div>
+          {reauthorize === null ? null : action}
+        </div>
+        {reauthorize === null ? null : (
+          <Note tone="warn">{REAUTHORIZE_NOTE[reauthorize]}</Note>
+        )}
+        {failureNote}
       </div>
     );
   }
 
   if (status === "pending") {
     return (
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex min-w-0 flex-col gap-0.5">
-          <span className="text-[13px] font-medium text-ink">OAuth</span>
-          <span className="text-[12px] leading-snug text-ink-4">
-            Not connected yet — authorize access in a popup to finish setup.
-          </span>
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-[13px] font-medium text-ink">OAuth</span>
+            <span className="text-[12px] leading-snug text-ink-4">
+              Not connected yet — authorize access in a popup to finish setup.
+            </span>
+          </div>
+          {action}
         </div>
-        {readOnly ? null : (
-          <Button
-            size="sm"
-            className="shrink-0"
-            loading={connectOauth.isPending}
-            onClick={connect}
-          >
-            Connect
-          </Button>
-        )}
+        {failureNote}
       </div>
     );
   }
@@ -543,20 +669,9 @@ function OauthPanel({
   return (
     <div className="flex flex-col gap-2">
       <span className="text-[13px] font-medium text-ink">OAuth</span>
-      <p className="rounded-card border border-warn/25 bg-warn/[0.06] px-3 py-2 text-[12.5px] leading-relaxed text-ink-2">
-        {OAUTH_STATUS_NOTE[status]}
-      </p>
-      {readOnly ? null : (
-        <div>
-          <Button
-            size="sm"
-            loading={connectOauth.isPending}
-            onClick={connect}
-          >
-            Reconnect
-          </Button>
-        </div>
-      )}
+      <Note tone="warn">{OAUTH_STATUS_NOTE[status]}</Note>
+      {failureNote}
+      {action === null ? null : <div>{action}</div>}
     </div>
   );
 }
@@ -839,6 +954,37 @@ function ApprovalSection({
 
 // ── Health ──────────────────────────────────────────────────────────────────
 
+/**
+ * What the health badge MEANS for an OAuth row, given the grant beside it.
+ * The badge keeps telling the truth about `connections.health` — inventing a
+ * sixth health value here would just move the contradiction — and this is the
+ * sentence underneath it that makes the pair readable:
+ *
+ *  - grant `pending`: nothing has been probed and nothing should be. A brand
+ *    new connection is not unhealthy, it is unfinished (fix plan P1.2).
+ *  - grant `expired`/`revoked`/`error`: no request was sent at all, so the
+ *    amber badge is about the grant, not about the server being down.
+ *  - grant `connected` but the probe says otherwise: the interesting case, and
+ *    the one that used to read as "Connected" beside a flat 401.
+ *
+ * Null for every other combination — a healthy OAuth connection, and every
+ * non-OAuth row, need no reconciling.
+ */
+function healthPairingNote(connection: ConnectionDto): string | null {
+  if (connection.authType !== "oauth") return null;
+  const status = connection.oauthStatus ?? "pending";
+  if (status === "pending") {
+    return "Not authorized yet — the first health check runs once the connection is authorized.";
+  }
+  if (status !== "connected") {
+    return "Nothing was sent to the server: the stored authorization can no longer be used. Reconnect it in Authentication above.";
+  }
+  if (connection.health === "auth_required" || connection.health === "auth_error") {
+    return "The grant is stored, but the server would not accept it. Reconnect in Authentication above — the server URL and tool policy are not the problem.";
+  }
+  return null;
+}
+
 function HealthSection({
   connection,
   readOnly,
@@ -850,6 +996,7 @@ function HealthSection({
   probing: boolean;
   onProbe: () => void;
 }) {
+  const pairing = healthPairingNote(connection);
   return (
     <Section title="Health">
       <div className="flex items-center justify-between gap-3">
@@ -867,6 +1014,9 @@ function HealthSection({
           </Button>
         )}
       </div>
+      {pairing === null ? null : (
+        <p className="px-0.5 text-[12.5px] leading-relaxed text-ink-3">{pairing}</p>
+      )}
       {connection.lastError ? (
         <p className="break-words rounded-card border border-err/20 bg-err/[0.04] px-3 py-2 font-mono text-[12px] leading-relaxed text-err">
           {connection.lastError}

@@ -17,8 +17,31 @@
  * use, so a returned refresh_token replaces the stored one. `invalid_grant`
  * is the AS saying the grant is dead — the row lands `expired`, the
  * connection's health flips to `auth_error`, and callers get the typed 409
- * `oauth_not_connected` (re-consent is the only recovery). Any other refresh
- * failure lands `error` and rethrows typed.
+ * `oauth_not_connected` (re-consent is the only recovery).
+ *
+ * That rejection is the ONLY terminal one (2026-08-31 fix plan F4/P3.1).
+ * Every other refresh failure — AS 5xx, egress timeout, guard refusal — is a
+ * blip that never spent the refresh token, so the row stays `connected` and
+ * the typed error is simply rethrown for the caller to retry. Writing a
+ * status there would trip this function's own `status !== "connected"` gate
+ * on every LATER demand, making a 30-second outage at the authorization
+ * server indistinguishable from a dead grant and forcing a needless
+ * re-consent.
+ *
+ * WHERE THESE REQUESTS GO IS AN INVARIANT THIS MODULE DOES NOT CHECK, and
+ * must not be weakened elsewhere. `row.token_endpoint`, `row.resource` and
+ * `row.revocation_endpoint` all came from discovery against an MCP server
+ * that names its own authorization server, and the refresh below POSTs the
+ * stored refresh token AND client secret at the first of them, months after
+ * consent, with no issuer comparison of any kind. What makes that safe is
+ * that oauth/broker.ts promotes those columns ONLY in the same write that
+ * stores tokens minted through them (its `pending_flow` staging): a consent
+ * flow that discovers a different authorization server and then fails, or is
+ * simply abandoned, cannot move them. Restore a start-time write of any of
+ * those columns and this function becomes the delivery mechanism — every
+ * failed re-consent hands a live refresh token to whatever endpoint the MCP
+ * server last advertised. The guard is broker.test.ts's "a re-consent that
+ * never completes cannot repoint a live grant" case.
  *
  * SECRETS: access/refresh tokens and client secrets exist in plaintext only
  * inside function scope — never logged, never in an error message or DTO.
@@ -168,12 +191,14 @@ export async function getAccessToken(
           return { kind: "fail", error: errors.oauthNotConnected() };
         }
         if (error instanceof RuntimeApiError) {
-          await tx
-            .update(schema.connectionOauth)
-            .set({ status: "error" })
-            .where(eq(schema.connectionOauth.id, row.id));
+          // TRANSIENT by construction: the AS timed out, answered 5xx, or the
+          // egress guard refused the hop — none of which is the AS disowning
+          // the grant, and none of which spent the refresh token. Persist
+          // NOTHING (a status write here bricks the grant on the gate above)
+          // and hand the typed error back: the next demand retries with the
+          // still-valid refresh material. Only `invalid_grant` is terminal.
           deps.logger.warn("oauth.refresh_failed", {
-            fields: { connectionId, reason: error.code },
+            fields: { connectionId, reason: error.code, terminal: false },
           });
           return { kind: "fail", error };
         }

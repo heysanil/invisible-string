@@ -6,12 +6,14 @@
  * fire resource fetches before a workspace id exists, or misreport an outage
  * as "you have no workspaces".
  */
-import { Building2, TriangleAlert } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Building2 } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { refetchViewer } from "../lib/auth/viewer";
 import { useWorkspace, useWorkspaceRole } from "../lib/workspace";
-import { Button } from "./ui/Button";
 import { EmptyState } from "./ui/EmptyState";
+import { ErrorState } from "./ui/ErrorState";
 import { Panel } from "./ui/Panel";
 import { Spinner } from "./ui/Spinner";
 
@@ -32,6 +34,7 @@ export interface WorkspaceGateProps {
 export function WorkspaceGate({ title, children }: WorkspaceGateProps) {
   const { workspace, isPending, error } = useWorkspace();
   const role = useWorkspaceRole(workspace?.id);
+  const queryClient = useQueryClient();
 
   if (error) {
     return (
@@ -41,10 +44,10 @@ export function WorkspaceGate({ title, children }: WorkspaceGateProps) {
         </header>
         <div aria-hidden="true" className="mx-6 h-px bg-black/[0.06]" />
         <div className="flex-1">
-          <EmptyState
-            icon={TriangleAlert}
+          <ErrorState
             title="Can't load your workspace"
-            description="Check your connection, then try again."
+            message="Check your connection, then try again."
+            onRetry={() => void refetchViewer(queryClient)}
           />
         </div>
       </Panel>

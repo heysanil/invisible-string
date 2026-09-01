@@ -138,7 +138,13 @@ type ModelAllowlistRow = typeof schema.modelAllowlist.$inferSelect;
 
 /**
  * Rebuilt `connections` row → wire DTO. Secrets are NEVER echoed — only
- * `hasCredentials` (an `oauth` row always counts as credentialed).
+ * `hasCredentials`, which answers "can this connection actually present a
+ * credential right now?": a stored auth envelope for static auth, and for an
+ * oauth row a grant that has reached `connected`. It used to be hardcoded
+ * true for every oauth row, which is what dressed "I hold no token" up as
+ * "your token was rejected" and pointed every debugger at the server
+ * (2026-08-31 fix plan F10) — a `pending` grant is NOT credentialed.
+ *
  * `oauthStatus` is caller-supplied: create passes the newborn grant's
  * `pending`; every reader of an oauth row loads its `connection_oauth`
  * status (resources/connections.ts `oauthStatusOf`) — a null here means
@@ -159,7 +165,10 @@ export function connectionDto(
     url: row.url,
     transport: row.transport,
     authType: row.authType,
-    hasCredentials: row.authConfigEncrypted != null || row.authType === "oauth",
+    hasCredentials:
+      row.authType === "oauth"
+        ? oauthStatus === "connected"
+        : row.authConfigEncrypted != null,
     oauthStatus,
     toolAllow: row.toolAllow ?? null,
     toolBlock: row.toolBlock ?? null,

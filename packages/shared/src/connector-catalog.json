@@ -107,16 +107,5 @@
     "transport": "streamable-http",
     "auth": { "type": "oauth" },
     "websiteUrl": "https://www.paypal.com"
-  },
-  {
-    "slug": "vercel",
-    "title": "Vercel",
-    "category": "dev-tools",
-    "description": "Projects, deployments, and logs on Vercel.",
-    "modelDescription": "Vercel: inspect projects, deployments, domains, and logs for the connected Vercel account.",
-    "url": "https://mcp.vercel.com",
-    "transport": "streamable-http",
-    "auth": { "type": "oauth" },
-    "websiteUrl": "https://vercel.com"
   }
 ]

@@ -9,7 +9,9 @@
  *     the pending connection and chain straight into the consent popup
  *     ({@link useConnectOauth} — spec §6): success closes the dialog, a
  *     dismissed popup leaves the pending connection reconnectable from its
- *     detail surface.
+ *     detail surface, and a FAILED consent names its own cause (2026-08-31
+ *     fix plan F9) plus where to finish — this browse step has no inline
+ *     surface to park an explanation on, so the toast has to carry both.
  *  2. Community search: one search field pins catalog matches above results
  *     from the control plane's Meilisearch mirror. `search_unavailable`
  *     renders an inline degraded note — the catalog stays fully usable
@@ -33,6 +35,8 @@ import { parseConnectorCatalog } from "@invisible-string/shared";
 import rawCatalog from "@invisible-string/shared/connector-catalog.json";
 
 import {
+  oauthErrorCopy,
+  oauthFailureCopy,
   openOauthPopup,
   useConnectOauth,
   useConnections,
@@ -182,15 +186,20 @@ export function AddConnectionDialog({
           });
           close();
         } else if (!outcome.dismissed) {
+          // The row exists and is pending — say why sign-in failed AND that
+          // the connection is recoverable, or the user is left assuming
+          // nothing happened and installs it a second time.
           toast({
             variant: "error",
-            message:
-              "Authorization failed. Reconnect from the connection's settings.",
+            message: `${oauthFailureCopy(outcome.reason)} ${result.connection.name} was added — reconnect from its settings.`,
           });
         }
       })().catch((error) => {
         popup?.close();
-        toast({ variant: "error", message: errorMessage(error) });
+        // Start-route failures (discovery, client registration) and the SPA's
+        // own refusal of an unsafe authorization URL: same vocabulary, so the
+        // dialog and the detail surface never disagree about what went wrong.
+        toast({ variant: "error", message: oauthErrorCopy(error) });
       });
       return;
     }

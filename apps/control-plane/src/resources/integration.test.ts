@@ -26,6 +26,7 @@ import {
   generateMasterKeyBase64,
   SESSION_MESSAGE_PREVIEW_MAX_CHARS,
   type AgentDefinitionInput,
+  type CreateConnectionResponse,
   type CreateSessionResponse,
   type GetAgentResponse,
   type GetAgentVersionToolsResponse,
@@ -836,6 +837,211 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     });
     expect(clash.status).toBe(409);
     expect(((await clash.json()) as { error: { code: string } }).error.code).toBe("duplicate_connection_name");
+  });
+
+  test("connections: an oauth create is born auth_required and fires NO create-time probe", async () => {
+    // Created BEFORE the static control below, so a create-time probe for it
+    // would have been enqueued first — and would have settled sooner still,
+    // since a probe against a `pending` grant classifies with no dial at all
+    // (probe/service.ts). The control's persisted `last_checked_at` is
+    // therefore proof that this row's absence of one is a SKIP, not a race
+    // this assertion merely won (fix plan F10/F11, P1.2).
+    const create = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "custom",
+        name: "Oauth Newborn",
+        url: "https://mcp.example/newborn",
+        auth: { type: "oauth" },
+      },
+    });
+    expect(create.status).toBe(201);
+    const created = (await create.json()) as CreateConnectionResponse;
+    expect(created.connection.authType).toBe("oauth");
+    expect(created.connection.oauthStatus).toBe("pending");
+    expect(created.oauthStartPath).toBe(
+      `/workspaces/${orgId}/connections/${created.connection.id}/oauth/start`,
+    );
+    // A pending grant holds no token, so the honest reading is "connect me",
+    // never `unknown` (nothing to discover) and never `auth_error` (nothing
+    // was rejected — the old create-time probe dialled unauthenticated and
+    // collected the server's entirely correct 401).
+    expect(created.connection.hasCredentials).toBeFalse();
+    expect(created.connection.health).toBe("auth_required");
+    expect(created.connection.lastCheckedAt).toBeNull();
+
+    // The control: plain `http:` is refused by the egress guard BEFORE any DNS
+    // (guarded-fetch.ts), so its probe settles offline and immediately —
+    // no network, no timeout, nothing to flake on.
+    const control = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Probe Control", url: "http://mcp.example/control" },
+    });
+    expect(control.status).toBe(201);
+    const controlId = ((await control.json()) as GetConnectionResponse).connection.id;
+    await until(async () => {
+      const rows = await db
+        .select({ lastCheckedAt: schema.connections.lastCheckedAt })
+        .from(schema.connections)
+        .where(eq(schema.connections.id, controlId));
+      return rows[0]!.lastCheckedAt !== null;
+    }, "the control connection's create-time probe to persist");
+
+    const oauthRow = await db
+      .select({
+        health: schema.connections.health,
+        lastCheckedAt: schema.connections.lastCheckedAt,
+        lastError: schema.connections.lastError,
+      })
+      .from(schema.connections)
+      .where(eq(schema.connections.id, created.connection.id));
+    expect(oauthRow[0]!.lastCheckedAt).toBeNull();
+    expect(oauthRow[0]!.health).toBe("auth_required");
+    expect(oauthRow[0]!.lastError).toBeNull();
+
+    // The newborn grant claims NO client-identity mode: only a catalog recipe
+    // declaring `preregistered` states one at create (operator-configured
+    // credentials, no registration hop), and CIMD-vs-DCR is a runtime fact
+    // about the AS the broker records when it arms the flow.
+    const grant = await db
+      .select({
+        status: schema.connectionOauth.status,
+        clientIdentityMode: schema.connectionOauth.clientIdentityMode,
+      })
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, created.connection.id));
+    expect(grant[0]!.status).toBe("pending");
+    expect(grant[0]!.clientIdentityMode).toBeNull();
+  });
+
+  test("connections: resetting an oauth grant clears the probe state that described it", async () => {
+    /** A row landed where a completed consent + a probe would leave it. */
+    async function seedConnectedGrant(connectionId: string): Promise<void> {
+      // No revocation endpoint: the reset's best-effort revoke is a no-op, so
+      // this suite needs no authorization server (oauth/tokens.ts).
+      await db
+        .update(schema.connectionOauth)
+        .set({
+          status: "connected",
+          authorizationServer: "https://as.example",
+          authorizationEndpoint: "https://as.example/authorize",
+          tokenEndpoint: "https://as.example/token",
+          clientId: "client-abc",
+          connectedBy: ownerUserId,
+        })
+        .where(eq(schema.connectionOauth.connectionId, connectionId));
+      await db
+        .update(schema.connections)
+        .set({
+          health: "auth_error",
+          lastError: "http 401",
+          lastCheckedAt: new Date(),
+          toolsCache: [{ name: "create_issue", description: "Create an issue", params: ["title"] }],
+          toolsCachedAt: new Date(),
+        })
+        .where(eq(schema.connections.id, connectionId));
+    }
+
+    // (a) URL change while STAYING oauth → blank pending grant, and the probe
+    //     columns go with it: health, last_error, last_checked_at, and the
+    //     tool cache, which belonged to a different server entirely. Leaving
+    //     them is F16 — the SPA renders a stale 401 badge for an endpoint
+    //     nothing has dialled since.
+    const movedCreate = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Repointed", url: "https://mcp.example/repoint-a", auth: { type: "oauth" } },
+    });
+    expect(movedCreate.status).toBe(201);
+    const repointed = ((await movedCreate.json()) as GetConnectionResponse).connection;
+    await seedConnectedGrant(repointed.id);
+
+    const moved = await api("PATCH", `/workspaces/${orgId}/connections/${repointed.id}`, {
+      cookie: ownerCookie,
+      body: { url: "https://mcp.example/repoint-b" },
+    });
+    expect(moved.status).toBe(200);
+    const movedConn = ((await moved.json()) as GetConnectionResponse).connection;
+    expect(movedConn.url).toBe("https://mcp.example/repoint-b");
+    expect(movedConn.oauthStatus).toBe("pending");
+    expect(movedConn.hasCredentials).toBeFalse();
+    expect(movedConn.health).toBe("auth_required");
+    expect(movedConn.lastError).toBeNull();
+    expect(movedConn.lastCheckedAt).toBeNull();
+    expect(movedConn.tools).toBeNull();
+    expect(movedConn.toolsCachedAt).toBeNull();
+    const grant = await db
+      .select()
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, repointed.id));
+    expect(grant[0]!.status).toBe("pending");
+    expect(grant[0]!.clientId).toBeNull();
+    expect(grant[0]!.authorizationServer).toBeNull();
+    expect(grant[0]!.connectedBy).toBeNull();
+
+    // (b) Leaving oauth entirely → the grant row is deleted and the same probe
+    //     columns clear, but health lands `unknown`: the caller's brand-new
+    //     static credential has not been tried, so "connect me" would be a lie.
+    const leftCreate = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: { source: "custom", name: "Switched Off Oauth", url: "https://mcp.example/switched", auth: { type: "oauth" } },
+    });
+    expect(leftCreate.status).toBe(201);
+    const switched = ((await leftCreate.json()) as GetConnectionResponse).connection;
+    await seedConnectedGrant(switched.id);
+
+    const left = await api("PATCH", `/workspaces/${orgId}/connections/${switched.id}`, {
+      cookie: ownerCookie,
+      body: { auth: { type: "bearer", values: { token: "static-token-after-oauth" } } },
+    });
+    expect(left.status).toBe(200);
+    const leftConn = ((await left.json()) as GetConnectionResponse).connection;
+    expect(leftConn.authType).toBe("bearer");
+    expect(leftConn.oauthStatus).toBeNull();
+    expect(leftConn.hasCredentials).toBeTrue();
+    expect(leftConn.health).toBe("unknown");
+    expect(leftConn.lastError).toBeNull();
+    expect(leftConn.lastCheckedAt).toBeNull();
+    expect(JSON.stringify(leftConn)).not.toContain("static-token-after-oauth");
+    const gone = await db
+      .select()
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, switched.id));
+    expect(gone).toHaveLength(0);
+    // The URL did not move, so the server's advertised tools are still its
+    // tools — a re-auth must not blank the tool picker.
+    expect(leftConn.tools).toHaveLength(1);
+
+    // (c) The mirror image: a static connection switched INTO oauth holds a
+    //     health describing the credential the caller just discarded.
+    const enteringCreate = await api("POST", `/workspaces/${orgId}/connections`, {
+      cookie: ownerCookie,
+      body: {
+        source: "custom",
+        name: "Switched Into Oauth",
+        url: "https://mcp.example/entering",
+        auth: { type: "bearer", values: { token: "soon-to-be-replaced" } },
+      },
+    });
+    expect(enteringCreate.status).toBe(201);
+    const entering = ((await enteringCreate.json()) as GetConnectionResponse).connection;
+    await db
+      .update(schema.connections)
+      .set({ health: "ok", lastError: null, lastCheckedAt: new Date() })
+      .where(eq(schema.connections.id, entering.id));
+
+    const entered = await api("PATCH", `/workspaces/${orgId}/connections/${entering.id}`, {
+      cookie: ownerCookie,
+      body: { auth: { type: "oauth" } },
+    });
+    expect(entered.status).toBe(200);
+    const enteredConn = ((await entered.json()) as GetConnectionResponse).connection;
+    expect(enteredConn.authType).toBe("oauth");
+    // No grant row yet — the start route mints it lazily — which reads as a
+    // pending grant, so `ok` would be claiming a credential that is gone.
+    expect(enteredConn.oauthStatus).toBe("pending");
+    expect(enteredConn.hasCredentials).toBeFalse();
+    expect(enteredConn.health).toBe("auth_required");
+    expect(enteredConn.lastCheckedAt).toBeNull();
   });
 
   test("connections: authz matrix — anonymous 401, outsider 403/404, member reads but cannot mutate", async () => {

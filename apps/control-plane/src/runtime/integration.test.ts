@@ -29,7 +29,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
@@ -1468,6 +1468,37 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         })
         .returning();
       return rows[0]!;
+    }
+
+    // Boot reconciliation is a GLOBAL sweep — crash recovery for the whole
+    // control plane, not one workspace — and every DB-gated suite shares the
+    // same `product` database, so runs an EARLIER FILE left `queued`/
+    // `running` land in this tally too (that is the flake: `failed: 4` for
+    // one seeded orphan). Settle those strays first, exactly as this suite
+    // clears the global `workers` table in beforeAll, so the counters below
+    // describe only what this test seeds. Runs this process is still tailing
+    // (the caps test's HOLD tails) are deliberately LEFT interrupted — the
+    // sweep must still skip them on its own.
+    const strays = await db
+      .select({ id: schema.runs.id })
+      .from(schema.runs)
+      .innerJoin(
+        schema.agentSessions,
+        eq(schema.runs.agentSessionId, schema.agentSessions.id),
+      )
+      .where(inArray(schema.runs.status, ["queued", "running"]));
+    const orphanedStrays = strays
+      .map((row) => row.id)
+      .filter((id) => stack.runtime!.tailers.get(id) === undefined);
+    if (orphanedStrays.length > 0) {
+      await db
+        .update(schema.runs)
+        .set({
+          status: "failed",
+          completedAt: new Date(),
+          error: "settled by the reconciliation fixture (leaked by an earlier suite)",
+        })
+        .where(inArray(schema.runs.id, orphanedStrays));
     }
 
     // Orphan A: live worker + real eve session → its tail is re-attached and

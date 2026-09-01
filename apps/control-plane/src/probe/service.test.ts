@@ -9,7 +9,13 @@
  *  - a later 401 (credentials present) → `auth_error`, prior tools RETAINED;
  *  - authz matrix on the workspace and /me probe routes;
  *  - create fires a fire-and-forget probe: the create response never waits
- *    (health `unknown` in the response, `ok` shortly after in the row).
+ *    (health `unknown` in the response, `ok` shortly after in the row);
+ *  - the OAuth lane (2026-08-31 fix plan P1.1 / F1 + F10): a `connected` grant
+ *    dials WITH the broker's bearer token and reaches `ok`, an unconsented or
+ *    dead grant reads `auth_required` without dialling at all, and the token
+ *    never reaches `last_error`. The fixture below REQUIRES the bearer for
+ *    those cases — the permissiveness of the old fixtures is what let a probe
+ *    that sent no token at all look like a server-side rejection.
  *
  * The stack boots with MCP_PROBE_ALLOW_PRIVATE=1 so the guarded egress fetch
  * admits the loopback http fixture — exactly how dev/e2e run probes.
@@ -31,7 +37,9 @@ import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { schema } from "@invisible-string/db";
 import {
+  encryptSecret,
   generateMasterKeyBase64,
+  parseMasterKey,
   type GetConnectionResponse,
 } from "@invisible-string/shared";
 
@@ -40,10 +48,12 @@ import type { CompileAgentFn } from "../build/compiler-contract";
 import type { BuildSteps } from "../build/steps";
 import { createAppStack, type AppStack } from "../index";
 import { runMigrations } from "../migrate";
+import { connectionOauthAad } from "../oauth/client-identity";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
 const MASTER_KEY_B64 = generateMasterKeyBase64();
+const MASTER_KEY = parseMasterKey(MASTER_KEY_B64);
 
 // ── stubs (the seed-agent background publish needs a cheap compile path) ─────
 
@@ -94,9 +104,18 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return raw.length > 0 ? JSON.parse(raw) : undefined;
 }
 
-/** Loopback MCP server whose auth behaviour flips via `mode`. */
+/**
+ * Loopback MCP server whose auth behaviour flips via `mode`, and which can
+ * DEMAND a bearer token the way every real OAuth MCP server does.
+ */
 class ProbeFixture {
   mode: FixtureMode = "ok";
+  /** When set, `initialize`/`tools/list` require `Bearer <requiredBearer>`. */
+  requiredBearer: string | null = null;
+  /** The `Authorization` header of the most recent request (null = none sent). */
+  lastAuthorization: string | null = null;
+  /** Request count — the "do not dial" branches are proven by it not moving. */
+  dials = 0;
   private server: ReturnType<typeof createServer> | null = null;
   private readonly sockets = new Set<Socket>();
   private port = 0;
@@ -120,6 +139,15 @@ class ProbeFixture {
     this.port = (this.server.address() as AddressInfo).port;
   }
 
+  /**
+   * Forget the last dial so a test can assert on the NEXT one. A method, not a
+   * bare assignment: assigning `null` to the field narrows its type for the
+   * rest of the block and makes the later comparison a type error.
+   */
+  forgetLastDial(): void {
+    this.lastAuthorization = null;
+  }
+
   async stop(): Promise<void> {
     if (!this.server) return;
     for (const socket of this.sockets) socket.destroy();
@@ -128,7 +156,13 @@ class ProbeFixture {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (this.mode === "unauthorized") {
+    this.dials += 1;
+    this.lastAuthorization = req.headers.authorization ?? null;
+    const rejected =
+      this.mode === "unauthorized" ||
+      (this.requiredBearer !== null &&
+        this.lastAuthorization !== `Bearer ${this.requiredBearer}`);
+    if (rejected) {
       res.statusCode = 401;
       res.setHeader("www-authenticate", 'Bearer realm="mcp"');
       res.end("unauthorized");
@@ -251,6 +285,85 @@ describe.skipIf(!TEST_DATABASE_URL)("probe service + routes", () => {
       const row = await rowOf(id);
       return row && row.health !== "unknown" ? row : undefined;
     }, `connection ${id} first probe`);
+  }
+
+  /**
+   * Give the after-create probe a bounded window to land so a straggler can
+   * never overwrite the explicit probe a test is about to run. A SETTLE, not
+   * an assert: P1.2 stops firing that probe for OAuth rows entirely, and a row
+   * that simply stays `unknown` is then the correct outcome.
+   */
+  async function settleFirstProbe(id: string, timeoutMs = 1_500): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const row = await rowOf(id);
+      if (row && row.health !== "unknown") return;
+      if (Date.now() > deadline) return;
+      await Bun.sleep(25);
+    }
+  }
+
+  async function grantOf(connectionId: string) {
+    const rows = await db
+      .select()
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, connectionId));
+    const grant = rows[0];
+    if (!grant) throw new Error(`no connection_oauth row for ${connectionId}`);
+    return grant;
+  }
+
+  /** Seal a secret exactly as the broker does: envelope AAD-bound to the row. */
+  function seal(
+    value: string,
+    column: "access_token" | "refresh_token",
+    grantId: string,
+  ): string {
+    return JSON.stringify(
+      encryptSecret(value, MASTER_KEY, connectionOauthAad(column, grantId)),
+    );
+  }
+
+  /**
+   * Stand in for a completed consent flow: seal an access token the way the
+   * broker does and mark the grant `connected`, so `getAccessToken` hands the
+   * probe a real token.
+   */
+  async function connectGrant(
+    connectionId: string,
+    token: string,
+    expiresAt: Date | null = new Date(Date.now() + 3_600_000),
+  ): Promise<void> {
+    const grant = await grantOf(connectionId);
+    await db
+      .update(schema.connectionOauth)
+      .set({
+        status: "connected",
+        accessTokenEncrypted: seal(token, "access_token", grant.id),
+        accessTokenExpiresAt: expiresAt,
+      })
+      .where(eq(schema.connectionOauth.id, grant.id));
+  }
+
+  /** A loopback URL nothing is listening on — a third party that is simply down. */
+  async function closedLoopbackUrl(path: string): Promise<string> {
+    const idle = createServer();
+    await new Promise<void>((resolve) =>
+      idle.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const { port } = idle.address() as AddressInfo;
+    await new Promise<void>((resolve) => idle.close(() => resolve()));
+    return `http://127.0.0.1:${port}${path}`;
+  }
+
+  async function probeVia(id: string): Promise<GetConnectionResponse["connection"]> {
+    const res = await api("POST", `/workspaces/${orgId}/connections/${id}/probe`, {
+      cookie: ownerCookie,
+    });
+    // An unhealthy server (or an unusable grant) is a 200 with its
+    // classification — 502 `probe_failed` is for the machinery itself.
+    expect(res.status).toBe(200);
+    return ((await res.json()) as GetConnectionResponse).connection;
   }
 
   beforeAll(async () => {
@@ -430,5 +543,183 @@ describe.skipIf(!TEST_DATABASE_URL)("probe service + routes", () => {
     expect(row.health).toBe("ok");
     expect(row.toolsCache?.map((t) => t.name)).toContain("save_note");
     expect(row.lastCheckedAt).not.toBeNull();
+  }, 30_000);
+
+  // ── OAuth lane (2026-08-31 fix plan P1.1 — F1 + F10) ───────────────────────
+  //
+  // The bug these cover: an oauth row's token lives in
+  // `connection_oauth.access_token_encrypted`, NOT in
+  // `connections.auth_config_encrypted` (which is always NULL for one, and
+  // which `decryptConnectionAuthHeaders` refuses to read for authType "oauth"
+  // anyway). The probe used to dial with no Authorization header at all,
+  // collect the server's entirely correct 401, and — because `hasCredentials`
+  // was hardcoded true for oauth — persist `auth_error`: "your token was
+  // rejected" about a token that was never sent. The fixture below demands the
+  // bearer, so a probe that reads only the static-auth column cannot pass.
+
+  test("oauth connection with a connected grant dials WITH the broker token → ok + tools cached", async () => {
+    fixture.mode = "ok";
+    const token = "broker-issued-access-token-1";
+    fixture.requiredBearer = token;
+    try {
+      const conn = await createCustom(
+        `/workspaces/${orgId}/connections`,
+        "OAuth Notes",
+        { auth: { type: "oauth" } },
+      );
+      // F10: the grant is born `pending` — no token exists yet, so the DTO must
+      // NOT claim credentials.
+      expect(conn.authType).toBe("oauth");
+      expect(conn.oauthStatus).toBe("pending");
+      expect(conn.hasCredentials).toBeFalse();
+      await settleFirstProbe(conn.id);
+
+      await connectGrant(conn.id, token);
+      fixture.forgetLastDial();
+
+      const probed = await probeVia(conn.id);
+      expect(probed.health).toBe("ok");
+      expect(probed.lastError).toBeNull();
+      expect(probed.oauthStatus).toBe("connected");
+      expect(probed.hasCredentials).toBeTrue();
+      expect(probed.tools?.map((t) => t.name)).toContain("save_note");
+      // The decisive assertion: the server saw the broker's token.
+      expect(fixture.lastAuthorization).toBe(`Bearer ${token}`);
+
+      // Persisted, not echoed — an OAuth connection must be able to fill the
+      // tool picker like any other.
+      const row = await rowOf(conn.id);
+      expect(row?.health).toBe("ok");
+      expect(row?.toolsCache?.map((t) => t.name)).toContain("save_note");
+      // And the token stayed in function scope: nothing about it was stored.
+      expect(row?.authConfigEncrypted).toBeNull();
+      expect(JSON.stringify(probed)).not.toContain(token);
+    } finally {
+      fixture.requiredBearer = null;
+    }
+  }, 30_000);
+
+  test("oauth connection with a pending grant → auth_required, and the server is never dialled", async () => {
+    fixture.mode = "ok";
+    const conn = await createCustom(
+      `/workspaces/${orgId}/connections`,
+      "Unconsented OAuth",
+      { auth: { type: "oauth" } },
+    );
+    await settleFirstProbe(conn.id);
+
+    const dialsBefore = fixture.dials;
+    const probed = await probeVia(conn.id);
+    expect(probed.health).toBe("auth_required");
+    // The honest state carries no error: nothing failed, consent is missing.
+    expect(probed.lastError).toBeNull();
+    expect(probed.oauthStatus).toBe("pending");
+    expect(probed.hasCredentials).toBeFalse();
+    expect(probed.tools).toBeNull();
+    // No consent means no token means nothing worth asking the server.
+    expect(fixture.dials).toBe(dialsBefore);
+  }, 30_000);
+
+  test("a RETIRED oauth grant reads auth_error — a credential existed and stopped working", async () => {
+    fixture.mode = "ok";
+    const conn = await createCustom(
+      `/workspaces/${orgId}/connections`,
+      "Dead OAuth Grant",
+      { auth: { type: "oauth" } },
+    );
+    await settleFirstProbe(conn.id);
+
+    // `connected`, but with nothing left to spend: no access token and no
+    // refresh token, so `getAccessToken` retires the grant and answers
+    // `oauth_not_connected`. This grant WAS consented, so the honest badge is
+    // `auth_error` — a credential existed and no longer works. `auth_required`
+    // belongs to the never-consented case above, and the probe reads the
+    // grant's status precisely so the two do not collapse.
+    const grant = await grantOf(conn.id);
+    await db
+      .update(schema.connectionOauth)
+      .set({
+        status: "connected",
+        accessTokenEncrypted: null,
+        accessTokenExpiresAt: null,
+        refreshTokenEncrypted: null,
+      })
+      .where(eq(schema.connectionOauth.id, grant.id));
+
+    const dialsBefore = fixture.dials;
+    const probed = await probeVia(conn.id);
+    expect(probed.health).toBe("auth_error");
+    expect(probed.lastError).toBeNull();
+    expect(probed.oauthStatus).toBe("expired");
+    expect(probed.hasCredentials).toBeFalse();
+    expect(fixture.dials).toBe(dialsBefore);
+  }, 30_000);
+
+  test("a rejected broker token reads auth_error and never reaches last_error", async () => {
+    fixture.mode = "ok";
+    const token = "broker-token-that-must-never-be-persisted";
+    const conn = await createCustom(
+      `/workspaces/${orgId}/connections`,
+      "Rejected OAuth Token",
+      { auth: { type: "oauth" } },
+    );
+    await settleFirstProbe(conn.id);
+    await connectGrant(conn.id, token);
+
+    // The server knows a different token — a genuine rejection this time.
+    fixture.requiredBearer = "some-other-token";
+    try {
+      const probed = await probeVia(conn.id);
+      expect(probed.health).toBe("auth_error");
+      expect(fixture.lastAuthorization).toBe(`Bearer ${token}`);
+      expect(probed.lastError).toBeTruthy();
+      expect(probed.lastError).not.toContain(token);
+      expect(JSON.stringify(probed)).not.toContain(token);
+
+      const row = await rowOf(conn.id);
+      expect(row?.health).toBe("auth_error");
+      expect(row?.lastError).not.toContain(token);
+    } finally {
+      fixture.requiredBearer = null;
+    }
+  }, 30_000);
+
+  test("an unreachable authorization server reads unreachable and leaves the grant alive", async () => {
+    fixture.mode = "ok";
+    const refreshToken = "refresh-token-for-a-down-authorization-server";
+    const conn = await createCustom(
+      `/workspaces/${orgId}/connections`,
+      "AS Outage",
+      { auth: { type: "oauth" } },
+    );
+    await settleFirstProbe(conn.id);
+
+    // A stale access token plus a token endpoint nothing answers: the central
+    // refresh fails the way a real AS outage does. That is a third party we
+    // could not reach — `unreachable` — not a dead grant and not a failure of
+    // the probe machinery, so the route still answers 200 and the grant keeps
+    // its material for the next attempt (fix plan P3.1).
+    const grant = await grantOf(conn.id);
+    await db
+      .update(schema.connectionOauth)
+      .set({
+        status: "connected",
+        tokenEndpoint: await closedLoopbackUrl("/token"),
+        accessTokenEncrypted: seal("stale-access-token", "access_token", grant.id),
+        accessTokenExpiresAt: new Date(Date.now() - 1_000),
+        refreshTokenEncrypted: seal(refreshToken, "refresh_token", grant.id),
+      })
+      .where(eq(schema.connectionOauth.id, grant.id));
+
+    const dialsBefore = fixture.dials;
+    const probed = await probeVia(conn.id);
+    expect(probed.health).toBe("unreachable");
+    expect(probed.lastError).toBeTruthy();
+    expect(probed.lastError).not.toContain(refreshToken);
+    // No token, so the MCP server was never asked anything.
+    expect(fixture.dials).toBe(dialsBefore);
+    // The blip did not brick the grant — it is still connected and credentialed.
+    expect(probed.oauthStatus).toBe("connected");
+    expect(probed.hasCredentials).toBeTrue();
   }, 30_000);
 });

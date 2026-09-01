@@ -17,8 +17,31 @@
  * use, so a returned refresh_token replaces the stored one. `invalid_grant`
  * is the AS saying the grant is dead — the row lands `expired`, the
  * connection's health flips to `auth_error`, and callers get the typed 409
- * `oauth_not_connected` (re-consent is the only recovery). Any other refresh
- * failure lands `error` and rethrows typed.
+ * `oauth_not_connected` (re-consent is the only recovery).
+ *
+ * That rejection is the ONLY terminal one (2026-08-31 fix plan F4/P3.1).
+ * Every other refresh failure — AS 5xx, egress timeout, guard refusal — is a
+ * blip that never spent the refresh token, so the row stays `connected` and
+ * the typed error is simply rethrown for the caller to retry. Writing a
+ * status there would trip this function's own `status !== "connected"` gate
+ * on every LATER demand, making a 30-second outage at the authorization
+ * server indistinguishable from a dead grant and forcing a needless
+ * re-consent.
+ *
+ * WHERE THESE REQUESTS GO IS AN INVARIANT THIS MODULE DOES NOT CHECK, and
+ * must not be weakened elsewhere. `row.token_endpoint`, `row.resource` and
+ * `row.revocation_endpoint` all came from discovery against an MCP server
+ * that names its own authorization server, and the refresh below POSTs the
+ * stored refresh token AND client secret at the first of them, months after
+ * consent, with no issuer comparison of any kind. What makes that safe is
+ * that oauth/broker.ts promotes those columns ONLY in the same write that
+ * stores tokens minted through them (its `pending_flow` staging): a consent
+ * flow that discovers a different authorization server and then fails, or is
+ * simply abandoned, cannot move them. Restore a start-time write of any of
+ * those columns and this function becomes the delivery mechanism — every
+ * failed re-consent hands a live refresh token to whatever endpoint the MCP
+ * server last advertised. The guard is broker.test.ts's "a re-consent that
+ * never completes cannot repoint a live grant" case.
  *
  * SECRETS: access/refresh tokens and client secrets exist in plaintext only
  * inside function scope — never logged, never in an error message or DTO.
@@ -37,6 +60,11 @@ import {
 import type { Db } from "../db";
 import { EgressBlockedError } from "../net/guarded-fetch";
 import { errors, RuntimeApiError } from "../runtime/errors";
+import {
+  describeProviderFailure,
+  isTerminalTokenError,
+  providerErrorCode,
+} from "./error-codes";
 import { clientMetadataUrl, connectionOauthAad } from "./client-identity";
 
 type OauthRow = typeof schema.connectionOauth.$inferSelect;
@@ -127,7 +155,7 @@ export async function getAccessToken(
       // endpoint discovery recorded) the grant cannot be renewed server-side:
       // that is the same terminal state as a rejected refresh.
       if (row.refreshTokenEncrypted === null || row.tokenEndpoint === null) {
-        await markExpired(tx, row, connectionId);
+        await markExpired(tx, row, connectionId, "no_refresh_material");
         return { kind: "fail", error: errors.oauthNotConnected() };
       }
       const refreshToken = decryptRowSecret(
@@ -159,21 +187,26 @@ export async function getAccessToken(
           resource: row.resource,
         });
       } catch (error) {
-        if (error instanceof RefreshInvalidGrantError) {
-          // The AS says the grant is dead — only re-consent recovers it.
-          await markExpired(tx, row, connectionId);
+        if (error instanceof RefreshTerminalError) {
+          // The AS disowned the grant or the client — only re-consent recovers
+          // it. Retiring the row makes the next probe read `auth_required`
+          // ("reconnect"), where leaving it `connected` would retry a dead
+          // grant forever and report the AS as merely unreachable.
+          await markExpired(tx, row, connectionId, error.code);
           deps.logger.warn("oauth.refresh_rejected", {
-            fields: { connectionId, reason: "invalid_grant" },
+            fields: { connectionId, reason: error.code },
           });
           return { kind: "fail", error: errors.oauthNotConnected() };
         }
         if (error instanceof RuntimeApiError) {
-          await tx
-            .update(schema.connectionOauth)
-            .set({ status: "error" })
-            .where(eq(schema.connectionOauth.id, row.id));
+          // TRANSIENT by construction: the AS timed out, answered 5xx, or the
+          // egress guard refused the hop — none of which is the AS disowning
+          // the grant, and none of which spent the refresh token. Persist
+          // NOTHING (a status write here bricks the grant on the gate above)
+          // and hand the typed error back: the next demand retries with the
+          // still-valid refresh material. Only `invalid_grant` is terminal.
           deps.logger.warn("oauth.refresh_failed", {
-            fields: { connectionId, reason: error.code },
+            fields: { connectionId, reason: error.code, terminal: false },
           });
           return { kind: "fail", error };
         }
@@ -229,15 +262,30 @@ export async function getAccessToken(
 /** Transaction client — what `db.transaction` hands the callback. */
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-/** Grant is dead: row → `expired`, connection health → `auth_error`. */
+/**
+ * Grant is dead: row → `expired`, connection health → `auth_error`.
+ *
+ * `auth_error`, NOT `auth_required`. The two are not decoration: `auth_required`
+ * means no credential is configured, `auth_error` means one WAS and the server
+ * rejected it. Reaching here means the authorization server disowned a grant the
+ * user really did complete — `invalid_grant`, or a client the AS no longer
+ * honours — so `auth_error` is the honest one, and it is what lets the detail
+ * view say "Authorization expired" and offer Reconnect rather than the
+ * never-connected copy. The probe agrees with this (see `probe/service.ts`,
+ * which reads the grant's status precisely so a pending grant and a retired one
+ * do not collapse into the same badge).
+ *
+ * `reason` is a vocabulary code (oauth/error-codes.ts), never provider text.
+ */
 async function markExpired(
   tx: Tx,
   row: OauthRow,
   connectionId: string,
+  reason: string,
 ): Promise<void> {
   await tx
     .update(schema.connectionOauth)
-    .set({ status: "expired" })
+    .set({ status: "expired", lastErrorCode: reason })
     .where(eq(schema.connectionOauth.id, row.id));
   await tx
     .update(schema.connections)
@@ -258,16 +306,29 @@ const tokenResponseSchema = z.object({
 });
 type TokenResponse = z.infer<typeof tokenResponseSchema>;
 
-/** RFC 6749 §5.2 error body — only the machine `error` code is surfaced. */
+/**
+ * RFC 6749 §5.2 error body. The string is UNTRUSTED and deliberately typed
+ * loosely here — `providerErrorCode` is what narrows it to the vocabulary; no
+ * caller may interpolate `error` directly.
+ */
 const tokenErrorSchema = z.object({ error: z.string().min(1) });
 
 /** Token responses are small JSON; anything past this is discarded. */
 const MAX_TOKEN_BODY_BYTES = 262_144;
 
-/** Internal marker: the AS answered `invalid_grant` — terminal, not retryable. */
-class RefreshInvalidGrantError extends Error {
-  constructor() {
-    super("refresh rejected: invalid_grant");
+/**
+ * Internal marker: the AS disowned the grant or its client identity, so the
+ * failure is TERMINAL and retrying spends nothing but the row lock. Carries the
+ * vocabulary code (see `oauth/error-codes.ts`) so the row can record WHY it
+ * retired — `invalid_grant` is the common case, but `invalid_client`,
+ * `unauthorized_client`, `unsupported_grant_type` and `invalid_scope` are just
+ * as permanent, and were previously misfiled as transient and retried forever.
+ */
+class RefreshTerminalError extends Error {
+  readonly code: string;
+  constructor(code: string) {
+    super(`refresh rejected: ${code}`);
+    this.code = code;
   }
 }
 
@@ -318,11 +379,15 @@ async function refreshGrant(
   const json = await readJsonCapped(res);
   if (res.status !== 200) {
     const parsedError = tokenErrorSchema.safeParse(json);
-    if (parsedError.success && parsedError.data.error === "invalid_grant") {
-      throw new RefreshInvalidGrantError();
+    const raw = parsedError.success ? parsedError.data.error : null;
+    if (isTerminalTokenError(raw)) {
+      throw new RefreshTerminalError(providerErrorCode(raw) as string);
     }
-    const code = parsedError.success ? `: ${parsedError.data.error}` : "";
-    throw errors.oauthExchangeFailed(`HTTP ${res.status}${code}`);
+    // Only a code from the CLOSED vocabulary reaches the message. This request
+    // carried the refresh token, so an unrecognised `error` may BE that token
+    // echoed back — and this message is persisted to `connections.last_error`
+    // and returned in the DTO (oauth/error-codes.ts).
+    throw errors.oauthExchangeFailed(describeProviderFailure(res.status, raw));
   }
   const parsed = tokenResponseSchema.safeParse(json);
   if (!parsed.success) {

@@ -380,6 +380,48 @@ describe("DeliveryService.deliver", () => {
     expect(world.outcomes).toEqual(["failed"]);
   });
 
+  // `deliver` documents "never throws" and the tailer hook takes it at its
+  // word — index.ts fires it as `void delivery.deliver(info)`, so anything
+  // that escapes is an UNHANDLED rejection in the process, not a caught
+  // error. The settle write is the one call that can reject in production:
+  // at shutdown `close()` awaits `tailers.stopAll()` (which finishes runs and
+  // starts their deliveries) and then ends the pool underneath the in-flight
+  // settle, which surfaced as `Failed query: update "runs" set
+  // "delivery_status" … CONNECTION_ENDED` between test files. Every
+  // settleFailed path must therefore be AWAITED inside deliver's try — a bare
+  // `return settleFailed(…)` adopts the promise after the try block exits and
+  // the catch never sees it.
+  test.each([
+    ["a terminal non-succeeded run", slackRun({ runStatus: "failed" }), "failed" as const],
+    ["a disconnected integration", slackRun(), "succeeded" as const],
+  ])("a settle write that rejects is caught, not thrown at the caller (%s)", async (
+    _what,
+    run,
+    status,
+  ) => {
+    const world = fakeWorld();
+    world.runs.set(run.runId, run);
+    const delivery = createDeliveryService({
+      reader: world.reader,
+      runStore: {
+        async markDelivery() {
+          throw new Error("write CONNECTION_ENDED localhost:5432");
+        },
+      },
+      slackClient: world.slack,
+      masterKey: MASTER_KEY,
+      logger: silentLogger,
+    });
+    // Resolves — never rejects — and reports the unexpected-error outcome.
+    expect(
+      await delivery.deliver({
+        runId: run.runId,
+        status,
+        lastAssistantMessage: "reply",
+      }),
+    ).toBe("failed");
+  });
+
   test("IM sessions (thread key third part = channel) thread on the envelope ts", async () => {
     const world = fakeWorld();
     world.runs.set(

@@ -5,11 +5,21 @@
  * still boots without any runtime env: `tryLoadRuntimeConfig` returns null
  * when NONE of the required runtime vars are present, and fails fast with a
  * complete problem list when the runtime is partially configured.
+ *
+ * The MCP OAuth broker's two deployment settings live at the BOTTOM of this
+ * file as standalone `env → value` loaders rather than as `RuntimeConfig`
+ * fields, because the broker is assembled OUTSIDE the nullable runtime graph
+ * (index.ts builds its `oauthBroker` deps unconditionally, reading
+ * `publicAppUrlFromEnv(env)` straight from the environment) — a value gated on
+ * `tryLoadRuntimeConfig` returning non-null would be silently ignored on a
+ * Phase-0 boot, which is the exact failure mode (a silently dropped setting)
+ * that F8 is about.
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError } from "../config";
+import { publicAppUrlFromEnv } from "../integrations/config";
 import {
   loadSessionTitleConfig,
   type SessionTitleConfig,
@@ -379,5 +389,262 @@ function parsePositiveInt(
     problems.push(`${name} must be a positive integer, got "${value}"`);
     return fallback;
   }
+  return parsed;
+}
+
+// ── MCP OAuth broker deployment settings ─────────────────────────────────────
+// Both take an `env` record and are meant to be called where index.ts already
+// calls `publicAppUrlFromEnv(env)` to build the broker deps. Neither is a
+// `RuntimeConfig` field — see the file header for why.
+
+/**
+ * THE SPA origin the OAuth consent popup `postMessage`s its result to
+ * (PUBLIC_WEB_URL), normalized to a bare origin because that is what the
+ * browser compares `targetOrigin` against.
+ *
+ * It defaults to {@link publicAppUrlFromEnv}, so a single-origin deployment —
+ * production behind the nginx gateway, where the SPA and the control plane
+ * share one origin — is completely unaffected by this var existing.
+ *
+ * It exists because the two origins are NOT the same thing and coincide only
+ * by deployment accident (F8): PUBLIC_APP_URL is the CONTROL-PLANE origin,
+ * correct for the OAuth `redirect_uri` and the CIMD client id since the
+ * control plane is what serves `/integrations/mcp-oauth/callback` — but the
+ * popup's OPENER is the SPA, which in local dev is Vite on :5173 while the API
+ * is on :3000. A `postMessage` whose `targetOrigin` does not match the
+ * receiving window's origin is dropped by the browser with no error, no
+ * exception and no devtools warning, so the consent result silently never
+ * arrives and the SPA falls back to popup-close polling — reporting a
+ * dismissal for a consent that actually succeeded.
+ *
+ * Throws {@link ConfigError} when PUBLIC_WEB_URL is set but is not an absolute
+ * http(s) URL: a malformed target origin would fail in exactly the same
+ * silent way. An empty/whitespace value counts as unset.
+ */
+export function publicWebUrlFromEnv(env: Env = process.env): string {
+  const raw = env.PUBLIC_WEB_URL?.trim();
+  if (!raw) return publicAppUrlFromEnv(env);
+  const origin = parseHttpOrigin(raw);
+  if (origin === null) {
+    throw new ConfigError([
+      'PUBLIC_WEB_URL must be an absolute http(s) origin (e.g. "http://localhost:5173")',
+    ]);
+  }
+  return origin;
+}
+
+/**
+ * One operator-supplied OAuth client registration. Held in memory only and
+ * never persisted: unlike a DCR registration (which is minted per connection
+ * and envelope-encrypted onto the `connection_oauth` row) this identity is
+ * deployment-wide and comes from the environment on every boot.
+ *
+ * `clientSecret` is plaintext — treat this object as secret-bearing: never put
+ * one in a log field, an error string, a DTO or agent env. (The structured
+ * logger's redaction would catch a `clientSecret`/`*_SECRET` KEY, but not a
+ * whole registration object interpolated into a message.)
+ */
+export interface OauthClientRegistration {
+  /**
+   * Normalized provider key: the catalog entry's `clientEnvPrefix` (or its
+   * slug) lower-cased with `_` folded to `-`, so `VERCEL`, `vercel` and a
+   * `hugging-face`/`HUGGING_FACE` pair all land on one key.
+   */
+  key: string;
+  clientId: string;
+  /** Null for a public pre-registered client (no secret issued). */
+  clientSecret: string | null;
+  /**
+   * Canonical issuer this registration is pinned to, or null for unpinned.
+   * A pinned registration is refused against any other authorization server
+   * (see {@link findOauthClientRegistration}): a `client_id` is issued BY one
+   * AS and means nothing to another, and a server-controlled discovery
+   * document decides which AS we end up talking to.
+   */
+  issuer: string | null;
+}
+
+/** Pre-registered OAuth clients by provider key (see the loader). */
+export type OauthClientRegistrations = ReadonlyMap<string, OauthClientRegistration>;
+
+const OAUTH_CLIENT_PREFIX = "MCP_OAUTH_";
+/**
+ * `MCP_OAUTH_<PREFIX>_<FIELD>` — greedy prefix, anchored field suffix, so
+ * `MCP_OAUTH_VERCEL_CLIENT_ID` backtracks to prefix `VERCEL` + `CLIENT_ID`
+ * rather than prefix `VERCEL_CLIENT` + `ID`.
+ */
+const OAUTH_CLIENT_VAR = /^MCP_OAUTH_(.+)_(CLIENT_ID|CLIENT_SECRET|ISSUER)$/;
+
+/** Fold a catalog `clientEnvPrefix`, a slug, or an env segment onto one key. */
+function normalizeProviderKey(raw: string): string {
+  return raw.trim().toLowerCase().replaceAll("_", "-");
+}
+
+/**
+ * Operator-supplied OAuth client credentials, for authorization servers that
+ * gate dynamic client registration behind an approved-client allowlist rather
+ * than serving open DCR (F2: Vercel's `registration_endpoint` answers every
+ * DCR POST with `400 invalid_redirect_uri`, because it only accepts redirect
+ * URIs belonging to clients Vercel has already approved — no tuning of the
+ * request body can pass it). For those the broker must skip DCR entirely and
+ * present an identity the AS issued out of band.
+ *
+ * The scheme is keyed so a deployment can configure several providers:
+ *
+ *     MCP_OAUTH_<PREFIX>_CLIENT_ID       required — the AS-issued client_id
+ *     MCP_OAUTH_<PREFIX>_CLIENT_SECRET   optional — omit for a public client
+ *     MCP_OAUTH_<PREFIX>_ISSUER          required — the AS issuer it is for
+ *
+ * `<PREFIX>` is the catalog entry's own `clientEnvPrefix`
+ * (`packages/shared/src/connector-catalog.ts`, whose `preregisteredClientEnvVars`
+ * renders the same two names for the UI and the preflight test); it is
+ * env-shaped, so `-` is written `_` and the key normalizes back
+ * (`MCP_OAUTH_HUGGING_FACE_CLIENT_ID` → key `hugging-face`).
+ *
+ * Fails fast on a half-configured provider (a secret or issuer with no client
+ * id) and on an unrecognised `MCP_OAUTH_*` suffix — a typo'd credential var
+ * that is silently ignored is a consent flow that mysteriously still 502s.
+ * Problem strings name VARIABLES only, never values.
+ */
+export function loadOauthClientRegistrations(
+  env: Env = process.env,
+): OauthClientRegistrations {
+  const problems: string[] = [];
+  const fields = new Map<string, { id?: string; secret?: string; issuer?: string }>();
+
+  for (const [name, rawValue] of Object.entries(env)) {
+    if (!name.startsWith(OAUTH_CLIENT_PREFIX)) continue;
+    const value = rawValue?.trim();
+    if (!value) continue; // an empty var is "unset", as everywhere else here
+    const matched = OAUTH_CLIENT_VAR.exec(name);
+    if (matched === null) {
+      problems.push(
+        `${name} is not a recognised pre-registered OAuth client variable — expected ${OAUTH_CLIENT_PREFIX}<PREFIX>_CLIENT_ID, _CLIENT_SECRET or _ISSUER`,
+      );
+      continue;
+    }
+    const field = matched[2]!;
+    const key = normalizeProviderKey(matched[1]!);
+    const entry = fields.get(key) ?? {};
+    if (field === "CLIENT_ID") entry.id = value;
+    else if (field === "CLIENT_SECRET") entry.secret = value;
+    else entry.issuer = value;
+    fields.set(key, entry);
+  }
+
+  const registrations = new Map<string, OauthClientRegistration>();
+  for (const [key, entry] of [...fields].sort(([a], [b]) => a.localeCompare(b))) {
+    const envVar = (field: string) =>
+      `${OAUTH_CLIENT_PREFIX}${key.toUpperCase().replaceAll("-", "_")}_${field}`;
+    if (entry.id === undefined) {
+      problems.push(
+        `${envVar("CLIENT_ID")} is required when ${envVar(entry.secret !== undefined ? "CLIENT_SECRET" : "ISSUER")} is set`,
+      );
+      continue;
+    }
+    // REQUIRED, not optional. Without it the registration matches whatever
+    // issuer discovery reports, so a repointed MCP server could nominate its
+    // own authorization server and be handed a deployment-wide approved client
+    // secret. Failing boot is the right trade: the value is a one-line addition
+    // an operator already knows, and the alternative fails silently and open.
+    if (entry.issuer === undefined) {
+      problems.push(
+        `${envVar("ISSUER")} is required when ${envVar("CLIENT_ID")} is set — a pre-registered client must be pinned to the authorization server that issued it`,
+      );
+      continue;
+    }
+    const issuer = canonicalIssuer(entry.issuer);
+    if (issuer === null) {
+      problems.push(`${envVar("ISSUER")} must be an absolute http(s) URL`);
+      continue;
+    }
+    registrations.set(key, {
+      key,
+      clientId: entry.id,
+      clientSecret: entry.secret ?? null,
+      issuer,
+    });
+  }
+
+  if (problems.length > 0) throw new ConfigError(problems);
+  return registrations;
+}
+
+/**
+ * Resolve the pre-registered client for a flow, by provider key (a catalog
+ * entry's `clientEnvPrefix` or slug) and/or the issuer discovery reported. The
+ * key is tried first (a catalog preset names its own provider); the issuer is
+ * the fallback, so a custom or registry
+ * connection pointed at the same authorization server picks up the same
+ * approved identity. A key whose registration is pinned to a DIFFERENT issuer
+ * resolves to nothing rather than falling through — sending an approved
+ * `client_id` to an authorization server it was not issued by is precisely the
+ * AS mix-up the pin exists to prevent.
+ */
+export function findOauthClientRegistration(
+  registrations: OauthClientRegistrations,
+  match: {
+    key?: string | null;
+    issuer?: string | null;
+    /**
+     * Whether an issuer-only match may resolve a registration configured under
+     * a DIFFERENT provider key. True for custom and registry connections, which
+     * name no provider and legitimately pick up an approved identity for the
+     * authorization server they point at. FALSE for a catalog preset that
+     * declares `dynamic`: that entry states DCR or CIMD works here, and
+     * silently substituting some other provider's operator credentials because
+     * the two happen to share an issuer contradicts the declaration. The keyed
+     * lookup is unaffected either way.
+     */
+    allowIssuerFallback?: boolean;
+  },
+): OauthClientRegistration | undefined {
+  const issuer = match.issuer ? canonicalIssuer(match.issuer) : null;
+  const key = match.key ? normalizeProviderKey(match.key) : "";
+  if (key) {
+    const byKey = registrations.get(key);
+    if (byKey !== undefined) {
+      // EXACT match, no fail-open. "Issuer unknown on either side" is not
+      // evidence that the two agree, and this credential is AS-issued and
+      // often deployment-wide. `_ISSUER` is required at load, so
+      // `byKey.issuer` is never null here.
+      return byKey.issuer !== null && byKey.issuer === issuer
+        ? byKey
+        : undefined;
+    }
+  }
+  if (issuer === null || match.allowIssuerFallback === false) return undefined;
+  for (const registration of registrations.values()) {
+    if (registration.issuer === issuer) return registration;
+  }
+  return undefined;
+}
+
+/** Bare `scheme://host[:port]` for an absolute http(s) URL; null otherwise. */
+function parseHttpOrigin(raw: string): string | null {
+  const parsed = parseHttpUrl(raw);
+  return parsed === null ? null : parsed.origin;
+}
+
+/**
+ * RFC 8414 issuer identifiers are compared as strings, so canonicalize before
+ * storing or comparing: origin + path, no trailing slash, no query/fragment
+ * (the path matters — one host can serve several tenant issuers).
+ */
+function canonicalIssuer(raw: string): string | null {
+  const parsed = parseHttpUrl(raw);
+  if (parsed === null) return null;
+  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
+}
+
+function parseHttpUrl(raw: string): URL | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.origin === "null" || parsed.hostname === "") return null;
   return parsed;
 }

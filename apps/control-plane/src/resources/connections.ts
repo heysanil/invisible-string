@@ -20,6 +20,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
+  connectorOauthClientIdentity,
   createConnectionRequestSchema,
   newId,
   updateConnectionRequestSchema,
@@ -285,10 +286,24 @@ export async function createConnection(
   const id = newId("cn");
 
   let values: typeof schema.connections.$inferInsert;
+  /**
+   * Catalog-declared client identity, carried onto the newborn grant (fix plan
+   * §5 Phase 2 option (b)). A `preregistered` recipe means the provider gates
+   * client registration — Vercel answers every DCR body `invalid_redirect_uri`
+   * — so the broker must take its client_id from operator config instead of
+   * discovering a strategy at start. `dynamic` (and every non-catalog source)
+   * leaves the column NULL: which of CIMD or DCR applies is a runtime fact
+   * about the AS metadata, unknowable here, and the broker records the outcome
+   * it actually used when it arms the flow.
+   */
+  let oauthClientIdentityMode: "preregistered" | null = null;
   if (input.source === "catalog") {
     const entry = (deps.catalog ?? loadConnectorCatalog()).get(input.slug);
     if (!entry) throw errors.catalogEntryNotFound(input.slug);
     const auth = requireRecipeAuth(entry, input.auth);
+    if (connectorOauthClientIdentity(entry.auth) === "preregistered") {
+      oauthClientIdentityMode = "preregistered";
+    }
     values = {
       id,
       ...scopeInsertValues(scope),
@@ -345,6 +360,14 @@ export async function createConnection(
     };
   }
 
+  // An OAuth connection is born WITHOUT a credential — consent has not happened
+  // yet — so `auth_required` is the honest initial health, not the `unknown`
+  // default that means "never looked". It is also exactly what a probe would
+  // persist for a `pending` grant (probe/service.ts classifies that arm with no
+  // dial at all), which is why stating it here costs nothing and the create-time
+  // probe below can be skipped outright.
+  if (values.authType === "oauth") values.health = "auth_required";
+
   await assertNameAndSlugFree(deps.db, scope, values.name);
   const rows = await deps.db.insert(schema.connections).values(values).returning();
   const row = rows[0]!;
@@ -355,23 +378,42 @@ export async function createConnection(
   if (row.authType === "oauth") {
     await deps.db
       .insert(schema.connectionOauth)
-      .values({ id: newId("co"), connectionId: row.id })
+      .values({
+        id: newId("co"),
+        connectionId: row.id,
+        clientIdentityMode: oauthClientIdentityMode,
+      })
       .onConflictDoNothing({ target: schema.connectionOauth.connectionId });
     oauthStartPath =
       scope.kind === "workspace"
         ? `/workspaces/${scope.organizationId}/connections/${row.id}/oauth/start`
         : `/me/connections/${row.id}/oauth/start`;
   }
-  // First health probe (spec §7): fire-and-forget — the create response NEVER
-  // waits on or fails from it. The outcome lands on the row's probe columns;
-  // an infrastructure failure only logs (no credential material in the error:
-  // probeAndPersist scrubs classification text, and typed errors carry ids).
-  void probeAndPersist(deps, row).catch((error) => {
-    deps.logger.warn("connections.initial_probe_failed", {
-      fields: { connectionId: row.id },
-      err: error,
+  // First health probe (spec §7) — STATIC auth only: fire-and-forget, so the
+  // create response NEVER waits on or fails from it. The outcome lands on the
+  // row's probe columns; an infrastructure failure only logs (no credential
+  // material in the error: probeAndPersist scrubs classification text, and
+  // typed errors carry ids).
+  //
+  // OAuth rows are deliberately EXCLUDED (fix plan F10/F11, P1.2). Consent has
+  // not happened at create time, so the probe could only report the absence of
+  // a grant — `auth_required`, which the insert above already states without a
+  // round trip. Firing it anyway is what made a brand-new Linear/Vercel install
+  // read "http 401" the moment it appeared: the probe dialled with no
+  // Authorization header and collected the server's entirely correct rejection.
+  // Worse, now that the POST-CALLBACK probe carries the broker's token, this
+  // one racing it can land LAST and overwrite a healthy result with that
+  // failure — a connection that really works showing a 401 forever. Not
+  // dialling removes the race by construction, which is strictly better than a
+  // probe-generation counter: a counter only narrows the window.
+  if (row.authType !== "oauth") {
+    void probeAndPersist(deps, row).catch((error) => {
+      deps.logger.warn("connections.initial_probe_failed", {
+        fields: { connectionId: row.id },
+        err: error,
+      });
     });
-  });
+  }
   return {
     connection: connectionDto(row, row.authType === "oauth" ? "pending" : null),
     ...(oauthStartPath !== undefined ? { oauthStartPath } : {}),
@@ -434,10 +476,41 @@ export async function updateConnection(
   // the grant a different way: the tokens, discovery metadata, and client
   // registration were all bound to the OLD resource/AS, so revoke and reset
   // the row to a blank `pending` for a fresh consent flow against the new URL.
+  // ENTERING oauth from a static auth type is the mirror image of the reset
+  // below, and stale in exactly the same way: the row's health describes a
+  // credential the caller just discarded, and a grant it has not consented to
+  // yet cannot present one. (The 1:1 grant row is minted lazily by the start
+  // route — `ensureOauthRow` — so nothing else is owed here.)
+  if (input.auth?.type === "oauth" && existing.authType !== "oauth") {
+    patch.health = "auth_required";
+    patch.lastError = null;
+    patch.lastCheckedAt = null;
+  }
+
   if (existing.authType === "oauth") {
     const leavingOauth = input.auth !== undefined && input.auth.type !== "oauth";
     const urlChanging = input.url !== undefined && input.url !== existing.url;
     if (leavingOauth || urlChanging) {
+      // The row's PROBE columns describe a world that no longer exists (fix
+      // plan F16, P3.4): a health and a `last_error` collected against the old
+      // grant — in practice the "http 401" of an unauthenticated dial — and, on
+      // a URL change, a tool cache belonging to a different server entirely.
+      // Left in place the SPA keeps rendering that stale failure for an
+      // endpoint nothing has dialled since, with no way for a user to tell it
+      // apart from a live one. `auth_required` is the honest reading for a
+      // blank `pending` grant (identical to what the create path stamps, and to
+      // what a probe would persist without a dial); leaving oauth instead lands
+      // `unknown`, because the caller's brand-new static credential has not
+      // been tried and "connect me" would be a different lie. `tools_cache`
+      // survives an auth switch on the SAME url — those really are still the
+      // server's tools, and blanking the tool picker on a re-auth helps nobody.
+      patch.health = leavingOauth ? "unknown" : "auth_required";
+      patch.lastError = null;
+      patch.lastCheckedAt = null;
+      if (urlChanging) {
+        patch.toolsCache = null;
+        patch.toolsCachedAt = null;
+      }
       const grant = await loadOauthGrant(deps.db, id);
       if (grant !== undefined) {
         await revokeBestEffort(deps.oauthBroker, grant);
@@ -456,14 +529,24 @@ export async function updateConnection(
               resource: null,
               revocationEndpoint: null,
               scopes: null,
+              // Client identity goes too: a registered client is only valid at
+              // the issuer that minted it, and the new URL may resolve to an
+              // entirely different authorization server.
+              clientIdentityMode: null,
               clientId: null,
               clientSecretEncrypted: null,
+              clientRegistrationIssuer: null,
               accessTokenEncrypted: null,
               accessTokenExpiresAt: null,
               refreshTokenEncrypted: null,
               pendingState: null,
               pendingCodeVerifierEncrypted: null,
               pendingExpiresAt: null,
+              pendingStartedBy: null,
+              pendingFlow: null,
+              expectedIssuer: null,
+              issParameterSupported: null,
+              lastErrorCode: null,
               connectedBy: null,
             })
             .where(eq(schema.connectionOauth.id, grant.id));

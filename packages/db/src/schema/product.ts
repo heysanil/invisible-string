@@ -182,6 +182,23 @@ export const connectionOauthStatus = pgEnum("connection_oauth_status", [
   "error",
 ]);
 
+/**
+ * How the broker obtained the OAuth client identity it authorizes with.
+ * - `cimd` — the AS advertises `client_id_metadata_document_supported`, so our
+ *   hosted client-metadata URL IS the client_id; nothing is registered.
+ * - `dcr` — RFC 7591 dynamic registration; the issued credentials live in
+ *   `client_id` / `client_secret_encrypted` and are keyed by
+ *   `client_registration_issuer` (re-register when the AS's issuer changes).
+ * - `preregistered` — an OPERATOR-supplied client, deployed via config for
+ *   providers that gate registration behind a redirect-URI allowlist (Vercel
+ *   rejects our DCR body with `invalid_redirect_uri`; see the 2026-08-31 OAuth
+ *   fix plan §3). Same two columns, no registration hop.
+ */
+export const connectionOauthClientMode = pgEnum(
+  "connection_oauth_client_mode",
+  ["cimd", "dcr", "preregistered"],
+);
+
 // ── Timestamp helpers ────────────────────────────────────────────────────────
 
 const createdAt = timestamp("created_at", { withTimezone: true })
@@ -802,6 +819,36 @@ export const connections = pgTable(
   ],
 );
 
+/**
+ * An armed consent flow's STAGED server-derived state: everything one
+ * `startOauth` learned from the MCP server's discovery chain, held apart from
+ * the live grant until a token exchange SUCCEEDS (2026-08-31 OAuth fix plan,
+ * adversarial review). Discovery is chosen by the MCP server — it names its
+ * own authorization server — so writing it straight onto the row let a
+ * re-consent that NEVER COMPLETED leave a still-`connected` grant pointing at
+ * endpoints the server had just nominated, and the next central refresh then
+ * POSTed the previous AS's refresh token (and client secret) there. The grant
+ * columns are promoted from here, once, beside the tokens they minted.
+ *
+ * `clientSecretEncrypted` is the same AES-256-GCM envelope the live column
+ * holds — AAD-bound to this row (`connection_oauth:client_secret:<id>`), so
+ * promotion is a verbatim copy and no plaintext ever exists here.
+ */
+export interface PendingOauthFlow {
+  authorizationServer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  resource: string;
+  revocationEndpoint: string | null;
+  /** Scopes to REQUEST (discovery rule 2), not the AS-wide advertisement. */
+  scopes: string[] | null;
+  clientIdentityMode: "cimd" | "dcr" | "preregistered";
+  /** NULL under CIMD, where the client id IS our hosted metadata URL. */
+  clientId: string | null;
+  clientSecretEncrypted: string | null;
+  clientRegistrationIssuer: string | null;
+}
+
 /** 1:1 OAuth grant state for `auth_type = 'oauth'` connections (spec §3/§6). */
 export const connectionOauth = pgTable("connection_oauth", {
   id: text("id").primaryKey(),
@@ -809,6 +856,14 @@ export const connectionOauth = pgTable("connection_oauth", {
     .notNull()
     .unique()
     .references(() => connections.id, { onDelete: "cascade" }),
+  /**
+   * The discovered OAuth surface of the grant that is actually LIVE. Written
+   * only by a successful token exchange (promoted out of `pending_flow`), for
+   * the reason that column documents: `token_endpoint` and
+   * `revocation_endpoint` are where the central refresh and RFC 7009
+   * revocation replay a still-valid refresh token months later, and an
+   * abandoned re-consent must not be able to choose their destination.
+   */
   authorizationServer: text("authorization_server"),
   authorizationEndpoint: text("authorization_endpoint"),
   tokenEndpoint: text("token_endpoint"),
@@ -818,8 +873,34 @@ export const connectionOauth = pgTable("connection_oauth", {
   /** RFC 7009 endpoint when the AS advertises one (best-effort revocation). */
   revocationEndpoint: text("revocation_endpoint"),
   scopes: jsonb("scopes").$type<string[]>(),
+  /**
+   * The armed flow's staged discovery + client identity ({@link
+   * PendingOauthFlow}), cleared when the single-use `pending_state` is
+   * claimed. NULL on a row with no flow in flight, and on rows armed before
+   * this column existed — those exchange against the live columns, which is
+   * why every read of it falls back rather than requiring it.
+   */
+  pendingFlow: jsonb("pending_flow").$type<PendingOauthFlow | null>(),
+  /**
+   * Which identity mode minted the credentials below. `preregistered` clients
+   * reuse `client_id`/`client_secret_encrypted` — there is exactly one home
+   * per credential — and skip registration entirely. NULL on rows armed before
+   * this column existed; the broker re-derives the mode on the next start.
+   *
+   * These three client columns are promoted out of `pending_flow` by a
+   * successful exchange, exactly like the endpoints above: a registration
+   * minted at an authorization server a connection never actually authorized
+   * against must not replace the one the live tokens were issued to.
+   */
+  clientIdentityMode: connectionOauthClientMode("client_identity_mode"),
   clientId: text("client_id"),
   clientSecretEncrypted: text("client_secret_encrypted"),
+  /**
+   * The AS `issuer` that issued the DCR credentials above. A stored client is
+   * only valid at the AS that minted it, so a migrated/changed issuer must
+   * force re-registration rather than replaying a foreign client_id.
+   */
+  clientRegistrationIssuer: text("client_registration_issuer"),
   accessTokenEncrypted: text("access_token_encrypted"),
   accessTokenExpiresAt: timestamp("access_token_expires_at", {
     withTimezone: true,
@@ -829,6 +910,32 @@ export const connectionOauth = pgTable("connection_oauth", {
   pendingState: text("pending_state"),
   pendingCodeVerifierEncrypted: text("pending_code_verifier_encrypted"),
   pendingExpiresAt: timestamp("pending_expires_at", { withTimezone: true }),
+  /**
+   * The user who ARMED the pending flow. State alone binds a callback to the
+   * connection, not to a person — without this any workspace admin could
+   * complete somebody else's consent. SET NULL on user delete: an orphaned
+   * pending flow simply cannot be completed, which is the safe outcome.
+   */
+  pendingStartedBy: text("pending_started_by").references(() => user.id, {
+    onDelete: "set null",
+  }),
+  /**
+   * The `issuer` discovery resolved for the armed flow, checked against the
+   * callback's `iss` before the code is exchanged (AS mix-up defence).
+   */
+  expectedIssuer: text("expected_issuer"),
+  /**
+   * Whether that AS advertises `authorization_response_iss_parameter_supported`
+   * — captured with the pending flow, because a MISSING `iss` is only an error
+   * when the AS promised to send one. NULL = unknown (pre-column rows).
+   */
+  issParameterSupported: boolean("iss_parameter_supported"),
+  /**
+   * Sanitized typed OAuth failure code (e.g. `oauth_registration_failed`), for
+   * the connection detail surface. A CODE, never a provider message: no
+   * OAuth value may reach a DTO.
+   */
+  lastErrorCode: text("last_error_code"),
   connectedBy: text("connected_by").references(() => user.id, {
     onDelete: "set null",
   }),

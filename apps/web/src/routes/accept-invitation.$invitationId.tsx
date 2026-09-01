@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createFileRoute,
   Navigate,
@@ -11,7 +12,12 @@ import { Button } from "../components/ui/Button";
 import { Chip } from "../components/ui/Chip";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
-import { authClient, signOut } from "../lib/auth-client";
+import { authClient } from "../lib/auth-client";
+import {
+  completeSignOut,
+  refetchViewer,
+  useViewer,
+} from "../lib/auth/viewer";
 
 export const Route = createFileRoute("/accept-invitation/$invitationId")({
   component: AcceptInvitationPage,
@@ -46,51 +52,27 @@ function variantFor(status?: number): "not-found" | "wrong-account" | "connectio
   return "connection";
 }
 
-type SessionProbe = "checking" | "authenticated" | "unauthenticated" | "failed";
-
 function AcceptInvitationPage() {
   const { invitationId } = Route.useParams();
-  const [sessionProbe, setSessionProbe] = useState<SessionProbe>("checking");
   const navigate = useNavigate();
   const router = useRouter();
   const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const { viewer, isPending: sessionPending, error: sessionError } = useViewer();
+  // Set when a 401 arrives mid-flow (the session died between requests).
+  const [sessionLost, setSessionLost] = useState(false);
 
   const [view, setView] = useState<InviteView>({ kind: "loading" });
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [attempt, setAttempt] = useState(0);
 
-  // The shared useSession() atom can hold a stale resolved-null snapshot
-  // right after the login/signup round-trip (no subscriber lives on the auth
-  // screens, and the remount refetch is deferred a macrotask), which bounced
-  // fresh invitees straight back to /login. Probe the server directly and
-  // gate the redirect on the answer instead of trusting the cached snapshot.
-  // A probe failure (network hiccup, 5xx) is NOT treated as "unauthenticated"
-  // — it renders a retryable connection-error card instead, so a flaky
-  // network doesn't bounce an otherwise signed-in user to /login.
+  // Identity comes from the shared viewer query (lib/auth/viewer.ts), the same
+  // source the router gate uses. This route used to run its own
+  // authClient.getSession() probe because the old useSession() atom could hold
+  // a stale resolved-null right after login; that atom is gone.
   useEffect(() => {
-    let cancelled = false;
-    setSessionProbe("checking");
-    void authClient
-      .getSession()
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error && (!error.status || error.status >= 500)) {
-          setSessionProbe("failed");
-        } else {
-          setSessionProbe(data ? "authenticated" : "unauthenticated");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setSessionProbe("failed");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [invitationId, attempt]);
-
-  useEffect(() => {
-    if (sessionProbe !== "authenticated") return;
+    if (!viewer || sessionLost) return;
     let cancelled = false;
     setView({ kind: "loading" });
     void authClient.organization
@@ -99,7 +81,7 @@ function AcceptInvitationPage() {
         if (cancelled) return;
         if (error?.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else if (error || !data) {
           setView({ kind: "error", variant: variantFor(error?.status) });
         } else {
@@ -115,9 +97,9 @@ function AcceptInvitationPage() {
     return () => {
       cancelled = true;
     };
-  }, [sessionProbe, invitationId, attempt]);
+  }, [viewer, sessionLost, invitationId, attempt]);
 
-  if (sessionProbe === "checking") {
+  if (sessionPending) {
     return (
       <InviteCard subtitle="Checking your session">
         <CenteredSpinner label="Loading invitation" />
@@ -125,11 +107,21 @@ function AcceptInvitationPage() {
     );
   }
 
-  if (sessionProbe === "failed") {
-    return <ConnectionErrorCard onRetry={() => setAttempt((n) => n + 1)} />;
+  if (sessionError) {
+    // `attempt` doesn't feed the viewer query (it's a static queryKey), so
+    // bumping it alone would leave the same cached error in place. Force a
+    // fresh network read instead, the same way WorkspaceGate's retry does —
+    // removing the cached entry alone does not notify a mounted observer.
+    return (
+      <ConnectionErrorCard
+        onRetry={() => {
+          void refetchViewer(queryClient);
+        }}
+      />
+    );
   }
 
-  if (sessionProbe === "unauthenticated") {
+  if (!viewer || sessionLost) {
     return (
       <Navigate
         to="/login"
@@ -148,7 +140,7 @@ function AcceptInvitationPage() {
       if (error) {
         if (error.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else {
           setView({ kind: "error", variant: variantFor(error.status) });
         }
@@ -169,6 +161,7 @@ function AcceptInvitationPage() {
           message: `Joined ${invitation.organizationName}.`,
         });
       }
+      await refetchViewer(queryClient);
       await navigate({ to: "/chat" });
     } catch {
       setView({ kind: "error", variant: "connection" });
@@ -186,7 +179,7 @@ function AcceptInvitationPage() {
       if (error) {
         if (error.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else {
           setView({ kind: "error", variant: variantFor(error.status) });
         }
@@ -206,7 +199,7 @@ function AcceptInvitationPage() {
   async function handleSignOut() {
     setSigningOut(true);
     try {
-      await signOut();
+      await completeSignOut(queryClient);
       // Round-trip back to this invitation once the right account signs in.
       router.history.push(
         `/login?redirect=${encodeURIComponent(`/accept-invitation/${invitationId}`)}`,

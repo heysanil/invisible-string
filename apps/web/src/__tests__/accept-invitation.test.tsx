@@ -163,3 +163,23 @@ test("a 400 shows the no-longer-valid state", async () => {
     await view.findByText("This invitation is no longer valid"),
   ).toBeTruthy();
 });
+
+test("an undetermined session shows the retry card, not a login bounce", async () => {
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  const { router, view } = renderInvite();
+  expect(await view.findByText("Can't load this invitation")).toBeTruthy();
+  expect(router.state.location.pathname).toContain("/accept-invitation/");
+});
+
+test("Try again recovers once the server answers", async () => {
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  const { view } = renderInvite();
+  await view.findByText("Can't load this invitation");
+
+  // The retry must drop the CACHED error, not just re-run an effect.
+  authMockState.getSessionError = null;
+  authMockState.session = demoSession();
+  authMockState.getInvitationResult = { data: INVITATION, error: null };
+  fireEvent.click(view.getByRole("button", { name: /try again/i }));
+  expect(await view.findByText("Join Acme")).toBeTruthy();
+});

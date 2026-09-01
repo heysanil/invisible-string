@@ -81,9 +81,12 @@ test("signing in once, after a signed-out boot, lands in the shell", async () =>
 
   submitLogin(view, "demo@example.com", "hunter2hunter2");
 
-  await waitFor(() => {
-    expect(router.state.location.pathname).toBe("/chat");
-  });
+  // The shell can only render once `_app`'s beforeLoad resolved WITHOUT
+  // throwing a redirect, so its presence is direct proof the gate passed —
+  // unlike `router.state.location.pathname`, which `history.push` updates
+  // optimistically before that guard has had a chance to bounce it back.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(router.state.location.pathname).toBe("/chat");
   expect(authMockState.signInCalls).toHaveLength(1);
 });
 
@@ -113,7 +116,7 @@ test("a deep link is preserved across the sign-in bounce", async () => {
   await view.findByText("Welcome back");
   submitLogin(view, "demo@example.com", "hunter2hunter2");
 
-  await waitFor(() => {
-    expect(router.state.location.pathname).toBe("/settings/members");
-  });
+  // Settled DOM first (see the first test's comment), then the pathname.
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
+  expect(router.state.location.pathname).toBe("/settings/members");
 });

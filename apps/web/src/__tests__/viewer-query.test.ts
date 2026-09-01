@@ -2,6 +2,7 @@ import { ensureDomForThisFile } from "../test/setup";
 import "../test/auth-mock";
 
 import { beforeEach, expect, test } from "bun:test";
+import { QueryClient } from "@tanstack/react-query";
 
 import {
   authMockState,
@@ -14,9 +15,18 @@ import {
 ensureDomForThisFile();
 registerAuthMock();
 
-const { fetchViewer, activeWorkspace, ViewerUnavailableError } = await import(
-  "../lib/auth/viewer"
-);
+const {
+  activateWorkspace,
+  ActivateWorkspaceError,
+  activeWorkspace,
+  AUTH_REQUEST_TIMEOUT_MS,
+  fetchViewer,
+  ViewerUnavailableError,
+} = await import("../lib/auth/viewer");
+
+function makeClient() {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
 
 beforeEach(resetAuthMock);
 
@@ -44,6 +54,107 @@ test("a 5xx throws rather than resolving to null", async () => {
 test("a transport failure with no status throws", async () => {
   authMockState.getSessionError = { message: "network" };
   await expect(fetchViewer()).rejects.toBeInstanceOf(ViewerUnavailableError);
+});
+
+/**
+ * 403 is NOT signed out. Only 401 is. A forbidden answer means the session is
+ * real but the request was refused, and collapsing it into "signed out" hands
+ * a login form to somebody who is already logged in.
+ */
+test("a 403 on the session call throws rather than resolving to null", async () => {
+  authMockState.getSessionError = { status: 403, message: "FORBIDDEN" };
+  await expect(fetchViewer()).rejects.toBeInstanceOf(ViewerUnavailableError);
+});
+
+test("a 403 on the org list throws rather than resolving to null", async () => {
+  authMockState.session = demoSession();
+  authMockState.listOrganizationsError = { status: 403, message: "FORBIDDEN" };
+  await expect(fetchViewer()).rejects.toBeInstanceOf(ViewerUnavailableError);
+});
+
+/**
+ * Better Auth usually resolves failures as `{error}`, but `@better-fetch/fetch`
+ * calls `await fetch(...)` with no try/catch — so a real transport failure
+ * (DNS, offline, an abort) REJECTS. Both halves must land on undetermined.
+ */
+test("a rejected session promise throws ViewerUnavailableError", async () => {
+  authMockState.rejectGetSession = true;
+  await expect(fetchViewer()).rejects.toBeInstanceOf(ViewerUnavailableError);
+});
+
+test("a rejected org-list promise throws ViewerUnavailableError", async () => {
+  authMockState.session = demoSession();
+  authMockState.rejectListOrganizations = true;
+  await expect(fetchViewer()).rejects.toBeInstanceOf(ViewerUnavailableError);
+});
+
+/**
+ * A proxy that ACCEPTS the request and never answers used to leave the router
+ * gate pending forever: the protected route never committed, and the retry
+ * card was unreachable because nothing threw. The bound must surface as
+ * UNDETERMINED — never as signed out, which would show a login form to a user
+ * whose session is fine.
+ */
+test("a session request that never answers times out as undetermined", async () => {
+  authMockState.hangGetSession = true;
+  await expect(fetchViewer({ timeoutMs: 20 })).rejects.toBeInstanceOf(
+    ViewerUnavailableError,
+  );
+});
+
+test("an org-list request that never answers times out as undetermined", async () => {
+  authMockState.session = demoSession();
+  authMockState.hangListOrganizations = true;
+  await expect(fetchViewer({ timeoutMs: 20 })).rejects.toBeInstanceOf(
+    ViewerUnavailableError,
+  );
+});
+
+test("an activation that never answers times out rather than hanging the gate", async () => {
+  authMockState.session = demoSession();
+  authMockState.organizations = [demoWorkspace()];
+  authMockState.hangSetActive = true;
+  await expect(
+    activateWorkspace(makeClient(), "org_test_1", { timeoutMs: 20 }),
+  ).rejects.toBeInstanceOf(ActivateWorkspaceError);
+});
+
+/** A rejected set-active is transport — wrapped, not left raw. */
+test("a rejected activation is wrapped as ActivateWorkspaceError", async () => {
+  authMockState.session = demoSession();
+  authMockState.rejectSetActive = true;
+  await expect(
+    activateWorkspace(makeClient(), "org_test_1"),
+  ).rejects.toBeInstanceOf(ActivateWorkspaceError);
+});
+
+/** A 401 during activation is definitive: signed out, not "server down". */
+test("a 401 during activation resolves null rather than throwing", async () => {
+  authMockState.session = demoSession();
+  authMockState.setActiveResult = {
+    data: null,
+    error: { status: 401, message: "UNAUTHORIZED" },
+  };
+  expect(await activateWorkspace(makeClient(), "org_test_1")).toBeNull();
+});
+
+/**
+ * Every auth call the gate depends on carries an AbortSignal by DEFAULT, not
+ * only when a test passes a short bound. Without this, the timeout tests above
+ * would still pass while production requests stayed unbounded.
+ */
+test("every auth call the gate depends on is bounded by default", async () => {
+  expect(Number.isFinite(AUTH_REQUEST_TIMEOUT_MS)).toBe(true);
+  expect(AUTH_REQUEST_TIMEOUT_MS).toBeGreaterThan(0);
+
+  authMockState.session = demoSession();
+  authMockState.organizations = [demoWorkspace()];
+  await fetchViewer();
+  await activateWorkspace(makeClient(), "org_test_1");
+
+  expect(authMockState.getSessionSignals[0]).toBeInstanceOf(AbortSignal);
+  expect(authMockState.listOrganizationsSignals[0]).toBeInstanceOf(AbortSignal);
+  expect(authMockState.setActiveSignals[0]).toBeInstanceOf(AbortSignal);
 });
 
 test("a signed-in viewer carries the user, active id, and sorted workspaces", async () => {

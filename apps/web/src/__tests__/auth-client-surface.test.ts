@@ -16,6 +16,34 @@ test("lib/auth-client re-exports no Better Auth React hook", async () => {
   }
 });
 
+/**
+ * Dropping the re-exports is necessary but NOT sufficient: `authClient` is
+ * Better Auth's dynamic path proxy, so `authClient.useSession()` resolves at
+ * runtime whether or not anything imports or re-exports it. The atom, and the
+ * whole bug, comes back through that door without a single new import.
+ */
+function bannedHookUse(text: string): string[] {
+  const hits: string[] = [];
+  for (const name of BANNED) {
+    // `authClient.useSession`, and through any intermediate segment
+    // (`authClient.organization.useListOrganizations`).
+    if (new RegExp(`authClient\\s*(?:\\.\\s*\\w+\\s*)*\\.\\s*${name}\\b`).test(text)) {
+      hits.push(`authClient.${name}`);
+    }
+  }
+  // The same hook by another route: `const { useSession } = authClient`.
+  for (const match of text.matchAll(
+    /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*authClient\b/g,
+  )) {
+    for (const name of BANNED) {
+      if (new RegExp(`\\b${name}\\b`).test(match[1] ?? "")) {
+        hits.push(`{ ${name} } = authClient`);
+      }
+    }
+  }
+  return hits;
+}
+
 test("no source file imports a Better Auth React hook", async () => {
   const glob = new Bun.Glob("**/*.{ts,tsx}");
   const root = new URL("../", import.meta.url).pathname;
@@ -30,4 +58,29 @@ test("no source file imports a Better Auth React hook", async () => {
     }
   }
   expect(offenders).toEqual([]);
+});
+
+test("no source file reaches a Better Auth React hook through authClient", async () => {
+  const glob = new Bun.Glob("**/*.{ts,tsx}");
+  const root = new URL("../", import.meta.url).pathname;
+  const offenders: string[] = [];
+  for await (const file of glob.scan({ cwd: root })) {
+    if (file.startsWith("__tests__/")) continue;
+    const text = await Bun.file(`${root}${file}`).text();
+    for (const hit of bannedHookUse(text)) offenders.push(`${file}: ${hit}`);
+  }
+  expect(offenders).toEqual([]);
+});
+
+/** The scanner has to actually catch the thing it exists to catch. */
+test("the authClient hook scanner catches every way in", () => {
+  expect(bannedHookUse("const s = authClient.useSession();")).toHaveLength(1);
+  expect(
+    bannedHookUse("authClient.organization.useListOrganizations()"),
+  ).toHaveLength(1);
+  expect(bannedHookUse("const { useSession } = authClient;")).toHaveLength(1);
+  // The app's own chat-session hook must NOT trip it.
+  expect(bannedHookUse('import { useSession } from "./queries/sessions";')).toEqual(
+    [],
+  );
 });

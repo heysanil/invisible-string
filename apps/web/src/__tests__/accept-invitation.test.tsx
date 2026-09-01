@@ -99,9 +99,9 @@ test("accepting joins, activates the workspace, and lands in the shell", async (
   await waitFor(() => {
     expect(authMockState.setActiveCalls.length).toBeGreaterThanOrEqual(1);
   });
-  expect(authMockState.setActiveCalls).toContainEqual({
-    organizationId: "org_test_1",
-  });
+  expect(
+    authMockState.setActiveCalls.map((call) => call["organizationId"]),
+  ).toContain("org_test_1");
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/chat");
   });
@@ -128,6 +128,43 @@ test("a failed workspace switch after accepting is reported honestly", async () 
   await waitFor(() => {
     expect(router.state.location.pathname).toBe("/chat");
   });
+});
+
+/**
+ * Acceptance is a COMMIT POINT: the invitation is consumed and the membership
+ * exists. Anything that fails afterwards must never route the user back to a
+ * state whose only recovery re-reads the invitation — the retry would fetch a
+ * consumed invitation and report "no longer valid", stranding a user who is
+ * already a member. Same partial-success principle as login.tsx,
+ * signup.tsx, and CreateWorkspaceScreen.tsx.
+ */
+test("a viewer refresh that fails after accepting never blames the invitation", async () => {
+  authMockState.session = demoSession();
+  authMockState.getInvitationResult = { data: INVITATION, error: null };
+  const { view } = renderInvite();
+  await view.findByText("Join Acme");
+
+  // The membership lands, then the follow-up viewer read hits a transient 503.
+  authMockState.acceptInvitationCalls = [];
+  authMockState.getSessionError = { status: 503, message: "unavailable" };
+  fireEvent.click(view.getByRole("button", { name: /accept invitation/i }));
+
+  expect(await view.findByText("Joined Acme")).toBeTruthy();
+  expect(view.queryByText("Can't load this invitation")).toBeNull();
+  expect(view.queryByText("This invitation is no longer valid")).toBeNull();
+
+  // The recovery re-reads the SESSION, never the consumed invitation.
+  const invitationReads = authMockState.getInvitationCalls.length;
+  authMockState.getSessionError = null;
+  fireEvent.click(view.getByRole("button", { name: /try again/i }));
+
+  await waitFor(() => {
+    expect(
+      view.queryByRole("navigation", { name: "Primary" }),
+    ).toBeTruthy();
+  });
+  expect(authMockState.getInvitationCalls.length).toBe(invitationReads);
+  expect(authMockState.acceptInvitationCalls).toHaveLength(1);
 });
 
 test("declining rejects the invitation and shows the declined state", async () => {

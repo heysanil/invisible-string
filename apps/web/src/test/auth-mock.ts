@@ -58,6 +58,40 @@ export const authMockState = {
   listOrganizationsCalls: 0,
   getSessionCalls: 0,
   signOutResult: ok(),
+  /**
+   * Make a call REJECT instead of resolving `{error}`. `@better-fetch/fetch`
+   * does not wrap its `await fetch(...)` in a try/catch, so a real transport
+   * failure rejects the proxy promise — this models that half.
+   */
+  rejectGetSession: false,
+  rejectListOrganizations: false,
+  rejectSetActive: false,
+  /**
+   * Hang until the caller's AbortSignal fires — a proxy that accepts the
+   * request and never answers. With NO signal the promise never settles,
+   * which is precisely the wedge an unbounded auth call produces.
+   */
+  hangGetSession: false,
+  hangListOrganizations: false,
+  hangSetActive: false,
+  /** The AbortSignal each call was handed, for the bounded-request wiring. */
+  getSessionSignals: [] as Array<AbortSignal | undefined>,
+  listOrganizationsSignals: [] as Array<AbortSignal | undefined>,
+  setActiveSignals: [] as Array<AbortSignal | undefined>,
+  /**
+   * `setActive` waits on this before it does anything. A mock that mutates
+   * synchronously and returns an already-resolved promise cannot tell an
+   * AWAITED activation from a fire-and-forget one — both satisfy the same
+   * assertions — so the gate test parks activation here on purpose.
+   */
+  setActiveGate: null as Promise<void> | null,
+  /**
+   * The session the "server" holds AFTER set-active. `undefined` leaves the
+   * normal behaviour alone; `null` models a session that died during
+   * activation, and a session whose active organization is still null models
+   * an activation that answered 200 without sticking.
+   */
+  sessionAfterSetActive: undefined as MockSessionData | null | undefined,
 
   // Organization plugin state
   organizations: [] as MockOrganization[],
@@ -97,6 +131,17 @@ export function resetAuthMock(): void {
   authMockState.listOrganizationsCalls = 0;
   authMockState.getSessionCalls = 0;
   authMockState.signOutResult = ok();
+  authMockState.rejectGetSession = false;
+  authMockState.rejectListOrganizations = false;
+  authMockState.rejectSetActive = false;
+  authMockState.hangGetSession = false;
+  authMockState.hangListOrganizations = false;
+  authMockState.hangSetActive = false;
+  authMockState.getSessionSignals = [];
+  authMockState.listOrganizationsSignals = [];
+  authMockState.setActiveSignals = [];
+  authMockState.setActiveGate = null;
+  authMockState.sessionAfterSetActive = undefined;
 
   authMockState.organizations = [];
   authMockState.inviteResult = ok();
@@ -154,6 +199,42 @@ export function signInToDemoWorkspace(): void {
   authMockState.organizations = [demoWorkspace()];
 }
 
+/**
+ * The AbortSignal the viewer handed this call. Better Auth's dynamic-path
+ * proxy spreads `arg.fetchOptions` into the options it passes to
+ * `@better-fetch/fetch`, which forwards `signal` straight to `fetch` — so
+ * this is where a bounded auth request shows up.
+ */
+function signalOf(args?: Record<string, unknown>): AbortSignal | undefined {
+  const fetchOptions = args?.["fetchOptions"] as
+    | { signal?: AbortSignal }
+    | undefined;
+  return fetchOptions?.signal;
+}
+
+/**
+ * Never resolves; rejects when the signal aborts. An aborted `fetch` rejects
+ * (better-fetch does not catch it), so this is what an abort really looks
+ * like to the caller — and with no signal at all, nothing ever settles.
+ */
+function hangUntilAborted(signal: AbortSignal | undefined): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    if (!signal) return;
+    const abort = () => {
+      reject(
+        Object.assign(new Error("The operation was aborted."), {
+          name: "AbortError",
+        }),
+      );
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathname;
 
 /**
@@ -167,6 +248,10 @@ const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathnam
 const organizationMock = {
   setActive: async (args: Record<string, unknown>) => {
     authMockState.setActiveCalls.push(args);
+    authMockState.setActiveSignals.push(signalOf(args));
+    if (authMockState.hangSetActive) return hangUntilAborted(signalOf(args));
+    if (authMockState.rejectSetActive) throw new Error("network");
+    if (authMockState.setActiveGate) await authMockState.setActiveGate;
     const result = authMockState.setActiveResult;
     if (result.error) return result;
     const id = (args["organizationId"] as string | null) ?? null;
@@ -183,6 +268,9 @@ const organizationMock = {
       authMockState.organizations = [...authMockState.organizations, org];
     }
     setSessionActiveOrganization(id);
+    if (authMockState.sessionAfterSetActive !== undefined) {
+      authMockState.session = authMockState.sessionAfterSetActive;
+    }
     return result;
   },
   create: async (args: Record<string, unknown>) => {
@@ -197,8 +285,12 @@ const organizationMock = {
     }
     return result;
   },
-  list: async (): Promise<MockAuthResult> => {
+  list: async (args?: Record<string, unknown>): Promise<MockAuthResult> => {
     authMockState.listOrganizationsCalls++;
+    authMockState.listOrganizationsSignals.push(signalOf(args));
+    if (authMockState.hangListOrganizations)
+      return hangUntilAborted(signalOf(args));
+    if (authMockState.rejectListOrganizations) throw new Error("network");
     if (authMockState.listOrganizationsError)
       return { data: null, error: authMockState.listOrganizationsError };
     // The real endpoint requires a session: no session means 401, which the
@@ -266,8 +358,13 @@ export function registerAuthMock(): void {
 
 const authMockFactory = () => ({
   authClient: {
-    getSession: async (): Promise<MockAuthResult> => {
+    getSession: async (
+      args?: Record<string, unknown>,
+    ): Promise<MockAuthResult> => {
       authMockState.getSessionCalls++;
+      authMockState.getSessionSignals.push(signalOf(args));
+      if (authMockState.hangGetSession) return hangUntilAborted(signalOf(args));
+      if (authMockState.rejectGetSession) throw new Error("network");
       if (authMockState.getSessionError)
         return { data: null, error: authMockState.getSessionError };
       return { data: authMockState.session, error: null };

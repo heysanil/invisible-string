@@ -2,18 +2,18 @@
 title: Overview
 section: Getting started
 order: 10
-description: "Give an Agent a role, a model, and the tools it needs, then chat with it like a teammate — or put it on standing duty from Slack, forms, webhooks, or a schedule."
+description: "Give an Agent a role, a model, and tools, then chat with it like a teammate — or put standing work on a pipeline that goes agentic only where needed."
 ---
 
 # Overview
 
 invisible-string is a multi-tenant cloud platform for AI agents. You give an
 **Agent** a role, a model, and the tools it needs, then chat with it like a
-teammate — or put it on standing duty from Slack, forms, webhooks, or a
-schedule. Runs stream live, pause for your approval, and are yours to run
-wherever you host them: every published Agent compiles into a real,
-self-hosted [eve](https://eve.dev) agent on a durable, Postgres-backed worker
-pool.
+teammate — or delegate standing work to a **Workflow**, a pipeline that fires
+from Slack, forms, webhooks, or a schedule. Runs stream live, pause for your
+approval, and are yours to run wherever you host them: every published Agent
+compiles into a real, self-hosted [eve](https://eve.dev) agent on a durable,
+Postgres-backed worker pool.
 
 ## Agents
 
@@ -27,11 +27,13 @@ standalone, version-pinned build, and that build is what you chat with.
 ## Workflows
 
 For standing work, delegate with a Workflow: a trigger (webhook, form, Slack
-event, or schedule), the published Agent that handles it, and instructions for
-what to do when it fires, with `@trigger` references into the event's data. A
-Workflow builds nothing — publishing is instant — and when the trigger fires
-the platform delivers the event *and the instructions* to the bound Agent as
-its task.
+event, or schedule) and a pipeline of **steps** the platform interprets when
+it fires — deterministic `tool` calls on the workspace's MCP connections,
+cheap `infer` model calls, real `agent` sessions, and loop/branch/filter/state
+control steps, wired together with `@` references into the trigger's data and
+each other's outputs. The deterministic 90% of a job runs without burning a
+model turn; only the steps that need judgment are agentic. A Workflow builds
+nothing — publishing is instant.
 
 ## How it fits together
 
@@ -45,14 +47,15 @@ an unchanged definition never rebuilds, so republishing after an unrelated
 edit is often instant too.
 
 Once published, an Agent is something you can chat with directly or delegate
-to. Chat starts a session and streams every run live; a Workflow instead binds
-the published Agent to a trigger and hands it a task whenever that trigger
-fires — no chat window required. See
-[Workflows](/docs/concepts/workflows).
+to. Chat starts a session and streams every run live; a Workflow instead runs
+its pipeline whenever its trigger fires, and any `agent` step in that pipeline
+dispatches the bound Agent's current published version as a child run — no
+chat window required. See [Workflows](/docs/concepts/workflows).
 
-Every run — chat or delegated — lands on a stateless worker pool backed by
-Postgres, so a worker dying mid-run doesn't lose the run: it resumes on
-whichever live worker picks it up next. See
+Every agent run — chat or delegated — lands on a stateless worker pool backed
+by Postgres, so a worker dying mid-run doesn't lose the run: it resumes on
+whichever live worker picks it up next. Pipeline runs are just as durable, on
+the control plane's own step ledger. See
 [Durability](/docs/platform/durability).
 
 ## Chat or a Workflow?
@@ -61,15 +64,16 @@ whichever live worker picks it up next. See
 |---|---|---|
 | Shape | Interactive — a back-and-forth conversation | Standing — fires on its own trigger |
 | Who starts it | You, by typing | A webhook, form submission, Slack event, or schedule |
-| Where output lands | The chat thread you're reading | Wherever the Workflow delivers it (for example, back to a Slack thread) |
+| What runs | One Agent, conversationally | A pipeline of steps — an Agent only where a step needs one |
+| Where output lands | The chat thread you're reading | Wherever the steps put it, plus a per-step timeline in the Runs tab |
 | Does publishing build anything | Yes — compiles and builds the Agent | No — publishing a Workflow is instant |
 
 ## What a Workflow is not
 
-A Workflow carries no persona, no model, and no context of its own — it binds
-to one published Agent and uses that Agent's equipment as-is. You don't chat
-with a Workflow directly; you chat with the Agent it delegates to, or you let
-its trigger fire it.
+A Workflow carries no persona and no model of its own — its `infer` steps
+borrow workspace presets, and its `agent` steps borrow published Agents whole,
+equipment included. You don't chat with a Workflow directly; you describe it,
+publish it, and read its runs.
 
 ## Where to go next
 

@@ -44,11 +44,39 @@ Limits on what you write directly into the platform: personas,
 The persona's 1,500-character guideline is only ever a hint in the editor —
 nothing stops you from publishing a longer persona, up to the hard cap.
 
+## Pipelines
+
+What bounds a [Workflow](/docs/concepts/workflows)'s pipeline runs. The
+declared-shape caps are fixed publish gates; the runtime knobs fall back to
+their defaults when unset.
+
+| Limit | Value | Configurable via |
+|---|---|---|
+| Declared steps per pipeline | 50 | — |
+| Wall clock per pipeline run | 30 minutes | `PIPELINE_MAX_WALL_CLOCK_MS` |
+| Executed step instances per run | 200 (each loop iteration's steps count) | `PIPELINE_MAX_STEPS_PER_RUN` |
+| Per-step output size | 256 KiB serialized — a larger output fails the step | `PIPELINE_MAX_STEP_OUTPUT_BYTES` |
+| For each items | 100 per loop — overflow **fails** the loop rather than truncating | — |
+| Workflow state | 200 keys per Workflow, 64 KiB per value | — |
+| Tool step timeout | 60 seconds by default; a step can configure up to 300 | per-step `timeoutMs` |
+| Infer step timeout | 120 seconds per attempt | — |
+| Infer prompt size | 128 KiB rendered — over it, the step fails rather than truncating | — |
+| Agent-step child poll | 5 seconds, backing up the live event subscription | `PIPELINE_CHILD_POLL_MS` |
+| Concurrent runs per Workflow | 1 by default — an overlapping trigger is skipped | — |
+
+Steps that fail transiently retry with exponential backoff (2 s doubling,
+capped at 60 s): a tool step gets 3 attempts by default and can configure up
+to 5, an infer step 2, an agent step 2 — and only genuinely transient
+failures (unreachable, timeout, rate-limited, server error) are retried. A
+tool error the server itself returned is an answer, not an outage, and is
+never retried.
+
 ## Runtime
 
 | Limit | Value | Configurable via |
 |---|---|---|
 | Concurrent runs per session | 1 (a waiting run counts as busy) | — |
+| Concurrent runs per workspace | 5 — a pipeline run and each of its agent-step child runs hold a slot each | `MAX_CONCURRENT_RUNS_PER_WORKSPACE` |
 | SSE heartbeat | 15 seconds | `SSE_HEARTBEAT_MS` |
 | Schedule ticker interval | 30 seconds | `SCHEDULE_TICK_MS` |
 | MCP registry sync interval | 6 hours | `REGISTRY_SYNC_INTERVAL_MS` |

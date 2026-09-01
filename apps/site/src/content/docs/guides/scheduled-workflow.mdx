@@ -2,47 +2,63 @@
 title: Build a scheduled Workflow
 section: Guides
 order: 48
-description: "Build a standup digest that runs every weekday at 09:00 UTC — the cron expression, the bound Agent, and where the digest ends up once it's generated."
+description: "Build the canonical pipeline: every 20 minutes, search Slack for new mentions, summarize each with a cheap model, file Linear issues, and advance a cursor."
 ---
 
 # Build a scheduled Workflow
 
-Say you want a standup digest to run every weekday at 09:00 UTC. This guide builds that as a scheduled Workflow — cron expression, bound Agent, and where the digest actually ends up once it's generated.
+Say you want every `@team-exec` mention in Slack turned into a well-formed Linear issue, without a person watching the channel. This guide builds that as the canonical scheduled pipeline: a cron trigger, a deterministic Slack search, a cheap model summary per message, a Linear issue per summary, and a durable cursor so nothing is processed twice.
 
 ## Before you start
 
-- A published Agent already equipped with whatever it needs to produce the digest — a connector to pull data from, or nothing at all if it's just summarizing its own context. See [Equip an Agent with a connector](/docs/guides/equip-an-agent) if it needs one.
-- Familiarity with how a Workflow's trigger, Agent, and instructions fit together — see [Workflows](/docs/concepts/workflows).
+- Workspace-scoped Slack and Linear [connections](/docs/building/context-mcp), healthy enough to have cached their tool lists. Tool steps run on workspace connections — a personal connection can't back an unattended run.
+- Familiarity with how a Workflow's trigger and steps fit together — see [Workflows](/docs/concepts/workflows).
+
+## The shape
+
+Only one step in this job needs a model, and none of it needs a full Agent:
+
+1. **Trigger: Schedule** — `*/20 * * * *`, every 20 minutes.
+2. **Tool** (`search`) — call the Slack connection's search tool for `@team-exec` mentions newer than `@state.cursor`.
+3. **For each** over `@steps.search`'s messages, per message:
+   - **Infer** (`summarize`) — a prompt on the `quick` preset that turns `@item` into an issue title and description, as declared structured output.
+   - **Tool** (`file_issue`) — call the Linear connection's create-issue tool, its args templated from `@steps.summarize` plus the message's permalink from `@item`.
+4. **State** — advance `cursor` to `@now`, so the next run only sees what's new.
 
 ## Steps
 
-1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor).
-2. In the Trigger section, pick **Schedule**.
-3. Enter the cron expression `0 9 * * 1-5` — five numeric fields: minute, hour, day-of-month, month, day-of-week. The field's live preview reads back what it understood underneath it, and a status chip beside it reads "Valid" once the expression parses; an expression it can't parse reads "Unrecognized" instead.
-4. Bind the Agent you equipped in the prerequisite step.
-5. Write instructions naming the exact shape you want the output in — for a standup digest, something like "list open items grouped by owner, one line each, ending with a one-sentence summary."
-6. Click **Publish**.
+1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor). The fastest path is the copilot composer: describe the job in a sentence or two — for a never-published draft the copilot applies its steps as it goes, and it looks up the real Slack and Linear tool names from your connections rather than guessing. The rest of these steps are the direct-manipulation equivalent, and either way you should end up with the same strip.
+2. On the Trigger card, pick **Schedule** and enter `*/20 * * * *`. The live preview reads back what it understood, with a Valid / Unrecognized status chip.
+3. Add a **Tool** step: pick the Slack connection, pick its search tool from the tool picker, and template the query with `@state.cursor` for the "newer than" bound. On the first run the cursor doesn't exist yet — an unset `@state` key just resolves empty.
+4. Add a **For each** step over the search step's message list (`@steps.search.…`).
+5. Inside its body, add an **Infer** step: the `quick` preset, a prompt over `@item`, and a declared output schema (`title`, `description`) so the next step gets fields, not prose.
+6. Still inside the body, add a **Tool** step on the Linear connection's create-issue tool, with args referencing `@steps.summarize.result.title`, `@steps.summarize.result.description`, and the permalink from `@item`.
+7. After the loop, add a **State** step that sets `cursor` to `@now`.
+8. Click **Publish** — instant, since a Workflow builds nothing.
+
+Before publishing, use **Test step** on the search step to see the real tool's real output shape — that's how you find the exact path for the For each's list. (Tool tests have real side effects; a search is safe, the create-issue step less so.)
+
+## Why the cursor works
+
+Ordering does the heavy lifting. The cursor only advances *after* the loop, so a run that fails mid-way never claims messages it didn't process — the next run re-reads them. And because a scheduled trigger skips a tick while the previous run is still live rather than overlapping it, two runs can never race the same cursor. The loop body is iteration-scoped on purpose: each message's summary is visible to its own issue-filing step and gone after that iteration, so there's no cross-item leakage.
 
 ## UTC only
 
-Schedules run on the platform clock, which is UTC — always, with no per-workspace timezone setting. If you actually want 09:00 in US/Eastern, you have to do the conversion yourself and write the UTC-equivalent expression: `0 14 * * 1-5` in winter (UTC-5) or `0 13 * * 1-5` once daylight saving starts (UTC-4). UTC itself never shifts across the DST boundary, so a schedule that's correct in January silently fires an hour off in July unless you edit the expression — the platform has no way to know you meant "9am wherever I am" instead of "9am UTC."
+Schedules run on the platform clock, which is UTC — always, with no per-workspace timezone setting. A cadence like `*/20 * * * *` doesn't care, but a clock-anchored expression like `0 9 * * 1-5` means 09:00 *UTC*: if you want 09:00 US/Eastern you must write the UTC equivalent yourself, and revisit it when daylight saving shifts the offset — the platform has no way to know you meant "9am wherever I am."
 
 ## No backfill
 
-Ticks missed while the platform is down are skipped, not queued up and replayed. A digest that misses Monday's 09:00 firing because of downtime runs once on Tuesday at its normal time — not twice back to back to make up for it. That's the right default for something like a digest: a digest that arrives twice, once stale and once current, is worse than one that's simply late by a day.
+Ticks missed while the platform is down are skipped, not queued up and replayed. That's the right default here: the next successful run's search picks up from the cursor anyway, so nothing is lost — it just arrives on the next tick instead of as a burst of catch-up runs.
 
 ## Test without waiting
 
-You don't need to wait for the next tick to see what the Workflow does. Open the header's **Run** popover and press **Fire now** to dispatch the instructions immediately, exactly as the ticker would when it fires — with no payload, since a schedule trigger carries none. Read the result the same way you would a real firing: in the run itself.
-
-## Where the output goes
-
-Nowhere, on its own — worth knowing before you wait a day to find out. A schedule firing doesn't publish or send anything by itself; the digest only reaches somewhere if the Agent's own equipped tools put it there — posting to Slack, sending an email through a connector, writing a row somewhere. Otherwise, the only place to read the result is the run itself, in the Workflow's run history.
+Open the header's **Run** popover and press **Fire now** to dispatch immediately, exactly as the ticker would — with no payload, since a schedule trigger carries none. The pipeline pane overlays live per-step progress, and **View run** opens the full timeline in the Runs tab: each step's rendered input and output, per-iteration instances under the loop, and the state write at the end.
 
 ## If it doesn't work
 
 - **The status chip reads "Unrecognized"** — the cron syntax is wrong. It needs exactly five numeric fields; month and day-of-week names aren't accepted, only numbers.
-- **Nothing fired at the expected time** — check the UTC conversion first, then confirm the Workflow is actually published. A draft schedule doesn't tick.
-- **Firing it by hand works but the real schedule didn't** — give it a full tick interval before assuming something's broken; a schedule that was just published won't necessarily catch a tick that's already in progress.
+- **Nothing fired at the expected time** — check the UTC conversion first, then confirm the Workflow is actually published. A draft schedule doesn't tick. If the previous run was still going, the tick was skipped for overlap — check the Runs tab.
+- **The For each fails with an empty or wrong list** — the `items` reference doesn't match the search tool's actual output shape. Test the search step and read its real output.
+- **The same message was processed twice** — a run crashed after filing its issue but before the cursor advanced; at-least-once is the deliberate trade. See [Durability](/docs/platform/durability).
 
 See [Triggers](/docs/building/triggers) for how the other trigger kinds compare, [Sessions & runs](/docs/concepts/sessions-and-runs) for how a scheduled dispatch shows up as a run, and [troubleshooting](/docs/reference/troubleshooting) for anything not covered above.

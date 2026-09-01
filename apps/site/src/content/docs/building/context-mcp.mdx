@@ -7,11 +7,11 @@ description: "The library your Agents are equipped from — adding MCP connectio
 
 # Context & MCP
 
-Context is the library your Agents are equipped from. MCP connections give an Agent tools — a server it can call out to — and equipping one packages it straight into the Agent's compiled artifact. Skills are covered separately — see [Skills](/docs/building/skills) — this page is about connections: adding them, their credentials, and how their health and tools surface.
+Context is the library your Agents are equipped from. MCP connections give an Agent tools — a server it can call out to — and equipping one packages it straight into the Agent's compiled artifact. The same connections also back a [Workflow](/docs/concepts/workflows)'s `tool` steps, which call one of a connection's tools directly, no Agent involved. Skills are covered separately — see [Skills](/docs/building/skills) — this page is about connections: adding them, their credentials, and how their health and tools surface.
 
 ## Workspace and personal scope
 
-The Context page opens on a **Workspace | Personal** segmented control. Workspace connections are shared with everyone in the workspace — "Connections and skills available to everyone in this workspace" — and mutating one requires the owner or admin role. Personal connections are private to you and follow you across every workspace you belong to, and you can always fully edit your own.
+The Context page opens on a **Workspace | Personal** segmented control. Workspace connections are shared with everyone in the workspace — "Connections and skills available to everyone in this workspace" — and mutating one requires the owner or admin role. Personal connections are private to you and follow you across every workspace you belong to, and you can always fully edit your own. One scope rule matters for pipelines: a Workflow's tool step can only use **workspace** connections — unattended runs execute on workspace authority, never a member's personal credential — so publishing a Workflow with a tool step on a personal connection is rejected.
 
 ## Adding a connection
 
@@ -39,7 +39,7 @@ The catalog grows over time; as of writing it holds nine entries:
 
 ## The connection detail view
 
-Opening a connection shows its name and slug, transport, live health, cached tool list, and a **Test connection** button, alongside the same write-once credential fields the add flow used — editing them replaces the stored value, and you never see what was there before. Deleting is blocked while an Agent still references the connection: "The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it," with the referencing Agents listed by name.
+Opening a connection shows its name and slug, transport, live health, cached tool list, and a **Test connection** button, alongside the same write-once credential fields the add flow used — editing them replaces the stored value, and you never see what was there before. Deleting is blocked while an Agent still references the connection: "The agents below still use this connection (in their draft or a published version). Detach it from each agent's context first, then remove it," with the referencing Agents listed by name. A Workflow's tool step doesn't block deletion the same way — the published Workflow instead gains a staleness warning, and that step fails at run time until the Workflow is fixed and republished.
 
 ## Health
 
@@ -57,7 +57,7 @@ Every connection carries one of five health states, shown as a dot plus label:
 
 ## The tool filter and approval policy
 
-A successful probe caches the server's tool list, and that cache drives two separate controls on the connection. The **tool filter** is a three-way switch — All tools, an allow-list, or a block-list — with checkboxes over the cached names plus free-text entry for anything the cache doesn't know; without a cache, it's free-text only, with a hint to run **Test connection** first. The filter belongs to the connection, not the Agent, so every Agent equipped with it sees the same filtered set.
+A successful probe caches the server's tool list, and that cache drives two separate controls on the connection. The **tool filter** is a three-way switch — All tools, an allow-list, or a block-list — with checkboxes over the cached names plus free-text entry for anything the cache doesn't know; without a cache, it's free-text only, with a hint to run **Test connection** first. The filter belongs to the connection, not the Agent, so every Agent equipped with it sees the same filtered set — and it binds a Workflow's tool steps too: a filtered-out tool fails the step rather than running.
 
 **Approval policy** is a separate, additional control: a default decision — `Never — auto-allow`, `Once per session`, or `Always ask` — plus per-tool overrides from the same cached list. The filter decides what an Agent can even see; approval policy decides whether a visible tool's call needs your sign-off before it runs.
 

@@ -34,8 +34,10 @@ In the workflow editor:
 | agent editor | `addContext` | Attaches a connection or skill |
 | agent editor | `removeContext` | Detaches a connection or skill |
 | workflow editor | `setTrigger` | The trigger type and its configuration |
-| workflow editor | `setAgent` | Which Agent the Workflow delegates to |
-| workflow editor | `setInstructions` | The workflow instructions text |
+| workflow editor | `addStep` | Appends a step at a position in the pipeline |
+| workflow editor | `updateStep` | Replaces an existing step's configuration |
+| workflow editor | `removeStep` | Removes a step |
+| workflow editor | `moveStep` | Reorders a step within the pipeline |
 
 `setModel` picks from the same presets and allowlist described in [Models](/docs/building/models) — copilot can't propose a model the workspace hasn't sanctioned any more than the Model section can.
 

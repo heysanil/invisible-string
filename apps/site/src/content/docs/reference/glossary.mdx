@@ -48,7 +48,7 @@ of what a term means.
 | [trigger](/docs/building/triggers) | What starts a Workflow: manual, webhook, form, Slack, or schedule. |
 | waiting | A run parked on a tool approval, a question, or a session-limit prompt — it still holds the session. |
 | worker | The stateless process pool that boots and runs compiled agents. |
-| [Workflow](/docs/concepts/workflows) | A standing delegation: trigger → Agent → instructions. |
+| [Workflow](/docs/concepts/workflows) | A standing delegation the control plane interprets as a pipeline: trigger → steps. |
 | [workspace](/docs/concepts/workspaces) | The multi-tenant boundary every Agent, Workflow, connection, and session belongs to. |
 | world database | The per-agent-version Postgres database holding that version's durable execution state. |
 
@@ -76,5 +76,5 @@ visible to an Agent if its filter excludes all of them.
 doesn't).** An Agent publish compiles its definition into a real eve project,
 builds it, and uploads the resulting artifact — a real build pipeline with
 real failure modes. A [Workflow](/docs/concepts/workflows) publish only
-validates and snapshots the delegation between trigger, Agent, and
-instructions — it never builds anything, so it's effectively instant.
+validates and snapshots the delegation — its trigger and pipeline of
+steps — it never builds anything, so it's effectively instant.

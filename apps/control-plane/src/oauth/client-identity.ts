@@ -79,6 +79,7 @@ import {
   type OauthClientRegistrations,
 } from "../runtime/config";
 import { errors } from "../runtime/errors";
+import { describeProviderFailure } from "./error-codes";
 import type { OauthDiscovery } from "./discovery";
 
 /** `client_name` used for both the CIMD document and DCR requests. */
@@ -313,7 +314,15 @@ export async function resolveClientIdentity(
 
   const configured = findOauthClientRegistration(
     deps.preregisteredClients ?? NO_PREREGISTERED_CLIENTS,
-    { key: context.providerKey ?? null, issuer },
+    {
+      key: context.providerKey ?? null,
+      issuer,
+      // A preset that declares `dynamic` says registration works at this AS;
+      // it must not inherit another provider's configured credentials merely
+      // because the issuers coincide. Custom/registry connections declare
+      // nothing and keep the fallback.
+      allowIssuerFallback: context.declaredIdentity !== "dynamic",
+    },
   );
   if (configured !== undefined) {
     // Re-persisted on EVERY start rather than only when it looks changed: the
@@ -357,21 +366,20 @@ export async function resolveClientIdentity(
       row.clientRegistrationIssuer === ""
         ? null
         : canonicalIssuer(row.clientRegistrationIssuer);
-    // A stored client is replayable only where it was minted (F13). An
-    // unrecorded issuer is legacy, not foreign: reuse and record it, so the
-    // NEXT change is detectable.
-    if (recorded === null || recorded === issuer) {
+    // A stored client is replayable ONLY where it was minted (F13).
+    //
+    // An unrecorded issuer used to be treated as "legacy, not foreign" and
+    // replayed against whatever issuer discovery had just returned. That is
+    // fail-open: a repointed MCP server nominates its own authorization server
+    // and is handed the client secret minted for the previous one. Since
+    // `pending_flow` staging landed, a replacement identity can be registered
+    // without disturbing the live grant, so there is no longer any reason to
+    // accept the risk — an unrecorded issuer now falls through to a fresh
+    // registration, which is staged and only promoted if consent succeeds.
+    if (recorded !== null && recorded === issuer) {
       const clientSecret = decryptStoredClientSecret(row, deps.masterKey);
       const mode: Exclude<ClientIdentityMode, "cimd"> =
         row.clientIdentityMode === "preregistered" ? "preregistered" : "dcr";
-      if (recorded === null) {
-        await deps.persistRegistration(row.id, {
-          clientId: row.clientId,
-          clientSecretEncrypted: row.clientSecretEncrypted,
-          clientIdentityMode: mode,
-          clientRegistrationIssuer: issuer,
-        });
-      }
       return {
         clientId: row.clientId,
         clientSecret,
@@ -519,7 +527,10 @@ function resolvedAuthMethod(
   );
 }
 
-/** RFC 7591 §3.2.2 error body — only the machine `error` code is surfaced. */
+/**
+ * RFC 7591 §3.2.2 error body. UNTRUSTED — narrowed by `providerErrorCode`,
+ * never interpolated directly (oauth/error-codes.ts).
+ */
 const registrationErrorSchema = z.object({ error: z.string().min(1) });
 
 /** Registration responses are small JSON; anything past this is discarded. */
@@ -572,9 +583,14 @@ async function registerClient(
   const body = await readBodyCapped(res);
   if (res.status !== 200 && res.status !== 201) {
     const parsedError = registrationErrorSchema.safeParse(body);
-    const code = parsedError.success ? `: ${parsedError.data.error}` : "";
+    // Vocabulary codes only (oauth/error-codes.ts). Registration is the one hop
+    // that does NOT carry a credential inbound, but it answers with one, and
+    // this message reaches the SPA — so it is held to the same closed set.
     throw errors.oauthRegistrationFailed(
-      `the authorization server rejected the registration (HTTP ${res.status}${code})`,
+      `the authorization server rejected the registration (${describeProviderFailure(
+        res.status,
+        parsedError.success ? parsedError.data.error : null,
+      )})`,
     );
   }
   const parsed = registrationResponseSchema.safeParse(body);

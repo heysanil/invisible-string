@@ -111,6 +111,7 @@ import { loadConnectorCatalog } from "../resources/catalog";
 import { scopeWhere, type Scope } from "../resources/common";
 import type { OauthClientRegistrations } from "../runtime/config";
 import { errors, isRuntimeApiError } from "../runtime/errors";
+import { describeProviderFailure } from "./error-codes";
 import { hasRole, type WorkspaceDeps } from "../workspace";
 import {
   clientMetadataUrl,
@@ -528,8 +529,22 @@ export async function handleCallback(
         eq(schema.connectionOauth.pendingState, state),
       ),
     )
-    .returning({ id: schema.connectionOauth.id });
+    .returning({
+      id: schema.connectionOauth.id,
+      updatedAt: schema.connectionOauth.updatedAt,
+    });
   if (claimed.length === 0) return fail(errors.oauthStateInvalid().code);
+  // Optimistic-concurrency token for the promotion far below. The exchange in
+  // between is a NETWORK round trip, and the connection is mutable throughout
+  // it: a URL change resets this grant (resources/connections.ts) and an auth
+  // -type change deletes the row outright. Without this predicate the
+  // promotion's bare `where(id)` would write the finished flow's tokens AND
+  // endpoints back onto a row that had since been reset — resurrecting a grant
+  // for a server the connection no longer points at, which is a token issued
+  // by one authorization server sitting on a row addressed to another. Every
+  // write goes through drizzle, whose `$onUpdate` bumps `updated_at`, so any
+  // intervening mutation makes this stale and the promotion match zero rows.
+  const claimStamp = claimed[0]!.updatedAt;
   if (
     oauth.pendingExpiresAt === null ||
     oauth.pendingExpiresAt.getTime() <= Date.now()
@@ -596,7 +611,7 @@ export async function handleCallback(
       verifier,
       resource: staged.resource,
     });
-    await deps.db
+    const promoted = await deps.db
       .update(schema.connectionOauth)
       .set({
         accessTokenEncrypted: JSON.stringify(
@@ -655,7 +670,25 @@ export async function handleCallback(
         // The attempt succeeded — the last one's verdict is history.
         lastErrorCode: null,
       })
-      .where(eq(schema.connectionOauth.id, oauth.id));
+      .where(
+        and(
+          eq(schema.connectionOauth.id, oauth.id),
+          eq(schema.connectionOauth.updatedAt, claimStamp),
+        ),
+      )
+      .returning({ id: schema.connectionOauth.id });
+    if (promoted.length === 0) {
+      // The connection was mutated (or deleted) while we were at the token
+      // endpoint. The tokens we just minted belong to a configuration that no
+      // longer exists, so they are DISCARDED rather than written: never
+      // persist a credential against a row whose url or auth mode has moved.
+      // Revocation is best-effort and deliberately not attempted here — the
+      // endpoints to revoke at went with the row.
+      deps.logger.warn("oauth.callback_superseded", {
+        fields: { connectionId: connection.id },
+      });
+      return fail("oauth_flow_superseded");
+    }
   } catch (error) {
     // F5 — `status: error` is right only when the flow had nothing to lose.
     // A first consent, or a re-consent of an expired/errored grant, really is
@@ -668,10 +701,18 @@ export async function handleCallback(
     // nothing above this line writes `status`, so it is the honest witness.
     const hadUsableGrant =
       oauth.status === "connected" && oauth.accessTokenEncrypted !== null;
-    await recordFailure(deps, oauth.id, {
-      ...(hadUsableGrant ? {} : { status: "error" as const }),
-      lastErrorCode: failureCode(error),
-    });
+    // Same supersession guard as the promotion: bookkeeping a failure onto a
+    // row that has since been reset would stamp a stale verdict (and possibly
+    // `status: "error"`) onto a grant this flow no longer describes.
+    await recordFailure(
+      deps,
+      oauth.id,
+      {
+        ...(hadUsableGrant ? {} : { status: "error" as const }),
+        lastErrorCode: failureCode(error),
+      },
+      claimStamp,
+    );
     if (isRuntimeApiError(error)) {
       // The message stays server-side; the popup only learns the code.
       deps.logger.warn("oauth.callback_failed", {
@@ -849,7 +890,10 @@ const tokenResponseSchema = z.object({
 });
 type TokenResponse = z.infer<typeof tokenResponseSchema>;
 
-/** RFC 6749 §5.2 error body — only the machine `error` code is surfaced. */
+/**
+ * RFC 6749 §5.2 error body. UNTRUSTED — narrowed by `providerErrorCode`, never
+ * interpolated directly (oauth/error-codes.ts).
+ */
 const tokenErrorSchema = z.object({ error: z.string().min(1) });
 
 /** Token responses are small JSON; anything past this is discarded. */
@@ -913,8 +957,15 @@ async function exchangeCode(
   const json = await readJsonCapped(res);
   if (res.status !== 200) {
     const parsedError = tokenErrorSchema.safeParse(json);
-    const code = parsedError.success ? `: ${parsedError.data.error}` : "";
-    throw errors.oauthExchangeFailed(`HTTP ${res.status}${code}`);
+    // Vocabulary codes only: this request carried the authorization code and
+    // the client secret, so an unrecognised `error` may be either of them
+    // reflected back (oauth/error-codes.ts).
+    throw errors.oauthExchangeFailed(
+      describeProviderFailure(
+        res.status,
+        parsedError.success ? parsedError.data.error : null,
+      ),
+    );
   }
   const parsed = tokenResponseSchema.safeParse(json);
   if (!parsed.success) {
@@ -978,12 +1029,26 @@ async function recordFailure(
   deps: OauthBrokerDeps,
   rowId: string,
   patch: Partial<typeof schema.connectionOauth.$inferInsert>,
+  /**
+   * Optional optimistic-concurrency token. When supplied, the write applies
+   * only while the row is still the one the caller claimed — a callback that
+   * lost its race to a URL or auth-mode change must not stamp its verdict onto
+   * the grant that replaced it.
+   */
+  expectedUpdatedAt?: Date,
 ): Promise<void> {
   try {
     await deps.db
       .update(schema.connectionOauth)
       .set(patch)
-      .where(eq(schema.connectionOauth.id, rowId));
+      .where(
+        expectedUpdatedAt === undefined
+          ? eq(schema.connectionOauth.id, rowId)
+          : and(
+              eq(schema.connectionOauth.id, rowId),
+              eq(schema.connectionOauth.updatedAt, expectedUpdatedAt),
+            ),
+      );
   } catch (error) {
     deps.logger.warn("oauth.failure_record_failed", {
       fields: { oauthRowId: rowId },

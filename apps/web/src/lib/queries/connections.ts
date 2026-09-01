@@ -265,6 +265,8 @@ export const OAUTH_FAILURE_COPY: Record<string, string> = {
     "The authorization server refused to register this app — it only accepts pre-approved clients, so this connector cannot finish sign-in from here.",
   encryption_key_missing:
     "This deployment cannot store credentials yet — its encryption key is not configured. Ask an administrator to set one.",
+  oauth_flow_superseded:
+    "This connection changed while the sign-in window was open, so the new credentials were discarded rather than saved against the old settings. Connect again.",
   oauth_internal_error:
     "Something went wrong while authorizing. Try connecting again.",
   [OAUTH_UNSAFE_URL_CODE]: UNSAFE_AUTHORIZE_URL_COPY,

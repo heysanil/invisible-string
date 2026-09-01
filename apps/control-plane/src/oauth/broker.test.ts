@@ -282,6 +282,19 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
    */
   const otherAs = new StubAuthorizationServer();
   const resource = new StubResource();
+  /**
+   * The pre-registered preset gets its OWN resource, nominating `otherAs`.
+   *
+   * It cannot share `resource`: an operator registration is pinned to exactly
+   * one issuer (`_ISSUER` is required and exact-matched), and
+   * `findOauthClientRegistration` will hand that identity to ANY connection
+   * reaching the same authorization server — deliberately, so a custom
+   * connection pointed at an approved AS inherits the approved client. With
+   * one shared AS the pin would therefore capture every `source: "custom"`
+   * connection in this file and silently skip the DCR path the other tests
+   * exist to cover.
+   */
+  const preregResource = new StubResource();
   let stack: AppStack;
   let db: AppStack["dbHandle"]["db"];
 
@@ -426,6 +439,9 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     // deliberately does NOT appear here: a token it issued is worthless at
     // the resource, which is what a mix-up costs the user.
     resource.start(as.issuer, (token) => as.issuedAccessTokens.includes(token));
+    preregResource.start(otherAs.issuer, (token) =>
+      otherAs.issuedAccessTokens.includes(token),
+    );
     const catalogEntry: ConnectorCatalogEntry = {
       slug: "stub-oauth",
       title: "Stub OAuth",
@@ -445,6 +461,7 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
       ...catalogEntry,
       slug: "stub-oauth-preregistered",
       title: "Stub OAuth (pre-registered)",
+      url: preregResource.mcpUrl,
       auth: {
         type: "oauth",
         clientIdentity: "preregistered",
@@ -477,6 +494,10 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
           PREREGISTERED_CLIENT_ID,
         [`MCP_OAUTH_${PREREGISTERED_ENV_PREFIX}_CLIENT_SECRET`]:
           "preapproved-client-secret",
+        // REQUIRED and exact-matched. Without the pin the registration would
+        // match whatever issuer discovery reported, so a repointed MCP server
+        // could nominate its own AS and be handed this approved secret.
+        [`MCP_OAUTH_${PREREGISTERED_ENV_PREFIX}_ISSUER`]: otherAs.issuer,
       },
       {
         compile: stubCompile,
@@ -501,6 +522,7 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     as.stop();
     otherAs.stop();
     resource.stop();
+    preregResource.stop();
   }, 30_000);
 
   // ── oauth-enabled creates ─────────────────────────────────────────────────
@@ -1198,25 +1220,27 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     // The authorization server refuses DCR outright, exactly as the provider
     // that forced this feature does — so any attempt to register is fatal,
     // and a start that succeeds proves none was made.
-    const registrationsBefore = as.registerRequests.length;
-    as.registrationMode = "forbidden";
+    // This preset has its OWN resource nominating `otherAs`, so the pin is
+    // exact-matched there and no custom connection in this file inherits it.
+    const registrationsBefore = otherAs.registerRequests.length;
+    otherAs.registrationMode = "forbidden";
     let authorizeUrl: URL;
     try {
       authorizeUrl = await startFlow(created.oauthStartPath!);
     } finally {
-      as.registrationMode = "ok";
+      otherAs.registrationMode = "ok";
     }
     expect(authorizeUrl.searchParams.get("client_id")).toBe(
       PREREGISTERED_CLIENT_ID,
     );
-    expect(as.registerRequests.length).toBe(registrationsBefore);
+    expect(otherAs.registerRequests.length).toBe(registrationsBefore);
 
     // Staged with the flow, like every other identity — the grant's own
     // client columns stay blank until an exchange succeeds.
     const armed = (await oauthRow(id))!;
     expect(armed.pendingFlow!.clientIdentityMode).toBe("preregistered");
     expect(armed.pendingFlow!.clientId).toBe(PREREGISTERED_CLIENT_ID);
-    expect(armed.pendingFlow!.clientRegistrationIssuer).toBe(as.issuer);
+    expect(armed.pendingFlow!.clientRegistrationIssuer).toBe(otherAs.issuer);
     expect(armed.clientId).toBeNull();
     // The operator's secret is at rest as an envelope, never in the clear.
     expect(armed.pendingFlow!.clientSecretEncrypted).not.toBeNull();
@@ -1232,13 +1256,64 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     expect(connected.status).toBe("connected");
     expect(connected.clientIdentityMode).toBe("preregistered");
     expect(connected.clientId).toBe(PREREGISTERED_CLIENT_ID);
-    expect(connected.clientRegistrationIssuer).toBe(as.issuer);
+    expect(connected.clientRegistrationIssuer).toBe(otherAs.issuer);
     expect(connected.clientSecretEncrypted).not.toContain(
       "preapproved-client-secret",
     );
-    expect(as.tokenRequests.at(-1)!.get("client_id")).toBe(
+    expect(otherAs.tokenRequests.at(-1)!.get("client_id")).toBe(
       PREREGISTERED_CLIENT_ID,
     );
+  });
+
+  /**
+   * The callback's optimistic-concurrency guard (2026-08-31 review).
+   *
+   * The claim on `pending_state` is a proper compare-and-swap, so a REPLAY dies
+   * there. It does not protect the window AFTER it: the code exchange is a
+   * network round trip, and the connection stays mutable throughout. A URL
+   * change resets this grant, and the promotion's original bare `where(id)`
+   * would then have written the finished flow's tokens AND endpoints back onto
+   * the reset row as `connected` — a token issued by one authorization server,
+   * sitting on a row now addressed at a different one, which the next probe or
+   * agent tool call would present there.
+   */
+  test("a callback that loses its race to a URL change discards its tokens", async () => {
+    const { id, startPath } = await createOauthConnection("Superseded");
+    const authorizeUrl = await startFlow(startPath);
+    const callbackPath = await approveConsent(authorizeUrl);
+
+    // Mutate the connection WHILE the broker is at the token endpoint — the
+    // one window the state CAS cannot cover.
+    let patched = false;
+    as.beforeToken = async () => {
+      if (patched) return;
+      patched = true;
+      const res = await api("PATCH", `/workspaces/${orgId}/connections/${id}`, {
+        cookie: ownerCookie,
+        body: { url: resource.mcpUrl.replace("/mcp", "/mcp-moved") },
+      });
+      expect(res.status).toBe(200);
+    };
+    let callback: Response;
+    try {
+      callback = await api("GET", callbackPath, { cookie: ownerCookie });
+    } finally {
+      as.beforeToken = undefined;
+    }
+    expect(patched).toBeTrue();
+
+    // The popup still renders (callback failures are never JSON errors), and
+    // it carries the typed reason.
+    expect(callback.status).toBe(200);
+    expect(await callback.text()).toContain("oauth_flow_superseded");
+
+    // Decisively: nothing from the dead flow reached the row. It was reset by
+    // the PATCH and must stay reset — no tokens, no endpoints, not connected.
+    const after = (await oauthRow(id))!;
+    expect(after.status).not.toBe("connected");
+    expect(after.accessTokenEncrypted).toBeNull();
+    expect(after.refreshTokenEncrypted).toBeNull();
+    expect(after.tokenEndpoint).toBeNull();
   });
 
   // ── authz ─────────────────────────────────────────────────────────────────

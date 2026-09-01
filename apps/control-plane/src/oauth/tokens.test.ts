@@ -631,7 +631,7 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
     expect(as.tokenRequests.length).toBe(asHitsBefore + 1);
   });
 
-  test("invalid_grant on refresh lands expired + auth_error and throws oauth_not_connected", async () => {
+  test("invalid_grant on refresh lands expired + auth_required and throws oauth_not_connected", async () => {
     const id = await connectFlow("Invalid Grant");
     // Same sentinel discipline as the transient case: start from `ok` so the
     // `auth_error` below is the REFRESH's write and not the post-connect
@@ -652,7 +652,12 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth token lifecycle", () => {
     const row = (await oauthRow(id))!;
     expect(row.status).toBe("expired");
     const conn = (await connectionRow(id))!;
-    expect(conn.health).toBe("auth_error");
+    // `auth_required`, not `auth_error`: the grant is dead and re-consent is
+    // the recovery, which is exactly what the probe classifies an unusable
+    // grant as. Writing `auth_error` here contradicted the probe between the
+    // failed refresh and the next probe — "your token was rejected" about a
+    // grant that needs reconnecting.
+    expect(conn.health).toBe("auth_required");
     // The reader is told to re-consent — not that some MCP dial 401'd.
     expect(conn.lastError).toContain("reconnect");
 

@@ -493,7 +493,7 @@ function normalizeProviderKey(raw: string): string {
  *
  *     MCP_OAUTH_<PREFIX>_CLIENT_ID       required — the AS-issued client_id
  *     MCP_OAUTH_<PREFIX>_CLIENT_SECRET   optional — omit for a public client
- *     MCP_OAUTH_<PREFIX>_ISSUER          optional — pin to one AS issuer
+ *     MCP_OAUTH_<PREFIX>_ISSUER          required — the AS issuer it is for
  *
  * `<PREFIX>` is the catalog entry's own `clientEnvPrefix`
  * (`packages/shared/src/connector-catalog.ts`, whose `preregisteredClientEnvVars`
@@ -542,13 +542,21 @@ export function loadOauthClientRegistrations(
       );
       continue;
     }
-    let issuer: string | null = null;
-    if (entry.issuer !== undefined) {
-      issuer = canonicalIssuer(entry.issuer);
-      if (issuer === null) {
-        problems.push(`${envVar("ISSUER")} must be an absolute http(s) URL`);
-        continue;
-      }
+    // REQUIRED, not optional. Without it the registration matches whatever
+    // issuer discovery reports, so a repointed MCP server could nominate its
+    // own authorization server and be handed a deployment-wide approved client
+    // secret. Failing boot is the right trade: the value is a one-line addition
+    // an operator already knows, and the alternative fails silently and open.
+    if (entry.issuer === undefined) {
+      problems.push(
+        `${envVar("ISSUER")} is required when ${envVar("CLIENT_ID")} is set — a pre-registered client must be pinned to the authorization server that issued it`,
+      );
+      continue;
+    }
+    const issuer = canonicalIssuer(entry.issuer);
+    if (issuer === null) {
+      problems.push(`${envVar("ISSUER")} must be an absolute http(s) URL`);
+      continue;
     }
     registrations.set(key, {
       key,
@@ -575,20 +583,37 @@ export function loadOauthClientRegistrations(
  */
 export function findOauthClientRegistration(
   registrations: OauthClientRegistrations,
-  match: { key?: string | null; issuer?: string | null },
+  match: {
+    key?: string | null;
+    issuer?: string | null;
+    /**
+     * Whether an issuer-only match may resolve a registration configured under
+     * a DIFFERENT provider key. True for custom and registry connections, which
+     * name no provider and legitimately pick up an approved identity for the
+     * authorization server they point at. FALSE for a catalog preset that
+     * declares `dynamic`: that entry states DCR or CIMD works here, and
+     * silently substituting some other provider's operator credentials because
+     * the two happen to share an issuer contradicts the declaration. The keyed
+     * lookup is unaffected either way.
+     */
+    allowIssuerFallback?: boolean;
+  },
 ): OauthClientRegistration | undefined {
   const issuer = match.issuer ? canonicalIssuer(match.issuer) : null;
   const key = match.key ? normalizeProviderKey(match.key) : "";
   if (key) {
     const byKey = registrations.get(key);
     if (byKey !== undefined) {
-      if (byKey.issuer === null || issuer === null || byKey.issuer === issuer) {
-        return byKey;
-      }
-      return undefined;
+      // EXACT match, no fail-open. "Issuer unknown on either side" is not
+      // evidence that the two agree, and this credential is AS-issued and
+      // often deployment-wide. `_ISSUER` is required at load, so
+      // `byKey.issuer` is never null here.
+      return byKey.issuer !== null && byKey.issuer === issuer
+        ? byKey
+        : undefined;
     }
   }
-  if (issuer === null) return undefined;
+  if (issuer === null || match.allowIssuerFallback === false) return undefined;
   for (const registration of registrations.values()) {
     if (registration.issuer === issuer) return registration;
   }

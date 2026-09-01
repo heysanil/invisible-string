@@ -73,20 +73,23 @@ describe("loadOauthClientRegistrations (pre-registered OAuth clients)", () => {
   test("maps underscores in the key segment to the catalog's kebab slugs", () => {
     const regs = loadOauthClientRegistrations({
       MCP_OAUTH_HUGGING_FACE_CLIENT_ID: "cl_hf",
+      MCP_OAUTH_HUGGING_FACE_ISSUER: "https://huggingface.co",
     });
     expect([...regs.keys()]).toEqual(["hugging-face"]);
     expect(regs.get("hugging-face")).toEqual({
       key: "hugging-face",
       clientId: "cl_hf",
       clientSecret: null,
-      issuer: null,
+      issuer: "https://huggingface.co",
     });
   });
 
   test("carries more than one provider", () => {
     const regs = loadOauthClientRegistrations({
       MCP_OAUTH_VERCEL_CLIENT_ID: "cl_vercel",
+      MCP_OAUTH_VERCEL_ISSUER: "https://vercel.com",
       MCP_OAUTH_NOTION_CLIENT_ID: "cl_notion",
+      MCP_OAUTH_NOTION_ISSUER: "https://notion.so",
     });
     expect([...regs.keys()].sort()).toEqual(["notion", "vercel"]);
   });
@@ -102,6 +105,25 @@ describe("loadOauthClientRegistrations (pre-registered OAuth clients)", () => {
     const message = (thrown as Error).message;
     expect(message).toContain("MCP_OAUTH_VERCEL_CLIENT_ID");
     expect(message).not.toContain("sh-secret");
+  });
+
+  /**
+   * A pre-registered client without `_ISSUER` used to load fine and then match
+   * ANY authorization server discovery reported. Boot-fatal is the right trade:
+   * the value is one line an operator already knows, and the alternative fails
+   * silently and open with a credential.
+   */
+  test("a client id with no issuer is a boot failure, naming the missing var", () => {
+    let caught: unknown;
+    try {
+      loadOauthClientRegistrations({ MCP_OAUTH_ACME_CLIENT_ID: "cl_acme" });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect(String((caught as ConfigError).message)).toContain(
+      "MCP_OAUTH_ACME_ISSUER",
+    );
   });
 
   test("rejects an unparseable issuer and an unknown suffix", () => {
@@ -122,28 +144,44 @@ describe("findOauthClientRegistration", () => {
     MCP_OAUTH_VERCEL_CLIENT_ID: "cl_vercel",
     MCP_OAUTH_VERCEL_ISSUER: "https://vercel.com",
     MCP_OAUTH_ACME_CLIENT_ID: "cl_acme",
+    MCP_OAUTH_ACME_ISSUER: "https://acme.test",
   });
 
-  test("matches on the catalog slug", () => {
-    expect(findOauthClientRegistration(regs, { key: "vercel" })?.clientId).toBe(
-      "cl_vercel",
-    );
-    expect(findOauthClientRegistration(regs, { key: "acme" })?.clientId).toBe("cl_acme");
+  test("matches on the catalog slug, with the issuer it is pinned to", () => {
+    expect(
+      findOauthClientRegistration(regs, {
+        key: "vercel",
+        issuer: "https://vercel.com",
+      })?.clientId,
+    ).toBe("cl_vercel");
+    expect(
+      findOauthClientRegistration(regs, { key: "acme", issuer: "https://acme.test" })
+        ?.clientId,
+    ).toBe("cl_acme");
   });
 
   test("accepts the catalog's env-shaped clientEnvPrefix verbatim", () => {
     const hf = loadOauthClientRegistrations({
       MCP_OAUTH_HUGGING_FACE_CLIENT_ID: "cl_hf",
+      MCP_OAUTH_HUGGING_FACE_ISSUER: "https://huggingface.co",
     });
-    expect(findOauthClientRegistration(regs, { key: "VERCEL" })?.clientId).toBe(
-      "cl_vercel",
-    );
-    expect(findOauthClientRegistration(hf, { key: "HUGGING_FACE" })?.clientId).toBe(
-      "cl_hf",
-    );
-    expect(findOauthClientRegistration(hf, { key: "hugging-face" })?.clientId).toBe(
-      "cl_hf",
-    );
+    // Key SHAPE is what this covers; the issuer is supplied throughout because
+    // an exact issuer match is now required (see the fail-closed test below).
+    const hfIssuer = "https://huggingface.co";
+    expect(
+      findOauthClientRegistration(regs, {
+        key: "VERCEL",
+        issuer: "https://vercel.com",
+      })?.clientId,
+    ).toBe("cl_vercel");
+    expect(
+      findOauthClientRegistration(hf, { key: "HUGGING_FACE", issuer: hfIssuer })
+        ?.clientId,
+    ).toBe("cl_hf");
+    expect(
+      findOauthClientRegistration(hf, { key: "hugging-face", issuer: hfIssuer })
+        ?.clientId,
+    ).toBe("cl_hf");
   });
 
   test("matches on the discovered issuer, canonicalized", () => {
@@ -158,11 +196,28 @@ describe("findOauthClientRegistration", () => {
     ).toBeUndefined();
   });
 
-  test("an unpinned registration is usable against any issuer", () => {
+  /**
+   * Previously a key match with an unknown issuer on EITHER side returned the
+   * registration. That is fail-open on a deployment-wide, AS-issued credential:
+   * a repointed MCP server nominates its own authorization server and is handed
+   * an approved client secret. The single production caller always knows the
+   * issuer (`resolveClientIdentity` passes `discovery.issuer`, which discovery
+   * requires), so failing closed costs nothing real.
+   */
+  test("a key match with no issuer resolves to nothing, never to a client", () => {
+    expect(findOauthClientRegistration(regs, { key: "vercel" })).toBeUndefined();
     expect(
-      findOauthClientRegistration(regs, { key: "acme", issuer: "https://acme.test" })
-        ?.clientId,
-    ).toBe("cl_acme");
+      findOauthClientRegistration(regs, { key: "vercel", issuer: null }),
+    ).toBeUndefined();
+  });
+
+  test("an unregistered issuer never resolves, even with a known key", () => {
+    expect(
+      findOauthClientRegistration(regs, {
+        key: "vercel",
+        issuer: "https://attacker.test",
+      }),
+    ).toBeUndefined();
   });
 
   test("an unknown key falls through to the issuer, and misses are undefined", () => {

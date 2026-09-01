@@ -394,9 +394,15 @@ describe("resolveClientIdentity — DCR fallback", () => {
 });
 
 describe("resolveClientIdentity — pre-registered clients (fix plan P2b)", () => {
+  // `_ISSUER` is REQUIRED and exact-matched — a registration that matched any
+  // issuer would hand a deployment-wide approved secret to whichever
+  // authorization server a repointed MCP server nominated. Cases below that
+  // care about the pin override this value; the default agrees with
+  // `discoveryFixture()` so the ordinary path resolves.
   const VERCEL_ENV = {
     MCP_OAUTH_VERCEL_CLIENT_ID: "vercel-approved-client",
     MCP_OAUTH_VERCEL_CLIENT_SECRET: "vercel-approved-secret",
+    MCP_OAUTH_VERCEL_ISSUER: "https://as.example.com",
   };
 
   test("an operator-configured client wins over CIMD and never registers", async () => {
@@ -461,7 +467,10 @@ describe("resolveClientIdentity — pre-registered clients (fix plan P2b)", () =
     const deps = makeDeps(
       LOCAL_BASE,
       neverFetch,
-      preregistered({ MCP_OAUTH_VERCEL_CLIENT_ID: "public-approved-client" }),
+      preregistered({
+        MCP_OAUTH_VERCEL_CLIENT_ID: "public-approved-client",
+        MCP_OAUTH_VERCEL_ISSUER: "https://as.example.com",
+      }),
     );
     const identity = await resolveClientIdentity(
       deps,
@@ -610,26 +619,55 @@ describe("resolveClientIdentity — DCR credentials are keyed by issuer (F13)", 
     expect(deps.persisted[0]!.clientId).toBe("dcr-client-new-as");
   });
 
-  test("a row predating the column is reused and BACKFILLED with the issuer", async () => {
-    const deps = makeDeps(LOCAL_BASE, neverFetch);
+  /**
+   * A row predating the issuer column is RE-REGISTERED, not replayed.
+   *
+   * This previously reused the stored client and backfilled it with whatever
+   * issuer discovery had just reported, on the reasoning that an unrecorded
+   * issuer is "not evidence of a CHANGED issuer" and that re-registering would
+   * strand the row's live tokens. The first half is fail-open — a repointed MCP
+   * server nominates its own authorization server and is handed the client
+   * minted for the previous one — and the second half stopped being true when
+   * `pending_flow` landed: `resolveClientIdentity` runs ONLY from
+   * `armConsentFlow` (broker.ts), its result is STAGED, and it replaces the
+   * live identity only when an exchange succeeds and issues tokens for it.
+   * Refresh reads `row.clientId` directly and never comes through here, so
+   * nothing is stranded.
+   */
+  test("a row predating the issuer column is re-registered, never replayed", async () => {
+    using fx = serveRegistration(() =>
+      Response.json({ client_id: "freshly-registered" }, { status: 201 }),
+    );
+    const deps = makeDeps(LOCAL_BASE, fetch);
     const identity = await resolveClientIdentity(
       deps,
-      discoveryFixture(),
+      discoveryFixture({ registrationEndpoint: fx.endpoint }),
       rowFixture({ clientId: "legacy-dcr-client" }),
     );
-    // Reused: an unrecorded issuer is not evidence of a CHANGED issuer, and
-    // re-registering here would strand the row's live tokens on a client id
-    // it no longer carries.
-    expect(identity.clientId).toBe("legacy-dcr-client");
-    expect(deps.persisted).toEqual([
-      {
-        rowId: "co_aaaaaaaaaaaaaaaa",
-        clientId: "legacy-dcr-client",
-        clientSecretEncrypted: null,
-        clientIdentityMode: "dcr",
-        clientRegistrationIssuer: "https://as.example.com",
-      },
-    ]);
+    expect(identity.clientId).toBe("freshly-registered");
+    expect(deps.persisted[0]!.clientId).toBe("freshly-registered");
+    expect(deps.persisted[0]!.clientRegistrationIssuer).toBe(
+      "https://as.example.com",
+    );
+  });
+
+  test("an unrecorded issuer is never replayed at a DIFFERENT authorization server", async () => {
+    // The attack the fail-open allowed: the MCP server repoints discovery, and
+    // the legacy client (and its secret) would have been presented there.
+    using fx = serveRegistration(() =>
+      Response.json({ client_id: "minted-for-attacker" }, { status: 201 }),
+    );
+    const deps = makeDeps(LOCAL_BASE, fetch);
+    const identity = await resolveClientIdentity(
+      deps,
+      discoveryFixture({
+        registrationEndpoint: fx.endpoint,
+        issuer: "https://attacker.example",
+        authorizationServer: "https://attacker.example",
+      }),
+      rowFixture({ clientId: "legacy-dcr-client" }),
+    );
+    expect(identity.clientId).not.toBe("legacy-dcr-client");
   });
 
   test("the registration is filed under the AS metadata's own issuer", async () => {

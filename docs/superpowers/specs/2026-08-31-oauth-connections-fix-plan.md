@@ -465,3 +465,47 @@ expected issuer + `iss` capability + `last_error_code`) and `0014`
   the first one that is will need those names added to
   `docker-compose.prod*.yml` (and to `docs/DEPLOY.md`'s configuration table)
   before an operator can configure it.
+
+---
+
+## 9. Post-review hardening (2026-09-01)
+
+An independent adversarial review of the landed branch found four defects, all
+of them INTERACTIONS between a new change and existing behaviour rather than
+mistakes inside any single change. All four are fixed on the same branch.
+
+| # | Defect | Fix | Regression test |
+|---|---|---|---|
+| H1 | A provider's `error` string was interpolated verbatim into `oauth_exchange_failed` / `oauth_registration_failed`. Every hop that reads one SENDS a credential (refresh token, authorization code, client secret), so a hostile or repointed AS could echo the secret back and have it persisted to `connections.last_error` and returned by `connectionDto`. | `oauth/error-codes.ts` — a CLOSED allowlist of RFC 6749/7591/8628 codes. Anything else becomes a bare `HTTP <status>`. Applied at all THREE sites (`tokens.ts`, `broker.ts`, `client-identity.ts`); the review found one. | `oauth/error-codes.test.ts` feeds it real credential shapes, including base64url tokens that a `[a-zA-Z0-9_-]` character class would pass |
+| H2 | The callback's promotion used a bare `where(id)`. The claim on `pending_state` is a correct compare-and-swap, but it does not cover the window AFTER it: the exchange is a network round trip and the connection stays mutable, so a URL change could be overwritten by the finished flow's tokens and endpoints. | An optimistic-concurrency stamp: the claim returns `updated_at`, and both the promotion and the failure bookkeeping require it to be unchanged. Zero rows → tokens DISCARDED and a typed `oauth_flow_superseded`. | `broker.test.ts` "a callback that loses its race to a URL change discards its tokens", driven by a new `beforeToken` seam on the stub AS. **Verified to fail without the guard** — the callback otherwise reports `ok: true` |
+| H3 | `MCP_OAUTH_<PREFIX>_ISSUER` was optional, and `findOauthClientRegistration` returned a match when the issuer was unknown on either side — so an unpinned, deployment-wide approved client could be handed to any AS a repointed MCP server nominated. | `_ISSUER` is REQUIRED (boot-fatal) and exact-matched, with no null fall-through. Separately, the issuer-only fallback no longer applies to a preset that declares `clientIdentity: "dynamic"` — that entry states DCR works there and must not inherit another provider's credentials because the issuers coincide. | `runtime/config.test.ts` — boot failure names the missing var; a key match with no issuer resolves to nothing |
+| H4 | Only `invalid_grant` was terminal on refresh, so `invalid_client`, `unauthorized_client`, `invalid_scope` and `unsupported_grant_type` were retried forever as transient — a permanently dead grant stayed `connected`, spun under the row lock, and reported the AS as merely `unreachable`. | `TERMINAL_TOKEN_ERROR_CODES` retires the grant. `invalid_request` is deliberately NOT terminal (it indicts our request, and servers return it transiently). | `error-codes.test.ts` pins both sets |
+
+Also corrected while here: `markExpired` wrote `health: "auth_error"`, contradicting
+the probe's own classification of an unusable grant as `auth_required` for the
+window between a failed refresh and the next probe — "your token was rejected"
+about a grant that needs reconnecting. It now writes `auth_required` and records
+the vocabulary code in `last_error_code`.
+
+### Judged NOT to be defects
+
+- **Issuer comparison is canonical, not byte-exact.** RFC 8414 says simple string
+  comparison, but normalizing host case and default ports is ordinary URL
+  handling, and strict byte equality would reject legitimately-conforming
+  servers. Trailing-slash tolerance is retained for the PRM *resource* binding,
+  where Vercel's real discrepancy actually lives.
+- **Cross-origin redirect refusal** (`guarded-fetch.ts`) remains deliberate. It
+  was never implicated in the Vercel 502: `EgressBlockedError` is typed at start
+  and classified `unreachable` inside a 200 in the probe, and no Vercel hop
+  redirects at all.
+
+### Still open
+
+- `connection_oauth.last_error_code` is written but exposed in NEITHER the DTO
+  nor `packages/shared/src/api.ts`; the broker comment claiming it "is read back
+  by a DTO" is false. Either surface it (so a reload can still explain the last
+  failure) or drop the column in the same cleanup pass that retires
+  `mcp_connections` and `agent_sessions.continuation_token`.
+- An abandoned `pending_flow` is cleared only by a callback claim, so its
+  verifier and staged DCR secret outlive the 10-minute TTL until the next
+  consent attempt.

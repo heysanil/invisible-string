@@ -61,6 +61,16 @@ export class StubAuthorizationServer {
   tokenMode: "ok" | "invalid_grant" = "ok";
 
   /**
+   * Awaited at the TOP of every token request, before any response is formed.
+   * A seam for exercising what happens while the broker is mid-exchange — the
+   * window in which the connection is still mutable and the callback's
+   * optimistic-concurrency guard is the only thing standing between a
+   * finished flow and a row that has since been reset. Left undefined the
+   * server behaves normally.
+   */
+  beforeToken?: () => Promise<void>;
+
+  /**
    * What the authorization response carries as its RFC 9207 `iss`:
    * - `correct` — this server's own issuer (the conformant default);
    * - `foreign` — {@link FOREIGN_ISSUER}, i.e. a response minted somewhere
@@ -205,6 +215,7 @@ export class StubAuthorizationServer {
   private async token(req: Request): Promise<Response> {
     const params = new URLSearchParams(await req.text());
     this.tokenRequests.push(params);
+    if (this.beforeToken !== undefined) await this.beforeToken();
     const fail = (error: string, status = 400) =>
       Response.json({ error }, { status });
     if (this.tokenMode === "invalid_grant") return fail("invalid_grant");

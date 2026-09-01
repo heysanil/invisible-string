@@ -1092,8 +1092,8 @@ function renderApp(path: string) {
 }
 
 function submitLogin(view: RenderResult, email: string, password: string) {
-  fireEvent.change(view.getByLabelText("Email"), { target: { value: email } });
-  fireEvent.change(view.getByLabelText("Password"), {
+  fireEvent.input(view.getByLabelText("Email"), { target: { value: email } });
+  fireEvent.input(view.getByLabelText("Password"), {
     target: { value: password },
   });
   const button = view.getByRole("button", { name: /sign in/i });

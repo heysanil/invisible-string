@@ -45,7 +45,6 @@ const ok = (): MockAuthResult => ({ data: null, error: null });
 
 export const authMockState = {
   session: null as MockSessionData | null,
-  pending: false,
   signInResult: ok(),
   signUpResult: ok(),
   signInCalls: [] as Array<Record<string, unknown>>,
@@ -62,7 +61,6 @@ export const authMockState = {
 
   // Organization plugin state
   organizations: [] as MockOrganization[],
-  orgPending: false,
   inviteResult: ok(),
   updateMemberRoleResult: ok(),
   updateOrganizationResult: ok(),
@@ -89,7 +87,6 @@ export const authMockState = {
 
 export function resetAuthMock(): void {
   authMockState.session = null;
-  authMockState.pending = false;
   authMockState.signInResult = ok();
   authMockState.signUpResult = ok();
   authMockState.signInCalls = [];
@@ -102,7 +99,6 @@ export function resetAuthMock(): void {
   authMockState.signOutResult = ok();
 
   authMockState.organizations = [];
-  authMockState.orgPending = false;
   authMockState.inviteResult = ok();
   authMockState.updateMemberRoleResult = ok();
   authMockState.updateOrganizationResult = ok();

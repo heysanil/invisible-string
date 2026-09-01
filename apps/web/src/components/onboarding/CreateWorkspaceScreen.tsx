@@ -49,6 +49,24 @@ export function CreateWorkspaceScreen() {
     setFormError("Connection failed — try again.");
   }
 
+  /**
+   * A partial success: `organization.create` above already succeeded — the
+   * workspace exists and the server activated it — and only the follow-up
+   * viewer read failed. A toast alone auto-dismisses in a few seconds and
+   * leaves the user on this unlabeled screen with the submit button
+   * re-enabled; without a persistent cue they may submit again and create a
+   * second workspace with the same name and a different slug. See
+   * signup.tsx's `sessionLoadFailed()` for the same shape.
+   */
+  function workspaceLoadFailed() {
+    toast({
+      variant: "error",
+      title: "Workspace created",
+      message: "Couldn't load it just yet — reload to continue.",
+    });
+    setFormError("Your workspace was created — reload the page to continue.");
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
@@ -86,11 +104,7 @@ export function CreateWorkspaceScreen() {
         await refetchViewer(queryClient);
         toast({ variant: "success", message: "Workspace created." });
       } catch {
-        toast({
-          variant: "error",
-          title: "Workspace created",
-          message: "Couldn't load it just yet — reload to continue.",
-        });
+        workspaceLoadFailed();
       }
       return;
     } catch {

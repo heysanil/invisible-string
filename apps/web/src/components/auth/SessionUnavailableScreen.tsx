@@ -10,11 +10,15 @@ import { AuthCard } from "./AuthCard";
  * 5xx, never a 401. A user whose session is fine must not be handed a login
  * form served by a server that cannot answer it.
  *
- * Do NOT call the `reset` prop. `ErrorComponentProps` declares it, but for an
- * error thrown from `beforeLoad`/`loader` the router passes
- * `reset={undefined as any}` (@tanstack/react-router `src/Match.tsx:382`), so
- * calling it throws a TypeError. `router.invalidate()` is the supported
- * recovery: it resets errored matches to pending and reloads them.
+ * Do NOT call the `reset` prop. It is a real, working callback here (this
+ * SPA has no SSR, and on the client the router's `CatchBoundary` supplies
+ * one — @tanstack/react-router `src/CatchBoundary.tsx`), but it only clears
+ * the boundary's OWN error state; it never re-runs `beforeLoad`. The
+ * underlying route match is still `status: 'error'`, so the very next
+ * render throws the same stale error right back into the boundary.
+ * `router.invalidate()` is the recovery that actually works: it resets the
+ * errored match to pending and re-runs `beforeLoad`, and it also advances
+ * `getResetKey`, which clears the boundary as a side effect.
  */
 export function SessionUnavailableScreen() {
   const queryClient = useQueryClient();

@@ -87,9 +87,12 @@ export const Route = createFileRoute("/_app")({
  * a render crash in a descendant route, say. Deliberately says nothing about
  * the network: that framing belongs only to `SessionUnavailableScreen`.
  *
- * Do NOT call the `reset` prop, same trap as `SessionUnavailableScreen`:
- * for an error thrown from `beforeLoad`/`loader` the router passes
- * `reset={undefined as any}` (`Match.tsx:382`).
+ * Do NOT call the `reset` prop, same trap as `SessionUnavailableScreen`: it
+ * only clears the `CatchBoundary`'s own error state and never re-runs
+ * `beforeLoad`, so the still-errored route match throws right back into it
+ * on the next render. `router.invalidate()` re-runs `beforeLoad` AND
+ * advances `getResetKey`, which clears the boundary too — the strictly
+ * stronger recovery.
  */
 function AppErrorScreen() {
   const router = useRouter();

@@ -210,7 +210,9 @@ Workspace selection is deterministic: `workspaces[0]` after the sort defined in 
 
 ### 4.3 `errorComponent` and `AppLayout`
 
-`SessionUnavailableScreen` renders the designed retry card — the same shape `accept-invitation.$invitationId.tsx` already uses for this exact condition. "Try again" invalidates the viewer query and calls the router's `reset`.
+`SessionUnavailableScreen` renders the designed retry card — the same shape `accept-invitation.$invitationId.tsx` already uses for this exact condition.
+
+Its "Try again" does **two** things, because the screen is reached two ways and each way needs one of them: `router.invalidate()` is the only thing that resets an ERRORED route match (`errorComponent`), and `refetchViewer` is the only thing that reaches a MOUNTED observer when the match is `status: 'success'` and the error lives purely in query state (the live observer below) — there, `invalidate()` alone just re-runs `beforeLoad` against a warm cache and changes nothing on screen. It deliberately does not call the boundary's `reset` (which never re-runs `beforeLoad`) and deliberately does not `removeQueries` the viewer (which detaches the mounted observer from the cache entry, so no later fetch under that key can reach it).
 
 `AppLayout` keeps only what genuinely belongs in render — a live `useQuery(viewerQueryOptions())` observer, branching on **all three** arms of §3.1 in the gate's own order:
 

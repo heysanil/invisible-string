@@ -2,7 +2,7 @@ import { ensureDomForThisFile } from "../test/setup";
 import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { focusManager, onlineManager } from "@tanstack/react-query";
 import {
   createMemoryHistory,
@@ -115,6 +115,13 @@ test("a refocus that cannot determine the session shows the retry card, not the 
 
   expect(await view.findByText("Can't reach the server")).toBeTruthy();
   expect(view.queryByRole("navigation", { name: "Primary" })).toBeNull();
+
+  // And it is a recoverable state, not a dead end. `removeQueries` alone does
+  // not notify a mounted observer, so the retry needs the `router.invalidate()`
+  // behind it to re-run the gate's own fetch.
+  authMockState.getSessionError = null;
+  fireEvent.click(view.getByRole("button", { name: "Try again" }));
+  expect(await view.findByRole("navigation", { name: "Primary" })).toBeTruthy();
 });
 
 /**

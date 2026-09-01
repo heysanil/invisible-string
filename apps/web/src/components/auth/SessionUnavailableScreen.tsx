@@ -1,7 +1,7 @@
 import { useRouter } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 
-import { viewerQueryKey } from "../../lib/auth/viewer";
+import { refetchViewer } from "../../lib/auth/viewer";
 import { Button } from "../ui/Button";
 import { AuthCard } from "./AuthCard";
 
@@ -19,13 +19,28 @@ import { AuthCard } from "./AuthCard";
  * `router.invalidate()` is the recovery that actually works: it resets the
  * errored match to pending and re-runs `beforeLoad`, and it also advances
  * `getResetKey`, which clears the boundary as a side effect.
+ *
+ * Retry does BOTH, because this screen is reached two ways and each way
+ * needs one of them.
+ *
+ * From `errorComponent`, the route match itself is errored and only
+ * `router.invalidate()` resets it. From `AppLayout`'s live observer
+ * (`_app.tsx`), the match is `status: 'success'` and the error lives purely
+ * in query state — so `invalidate()` alone re-runs `beforeLoad` against a
+ * warm cache and changes nothing on screen. That path needs a real fetch
+ * that a MOUNTED observer is notified of, which is what `refetchViewer`
+ * gives: `queryClient.removeQueries()` deliberately is NOT used, because
+ * `Query.destroy()` never dispatches — it would detach the observer from the
+ * cache entry and leave the same stale error rendered forever.
  */
 export function SessionUnavailableScreen() {
   const queryClient = useQueryClient();
   const router = useRouter();
 
   function retry() {
-    queryClient.removeQueries({ queryKey: viewerQueryKey });
+    // Rejection is expected when the server is still down; the query state
+    // records it and this screen stays up, which is the designed outcome.
+    void refetchViewer(queryClient).catch(() => {});
     void router.invalidate();
   }
 

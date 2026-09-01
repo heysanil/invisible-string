@@ -72,6 +72,35 @@ interface AuthCallResult<T> {
 }
 
 /**
+ * Every auth request the router gate depends on is bounded.
+ *
+ * Without this a proxy that ACCEPTS `/get-session` and never answers leaves
+ * `beforeLoad`'s promise pending forever: the protected route never commits,
+ * and the retry card is unreachable because nothing ever throws. A timeout
+ * must surface as UNDETERMINED, never as signed out — and it does, because
+ * an aborted request REJECTS (`@better-fetch/fetch` calls `await fetch(...)`
+ * with no try/catch), which `call()` below converts to
+ * `ViewerUnavailableError`.
+ *
+ * The signal rides `fetchOptions`, which Better Auth's dynamic-path proxy
+ * spreads into the options it hands better-fetch (`dist/client/proxy.mjs`);
+ * better-fetch then prefers `opts.signal` over its own controller and passes
+ * it straight to `fetch`. Its own `timeout` option is deliberately NOT used:
+ * it is cleared the moment response HEADERS arrive, so a body that never
+ * completes would still hang.
+ */
+export const AUTH_REQUEST_TIMEOUT_MS = 15_000;
+
+export interface FetchViewerOptions {
+  /** Per-request bound. Tests override it; nothing else should. */
+  timeoutMs?: number;
+}
+
+interface AuthFetchOptions {
+  fetchOptions: { signal: AbortSignal };
+}
+
+/**
  * Only 401 means signed out. Every other failure — including a 403 or a
  * status-less transport error — is "undetermined", because logging someone
  * out on an ambiguous answer is the failure mode this whole module exists to
@@ -88,12 +117,23 @@ function unavailable(error: AuthCallError): ViewerUnavailableError {
   );
 }
 
-/** Better Auth resolves most failures as `{error}` but can still reject. */
-async function call<T>(fn: () => Promise<AuthCallResult<T>>): Promise<AuthCallResult<T>> {
+/**
+ * Better Auth resolves most failures as `{error}` but can still reject — and
+ * a timeout abort is exactly such a rejection. Both land on the SAME
+ * undetermined outcome, which is the point: neither may be read as signed out.
+ */
+async function call<T>(
+  fn: (options: AuthFetchOptions) => Promise<AuthCallResult<T>>,
+  timeoutMs: number,
+): Promise<AuthCallResult<T>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fn();
+    return await fn({ fetchOptions: { signal: controller.signal } });
   } catch {
     throw new ViewerUnavailableError(undefined, "Could not reach the server.");
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -133,9 +173,13 @@ interface SessionShape {
   session?: { activeOrganizationId?: string | null } | null;
 }
 
-export async function fetchViewer(): Promise<Viewer | null> {
+export async function fetchViewer({
+  timeoutMs = AUTH_REQUEST_TIMEOUT_MS,
+}: FetchViewerOptions = {}): Promise<Viewer | null> {
   const session = await call<SessionShape>(
-    () => authClient.getSession() as Promise<AuthCallResult<SessionShape>>,
+    (options) =>
+      authClient.getSession(options) as Promise<AuthCallResult<SessionShape>>,
+    timeoutMs,
   );
   if (session.error) {
     if (isSignedOut(session.error)) return null;
@@ -144,7 +188,11 @@ export async function fetchViewer(): Promise<Viewer | null> {
   if (!session.data?.user) return null;
 
   const orgs = await call<RawOrganization[]>(
-    () => authClient.organization.list() as Promise<AuthCallResult<RawOrganization[]>>,
+    (options) =>
+      authClient.organization.list(options) as Promise<
+        AuthCallResult<RawOrganization[]>
+      >,
+    timeoutMs,
   );
   if (orgs.error) {
     // The session was valid a moment ago, so a 401 here means it just died.
@@ -163,21 +211,73 @@ export async function fetchViewer(): Promise<Viewer | null> {
   };
 }
 
+/** Who a cached query set belongs to. `null` is a principal too: nobody. */
+function principalOf(viewer: Viewer | null): string | null {
+  return viewer?.user.id ?? null;
+}
+
+/**
+ * Drop every non-viewer query when the resolved principal changes.
+ *
+ * `completeSignIn`/`completeSignOut` only cover a principal change made in
+ * THIS tab. Cookies are shared across tabs but QueryClients are not, so when
+ * another tab signs Alice out and Bob in, this tab's viewer simply refetches
+ * and becomes Bob — while every `["me"]`-scoped entry (`lib/queries/keys.ts`
+ * scopes user-level data under a bare `"me"` prefix, identical for every
+ * user) still holds Alice's rows. A mounted personal-skill or
+ * personal-connection route then renders Alice's data as Bob.
+ *
+ * This runs INSIDE the query function, before the new viewer is committed to
+ * the cache, so no render can ever observe the new principal beside the old
+ * principal's data. An effect after the fact is too late by construction.
+ *
+ * `undefined` (never resolved in this cache) is not a change — there is no
+ * previous principal to leak from. A THROW is not a change either: the
+ * function never gets here, which is correct, because "couldn't ask" must
+ * not evict anything.
+ */
+function purgeOnPrincipalChange(
+  queryClient: QueryClient,
+  next: Viewer | null,
+): void {
+  const cached = queryClient.getQueryData<Viewer | null>(viewerQueryKey);
+  if (cached === undefined) return;
+  if (principalOf(cached) === principalOf(next)) return;
+  queryClient.removeQueries({
+    predicate: (query) => query.queryKey[0] !== viewerQueryKey[0],
+  });
+}
+
 export function viewerQueryOptions() {
   return queryOptions({
     queryKey: viewerQueryKey,
-    queryFn: fetchViewer,
+    // `client` is the QueryClient (query-core's `queryFnContext`), which is
+    // what lets the purge run before this result is committed. The context's
+    // `signal` is deliberately NOT consumed: reading it sets query-core's
+    // `#abortSignalConsumed`, which cancels an in-flight fetch when the last
+    // observer unmounts — and `AppLayout` unmounting mid-gate would then
+    // reject `beforeLoad`'s own `fetchQuery`. The bound comes from
+    // `AUTH_REQUEST_TIMEOUT_MS` instead.
+    queryFn: async ({ client }) => {
+      const viewer = await fetchViewer();
+      purgeOnPrincipalChange(client, viewer);
+      return viewer;
+    },
     // Keeps the router gate a cache hit for in-app navigation; without it
     // every route change would issue a /get-session.
     staleTime: 30_000,
     // The gate blocks navigation — fail fast into the retry card rather than
     // doubling time-to-error. Overrides the app default of `retry: 1`.
     retry: false,
-    // Overrides the app default of `false`. Load-bearing: this is how a
-    // session revoked in another tab is noticed, replacing the BroadcastChannel
-    // sync we lose by leaving Better Auth's session manager.
-    refetchOnWindowFocus: true,
-    refetchOnReconnect: true,
+    // "always", NOT `true`. `true` refetches only a STALE query
+    // (query-core 5.101.2, `shouldFetchOn`: `value === "always" || (value !==
+    // false && isStale(...))`), and this query is deliberately fresh for 30 s
+    // — so a session revoked in another tab five seconds ago would survive
+    // the refocus that is supposed to notice it, and staleness alone never
+    // schedules a request. This is the BroadcastChannel sync we gave up by
+    // leaving Better Auth's session manager; it has to actually fire.
+    refetchOnWindowFocus: "always",
+    refetchOnReconnect: "always",
   });
 }
 
@@ -219,17 +319,42 @@ export async function completeSignOut(queryClient: QueryClient): Promise<void> {
   queryClient.clear();
 }
 
+/**
+ * Select a workspace for a session that has none, then re-read the viewer.
+ *
+ * Returns `null` for the SAME reason `fetchViewer` does — the session is
+ * gone. A 401 here is definitive (the session died between the viewer read
+ * and this call), so it must reach the gate as signed-out and redirect to
+ * /login; wrapping it as `ActivateWorkspaceError` would show "Can't reach the
+ * server" to a user who simply needs to sign in again. A rejected promise is
+ * the opposite: transport, never an answer, so it stays undetermined.
+ */
 export async function activateWorkspace(
   queryClient: QueryClient,
   organizationId: string,
+  { timeoutMs = AUTH_REQUEST_TIMEOUT_MS }: FetchViewerOptions = {},
 ): Promise<Viewer | null> {
-  const { error } = (await authClient.organization.setActive({
-    organizationId,
-  })) as AuthCallResult<unknown>;
-  if (error)
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let result: AuthCallResult<unknown>;
+  try {
+    result = (await authClient.organization.setActive({
+      organizationId,
+      fetchOptions: { signal: controller.signal },
+    })) as AuthCallResult<unknown>;
+  } catch {
+    // Includes the timeout abort: bounded, so a hung /set-active can never
+    // leave `beforeLoad` pending forever.
+    throw new ActivateWorkspaceError("Could not reach the server.");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (result.error) {
+    if (isSignedOut(result.error)) return null;
     throw new ActivateWorkspaceError(
-      error.message ?? "Could not select a workspace.",
+      result.error.message ?? "Could not select a workspace.",
     );
+  }
   return refetchViewer(queryClient);
 }
 

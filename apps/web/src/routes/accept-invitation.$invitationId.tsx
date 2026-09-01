@@ -14,6 +14,8 @@ import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
 import { authClient } from "../lib/auth-client";
 import {
+  activateWorkspace,
+  ActivateWorkspaceError,
   completeSignOut,
   refetchViewer,
   useViewer,
@@ -37,6 +39,12 @@ interface InvitationDetails {
 type InviteView =
   | { kind: "loading" }
   | { kind: "ready"; invitation: InvitationDetails }
+  /**
+   * The COMMIT POINT. The invitation is consumed and the membership exists;
+   * from here the page owns the screen and every recovery re-reads the
+   * SESSION, never the invitation.
+   */
+  | { kind: "joined"; organizationId: string; organizationName: string }
   | { kind: "declined"; organizationName: string }
   | { kind: "error"; variant: "not-found" | "wrong-account" | "connection" };
 
@@ -66,6 +74,9 @@ function AcceptInvitationPage() {
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  // Post-commit only: opening the joined workspace, and whether that failed.
+  const [entering, setEntering] = useState(false);
+  const [enterFailed, setEnterFailed] = useState(false);
 
   // Identity comes from the shared viewer query (lib/auth/viewer.ts), the same
   // source the router gate uses. This route used to run its own
@@ -98,6 +109,39 @@ function AcceptInvitationPage() {
       cancelled = true;
     };
   }, [viewer, sessionLost, invitationId, attempt]);
+
+  // FIRST, ahead of every session/invitation guard below. Once acceptance has
+  // committed, a session hiccup must not render "Can't load this invitation"
+  // (whose retry re-reads a consumed invite and reports "no longer valid"),
+  // and a `null` viewer must not bounce to /login carrying this consumed
+  // invitation as the redirect. The only recovery offered here refreshes the
+  // viewer and navigates.
+  if (view.kind === "joined") {
+    return (
+      <AuthCard
+        title={`Joined ${view.organizationName}`}
+        subtitle={
+          enterFailed
+            ? "You're a member — we just couldn't open the workspace"
+            : "Opening your workspace"
+        }
+      >
+        {enterFailed ? (
+          <Button
+            className="w-full"
+            loading={entering}
+            onClick={() =>
+              void enterWorkspace(view.organizationId, view.organizationName)
+            }
+          >
+            Try again
+          </Button>
+        ) : (
+          <CenteredSpinner label="Opening your workspace" />
+        )}
+      </AuthCard>
+    );
+  }
 
   if (sessionPending) {
     return (
@@ -146,27 +190,55 @@ function AcceptInvitationPage() {
         }
         return;
       }
-      const activated = await authClient.organization.setActive({
-        organizationId: invitation.organizationId,
-      });
-      if (activated.error) {
-        // The membership exists; only switching the active workspace failed.
-        toast({
-          variant: "error",
-          message: `Joined ${invitation.organizationName}, but couldn't switch to it.`,
-        });
-      } else {
-        toast({
-          variant: "success",
-          message: `Joined ${invitation.organizationName}.`,
-        });
-      }
-      await refetchViewer(queryClient);
-      await navigate({ to: "/chat" });
     } catch {
       setView({ kind: "error", variant: "connection" });
+      return;
     } finally {
       setActing(null);
+    }
+
+    // ---- COMMIT POINT ----
+    // The invitation is consumed and the membership exists. Everything past
+    // here is recoverable on its own terms; nothing may fall back to a state
+    // whose retry re-reads the invitation.
+    setView({
+      kind: "joined",
+      organizationId: invitation.organizationId,
+      organizationName: invitation.organizationName,
+    });
+    await enterWorkspace(
+      invitation.organizationId,
+      invitation.organizationName,
+    );
+  }
+
+  /** Post-commit: switch to the joined workspace and go. Retryable forever. */
+  async function enterWorkspace(
+    organizationId: string,
+    organizationName: string,
+  ) {
+    setEntering(true);
+    setEnterFailed(false);
+    try {
+      try {
+        await activateWorkspace(queryClient, organizationId);
+        toast({ variant: "success", message: `Joined ${organizationName}.` });
+      } catch (activationError) {
+        // Only the SWITCH failed — say so, then still refresh and go: the
+        // membership is real and /_app resolves the existing workspace.
+        if (!(activationError instanceof ActivateWorkspaceError))
+          throw activationError;
+        toast({
+          variant: "error",
+          message: `Joined ${organizationName}, but couldn't switch to it.`,
+        });
+        await refetchViewer(queryClient);
+      }
+      await navigate({ to: "/chat" });
+    } catch {
+      setEnterFailed(true);
+    } finally {
+      setEntering(false);
     }
   }
 

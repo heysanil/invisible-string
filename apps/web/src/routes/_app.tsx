@@ -5,6 +5,7 @@ import {
   redirect,
   useRouter,
 } from "@tanstack/react-router";
+import { useEffect } from "react";
 
 import { AppShell } from "../components/AppShell";
 import { SessionUnavailableScreen } from "../components/auth/SessionUnavailableScreen";
@@ -60,8 +61,35 @@ export const Route = createFileRoute("/_app")({
     // active organization. Activation is AWAITED here so its failure is an
     // error the user can see and retry, rather than the fire-and-forget
     // effect that used to leave useWorkspace() pending forever.
+    //
+    // Its RESULT is checked, not discarded. Activation re-reads the viewer,
+    // and that read can answer either of the other two ways: `null` means the
+    // session died mid-activation, which has to redirect while `location.href`
+    // is still the target the user asked for (the render-time <Navigate>
+    // below carries no redirect and would silently drop it); a viewer that
+    // still has no active workspace means the activation did not stick, which
+    // must fail visibly rather than commit a shell WorkspaceGate cannot
+    // resolve.
     if (activeWorkspace(viewer) === null && viewer.workspaces.length > 0) {
-      await activateWorkspace(context.queryClient, viewer.workspaces[0]!.id);
+      const activated = await activateWorkspace(
+        context.queryClient,
+        viewer.workspaces[0]!.id,
+      );
+      if (!activated) {
+        throw redirect({
+          to: "/login",
+          search: { redirect: location.href },
+          replace: true,
+        });
+      }
+      if (
+        activeWorkspace(activated) === null &&
+        activated.workspaces.length > 0
+      ) {
+        throw new ActivateWorkspaceError(
+          "The workspace could not be selected.",
+        );
+      }
     }
   },
   // `_app` is the only route in the tree with an `errorComponent`, so its
@@ -106,10 +134,44 @@ function AppErrorScreen() {
   );
 }
 
+/**
+ * The live observer.
+ *
+ * A render-time decision is acceptable HERE and nowhere else: the value being
+ * read is authoritative query state whose `isPending` is honest, not a Better
+ * Auth snapshot that reports `isPending: false` over data it never fetched.
+ * It exists because `beforeLoad` runs only on navigation, and a session can
+ * end without one — revoked in another tab, expired on the wire. All three
+ * arms of the viewer contract are branched on here, exactly as they are in
+ * the gate: `error` (undetermined) before `null` (signed out) before a
+ * `Viewer`.
+ */
 function AppLayout() {
+  const router = useRouter();
   // Kept mounted so a focus refetch that resolves null (session revoked or
   // signed out in another tab) leaves the shell instead of stranding it.
-  const { viewer, isPending } = useViewer(!FIXTURE_MODE);
+  const { viewer, isPending, error } = useViewer(!FIXTURE_MODE);
+
+  // A live update can leave a signed-in viewer holding workspaces with no
+  // RESOLVABLE active one — the active organization was removed elsewhere.
+  // `beforeLoad` is the only place that awaits activation and it does not
+  // re-run without a navigation, so re-enter it rather than committing a
+  // shell whose WorkspaceGate can only show its defensive empty state.
+  const needsActivation =
+    !FIXTURE_MODE &&
+    viewer !== null &&
+    viewer.workspaces.length > 0 &&
+    activeWorkspace(viewer) === null;
+
+  useEffect(() => {
+    if (!needsActivation) return;
+    // `invalidate()` re-runs `beforeLoad` (router-core's `shouldSkipLoader`
+    // does not skip a successful match), and the viewer it re-reads is the
+    // one this render just saw — so the gate activates and the flag clears.
+    // A failure there throws into `errorComponent`; it cannot spin, because
+    // the effect only fires on the transition into this state.
+    void router.invalidate();
+  }, [needsActivation, router]);
 
   if (FIXTURE_MODE) {
     return (
@@ -119,7 +181,12 @@ function AppLayout() {
     );
   }
 
-  if (isPending) {
+  // Undetermined, NOT signed out. Without this arm a focus refetch that
+  // throws kept rendering the shell over the last viewer we happened to have,
+  // so the three-way contract held only on initial navigation.
+  if (error) return <SessionUnavailableScreen />;
+
+  if (isPending || needsActivation) {
     return (
       <div
         role="status"

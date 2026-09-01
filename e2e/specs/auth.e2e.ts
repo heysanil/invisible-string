@@ -7,6 +7,7 @@ import { expect, test } from "@playwright/test";
 
 import { API_BASE_URL } from "../config.ts";
 import {
+  createWorkspace,
   createWorkspaceViaOnboarding,
   login,
   signUp,
@@ -64,4 +65,40 @@ test("login rejects a bad password without leaving the login page", async ({
 
   await expect(page.getByRole("alert")).toBeVisible();
   await expect(page).toHaveURL(/\/login$/);
+});
+
+/**
+ * Deliberately does NOT start with `page.goto("/login")` (the way `login()`
+ * does, `e2e/support/flows.ts:48`). That full navigation rebuilds the SPA's
+ * Better Auth client and query-cache singletons from scratch right at the
+ * login form — which erases exactly the stale state a real "hit a protected
+ * route while signed out, got redirected" visit leaves behind, and is why
+ * CI never caught the double-login bug this covers. Instead this reaches
+ * `/login` the way a real user does: `/chat` while signed out, and let
+ * `_app`'s own `beforeLoad` gate issue the redirect.
+ */
+test("signing in once resolves a protected route reached while signed out, without a reload", async ({
+  page,
+}) => {
+  const account = uniqueAccount("auth-redirect");
+  await signUp(page, account);
+  await createWorkspace(page, `${account.name} ws`);
+
+  // Sign out through the UI so the tab is genuinely signed out — server
+  // session dropped — before the redirect case below.
+  await page.goto("/settings/workspace");
+  await page.getByRole("button", { name: /sign out/i }).click();
+  await page.waitForURL("**/login");
+
+  // The case under test — see the comment above the test.
+  await page.goto("/chat");
+  await page.waitForURL(/\/login/);
+
+  await page.getByLabel("Email").fill(account.email);
+  await page.getByLabel("Password").fill(account.password);
+  await page.getByRole("button", { name: /^sign in$/i }).click();
+
+  await page.waitForURL("**/chat");
+  // Real, workspace-scoped shell content — not merely the URL.
+  await expect(page.getByRole("button", { name: "New chat" })).toBeVisible();
 });

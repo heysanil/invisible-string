@@ -1,14 +1,19 @@
 /**
  * Resolves the active workspace and the viewer's role in it, then hands both
  * to `children`. While resolving it shows a titled loading panel; with no
- * workspace it shows a friendly empty panel — screens never flash blank or
- * fire resource fetches before a workspace id exists.
+ * workspace it shows a friendly empty panel; an outage that leaves the
+ * viewer undetermined gets its own error panel — screens never flash blank,
+ * fire resource fetches before a workspace id exists, or misreport an outage
+ * as "you have no workspaces".
  */
+import { useQueryClient } from "@tanstack/react-query";
 import { Building2 } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { refetchViewer } from "../lib/auth/viewer";
 import { useWorkspace, useWorkspaceRole } from "../lib/workspace";
 import { EmptyState } from "./ui/EmptyState";
+import { ErrorState } from "./ui/ErrorState";
 import { Panel } from "./ui/Panel";
 import { Spinner } from "./ui/Spinner";
 
@@ -27,8 +32,27 @@ export interface WorkspaceGateProps {
 }
 
 export function WorkspaceGate({ title, children }: WorkspaceGateProps) {
-  const { workspace, isPending } = useWorkspace();
+  const { workspace, isPending, error } = useWorkspace();
   const role = useWorkspaceRole(workspace?.id);
+  const queryClient = useQueryClient();
+
+  if (error) {
+    return (
+      <Panel className="panel-enter flex h-full min-w-0 flex-col overflow-hidden">
+        <header className="px-6 pb-4 pt-5">
+          <h1 className="text-[17px]">{title}</h1>
+        </header>
+        <div aria-hidden="true" className="mx-6 h-px bg-black/[0.06]" />
+        <div className="flex-1">
+          <ErrorState
+            title="Can't load your workspace"
+            message="Check your connection, then try again."
+            onRetry={() => void refetchViewer(queryClient)}
+          />
+        </div>
+      </Panel>
+    );
+  }
 
   if (isPending) {
     return (

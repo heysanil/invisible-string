@@ -45,7 +45,9 @@ the stub MCP server twice over (loopback address, plain http).
 
 ## Specs (`specs/*.e2e.ts`)
 
-- **auth** — signup → land in the shell; logout; login (+ a bad-password path).
+- **auth** — signup → land in the shell; logout; login (+ a bad-password
+  path); and signing in ONCE after a signed-out visit to a protected route,
+  without the `page.goto("/login")` that would reset the SPA's auth client.
 - **add-connection** — the add-connection dialog's three lanes: the curated
   catalog renders its seeded tiles with zero network calls; community search
   (the Meilisearch mirror) surfaces the stub server with its Verified badge

@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createFileRoute,
   Link,
@@ -11,6 +12,7 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { useToast } from "../components/ui/Toast";
 import { signUp } from "../lib/auth-client";
+import { completeSignIn } from "../lib/auth/viewer";
 import { safeRedirectPath } from "../lib/redirect";
 import { isValidEmail, PASSWORD_MIN_LENGTH } from "../lib/validate";
 
@@ -43,6 +45,7 @@ function focusFirstError(errors: FieldErrors) {
 function SignupPage() {
   const navigate = useNavigate();
   const router = useRouter();
+  const queryClient = useQueryClient();
   const { redirect } = Route.useSearch();
   const { toast } = useToast();
 
@@ -74,6 +77,22 @@ function SignupPage() {
     setFormError("Connection failed — no account was created.");
   }
 
+  /**
+   * A partial success: the credential call above already succeeded — the
+   * account was created and the session cookie is set — and only the
+   * follow-up viewer read failed. Reusing `connectionFailed()` here would
+   * claim "no account was created", which is false and would invite the
+   * user to sign up again and create a duplicate account.
+   */
+  function sessionLoadFailed() {
+    toast({
+      variant: "error",
+      title: "Account created, but the app couldn't load",
+      message: "Reload the page to continue.",
+    });
+    setFormError("Your account was created — reload the page to continue.");
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
@@ -90,6 +109,15 @@ function SignupPage() {
         password,
       });
       if (!error) {
+        // Read the session authoritatively BEFORE navigating — see login.tsx.
+        try {
+          await completeSignIn(queryClient);
+        } catch {
+          // See sessionLoadFailed(): the credential call above already
+          // succeeded, so this must not be reported as a failed sign-up.
+          sessionLoadFailed();
+          return;
+        }
         // `redirect` is pre-validated to a same-app path; history.push keeps
         // the typed router happy with a runtime-known destination.
         if (redirect) router.history.push(redirect);

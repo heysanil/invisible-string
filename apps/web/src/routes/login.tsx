@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createFileRoute,
   Link,
@@ -11,6 +12,7 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { useToast } from "../components/ui/Toast";
 import { signIn } from "../lib/auth-client";
+import { completeSignIn } from "../lib/auth/viewer";
 import { safeRedirectPath } from "../lib/redirect";
 import { isValidEmail } from "../lib/validate";
 
@@ -38,6 +40,7 @@ function focusFirstError(errors: FieldErrors) {
 function LoginPage() {
   const navigate = useNavigate();
   const router = useRouter();
+  const queryClient = useQueryClient();
   const { redirect } = Route.useSearch();
   const { toast } = useToast();
 
@@ -65,6 +68,22 @@ function LoginPage() {
     setFormError("Connection failed — nothing was signed in.");
   }
 
+  /**
+   * A partial success: the credential call above already succeeded — the
+   * session cookie is set and the user IS signed in — and only the
+   * follow-up viewer read failed. Reusing `connectionFailed()` here would
+   * claim "nothing was signed in", which is false and would leave the user
+   * unsure whether it's safe to retry signing in.
+   */
+  function sessionLoadFailed() {
+    toast({
+      variant: "error",
+      title: "Signed in, but the app couldn't load",
+      message: "Reload the page to continue.",
+    });
+    setFormError("You're signed in — reload the page to continue.");
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
@@ -77,6 +96,18 @@ function LoginPage() {
     try {
       const { error } = await signIn.email({ email: email.trim(), password });
       if (!error) {
+        // Read the session authoritatively BEFORE navigating. Better Auth
+        // defers its own session signal by 10ms, so navigating first is how
+        // the gate used to see a pre-login snapshot and bounce back here.
+        // This also clears the previous principal's query cache.
+        try {
+          await completeSignIn(queryClient);
+        } catch {
+          // See sessionLoadFailed(): the credential call above already
+          // succeeded, so this must not be reported as a failed sign-in.
+          sessionLoadFailed();
+          return;
+        }
         // `redirect` is pre-validated to a same-app path; history.push keeps
         // the typed router happy with a runtime-known destination.
         if (redirect) router.history.push(redirect);

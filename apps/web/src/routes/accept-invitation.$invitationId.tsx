@@ -1,17 +1,25 @@
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createFileRoute,
   Navigate,
   useNavigate,
   useRouter,
 } from "@tanstack/react-router";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { AuthCard } from "../components/auth/AuthCard";
 import { Button } from "../components/ui/Button";
 import { Chip } from "../components/ui/Chip";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
-import { authClient, signOut } from "../lib/auth-client";
+import { authClient } from "../lib/auth-client";
+import {
+  activateWorkspace,
+  ActivateWorkspaceError,
+  completeSignOut,
+  refetchViewer,
+  useViewer,
+} from "../lib/auth/viewer";
 
 export const Route = createFileRoute("/accept-invitation/$invitationId")({
   component: AcceptInvitationPage,
@@ -31,6 +39,12 @@ interface InvitationDetails {
 type InviteView =
   | { kind: "loading" }
   | { kind: "ready"; invitation: InvitationDetails }
+  /**
+   * The COMMIT POINT. The invitation is consumed and the membership exists;
+   * from here the page owns the screen and every recovery re-reads the
+   * SESSION, never the invitation.
+   */
+  | { kind: "joined"; organizationId: string; organizationName: string }
   | { kind: "declined"; organizationName: string }
   | { kind: "error"; variant: "not-found" | "wrong-account" | "connection" };
 
@@ -46,51 +60,39 @@ function variantFor(status?: number): "not-found" | "wrong-account" | "connectio
   return "connection";
 }
 
-type SessionProbe = "checking" | "authenticated" | "unauthenticated" | "failed";
-
 function AcceptInvitationPage() {
   const { invitationId } = Route.useParams();
-  const [sessionProbe, setSessionProbe] = useState<SessionProbe>("checking");
   const navigate = useNavigate();
   const router = useRouter();
   const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const { viewer, isPending: sessionPending, error: sessionError } = useViewer();
+  // Set when a 401 arrives mid-flow (the session died between requests).
+  const [sessionLost, setSessionLost] = useState(false);
 
   const [view, setView] = useState<InviteView>({ kind: "loading" });
+  // Set alongside the `joined`/`declined` transitions below — both consume
+  // the invitation server-side, so once either lands, no code path may read
+  // it again. A `view.kind` dependency on the effect would work too, but the
+  // effect's own `setView({kind: "loading"})` would then flip `view.kind`
+  // between "loading" and "ready"/"error" and re-trigger itself forever; a
+  // ref sidesteps that without touching the effect's deps, and (since refs
+  // are always current) without the stale-closure risk of reading `view`
+  // from inside the effect without listing it.
+  const committedRef = useRef(false);
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  // Post-commit only: opening the joined workspace, and whether that failed.
+  const [entering, setEntering] = useState(false);
+  const [enterFailed, setEnterFailed] = useState(false);
 
-  // The shared useSession() atom can hold a stale resolved-null snapshot
-  // right after the login/signup round-trip (no subscriber lives on the auth
-  // screens, and the remount refetch is deferred a macrotask), which bounced
-  // fresh invitees straight back to /login. Probe the server directly and
-  // gate the redirect on the answer instead of trusting the cached snapshot.
-  // A probe failure (network hiccup, 5xx) is NOT treated as "unauthenticated"
-  // — it renders a retryable connection-error card instead, so a flaky
-  // network doesn't bounce an otherwise signed-in user to /login.
+  // Identity comes from the shared viewer query (lib/auth/viewer.ts), the same
+  // source the router gate uses. This route used to run its own
+  // authClient.getSession() probe because the old useSession() atom could hold
+  // a stale resolved-null right after login; that atom is gone.
   useEffect(() => {
-    let cancelled = false;
-    setSessionProbe("checking");
-    void authClient
-      .getSession()
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error && (!error.status || error.status >= 500)) {
-          setSessionProbe("failed");
-        } else {
-          setSessionProbe(data ? "authenticated" : "unauthenticated");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setSessionProbe("failed");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [invitationId, attempt]);
-
-  useEffect(() => {
-    if (sessionProbe !== "authenticated") return;
+    if (!viewer || sessionLost || committedRef.current) return;
     let cancelled = false;
     setView({ kind: "loading" });
     void authClient.organization
@@ -99,7 +101,7 @@ function AcceptInvitationPage() {
         if (cancelled) return;
         if (error?.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else if (error || !data) {
           setView({ kind: "error", variant: variantFor(error?.status) });
         } else {
@@ -115,9 +117,42 @@ function AcceptInvitationPage() {
     return () => {
       cancelled = true;
     };
-  }, [sessionProbe, invitationId, attempt]);
+  }, [viewer, sessionLost, invitationId, attempt]);
 
-  if (sessionProbe === "checking") {
+  // FIRST, ahead of every session/invitation guard below. Once acceptance has
+  // committed, a session hiccup must not render "Can't load this invitation"
+  // (whose retry re-reads a consumed invite and reports "no longer valid"),
+  // and a `null` viewer must not bounce to /login carrying this consumed
+  // invitation as the redirect. The only recovery offered here refreshes the
+  // viewer and navigates.
+  if (view.kind === "joined") {
+    return (
+      <AuthCard
+        title={`Joined ${view.organizationName}`}
+        subtitle={
+          enterFailed
+            ? "You're a member — we just couldn't open the workspace"
+            : "Opening your workspace"
+        }
+      >
+        {enterFailed ? (
+          <Button
+            className="w-full"
+            loading={entering}
+            onClick={() =>
+              void enterWorkspace(view.organizationId, view.organizationName)
+            }
+          >
+            Try again
+          </Button>
+        ) : (
+          <CenteredSpinner label="Opening your workspace" />
+        )}
+      </AuthCard>
+    );
+  }
+
+  if (sessionPending) {
     return (
       <InviteCard subtitle="Checking your session">
         <CenteredSpinner label="Loading invitation" />
@@ -125,11 +160,21 @@ function AcceptInvitationPage() {
     );
   }
 
-  if (sessionProbe === "failed") {
-    return <ConnectionErrorCard onRetry={() => setAttempt((n) => n + 1)} />;
+  if (sessionError) {
+    // `attempt` doesn't feed the viewer query (it's a static queryKey), so
+    // bumping it alone would leave the same cached error in place. Force a
+    // fresh network read instead, the same way WorkspaceGate's retry does —
+    // removing the cached entry alone does not notify a mounted observer.
+    return (
+      <ConnectionErrorCard
+        onRetry={() => {
+          void refetchViewer(queryClient);
+        }}
+      />
+    );
   }
 
-  if (sessionProbe === "unauthenticated") {
+  if (!viewer || sessionLost) {
     return (
       <Navigate
         to="/login"
@@ -148,32 +193,66 @@ function AcceptInvitationPage() {
       if (error) {
         if (error.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else {
           setView({ kind: "error", variant: variantFor(error.status) });
         }
         return;
       }
-      const activated = await authClient.organization.setActive({
-        organizationId: invitation.organizationId,
-      });
-      if (activated.error) {
-        // The membership exists; only switching the active workspace failed.
+    } catch {
+      setView({ kind: "error", variant: "connection" });
+      return;
+    } finally {
+      setActing(null);
+    }
+
+    // ---- COMMIT POINT ----
+    // The invitation is consumed and the membership exists. Everything past
+    // here is recoverable on its own terms; nothing may fall back to a state
+    // whose retry re-reads the invitation. `committedRef` must be set BEFORE
+    // `enterWorkspace()` starts (not just before `setView`): the invitation-
+    // fetch effect above depends on `viewer`, and `enterWorkspace()` is what
+    // changes it (`activateWorkspace` -> `refetchViewer`), so a viewer
+    // refetch racing that same call must already see the guard up.
+    committedRef.current = true;
+    setView({
+      kind: "joined",
+      organizationId: invitation.organizationId,
+      organizationName: invitation.organizationName,
+    });
+    await enterWorkspace(
+      invitation.organizationId,
+      invitation.organizationName,
+    );
+  }
+
+  /** Post-commit: switch to the joined workspace and go. Retryable forever. */
+  async function enterWorkspace(
+    organizationId: string,
+    organizationName: string,
+  ) {
+    setEntering(true);
+    setEnterFailed(false);
+    try {
+      try {
+        await activateWorkspace(queryClient, organizationId);
+        toast({ variant: "success", message: `Joined ${organizationName}.` });
+      } catch (activationError) {
+        // Only the SWITCH failed — say so, then still refresh and go: the
+        // membership is real and /_app resolves the existing workspace.
+        if (!(activationError instanceof ActivateWorkspaceError))
+          throw activationError;
         toast({
           variant: "error",
-          message: `Joined ${invitation.organizationName}, but couldn't switch to it.`,
+          message: `Joined ${organizationName}, but couldn't switch to it.`,
         });
-      } else {
-        toast({
-          variant: "success",
-          message: `Joined ${invitation.organizationName}.`,
-        });
+        await refetchViewer(queryClient);
       }
       await navigate({ to: "/chat" });
     } catch {
-      setView({ kind: "error", variant: "connection" });
+      setEnterFailed(true);
     } finally {
-      setActing(null);
+      setEntering(false);
     }
   }
 
@@ -186,12 +265,15 @@ function AcceptInvitationPage() {
       if (error) {
         if (error.status === 401) {
           // Session expired mid-flow: bounce to re-login, not "invalid invite".
-          setSessionProbe("unauthenticated");
+          setSessionLost(true);
         } else {
           setView({ kind: "error", variant: variantFor(error.status) });
         }
         return;
       }
+      // Also a commit point: `rejectInvitation` consumes the invitation
+      // server-side too, so a later re-read would 400 the same way.
+      committedRef.current = true;
       setView({
         kind: "declined",
         organizationName: invitation.organizationName,
@@ -206,7 +288,7 @@ function AcceptInvitationPage() {
   async function handleSignOut() {
     setSigningOut(true);
     try {
-      await signOut();
+      await completeSignOut(queryClient);
       // Round-trip back to this invitation once the right account signs in.
       router.history.push(
         `/login?redirect=${encodeURIComponent(`/accept-invitation/${invitationId}`)}`,

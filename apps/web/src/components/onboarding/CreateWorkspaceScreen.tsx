@@ -1,7 +1,9 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useState, type FormEvent } from "react";
 
-import { authClient, signOut } from "../../lib/auth-client";
+import { authClient } from "../../lib/auth-client";
+import { completeSignOut, refetchViewer } from "../../lib/auth/viewer";
 import { workspaceSlug } from "../../lib/slug";
 import { AuthCard } from "../auth/AuthCard";
 import { Button } from "../ui/Button";
@@ -14,12 +16,15 @@ const FIELD_ID = "workspace-name";
 /**
  * First-run onboarding: a signed-in user with no workspace names one and
  * lands in the shell. Creation MUST go through `authClient` — the server's
- * afterCreateOrganization hook seeds the locked workspace defaults, and the
- * client's $listOrg store refetches on create so the `_app` gate flips
- * without a reload or navigation.
+ * afterCreateOrganization hook seeds the locked workspace defaults.
+ * `/organization/create` also activates the new organization server-side
+ * (better-auth's crud-org.mjs), so there is no client-side `setActive` round
+ * trip here — only a `refetchViewer` (viewer.ts), which is what flips the
+ * `_app` gate into the shell.
  */
 export function CreateWorkspaceScreen() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const [name, setName] = useState("");
@@ -41,7 +46,25 @@ export function CreateWorkspaceScreen() {
       title: "Can't reach the server",
       message: "Check that the API is running, then try again.",
     });
-    setFormError("Connection failed — nothing was created.");
+    setFormError("Connection failed — try again.");
+  }
+
+  /**
+   * A partial success: `organization.create` above already succeeded — the
+   * workspace exists and the server activated it — and only the follow-up
+   * viewer read failed. A toast alone auto-dismisses in a few seconds and
+   * leaves the user on this unlabeled screen with the submit button
+   * re-enabled; without a persistent cue they may submit again and create a
+   * second workspace with the same name and a different slug. See
+   * signup.tsx's `sessionLoadFailed()` for the same shape.
+   */
+  function workspaceLoadFailed() {
+    toast({
+      variant: "error",
+      title: "Workspace created",
+      message: "Couldn't load it just yet — reload to continue.",
+    });
+    setFormError("Your workspace was created — reload the page to continue.");
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -70,12 +93,20 @@ export function CreateWorkspaceScreen() {
         }
         return;
       }
-      await authClient.organization.setActive({
-        organizationId: created.data.id,
-      });
-      toast({ variant: "success", message: "Workspace created." });
-      // No navigation: the org-list store refetched on create, so the
-      // `_app` gate re-renders into the shell at the current URL.
+      // The server activates the new organization as part of /organization/create,
+      // so no setActive round trip is needed — only a fresh read of the viewer.
+      // No navigation either: the layout flips into the shell at this URL.
+      //
+      // The workspace EXISTS from here on. A refresh failure is a partial
+      // success: never tell the user nothing was created, or they will create
+      // a second one.
+      try {
+        await refetchViewer(queryClient);
+        toast({ variant: "success", message: "Workspace created." });
+      } catch {
+        workspaceLoadFailed();
+      }
+      return;
     } catch {
       connectionFailed();
     } finally {
@@ -86,7 +117,7 @@ export function CreateWorkspaceScreen() {
   async function handleSignOut() {
     setSigningOut(true);
     try {
-      await signOut();
+      await completeSignOut(queryClient);
       await navigate({ to: "/login" });
     } catch {
       toast({ variant: "error", message: "Could not sign out. Try again." });

@@ -8,7 +8,6 @@
  * role changes) so settings/context screens render without a live API.
  */
 import { mock } from "bun:test";
-import { useSyncExternalStore } from "react";
 
 export interface MockUser {
   id: string;
@@ -46,16 +45,56 @@ const ok = (): MockAuthResult => ({ data: null, error: null });
 
 export const authMockState = {
   session: null as MockSessionData | null,
-  pending: false,
   signInResult: ok(),
   signUpResult: ok(),
   signInCalls: [] as Array<Record<string, unknown>>,
   signUpCalls: [] as Array<Record<string, unknown>>,
+  /** The session the server hands back when signIn/signUp succeeds. */
+  sessionAfterSignIn: null as MockSessionData | null,
+  /** Force `organization.list()` to fail with this error (viewer contract tests). */
+  listOrganizationsError: null as MockAuthError | null,
+  /** Force `getSession()` to fail with this error (viewer contract tests). */
+  getSessionError: null as MockAuthError | null,
+  listOrganizationsCalls: 0,
+  getSessionCalls: 0,
+  signOutResult: ok(),
+  /**
+   * Make a call REJECT instead of resolving `{error}`. `@better-fetch/fetch`
+   * does not wrap its `await fetch(...)` in a try/catch, so a real transport
+   * failure rejects the proxy promise — this models that half.
+   */
+  rejectGetSession: false,
+  rejectListOrganizations: false,
+  rejectSetActive: false,
+  /**
+   * Hang until the caller's AbortSignal fires — a proxy that accepts the
+   * request and never answers. With NO signal the promise never settles,
+   * which is precisely the wedge an unbounded auth call produces.
+   */
+  hangGetSession: false,
+  hangListOrganizations: false,
+  hangSetActive: false,
+  /** The AbortSignal each call was handed, for the bounded-request wiring. */
+  getSessionSignals: [] as Array<AbortSignal | undefined>,
+  listOrganizationsSignals: [] as Array<AbortSignal | undefined>,
+  setActiveSignals: [] as Array<AbortSignal | undefined>,
+  /**
+   * `setActive` waits on this before it does anything. A mock that mutates
+   * synchronously and returns an already-resolved promise cannot tell an
+   * AWAITED activation from a fire-and-forget one — both satisfy the same
+   * assertions — so the gate test parks activation here on purpose.
+   */
+  setActiveGate: null as Promise<void> | null,
+  /**
+   * The session the "server" holds AFTER set-active. `undefined` leaves the
+   * normal behaviour alone; `null` models a session that died during
+   * activation, and a session whose active organization is still null models
+   * an activation that answered 200 without sticking.
+   */
+  sessionAfterSetActive: undefined as MockSessionData | null | undefined,
 
   // Organization plugin state
   organizations: [] as MockOrganization[],
-  activeOrganization: null as MockOrganization | null,
-  orgPending: false,
   inviteResult: ok(),
   updateMemberRoleResult: ok(),
   updateOrganizationResult: ok(),
@@ -82,15 +121,29 @@ export const authMockState = {
 
 export function resetAuthMock(): void {
   authMockState.session = null;
-  authMockState.pending = false;
   authMockState.signInResult = ok();
   authMockState.signUpResult = ok();
   authMockState.signInCalls = [];
   authMockState.signUpCalls = [];
+  authMockState.sessionAfterSignIn = null;
+  authMockState.listOrganizationsError = null;
+  authMockState.getSessionError = null;
+  authMockState.listOrganizationsCalls = 0;
+  authMockState.getSessionCalls = 0;
+  authMockState.signOutResult = ok();
+  authMockState.rejectGetSession = false;
+  authMockState.rejectListOrganizations = false;
+  authMockState.rejectSetActive = false;
+  authMockState.hangGetSession = false;
+  authMockState.hangListOrganizations = false;
+  authMockState.hangSetActive = false;
+  authMockState.getSessionSignals = [];
+  authMockState.listOrganizationsSignals = [];
+  authMockState.setActiveSignals = [];
+  authMockState.setActiveGate = null;
+  authMockState.sessionAfterSetActive = undefined;
 
   authMockState.organizations = [];
-  authMockState.activeOrganization = null;
-  authMockState.orgPending = false;
   authMockState.inviteResult = ok();
   authMockState.updateMemberRoleResult = ok();
   authMockState.updateOrganizationResult = ok();
@@ -122,6 +175,15 @@ export function demoSession(): MockSessionData {
   };
 }
 
+/** Mirror the server: rewrite the session's active organization in place. */
+function setSessionActiveOrganization(organizationId: string | null): void {
+  if (!authMockState.session) return;
+  authMockState.session = {
+    ...authMockState.session,
+    session: { activeOrganizationId: organizationId },
+  };
+}
+
 export function demoWorkspace(): MockOrganization {
   return {
     id: "org_test_1",
@@ -135,80 +197,108 @@ export function demoWorkspace(): MockOrganization {
 export function signInToDemoWorkspace(): void {
   authMockState.session = demoSession();
   authMockState.organizations = [demoWorkspace()];
-  authMockState.activeOrganization = demoWorkspace();
+}
+
+/**
+ * The AbortSignal the viewer handed this call. Better Auth's dynamic-path
+ * proxy spreads `arg.fetchOptions` into the options it passes to
+ * `@better-fetch/fetch`, which forwards `signal` straight to `fetch` — so
+ * this is where a bounded auth request shows up.
+ */
+function signalOf(args?: Record<string, unknown>): AbortSignal | undefined {
+  const fetchOptions = args?.["fetchOptions"] as
+    | { signal?: AbortSignal }
+    | undefined;
+  return fetchOptions?.signal;
+}
+
+/**
+ * Never resolves; rejects when the signal aborts. An aborted `fetch` rejects
+ * (better-fetch does not catch it), so this is what an abort really looks
+ * like to the caller — and with no signal at all, nothing ever settles.
+ */
+function hangUntilAborted(signal: AbortSignal | undefined): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    if (!signal) return;
+    const abort = () => {
+      reject(
+        Object.assign(new Error("The operation was aborted."), {
+          name: "AbortError",
+        }),
+      );
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  });
 }
 
 const authClientPath = new URL("../lib/auth-client.ts", import.meta.url).pathname;
 
 /**
- * The real better-auth client backs `useListOrganizations`/
- * `useActiveOrganization` with nanostores, so a mutation (create/setActive)
- * re-renders every subscribed component directly — independent of the React
- * tree shape. This mock's hooks must do the same: `authMockState` is a plain
- * mutable object, so without this subscription a consumer only sees fresh
- * data if it happens to re-render for an unrelated reason. Route layouts
- * (e.g. `_app`'s zero-org gate) sit behind a state boundary (`ToastProvider`)
- * that bails out of re-rendering unchanged `children` elements, so they'd
- * otherwise never notice the mutation and the gate would never flip live.
- *
- * Deliberate divergence from the real client: only setActive() notifies
- * subscribers. The real client also refetches the org list on create(),
- * which can race the explicit setActive round-trip and let useWorkspace's
- * first-org self-heal fire a duplicate same-id setActive in production
- * (harmless there). Tests must therefore never assert EXACT setActive call
- * counts — assert on call content instead.
+ * This mock models the SERVER, not a client cache: `getSession` returns
+ * whatever session the "server" holds, `organization.list` 401s without one,
+ * and signIn/signUp establish a session the way the real endpoints do. The
+ * previous version hand-wrote reactive hooks and was, as a result, strictly
+ * more correct than the library it replaced — which is why the suite could
+ * never fail on the double-login bug.
  */
-let orgStoreVersion = 0;
-const orgStoreListeners = new Set<() => void>();
-function notifyOrgStore(): void {
-  orgStoreVersion++;
-  for (const listener of orgStoreListeners) listener();
-}
-function subscribeOrgStore(listener: () => void): () => void {
-  orgStoreListeners.add(listener);
-  return () => orgStoreListeners.delete(listener);
-}
-function getOrgStoreVersion(): number {
-  return orgStoreVersion;
-}
-
 const organizationMock = {
   setActive: async (args: Record<string, unknown>) => {
     authMockState.setActiveCalls.push(args);
+    authMockState.setActiveSignals.push(signalOf(args));
+    if (authMockState.hangSetActive) return hangUntilAborted(signalOf(args));
+    if (authMockState.rejectSetActive) throw new Error("network");
+    if (authMockState.setActiveGate) await authMockState.setActiveGate;
     const result = authMockState.setActiveResult;
     if (result.error) return result;
-    const id = args["organizationId"] as string;
-    const known = authMockState.organizations.find((org) => org.id === id);
-    // Unknown id: mirror the real client — the active-org store refetches
-    // from the server, which knows orgs the (stale) list hook does not,
-    // e.g. right after accepting an invitation.
-    authMockState.activeOrganization =
-      known ??
-      (id
-        ? { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" }
-        : null);
-    notifyOrgStore();
+    const id = (args["organizationId"] as string | null) ?? null;
+    if (!id) {
+      setSessionActiveOrganization(null);
+      return result;
+    }
+    let org = authMockState.organizations.find((candidate) => candidate.id === id);
+    if (!org) {
+      // Unknown id: mirror the real client, which fetches this org fresh
+      // from the server even when the (stale) list doesn't have it yet,
+      // e.g. right after accepting an invitation.
+      org = { id, name: id, slug: id, createdAt: "2026-07-08T00:00:00.000Z" };
+      authMockState.organizations = [...authMockState.organizations, org];
+    }
+    setSessionActiveOrganization(id);
+    if (authMockState.sessionAfterSetActive !== undefined) {
+      authMockState.session = authMockState.sessionAfterSetActive;
+    }
     return result;
   },
   create: async (args: Record<string, unknown>) => {
     authMockState.createOrganizationCalls.push(args);
     const result = authMockState.createOrganizationResult;
     if (!result.error && result.data) {
-      // Mirror the real client: /organization/create fires $listOrg, so
-      // list hooks re-read — append so layout gates flip in tests. Do NOT
-      // notify subscribers here: every caller in this codebase immediately
-      // follows a successful create with setActive (see CreateWorkspaceScreen),
-      // and notifying now would let a subscribed component observe a
-      // half-updated store (list non-empty, no active org yet) and run its
-      // own first-org self-heal (useWorkspace) — a spurious extra setActive
-      // call. Deferring notification to setActive() below means the two
-      // fields always change together from a subscriber's point of view.
-      authMockState.organizations = [
-        ...authMockState.organizations,
-        result.data as MockOrganization,
-      ];
+      const org = result.data as MockOrganization;
+      authMockState.organizations = [...authMockState.organizations, org];
+      // Better Auth activates a newly created organization server-side
+      // (crud-org.mjs), which is why the client sends no setActive.
+      setSessionActiveOrganization(org.id);
     }
     return result;
+  },
+  list: async (args?: Record<string, unknown>): Promise<MockAuthResult> => {
+    authMockState.listOrganizationsCalls++;
+    authMockState.listOrganizationsSignals.push(signalOf(args));
+    if (authMockState.hangListOrganizations)
+      return hangUntilAborted(signalOf(args));
+    if (authMockState.rejectListOrganizations) throw new Error("network");
+    if (authMockState.listOrganizationsError)
+      return { data: null, error: authMockState.listOrganizationsError };
+    // The real endpoint requires a session: no session means 401, which the
+    // viewer reads as "signed out". Modelling this is the whole point — the
+    // old mock returned data regardless and could never reproduce the bug.
+    if (!authMockState.session)
+      return { data: null, error: { status: 401, message: "UNAUTHORIZED" } };
+    return { data: authMockState.organizations, error: null };
   },
   getInvitation: async (args: Record<string, unknown>) => {
     authMockState.getInvitationCalls.push(args);
@@ -228,7 +318,17 @@ const organizationMock = {
   },
   update: async (args: Record<string, unknown>) => {
     authMockState.updateOrganizationCalls.push(args);
-    return authMockState.updateOrganizationResult;
+    const result = authMockState.updateOrganizationResult;
+    if (!result.error) {
+      const id = args["organizationId"] as string;
+      const name = (args["data"] as { name?: string } | undefined)?.name;
+      if (name) {
+        authMockState.organizations = authMockState.organizations.map((org) =>
+          org.id === id ? { ...org, name } : org,
+        );
+      }
+    }
+    return result;
   },
   listInvitations: async () => authMockState.listInvitationsResult,
   acceptInvitation: async (args: Record<string, unknown>) => {
@@ -239,26 +339,6 @@ const organizationMock = {
     authMockState.cancelInvitationCalls.push(args);
     return authMockState.cancelInvitationResult;
   },
-};
-
-const useActiveOrganization = () => {
-  useSyncExternalStore(subscribeOrgStore, getOrgStoreVersion, getOrgStoreVersion);
-  return {
-    data: authMockState.activeOrganization,
-    isPending: authMockState.orgPending,
-    error: null,
-    refetch: () => {},
-  };
-};
-
-const useListOrganizations = () => {
-  useSyncExternalStore(subscribeOrgStore, getOrgStoreVersion, getOrgStoreVersion);
-  return {
-    data: authMockState.organizations,
-    isPending: authMockState.orgPending,
-    error: null,
-    refetch: () => {},
-  };
 };
 
 /**
@@ -278,30 +358,38 @@ export function registerAuthMock(): void {
 
 const authMockFactory = () => ({
   authClient: {
-    getSession: async () => ({ data: authMockState.session, error: null }),
+    getSession: async (
+      args?: Record<string, unknown>,
+    ): Promise<MockAuthResult> => {
+      authMockState.getSessionCalls++;
+      authMockState.getSessionSignals.push(signalOf(args));
+      if (authMockState.hangGetSession) return hangUntilAborted(signalOf(args));
+      if (authMockState.rejectGetSession) throw new Error("network");
+      if (authMockState.getSessionError)
+        return { data: null, error: authMockState.getSessionError };
+      return { data: authMockState.session, error: null };
+    },
     organization: organizationMock,
   },
-  useSession: () => ({
-    data: authMockState.session,
-    isPending: authMockState.pending,
-    error: null,
-    refetch: () => {},
-  }),
-  useActiveOrganization,
-  useListOrganizations,
   signIn: {
     email: async (args: Record<string, unknown>) => {
       authMockState.signInCalls.push(args);
-      return authMockState.signInResult;
+      const result = authMockState.signInResult;
+      if (!result.error && authMockState.sessionAfterSignIn)
+        authMockState.session = authMockState.sessionAfterSignIn;
+      return result;
     },
   },
   signUp: {
     email: async (args: Record<string, unknown>) => {
       authMockState.signUpCalls.push(args);
-      return authMockState.signUpResult;
+      const result = authMockState.signUpResult;
+      if (!result.error && authMockState.sessionAfterSignIn)
+        authMockState.session = authMockState.sessionAfterSignIn;
+      return result;
     },
   },
-  signOut: async () => ok(),
+  signOut: async () => authMockState.signOutResult,
 });
 
 // First-import registration: when a mock-consuming file is the first to

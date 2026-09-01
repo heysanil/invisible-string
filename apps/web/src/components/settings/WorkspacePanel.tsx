@@ -2,10 +2,12 @@
  * Workspace settings: rename the workspace (owners/admins) + a danger-zone
  * placeholder. Rename goes through Better Auth's organization update.
  */
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
-import { authClient, signOut } from "../../lib/auth-client";
+import { authClient } from "../../lib/auth-client";
+import { completeSignOut, refetchViewer } from "../../lib/auth/viewer";
 import { Button } from "../ui/Button";
 import { Input } from "../ui/Input";
 import { useToast } from "../ui/Toast";
@@ -24,6 +26,7 @@ export function WorkspacePanel({
 }: WorkspacePanelProps) {
   const { toast } = useToast();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [name, setName] = useState(workspaceName);
   const [saving, setSaving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
@@ -52,7 +55,14 @@ export function WorkspacePanel({
         toast({ variant: "error", message: updateError.message ?? "Could not rename." });
         return;
       }
+      // The rename has already landed server-side; a failed refresh must not
+      // be reported as a failed rename.
       toast({ variant: "success", message: "Workspace renamed." });
+      try {
+        await refetchViewer(queryClient);
+      } catch {
+        // The name is saved; the shell will pick it up on the next viewer read.
+      }
     } catch {
       toast({ variant: "error", message: "Could not rename the workspace." });
     } finally {
@@ -63,7 +73,7 @@ export function WorkspacePanel({
   async function handleSignOut() {
     setSigningOut(true);
     try {
-      await signOut();
+      await completeSignOut(queryClient);
       await navigate({ to: "/login" });
     } catch {
       toast({ variant: "error", message: "Could not sign out. Try again." });

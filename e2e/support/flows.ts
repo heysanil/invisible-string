@@ -85,7 +85,10 @@ export async function createWorkspace(
 
 /**
  * Drive the first-run onboarding screen: name the workspace and wait for the
- * shell to replace it (the org-list store refetches on create — no reload).
+ * shell to replace it. No reload, and no org-list store: the screen refetches
+ * the viewer query (`apps/web/src/lib/auth/viewer.ts`) after create, and the
+ * `_app` layout flips into the shell at the same URL. The server activates a
+ * newly created organization itself, so there is no client `setActive` here.
  */
 export async function createWorkspaceViaOnboarding(
   page: Page,

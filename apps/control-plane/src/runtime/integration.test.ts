@@ -66,6 +66,7 @@ import {
 } from "./jwt";
 import { reconcileInterruptedRuns } from "./reconcile";
 import { createAppStack, type AppStack } from "../index";
+import type { PipelineRunner } from "../pipeline/runner";
 import {
   eveAccepted,
   eveSessionNotActive,
@@ -980,6 +981,71 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
   });
 
   // ── workflow manual "Run now" ────────────────────────────────────────────
+
+  test("workflow /run maps the runner's two `started:false` refusals to their own codes: 409 run_overlap_skipped (policy) vs the transient 503 pipeline_lock_pool_exhausted (capacity) — G4", async () => {
+    const config = {
+      version: 2,
+      trigger: { type: "manual" },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
+          agentId,
+          instructions: { markdown: "Say hello." },
+          session: "fresh",
+        },
+      ],
+    };
+    const inserted = await db
+      .insert(schema.workflows)
+      .values({
+        organizationId: orgId,
+        name: "Runtime Run-now Refusals",
+        draft: config as unknown as Record<string, unknown>,
+        published: config as unknown as Record<string, unknown>,
+        publishedAt: new Date(),
+        enabled: true,
+      })
+      .returning({ id: schema.workflows.id });
+    const wfId = inserted[0]!.id;
+    const runtime = stack.runtime!;
+    const real = runtime.pipelines;
+    const refusing = (reason: "overlap_skipped" | "lock_pool_exhausted"): PipelineRunner =>
+      ({ start: async () => ({ started: false, reason }) }) as unknown as PipelineRunner;
+    try {
+      runtime.pipelines = refusing("overlap_skipped");
+      const overlap = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
+        cookie: ownerCookie,
+        body: { message: "again" },
+      });
+      expect(overlap.status).toBe(409);
+      expect(((await overlap.json()) as { error: { code: string } }).error.code).toBe(
+        "run_overlap_skipped",
+      );
+
+      // Pre-fix: this branch ALSO answered 409 run_overlap_skipped — a
+      // capacity refusal (nothing created, retry shortly) rendered as
+      // "already running".
+      runtime.pipelines = refusing("lock_pool_exhausted");
+      const exhausted = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
+        cookie: ownerCookie,
+        body: { message: "again" },
+      });
+      expect(exhausted.status).toBe(503);
+      expect(((await exhausted.json()) as { error: { code: string } }).error.code).toBe(
+        "pipeline_lock_pool_exhausted",
+      );
+    } finally {
+      runtime.pipelines = real;
+    }
+    // Neither refusal created a run.
+    const rows = await db
+      .select({ id: schema.runs.id })
+      .from(schema.runs)
+      .where(eq(schema.runs.workflowId, wfId));
+    expect(rows).toHaveLength(0);
+  });
 
   test("workflow /run starts a PIPELINE run; the agent step dispatches the rendered child; overlap-free reruns work", async () => {
     await freshWorkerHeartbeat();

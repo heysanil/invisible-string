@@ -4,14 +4,16 @@
  * SEMANTICS (ledger replay, at_most_once, re-attach) are covered in
  * runner.test.ts; this suite covers the adoption orchestration: which runs
  * are handed to the driver, lock contention, live-handle skips, and the
- * fail-outright path.
+ * fail-outright path — and the PERIODIC sweeper (G3) that re-runs it in a
+ * healthy process, so a `locked` orphan is adopted once its lock frees
+ * instead of holding its cap slot until the next restart.
  */
 import { describe, expect, test } from "bun:test";
 
 import { newStepId, type Logger, type WorkflowConfig } from "@invisible-string/shared";
 
 import { RunEventBus } from "../runs/bus";
-import { recoverPipelineRuns } from "./recovery";
+import { createPipelineRecoverySweeper, recoverPipelineRuns } from "./recovery";
 import {
   createPipelineRunner,
   type PipelineRunner,
@@ -184,5 +186,93 @@ describe("recoverPipelineRuns", () => {
     });
     expect(outcome).toEqual({ resumed: 1, locked: 0, failed: 1 });
     expect((await waitForTerminal(runStore, good.id)).status).toBe("succeeded");
+  });
+});
+
+describe("createPipelineRecoverySweeper (G3)", () => {
+  test("a `locked` orphan is adopted by a LATER tick once its lock frees — no restart needed", async () => {
+    const { runner, runStore, locks } = rig();
+    const run = orphan(runStore, "queued");
+    // Boot found the run un-adoptable (a pool exhausted, a driver elsewhere
+    // still holding the lock): counted `locked`, left active.
+    locks.hold(run.id);
+    // The seam mirrors the real query's status filter (queued/running/
+    // waiting only), so a settled run drops out of the scan.
+    const live = new Set(["queued", "running", "waiting"]);
+    const sweeper = createPipelineRecoverySweeper(
+      {
+        runner,
+        logger: nullLogger,
+        listRuns: async () =>
+          live.has(runStore.statuses.get(run.id)?.status ?? "queued") ? [run] : [],
+        elect: async () => true,
+      },
+      { intervalMs: 60_000 },
+    );
+    expect(await sweeper.tick()).toEqual({ resumed: 0, locked: 1, failed: 0 });
+    expect(runStore.statuses.get(run.id)?.status).toBe("queued");
+    // The lock frees (the pool drained / the foreign driver died). Pre-fix
+    // nothing ever re-ran the sweep; now the next tick adopts it.
+    locks.held.delete(run.id);
+    expect(await sweeper.tick()).toEqual({ resumed: 1, locked: 0, failed: 0 });
+    expect((await waitForTerminal(runStore, run.id)).status).toBe("succeeded");
+    // Idempotent: the now-terminal run is out of the scan, and nothing is
+    // double-driven.
+    expect(await sweeper.tick()).toEqual({ resumed: 0, locked: 0, failed: 0 });
+  });
+
+  test("a tick that loses the replica election scans nothing (null), and a run this process drives is never lock-probed", async () => {
+    const { runner, runStore, locks } = rig();
+    const run = orphan(runStore, "running");
+    let elected = false;
+    const sweeper = createPipelineRecoverySweeper(
+      { runner, logger: nullLogger, listRuns: async () => [run], elect: async () => elected },
+      { intervalMs: 60_000 },
+    );
+    expect(await sweeper.tick()).toBeNull();
+    expect(locks.acquired).toHaveLength(0);
+    elected = true;
+    (runner.handles as Map<string, unknown>).set(run.id, {
+      runId: run.id,
+      workflowId: "",
+      done: Promise.resolve(),
+    });
+    expect(await sweeper.tick()).toEqual({ resumed: 0, locked: 1, failed: 0 });
+    expect(locks.acquired).toHaveLength(0);
+  });
+
+  test("start() ticks on its cadence and stop() waits for the in-flight tick", async () => {
+    const { runner, runStore } = rig();
+    const run = orphan(runStore, "queued");
+    let ticks = 0;
+    const sweeper = createPipelineRecoverySweeper(
+      {
+        runner,
+        logger: nullLogger,
+        listRuns: async () => {
+          ticks += 1;
+          return [run];
+        },
+        elect: async () => true,
+      },
+      { intervalMs: 5 },
+    );
+    sweeper.start();
+    sweeper.start(); // idempotent
+    const deadline = Date.now() + 5_000;
+    while (ticks === 0 && Date.now() < deadline) await Bun.sleep(5);
+    expect(ticks).toBeGreaterThanOrEqual(1);
+    await sweeper.stop();
+    const seen = ticks;
+    await Bun.sleep(30);
+    expect(ticks).toBe(seen); // no tick after stop
+    expect((await waitForTerminal(runStore, run.id)).status).toBe("succeeded");
+  });
+
+  test("construction without a db or an election seam is refused (never a silently always-elected sweeper)", () => {
+    const { runner } = rig();
+    expect(() =>
+      createPipelineRecoverySweeper({ runner, logger: nullLogger, listRuns: async () => [] }),
+    ).toThrow(/either `db` or an injected `elect`/);
   });
 });

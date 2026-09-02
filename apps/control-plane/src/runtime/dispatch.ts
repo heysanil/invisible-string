@@ -75,9 +75,11 @@
  * persist-then-recheck, so a cancel landing after the persist finds the id on
  * the row and chases eve itself, while one that landed earlier is caught by
  * the recheck and the accepted turn remote-canceled with the just-obtained
- * session id instead of tailed. The remote leg is skipped when a NEWER run
- * already owns the session (an unqualified session-level cancel must never
- * stop a turn that is not this run's).
+ * session id instead of tailed. The remote leg is skipped only when a NEWER
+ * run PROVABLY reached eve (routes.ts `classifySessionSuccessor` — an
+ * unqualified session-level cancel must never stop a turn that is not this
+ * run's); a merely queued successor proves nothing, so the cancel is
+ * withheld AND the obligation stays on the run for the guarded chase.
  *
  * PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts). The fences above
  * are individually correct, but three decisions about one session used to
@@ -142,7 +144,9 @@ import { errors, isRuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
 import {
   acquireFreshSessionDispatchLock,
+  classifySessionSuccessor,
   countDispatchingRuns,
+  markRemoteCancelPending,
   ensureAgentOnWorker,
   failEveDispatch,
   startTail,
@@ -1096,10 +1100,17 @@ export interface EveTurnTarget {
  * The post-eve recheck's verdict: `live` — the run is still non-terminal,
  * proceed to tail; `canceled` — the run settled terminal while the eve call
  * was in flight and the accepted turn was remote-canceled (best-effort);
- * `superseded` — the run settled terminal but a NEWER run has already been
- * admitted on the session, so the remote leg was deliberately SKIPPED.
+ * `superseded` — the run settled terminal but a NEWER run has PROVABLY
+ * reached eve on the session (routes.ts `classifySessionSuccessor`), so the
+ * remote leg was deliberately SKIPPED; `deferred` — the run settled terminal
+ * and the only successor is a QUEUED row, which proves nothing about the
+ * accepted turn but could be sent, so the unqualified cancel was WITHHELD
+ * and the durable obligation (`remote_cancel_pending_at`) left on the run
+ * for the guarded chase / sweep to retry under the session lock. Every
+ * non-`live` verdict means no tail starts; only `canceled` closes a session
+ * born in this dispatch.
  */
-export type PostEveRecheck = "live" | "canceled" | "superseded";
+export type PostEveRecheck = "live" | "canceled" | "superseded" | "deferred";
 
 /**
  * POST-EVE CANCEL RECHECK, shared by every dispatch path (dispatchRenderedRun
@@ -1133,18 +1144,33 @@ export async function recheckCanceledDuringEve(
 ): Promise<PostEveRecheck> {
   const current = await deps.runStore.getRunStatus(runId);
   if (current && !TERMINAL_RUN_STATUSES.has(current.status)) return "live";
-  const newerLive = await countDispatchingRuns(deps.db, agentSessionId, {
-    excludeRunId: runId,
-  });
-  if (newerLive > 0) {
+  const successor = await classifySessionSuccessor(deps.db, agentSessionId, runId);
+  if (successor === "proven") {
     deps.logger.warn("dispatch.post_eve_cancel_skipped", {
       runId,
       fields: {
         sessionId: agentSessionId,
-        reason: "a newer run was admitted on the session",
+        reason: "a newer run provably reached eve on the session",
       },
     });
     return "superseded";
+  }
+  if (successor === "unproven") {
+    // A queued successor is no proof this run's accepted turn ended, and an
+    // unqualified cancel could land on that successor's turn once sent. Do
+    // not fire; make sure the obligation is durable (the Stop's own CAS
+    // normally set it — this re-asserts it for a run settled by any other
+    // canceling actor) and let the guarded chase retry under the lock.
+    await markRemoteCancelPending(deps.db, runId);
+    deps.logger.warn("dispatch.post_eve_cancel_deferred", {
+      runId,
+      fields: {
+        sessionId: agentSessionId,
+        reason:
+          "a queued successor is no proof the accepted turn ended — cancel withheld, obligation kept",
+      },
+    });
+    return "deferred";
   }
   try {
     await deps.workerClient.cancelEveTurn(
@@ -1174,7 +1200,9 @@ export async function recheckCanceledDuringEve(
  * A brand-NEW session is closed (markSession releases any Slack thread-key
  * claim — the claim must not outlive the one dispatch that owned it) UNLESS
  * a newer run superseded this one (the session is then live property of that
- * run); a CONTINUATION's session belongs to its thread and stays untouched.
+ * run) or the recheck was deferred behind a queued successor (the same
+ * property claim); a CONTINUATION's session belongs to its thread and stays
+ * untouched.
  * Reported as `canceledBeforeDispatch`: no tail starts.
  */
 async function abandonCanceledDuringEve(

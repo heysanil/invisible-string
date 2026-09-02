@@ -409,6 +409,10 @@ export interface CancelOptions {
  * What became of the remote cancel: `issued` (request completed, or fired
  * when not awaited), `failed` (awaited and rejected — logged, best-effort),
  * `skipped` (unqualified and not allowed), `unavailable` (no remote seam).
+ * A user cancel ending `failed` or `skipped` finalizes the row WITH
+ * `remote_cancel_pending_at` in the same CAS (the durable obligation the
+ * guarded chase / sweep / boot reconciliation finish) — the caller never
+ * needs, and must never add, a second statement for it.
  */
 export type RemoteCancelOutcome = "issued" | "failed" | "skipped" | "unavailable";
 
@@ -465,6 +469,12 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
   // unless a user cancel flipped this flag, which marks it "canceled".
   let canceledByUser = false;
+  // A user cancel whose remote leg did NOT reach eve (`skipped`: unqualified
+  // and disallowed; `failed`: awaited and rejected in transport). The
+  // obligation is then written INTO the finalizing CAS (`finishRun`) as
+  // `remoteCancelPendingAt` — never as a second statement after it, which is
+  // exactly the crash window that left an accepted turn with no owner.
+  let remoteCancelObligation = false;
   let finished = false;
   // Final assistant reply of THIS run (see RunFinishedHook). Only tracked
   // once the run's own turn boundary has been seen — a leftover stop-message
@@ -491,10 +501,16 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // Compare-and-swap: markRun refuses to overwrite a terminal status. When
     // another actor (run-cancel API, sweeper) already finalized this run, the
     // tail steps aside — no session stomp, no duplicate status frame.
+    const now = new Date();
     const marked = await store.markRun(runId, {
       status,
       error: error ?? null,
-      ...(status === "waiting" ? {} : { completedAt: new Date() }),
+      ...(status === "waiting" ? {} : { completedAt: now }),
+      // ONE statement: a canceled row whose remote cancel never reached eve
+      // is born carrying its obligation (see `remoteCancelObligation`).
+      ...(status === "canceled" && remoteCancelObligation
+        ? { remoteCancelPendingAt: now }
+        : {}),
     });
     if (!marked) {
       log?.info("run.finish_skipped", {
@@ -839,6 +855,12 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       } else {
         requestRemoteCancel(why);
         outcome = "issued";
+      }
+      // Record the unmet obligation BEFORE the abort so the finalizing CAS
+      // the abort triggers carries it (see `finishRun`). An `unavailable`
+      // seam has nothing to owe.
+      if (options?.status === "canceled" && (outcome === "skipped" || outcome === "failed")) {
+        remoteCancelObligation = true;
       }
       abort.abort();
       return outcome;

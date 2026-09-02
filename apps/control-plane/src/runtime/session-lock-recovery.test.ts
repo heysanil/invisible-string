@@ -407,17 +407,20 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
       completedAt: new Date(),
       remoteCancelPendingAt: new Date(),
     });
-    // (b) superseded: the same residue, but a newer run already owns the
-    // session — eve serializes turns, so the settled turn is over. The
-    // obligation clears WITHOUT an unqualified cancel that could hit the
-    // successor's turn.
+    // (b) superseded: the same residue, but a newer run PROVABLY owns the
+    // session — it is `running`, i.e. its tail started, which the dispatch
+    // path does only after eve's 202 — and eve serializes turns, so the
+    // settled turn is over. The obligation clears WITHOUT an unqualified
+    // cancel that could hit the successor's turn. (A merely QUEUED successor
+    // is no such proof and RETAINS the marker — remote-cancel-durability
+    // .test.ts, G2.)
     const superseded = await insertSession();
     const supersededRun = await insertRun(superseded.id, {
       status: "canceled",
       completedAt: new Date(),
       remoteCancelPendingAt: new Date(),
     });
-    const successor = await insertRun(superseded.id, { status: "queued" });
+    const successor = await insertRun(superseded.id, { status: "running" });
 
     const outcome = await reconcileInterruptedRuns(deps);
     expect(outcome.remoteCancels.settled).toBeGreaterThanOrEqual(2);

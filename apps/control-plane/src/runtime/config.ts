@@ -101,6 +101,18 @@ export interface RuntimeConfig {
    * finished without a restart. Tests shrink it or call the tick directly.
    */
   remoteCancelSweepMs: number;
+  /**
+   * Pipeline-recovery sweep cadence (PIPELINE_RECOVERY_SWEEP_MS, default 60 s
+   * — keep in sync with pipeline/recovery.ts
+   * DEFAULT_PIPELINE_RECOVERY_SWEEP_MS): how often a HEALTHY process re-runs
+   * boot reconciliation's interrupted-pipeline adoption over queued/running/
+   * waiting pipeline runs with no live driver (an acquirable per-run lock),
+   * so an orphan left `locked` at boot — the pipeline lock pool was
+   * exhausted, or its driver died in another replica — is re-driven without
+   * a restart instead of holding its workspace-cap slot forever. Tests shrink
+   * it or call the tick directly.
+   */
+  pipelineRecoverySweepMs: number;
   /** Shared npm cache dir for agent-project installs (NPM_CACHE_DIR). */
   npmCacheDir: string;
   /**
@@ -256,6 +268,12 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     60_000,
     problems,
   );
+  const pipelineRecoverySweepMs = parsePositiveInt(
+    env.PIPELINE_RECOVERY_SWEEP_MS,
+    "PIPELINE_RECOVERY_SWEEP_MS",
+    60_000,
+    problems,
+  );
   const sseHeartbeatMs = parsePositiveInt(
     env.SSE_HEARTBEAT_MS,
     "SSE_HEARTBEAT_MS",
@@ -313,6 +331,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     workerSweepIntervalMs,
     scheduleTickMs,
     remoteCancelSweepMs,
+    pipelineRecoverySweepMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",

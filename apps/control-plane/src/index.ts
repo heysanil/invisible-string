@@ -89,6 +89,10 @@ import {
 } from "./search/meili";
 import { createRegistrySync, type RegistrySync } from "./search/registry-sync";
 import {
+  createPipelineRecoverySweeper,
+  type PipelineRecoverySweeper,
+} from "./pipeline/recovery";
+import {
   loadOauthClientRegistrations,
   publicWebUrlFromEnv,
   tryLoadRuntimeConfig,
@@ -776,6 +780,7 @@ if (import.meta.main) {
 
   let scheduleTicker: ScheduleTicker | null = null;
   let remoteCancelSweeper: RemoteCancelSweeper | null = null;
+  let pipelineRecoverySweeper: PipelineRecoverySweeper | null = null;
   let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
@@ -836,6 +841,24 @@ if (import.meta.main) {
       intervalMs: stack.runtime.runtime.remoteCancelSweepMs,
     });
     remoteCancelSweeper.start();
+    // Pipeline-recovery sweeper: re-runs boot reconciliation's interrupted-
+    // pipeline adoption every PIPELINE_RECOVERY_SWEEP_MS so an orphan left
+    // `locked` at boot (pipeline lock pool exhausted, or a driver that died
+    // in another replica) is re-driven by a HEALTHY process instead of
+    // holding its cap slot until the next restart. Replica-safe: advisory-
+    // try-locked scan, and adoption itself is gated on the per-run driver
+    // lock (an acquirable lock proves no live driver owns the run).
+    if (stack.pipelines) {
+      pipelineRecoverySweeper = createPipelineRecoverySweeper(
+        {
+          db: stack.dbHandle.db,
+          runner: stack.pipelines,
+          logger: logger.child({ fields: { component: "pipeline-recovery" } }),
+        },
+        { intervalMs: stack.runtime.runtime.pipelineRecoverySweepMs },
+      );
+      pipelineRecoverySweeper.start();
+    }
     // Registry→Meilisearch sync ETL: mirrors the official MCP registry into
     // the disposable search index (immediate full/incremental run, then
     // REGISTRY_SYNC_INTERVAL_MS cadence). Only when the meili client exists —
@@ -869,6 +892,7 @@ if (import.meta.main) {
     void Promise.all([
       scheduleTicker?.stop(),
       remoteCancelSweeper?.stop(),
+      pipelineRecoverySweeper?.stop(),
       registrySync?.stop(),
     ])
       .then(() => stack.close())

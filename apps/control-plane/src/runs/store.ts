@@ -24,6 +24,17 @@ export interface RunStatusPatch {
   error?: string | null;
   startedAt?: Date;
   completedAt?: Date;
+  /**
+   * The run's DURABLE remote-cancel obligation (`runs.remote_cancel_pending_at`),
+   * written in the SAME statement that settles the row `canceled` — the
+   * live-tail Stop whose remote leg was skipped or failed in transport
+   * records it here so no window exists in which the row reads canceled
+   * while nobody owes eve the cancel (a crash between two statements used
+   * to leave the accepted turn with no obligation at all). Only meaningful
+   * with `status: "canceled"`; cleared by the guarded chase
+   * (runtime/routes.ts `cancelEveTurnGuarded`) on a confirmed outcome.
+   */
+  remoteCancelPendingAt?: Date;
 }
 
 export interface RunStore {
@@ -178,6 +189,11 @@ export function createDrizzleRunStore(db: Db): RunStore {
           ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt } : {}),
           ...(patch.completedAt !== undefined
             ? { completedAt: patch.completedAt }
+            : {}),
+          // Same statement as the status flip (see RunStatusPatch): the
+          // obligation and the terminal status commit together or not at all.
+          ...(patch.remoteCancelPendingAt !== undefined
+            ? { remoteCancelPendingAt: patch.remoteCancelPendingAt }
             : {}),
         })
         .where(

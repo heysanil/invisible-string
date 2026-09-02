@@ -22,8 +22,20 @@
  * `agent` steps re-attach to their child run via `child_run_id`. A run whose
  * workflow or published config is gone fails outright (its delivery ledger
  * is settled).
+ *
+ * The sweep is NOT boot-only. "Un-adopted until the next sweep" was an empty
+ * promise while the only sweep was boot reconciliation: a `locked` orphan
+ * (pool exhausted at boot, or a driver in another replica that has since
+ * died) stayed active — holding its workspace-cap slot, its SSE followers on
+ * heartbeats — until the next restart. {@link createPipelineRecoverySweeper}
+ * re-runs this sweep every `PIPELINE_RECOVERY_SWEEP_MS` in a HEALTHY process,
+ * on the remote-cancel sweeper's pattern (runtime/reconcile.ts): one replica
+ * per instant is elected by a transaction-scoped advisory try-lock, and the
+ * body is safe to run repeatedly because adoption is already lock-gated — an
+ * acquirable per-run lock PROVES no live driver anywhere owns the run, and a
+ * run this process drives is skipped by its handle before any lock probe.
  */
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type { Logger } from "@invisible-string/shared";
 
@@ -111,4 +123,113 @@ export async function recoverPipelineRuns(
     });
   }
   return outcome;
+}
+
+// ── The periodic pipeline-recovery sweeper ──────────────────────────────────
+
+/** Default periodic sweep cadence; overridden by PIPELINE_RECOVERY_SWEEP_MS. */
+export const DEFAULT_PIPELINE_RECOVERY_SWEEP_MS = 60_000;
+
+/** Advisory key that elects one replica's scan per instant (a try-lock). */
+const PIPELINE_RECOVERY_SWEEP_LOCK_KEY = "pipeline-recovery-sweep";
+
+export interface PipelineRecoverySweeper {
+  /** Begin the periodic sweep (idempotent). */
+  start(): void;
+  /** Stop sweeping and wait for an in-flight tick to finish. */
+  stop(): Promise<void>;
+  /**
+   * One sweep pass (exposed for tests + acceptance proofs). Null when this
+   * tick lost the replica election (another instance is scanning right now).
+   */
+  tick(): Promise<PipelineRecoveryOutcome | null>;
+}
+
+export interface PipelineRecoverySweeperDeps extends RecoverPipelineRunsDeps {
+  /**
+   * Replica election seam (unit fixtures without a db). Production leaves it
+   * unset and elects through `pg_try_advisory_xact_lock` on `db`; a sweeper
+   * with neither `db` nor `elect` is a construction error, never a silently
+   * always-elected one.
+   */
+  elect?: () => Promise<boolean>;
+}
+
+/**
+ * Re-runs {@link recoverPipelineRuns} every `intervalMs` (module doc). Each
+ * tick first takes a short transaction-scoped advisory TRY-lock to elect one
+ * scanning replica per instant — the remote-cancel sweeper's election — and
+ * the real double-drive guard stays per run: the driver's own advisory lock,
+ * try-acquired by `resume`, which an orphan's dead driver released with its
+ * connection and a live driver (here or elsewhere) still holds. No pool
+ * resource is held across the tick's work: the election lock ends with its
+ * transaction before any adoption runs. A pool still exhausted simply counts
+ * `locked` again; the next tick is the retry.
+ *
+ * index.ts wiring (start/stop beside the other tickers) belongs to the
+ * integrator; this module only exposes the factory.
+ */
+export function createPipelineRecoverySweeper(
+  deps: PipelineRecoverySweeperDeps,
+  options: { intervalMs?: number } = {},
+): PipelineRecoverySweeper {
+  const intervalMs = options.intervalMs ?? DEFAULT_PIPELINE_RECOVERY_SWEEP_MS;
+  const { logger } = deps;
+  const db = deps.db;
+  if (!db && !deps.elect) {
+    throw new Error(
+      "createPipelineRecoverySweeper needs either `db` or an injected `elect`",
+    );
+  }
+  const elect =
+    deps.elect ??
+    (async (): Promise<boolean> =>
+      db!.transaction(async (tx) => {
+        const rows = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtext(${PIPELINE_RECOVERY_SWEEP_LOCK_KEY})::bigint) as elected`,
+        );
+        const row = (rows as unknown as Array<{ elected?: boolean }>)[0];
+        return row?.elected === true;
+      }));
+
+  async function tick(): Promise<PipelineRecoveryOutcome | null> {
+    if (!(await elect())) return null;
+    // `recoverPipelineRuns` logs `pipeline.recovered` itself when anything
+    // was adopted or failed; a quiet tick (nothing, or only `locked`) stays
+    // silent — live drivers in this and other replicas count `locked` on
+    // every pass and must not become log noise.
+    return recoverPipelineRuns(deps);
+  }
+
+  // setTimeout chain (not setInterval): ticks never overlap themselves, and a
+  // slow tick delays the next one instead of stacking.
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = true;
+  let inFlight: Promise<unknown> = Promise.resolve();
+
+  function scheduleNext(): void {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      inFlight = tick()
+        .catch((error) => {
+          logger.error("pipeline.recovery_sweep_failed", { err: error });
+        })
+        .finally(scheduleNext);
+    }, intervalMs);
+  }
+
+  return {
+    start() {
+      if (!stopped) return;
+      stopped = false;
+      scheduleNext();
+    },
+    async stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      await inFlight;
+    },
+    tick,
+  };
 }

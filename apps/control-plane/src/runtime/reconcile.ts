@@ -56,7 +56,9 @@
  *    accepted eve turn would otherwise keep running forever. Each is
  *    finished through `cancelEveTurnGuarded` (routes.ts): under the
  *    session's dispatch lock it chases eve, or skips as superseded when a
- *    newer run owns the session, or finds nothing to chase — and clears the
+ *    newer run PROVABLY reached eve (running/waiting, or terminal with
+ *    observed events — a merely queued successor is no proof and RETAINS
+ *    the marker instead), or finds nothing to chase — and clears the
  *    marker only on such a CONFIRMED outcome; at boot a held lock defers it
  *    into the background exactly as the live route does. After sweep 2 on
  *    purpose: a session that sweep just closed has no eve id, so its pending
@@ -73,7 +75,11 @@
  *    session or worker to re-tail) are re-driven from their `run_steps`
  *    ledger instead: pipeline/recovery.ts adopts every queued/running/
  *    waiting run whose per-run advisory lock is acquirable. Runs only when
- *    the PipelineRunner is wired.
+ *    the PipelineRunner is wired. Like sweep 2b this one has a PERIODIC
+ *    twin (`createPipelineRecoverySweeper`, `PIPELINE_RECOVERY_SWEEP_MS`):
+ *    an orphan counted `locked` here (pipeline lock pool exhausted, or a
+ *    driver in another replica) is re-adopted by a healthy process instead
+ *    of holding its cap slot until the next restart.
  *
  * 4. STRANDED DELIVERIES (agents-first §5.5) — TERMINAL runs whose
  *    `delivery_status` is still `pending`: succeeded ones (the process died
@@ -295,7 +301,8 @@ export type RemoteCancelSweepOutcome = {
   settled: number;
   /** Lock unavailable (held, or pool exhausted) — retried next tick / by the boot deferral. */
   deferred: number;
-  /** The cancel provably did not reach eve — marker kept for the next sweep. */
+  /** The cancel provably did not reach eve, or was withheld behind a queued
+   *  (unproven) successor — marker kept for the next sweep. */
   retained: number;
 };
 

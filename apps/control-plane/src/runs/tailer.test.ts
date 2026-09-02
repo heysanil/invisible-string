@@ -937,6 +937,112 @@ describe("tailRun — eve 0.31 plumbing", () => {
     expect(store.runStatus).toBe("canceled");
   });
 
+  test("a SKIPPED or transport-FAILED remote leg writes the durable obligation INTO the finalizing markRun patch — one statement, never a second write after it (G1)", async () => {
+    // The crash window this closes: the row read `canceled` (admission
+    // reopened, the session lock released) while `remote_cancel_pending_at`
+    // was still to be written by a SECOND statement in the cancel route. Now
+    // the tail's own finalize carries it, so the instant the row is canceled
+    // the obligation is on it.
+    const finalizeOf = (store: MemoryStore) => {
+      const patch = store.runPatches.at(-1)!;
+      expect(patch.status).toBe("canceled");
+      return patch;
+    };
+
+    // (a) skipped: unqualified and disallowed (no session lock).
+    const skipStore = memoryStore();
+    const skipped = tailRun({
+      runId: "run-oblig-skip",
+      agentSessionId: "sess-oblig",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {},
+      store: skipStore,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(skipStore);
+    expect(
+      await skipped.cancel("canceled by user", {
+        status: "canceled",
+        awaitRemote: true,
+        allowUnqualifiedRemote: false,
+      }),
+    ).toBe("skipped");
+    await skipped.done;
+    const skipFinalize = finalizeOf(skipStore);
+    expect(skipFinalize.remoteCancelPendingAt).toBeInstanceOf(Date);
+    // Same instant as the finalize itself: it is the same write.
+    expect(skipFinalize.remoteCancelPendingAt).toEqual(skipFinalize.completedAt);
+    expect(skipStore.runPatches.filter((p) => p.status === "canceled")).toHaveLength(1);
+
+    // (b) failed: awaited and rejected in transport.
+    const failStore = memoryStore();
+    const failed = tailRun({
+      runId: "run-oblig-fail",
+      agentSessionId: "sess-oblig",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        throw new Error("fetch failed: connect ECONNREFUSED");
+      },
+      store: failStore,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(failStore);
+    expect(
+      await failed.cancel("canceled by user", {
+        status: "canceled",
+        awaitRemote: true,
+        allowUnqualifiedRemote: true,
+      }),
+    ).toBe("failed");
+    await failed.done;
+    const failFinalize = finalizeOf(failStore);
+    expect(failFinalize.remoteCancelPendingAt).toBeInstanceOf(Date);
+    expect(failFinalize.remoteCancelPendingAt).toEqual(failFinalize.completedAt);
+
+    // (c) issued: eve acknowledged — nothing is owed, no marker.
+    const okStore = memoryStore();
+    const issued = tailRun({
+      runId: "run-oblig-ok",
+      agentSessionId: "sess-oblig",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {},
+      store: okStore,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(okStore);
+    expect(
+      await issued.cancel("canceled by user", {
+        status: "canceled",
+        awaitRemote: true,
+        allowUnqualifiedRemote: true,
+      }),
+    ).toBe("issued");
+    await issued.done;
+    expect(finalizeOf(okStore).remoteCancelPendingAt).toBeUndefined();
+
+    // (d) a shutdown/wall-clock FAILED finalize owes nothing either — the
+    // obligation is a user-cancel concept (the sweep scans canceled rows).
+    const wcStore = memoryStore();
+    const wc = tailRun({
+      runId: "run-oblig-wc",
+      agentSessionId: "sess-oblig",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        throw new Error("worker unreachable");
+      },
+      store: wcStore,
+      bus: new RunEventBus(),
+      maxWallClockMs: 30,
+    });
+    await wc.done;
+    const wcFinalize = wcStore.runPatches.at(-1)!;
+    expect(wcFinalize.status).toBe("failed");
+    expect(wcFinalize.remoteCancelPendingAt).toBeUndefined();
+  });
+
   test("with unqualified cancels disallowed but a turn observed, the QUALIFIED cancel is still issued", async () => {
     const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();

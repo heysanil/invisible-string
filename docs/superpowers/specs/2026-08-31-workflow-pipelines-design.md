@@ -372,8 +372,10 @@ conversational.
   claim/advance/no-backfill semantics unchanged; an overlap-skip logs
   `schedule.overlap_skipped` and never un-advances the cursor.
 - **Manual run** (`POST /workspaces/:id/workflows/:wfId/run`): 201
-  `{run: RunDto}` (no session), 409 `run_overlap_skipped` on overlap, 409
-  `workflow_not_published` pre-publish.
+  `{run: RunDto}` (no session), 409 `run_overlap_skipped` on overlap, 503
+  `pipeline_lock_pool_exhausted` when the pipeline lock pool is pinned by
+  live runs (transient; nothing created — the same code the webhook/form
+  ingress answers), 409 `workflow_not_published` pre-publish.
 - **Cancel** (`POST /runs/:id/cancel`): a pipeline run routes to
   `cancelPipelineRun` and cancels linked live child runs; a run with no live
   driver falls back to a direct CAS + delivery settle + bus publish.

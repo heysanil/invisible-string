@@ -305,7 +305,18 @@ cancels any live child run. Crash recovery (`reconcileInterruptedRuns` →
 advisory lock is free and REPLAYS the config against the ledger — terminal
 `run_steps` outputs rebuild the scope, only the frontier re-executes, and an
 interrupted agent step re-attaches to its child by `child_run_id` instead of
-double-dispatching.
+double-dispatching. That adoption is NOT boot-only: the PERIODIC
+pipeline-recovery sweeper (`createPipelineRecoverySweeper`,
+`PIPELINE_RECOVERY_SWEEP_MS`, default 60 s — `pipeline/recovery.ts`, wired
+beside the other tickers in `index.ts`) re-runs the same sweep in a healthy
+process, so a queued/running/waiting pipeline run with no live driver — an
+orphan boot counted `locked` because the pipeline lock pool was exhausted,
+or whose driver died in another replica — is re-driven without a restart
+instead of holding its workspace-cap slot indefinitely. It is safe to run
+repeatedly because adoption is lock-gated (an acquirable per-run lock proves
+no live driver owns the run, and a run this process drives is skipped by its
+handle before any lock probe); the scan itself is advisory-try-locked so one
+replica sweeps per instant.
 
 **The per-run driver lock rides its OWN pool.** A session-level advisory lock
 pins one physical connection for the driver's whole lifetime (up to
@@ -327,9 +338,11 @@ it as 503 `pipeline_lock_pool_exhausted`; a Slack message is dropped with a
 warning and a `failed` trigger count; a schedule window counts as a failed
 dispatch (its cursor already advanced); every refusal lands in
 `is_pipeline_dispatches_total{outcome="lock_pool_exhausted"}`. Boot adoption
-of an orphan on an exhausted pool defers to the next recovery sweep
-(counted `locked`, logged `pipeline.recovery_lock_pool_exhausted`) — never a
-queue, never a failed run. The runner refuses to fall back onto `$client`.
+of an orphan on an exhausted pool defers to the next PERIODIC recovery sweep
+(`PIPELINE_RECOVERY_SWEEP_MS`, above — counted `locked`, logged
+`pipeline.recovery_lock_pool_exhausted`) — never a queue, never a failed
+run, and never "until the next restart". The runner refuses to fall back
+onto `$client`.
 
 **One run per eve session at a time (hole closed):** `waiting` (parked HITL)
 counts as busy alongside queued/running — a new message into a parked session
@@ -419,22 +432,44 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   has observed `turn.started`) BEFORE finalizing the row, so admission
   cannot reopen under an airborne unqualified cancel that would kill the
   successor's turn. If the lock cannot be had, only a turn-qualified cancel
-  is issued (scoped, so safe without the lock) and an unqualified one is SKIPPED and
-  recorded — and so is a cancel the tail AWAITED that FAILED in transport
-  (a refused connection, a dead or absent worker, an HTTP error): `failed`
-  sets the obligation exactly like `skipped`. Every no-tail Stop sets
-  `runs.remote_cancel_pending_at` in the SAME CAS that settles the row
-  `canceled`; `cancelEveTurnGuarded` clears it ONLY on a CONFIRMED outcome
-  under the lock — eve acknowledged the cancel (202, or 200
-  `no_active_turn`, eve's one dead-session rendering), eve answered 409
-  `session_not_active` (provably terminal for that id, so nothing can be
-  running), a newer run provably owns the session (superseded — eve
-  serializes turns, so the settled turn is over), or there is nothing to
-  chase (no eve session). A transport/HTTP failure before the cancel
-  reached eve RETAINS the marker (the pre-fix best-effort swallow cleared it
-  and recorded a cancel that never left the process as done, leaving the
-  accepted turn running with nobody owing it). Retained and deferred
-  obligations are finished by three actors, all idempotent under the
+  is issued (scoped, so safe without the lock) and an unqualified one is
+  SKIPPED and recorded — and so is a cancel the tail AWAITED that FAILED in
+  transport (a refused connection, a dead or absent worker, an HTTP error):
+  `failed` sets the obligation exactly like `skipped`. In BOTH shapes the
+  tail writes `runs.remote_cancel_pending_at` INSIDE the CAS that finalizes
+  the row `canceled` (`runs/tailer.ts` `finishRun` →
+  `RunStatusPatch.remoteCancelPendingAt`) — one statement, the same shape as
+  the no-tail path's `settleRunCanceledPendingRemote` — never as a second
+  UPDATE after the finalize: the instant a row reads canceled (admission
+  reopened, the lock released) the obligation is already on it, so a crash
+  there leaves an owner for the accepted turn. Every no-tail Stop sets the
+  marker in the SAME CAS that settles the row `canceled`;
+  `cancelEveTurnGuarded` clears it ONLY on a CONFIRMED outcome under the
+  lock — eve acknowledged the cancel (202, or 200 `no_active_turn`, eve's
+  one dead-session rendering), eve answered 409 `session_not_active`
+  (provably terminal for that id, so nothing can be running), a newer run
+  PROVABLY owns the session (superseded — eve serializes turns, so the
+  settled turn is over), or there is nothing to chase (no eve session).
+  "Provably" is load-bearing (`classifySessionSuccessor`, routes.ts): the
+  successor must have REACHED eve — `running`/`waiting` (its tail was
+  started, which the dispatch path does only after eve's 202), or terminal
+  with persisted `run_events` beyond its first seq (its tail observed eve's
+  stream). A successor that is merely `queued` — a row committed by a
+  dispatch that never armed or sent it — is NO evidence the settled turn
+  ended: the old any-live-successor rule cleared the marker on it, another
+  replica's sweep dropped the obligation, the settled turn ran on, and the
+  queued row later failed undispatched. A queued successor therefore
+  RETAINS the marker without cancelling (the unqualified cancel could land
+  on its turn if it is sent) and the chase retries — once it is running,
+  superseded is proven; once it has failed undispatched, no successor exists
+  and the cancel proceeds. The post-eve recheck (`recheckCanceledDuringEve`)
+  applies the same rule: `superseded` only behind a proven successor,
+  otherwise `deferred` — the cancel withheld and the obligation re-asserted
+  on the run. A transport/HTTP failure before the cancel reached eve RETAINS
+  the marker (the pre-fix best-effort swallow cleared it and recorded a
+  cancel that never left the process as done, leaving the accepted turn
+  running with nobody owing it). Retained and deferred obligations are
+  finished by three actors, all idempotent under the
   session lock (the marker is re-read under the lock before any cancel, so a
   met obligation is never cancelled twice): the in-process deferred chase
   (the fast path, bounded at `SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS` and
@@ -720,8 +755,9 @@ Settings → Models says so on the panel. Design:
 `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
 `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
 (default 30000 — the schedule ticker's scan cadence), `REMOTE_CANCEL_SWEEP_MS`
-(default 60000 — the periodic pending-remote-cancel sweep's cadence), the
-product-DB pools `DB_POOL_SIZE` (default 10), `DB_LOCK_POOL_SIZE` (default 8
+(default 60000 — the periodic pending-remote-cancel sweep's cadence),
+`PIPELINE_RECOVERY_SWEEP_MS` (default 60000 — the periodic interrupted-
+pipeline adoption sweep's cadence), the product-DB pools `DB_POOL_SIZE` (default 10), `DB_LOCK_POOL_SIZE` (default 8
 — the session-dispatch lock pool) and `DB_PIPELINE_LOCK_POOL_SIZE` (default
 32 — the per-run pipeline driver lock pool, which bounds concurrent pipeline
 runs per control plane), the pipeline runner's
@@ -873,9 +909,10 @@ in-flight proxied requests, stops its agents, then deregisters.
   Slack event dedup, and OAuth nonce single-use are all in-process. A second
   replica would double-tail runs (the (run_id, seq) PK then crash-loops one
   tail), double-sweep failovers, and split SSE subscribers from their run's
-  tail. (The schedule ticker, the pipeline runner's run adoption and the
-  remote-cancel sweeper ARE multi-instance-safe in isolation — per-trigger,
-  per-run and per-session advisory locks — but nothing else is.) HA needs
+  tail. (The schedule ticker, the pipeline runner's run adoption — boot
+  and the periodic pipeline-recovery sweeper alike — and the remote-cancel
+  sweeper ARE multi-instance-safe in isolation — per-trigger, per-run and
+  per-session advisory locks — but nothing else is.) HA needs
   leader election / shared state first — do not scale this process
   horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface

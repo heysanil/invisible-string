@@ -816,10 +816,18 @@ export async function settleRunCanceledPendingRemote(
   return updated.length > 0;
 }
 
-/** Record a remote-cancel obligation on an ALREADY-canceled run (the live-tail
- *  Stop whose remote leg was SKIPPED — no lock for an unqualified cancel — or
- *  FAILED in transport before it reached eve). No-op unless the row is
- *  canceled. */
+/**
+ * Record a remote-cancel obligation on an ALREADY-canceled run. NOT the
+ * live-tail Stop's tool any more: a tail whose remote leg was SKIPPED or
+ * FAILED writes the marker INSIDE its finalizing CAS (runs/tailer.ts
+ * `finishRun` → `RunStatusPatch.remoteCancelPendingAt`), because a second
+ * statement after the finalize is precisely the crash window that left an
+ * accepted turn with no owner. The one remaining caller is the post-eve
+ * recheck (dispatch.ts `recheckCanceledDuringEve`) when it WITHHOLDS its
+ * unqualified cancel behind an unproven successor — it re-asserts the
+ * obligation the Stop's own CAS normally already set. No-op unless the row
+ * is canceled.
+ */
 export async function markRemoteCancelPending(
   db: DbClient,
   runId: string,
@@ -852,7 +860,8 @@ async function isRemoteCancelPending(db: DbClient, runId: string): Promise<boole
  * How one guarded remote-cancel attempt ended: the obligation was `settled`
  * under the lock (acknowledged, terminal, superseded, nothing to chase, or
  * already cleared by another actor), `retained` because the cancel provably
- * did not reach eve (the marker stays set for the sweep), or `deferred`
+ * did not reach eve — or was withheld behind a queued, unproven successor —
+ * (the marker stays set for the sweep), or `deferred`
  * because the lock could not be taken (a dispatch holds it, or the lock pool
  * is exhausted) — an in-process background chase may be running, and the
  * periodic sweep / boot reconciliation own it otherwise.
@@ -872,9 +881,11 @@ export type GuardedRemoteCancelOutcome = "settled" | "retained" | "deferred";
  *     the caller's snapshot; a cleared marker is settled, nothing to do); no
  *     live run besides the settled one may exist (admission needs the same
  *     lock), so re-read the session (the caller's row can be stale — the eve
- *     id may have been persisted since), skip if a successor sneaked in
- *     before the lock was taken (eve serializes turns, so the settled turn
- *     is already over — superseded), else chase eve.
+ *     id may have been persisted since), skip if a successor that PROVABLY
+ *     reached eve is on the session ({@link classifySessionSuccessor} — eve
+ *     serializes turns, so the settled turn is already over — superseded),
+ *     RETAIN the obligation without cancelling if the only successor is a
+ *     queued row that is no such proof, else chase eve.
  *   - lock HELD → a dispatch for this session is mid-flight. Its own
  *     post-eve recheck (which runs under the lock) normally settles the
  *     accepted turn — but it may already have read the run BEFORE this Stop
@@ -889,11 +900,13 @@ export type GuardedRemoteCancelOutcome = "settled" | "retained" | "deferred";
  * carries `remote_cancel_pending_at` (set by the same CAS that settled it)
  * until an attempt under the lock ends with eve acknowledging the cancel, eve
  * declaring the session terminal (`session_not_active`), a newer run
- * provably owning the session (superseded), or nothing to chase (no eve
- * session) — at which point it is cleared. A transport/HTTP failure before
- * the cancel reached eve KEEPS the marker (`retained`): the pre-fix swallow
- * cleared it and recorded a cancel that never left this process as done,
- * leaving the accepted turn running with no one owing it. Retained and
+ * PROVABLY owning the session (superseded — running/waiting, or terminal
+ * with observed events; a merely queued successor is not proof and never
+ * clears it), or nothing to chase (no eve session) — at which point it is
+ * cleared. A transport/HTTP failure before the cancel reached eve KEEPS the
+ * marker (`retained`), and so does an unproven successor: the pre-fix
+ * swallow cleared it and recorded a cancel that never left this process as
+ * done, leaving the accepted turn running with no one owing it. Retained and
  * deferred obligations are finished by the periodic remote-cancel sweep
  * (reconcile.ts `createRemoteCancelSweeper`) and by boot reconciliation; the
  * in-process deferral is only the fast path. Best-effort for the USER as
@@ -933,18 +946,33 @@ export async function cancelEveTurnGuarded(
       const session = rows[0];
       let result: RemoteCancelResult = "terminal";
       if (session?.eveSessionId) {
-        if (
-          (await countDispatchingRuns(deps.db, agentSessionId, {
-            excludeRunId: settledRunId,
-          })) > 0
-        ) {
+        const successor = await classifySessionSuccessor(
+          deps.db,
+          agentSessionId,
+          settledRunId,
+        );
+        if (successor === "proven") {
           deps.logger.debug("run.cancel_remote_skipped", {
             runId: settledRunId,
             fields: {
               sessionId: agentSessionId,
-              reason: "a newer run owns the session — the settled turn is superseded",
+              reason:
+                "a newer run provably reached eve — the settled turn is superseded",
             },
           });
+        } else if (successor === "unproven") {
+          // A queued successor is NOT proof the settled turn ended, and the
+          // unqualified cancel could land on its turn if it is sent. Neither
+          // clear nor cancel: keep the obligation for the next attempt.
+          deps.logger.info("run.cancel_remote_retained", {
+            runId: settledRunId,
+            fields: {
+              sessionId: agentSessionId,
+              reason:
+                "a queued successor is no proof the settled turn ended — obligation kept until it is running (superseded) or failed undispatched (chase)",
+            },
+          });
+          return "retained";
         } else {
           result = await cancelEveTurnClassified(deps, session);
         }
@@ -1050,9 +1078,14 @@ function isTerminalRunStatus(status: RunRow["status"]): boolean {
  * eve. If the lock cannot be had within the bound (a dispatch is settling
  * this instant), the tail finalizes with ONLY a turn-qualified cancel (safe
  * without the lock: it can never hit another turn); an unqualified one is
- * SKIPPED and recorded as a durable obligation ({@link markRemoteCancelPending})
- * that the guarded chase — deferred now, or boot reconciliation after a
- * crash — finishes under the lock.
+ * SKIPPED — and a skipped or transport-FAILED remote leg is recorded as a
+ * durable obligation IN THE TAIL'S OWN FINALIZING CAS (runs/tailer.ts:
+ * `remote_cancel_pending_at` rides the same UPDATE that flips the row
+ * `canceled`, exactly as {@link settleRunCanceledPendingRemote} does for the
+ * no-tail path) that the guarded chase — deferred now, or the sweep / boot
+ * reconciliation after a crash — finishes under the lock. There is no
+ * finalize-then-mark window: a crash the instant the row reads canceled
+ * finds the obligation already on it.
  *
  * NO TAIL (`queued`/`waiting`, or a tail that ended between the check and
  * the cancel). Settle the ROW FIRST — with the durable obligation in the
@@ -1097,11 +1130,14 @@ export async function cancelAgentRun(
       // without the lock) or FAILED in transport (a refused connection, a
       // dead worker, an HTTP error; eve's own `session_not_active` is
       // classified terminal by the seam and never lands here). Both are the
-      // same obligation (N1): make it durable, then chase it under the lock
-      // (deferred while a dispatch holds it; the periodic sweep and boot
-      // recovery finish it otherwise). The pre-fix path finalized `failed`
-      // as if issued, with no marker for anyone to retry.
-      await markRemoteCancelPending(deps.db, run.id);
+      // same obligation (N1), and the tail has ALREADY made it durable in
+      // the CAS that finalized the row (`cancelRunGuarded` awaits the
+      // tail's `done`, so the marker is committed by the time we are here).
+      // Chase it under the lock now (deferred while a dispatch holds it; the
+      // periodic sweep and boot recovery finish it otherwise). The two
+      // pre-fix shapes — finalizing `failed` as if issued with no marker,
+      // and marking in a SECOND statement after the finalize — both left a
+      // crash window with nobody owing eve the cancel.
       await cancelEveTurnGuarded(deps, session.id, run.id);
     }
     // A tail that ended as `waiting` (parked) leaves a live row behind — fall
@@ -1245,6 +1281,81 @@ export async function countDispatchingRuns(
       ),
     );
   return rows[0]?.value ?? 0;
+}
+
+/**
+ * What a settled run's session holds by way of a SUCCESSOR — the evidence
+ * behind every "superseded" verdict (the guarded remote cancel below and the
+ * post-eve recheck, dispatch.ts). An unqualified session-level cancel may
+ * be skipped only when the settled run's turn is PROVABLY over, and the
+ * only proof is a newer run that PROVABLY reached eve (eve serializes
+ * turns, so eve accepting a newer message means the older turn had ended):
+ *
+ *   - `proven`: a newer run is `running`/`waiting` (its tail was started —
+ *     the dispatch path does that only after eve's 202), or is TERMINAL with
+ *     persisted `run_events` beyond its first seq (its tail observed eve's
+ *     stream for it). Skipping the cancel is safe and the obligation is met.
+ *   - `unproven`: the only successor is `queued` — a row committed by a
+ *     dispatch that never armed/sent it (a crash after the claim), or one
+ *     still short of eve. That is NO evidence the settled turn ended: the
+ *     old rule cleared the marker on it, another replica's sweep then
+ *     dropped the obligation, the settled turn ran on, and the queued row
+ *     later failed undispatched. The cancel cannot be issued either (it
+ *     could land on that successor's turn if it IS sent), so the marker is
+ *     RETAINED and the chase retries: once the successor is running,
+ *     superseded is proven; once it has failed undispatched, no successor
+ *     exists and the cancel proceeds.
+ *   - `none`: nothing newer that is live or evidenced — chase eve.
+ *
+ * Age is by `created_at` for the terminal arm (a PREDECESSOR that ran to
+ * completion says nothing about the settled turn); live rows need no age
+ * check — admission refuses a second live run, so a live row beside a
+ * settled one is newer by construction. The canceled-mid-dispatch arm of
+ * {@link countDispatchingRuns} is deliberately not consulted: it exists for
+ * ADMISSION on eveless sessions, and neither caller here can act on it.
+ */
+export type SuccessorEvidence = "none" | "unproven" | "proven";
+
+export async function classifySessionSuccessor(
+  db: DbClient,
+  agentSessionId: string,
+  settledRunId: string,
+): Promise<SuccessorEvidence> {
+  const settled = await db
+    .select({ createdAt: schema.runs.createdAt })
+    .from(schema.runs)
+    .where(eq(schema.runs.id, settledRunId))
+    .limit(1);
+  const settledAt = settled[0]?.createdAt ?? null;
+  const rows = await db
+    .select({
+      status: schema.runs.status,
+      createdAt: schema.runs.createdAt,
+      evidenced: sql<boolean>`exists (
+        select 1 from ${schema.runEvents}
+        where ${schema.runEvents.runId} = ${schema.runs.id}
+          and ${schema.runEvents.seq} > 0
+      )`,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.agentSessionId, agentSessionId),
+        ne(schema.runs.id, settledRunId),
+      ),
+    );
+  let unproven = false;
+  for (const row of rows) {
+    if (row.status === "running" || row.status === "waiting") return "proven";
+    if (row.status === "queued") {
+      unproven = true;
+      continue;
+    }
+    // Terminal: evidence counts only from a NEWER run.
+    const newer = settledAt === null || row.createdAt > settledAt;
+    if (newer && row.evidenced) return "proven";
+  }
+  return unproven ? "unproven" : "none";
 }
 
 // ── agent publish (route + seeded-workspace kick share this core) ──────────
@@ -1886,7 +1997,18 @@ export function runtimePlugin(deps: RuntimeDeps) {
           deps.metrics.recordTrigger("manual", "failed");
           throw error;
         }
-        if (!result.started) throw runOverlapSkipped();
+        if (!result.started) {
+          if (result.reason === "lock_pool_exhausted") {
+            // Transient capacity, not policy: the pipeline lock pool is
+            // pinned by live runs and NOTHING was created — the same typed
+            // 503 the webhook/form ingress answers, so the UI can say "retry
+            // shortly" instead of "already running" (the pre-fix collapse
+            // of every `started:false` into 409 `run_overlap_skipped`).
+            deps.metrics.recordTrigger("manual", "failed");
+            throw pipelineLockPoolExhausted();
+          }
+          throw runOverlapSkipped();
+        }
         deps.metrics.recordTrigger("manual", "dispatched");
 
         set.status = 201;

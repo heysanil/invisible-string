@@ -24,7 +24,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   newId,
@@ -43,6 +43,7 @@ import { RunEventBus } from "../runs/bus";
 import { createDrizzleRunStore, type RunStore } from "../runs/store";
 import { PIPELINE_TRIGGER_AGENT_ID } from "../runtime/dispatch";
 import { MetricsRegistry } from "../runtime/metrics";
+import { createPipelineRecoverySweeper } from "./recovery";
 import {
   createPipelineRunner,
   startPipelineRun,
@@ -336,6 +337,76 @@ describe.skipIf(!GATE)("pipeline lock pool (N3)", () => {
         gate.resolve();
         await Promise.all([...runner.handles.values()].map((h) => h.done));
         expect(metrics.pipelineDispatchCounts().started).toBe(1);
+      } finally {
+        gate.resolve();
+        await starved.close();
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "G3 — an orphan left `locked` by an EXHAUSTED pipeline lock pool is adopted by the periodic recovery sweep once the pool frees, and driven to completion — no restart",
+    async () => {
+      const config = holdConfig();
+      const workflowId = await insertWorkflow(config);
+      const starved = createDb(TEST_DATABASE_URL!, { max: 3, lockMax: 2, pipelineLockMax: 1 });
+      const pinned = await starved.pipelineLockSql.reserve();
+      const runner = makeRunner(starved);
+      gate = deferred();
+      entered.length = 0;
+      const orphanRows = await handle.db
+        .insert(schema.runs)
+        .values({
+          agentSessionId: null,
+          organizationId: orgId,
+          workflowId,
+          mode: "pipeline",
+          triggerEvent: triggerEventFor(workflowId) as unknown as Record<string, unknown>,
+          status: "queued",
+        })
+        .returning();
+      const orphan = orphanRows[0]!;
+      // The sweeper is scoped to THIS workflow's live runs so leftovers from
+      // other suites sharing the database cannot skew the tallies; the
+      // election runs for real (`pg_try_advisory_xact_lock` on the root pool).
+      const sweeper = createPipelineRecoverySweeper(
+        {
+          db: starved.db,
+          runner,
+          logger,
+          listRuns: () =>
+            handle.db
+              .select()
+              .from(schema.runs)
+              .where(
+                and(
+                  eq(schema.runs.workflowId, workflowId),
+                  inArray(schema.runs.status, ["queued", "running", "waiting"]),
+                ),
+              ),
+        },
+        { intervalMs: 60_000 },
+      );
+      try {
+        // Pool exhausted: the orphan stays un-adopted — but pre-fix this
+        // was the LAST sweep until a restart.
+        expect(await sweeper.tick()).toEqual({ resumed: 0, locked: 1, failed: 0 });
+        expect((await runStore.getRunStatus(orphan.id))?.status).toBe("queued");
+        expect(entered).not.toContain(orphan.id);
+
+        // The pool frees ⇒ the next periodic tick adopts and drives it.
+        pinned.release();
+        expect(await sweeper.tick()).toEqual({ resumed: 1, locked: 0, failed: 0 });
+        await until(
+          () => (entered.includes(orphan.id) ? true : undefined),
+          "the adopted orphan to reach its step executor",
+        );
+        gate.resolve();
+        await Promise.all([...runner.handles.values()].map((h) => h.done));
+        expect((await runStore.getRunStatus(orphan.id))?.status).toBe("succeeded");
+        // Terminal ⇒ out of the scan; nothing to double-drive.
+        expect(await sweeper.tick()).toEqual({ resumed: 0, locked: 0, failed: 0 });
       } finally {
         gate.resolve();
         await starved.close();

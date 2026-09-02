@@ -737,19 +737,49 @@ export const runs = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
     /**
      * DURABLE remote-cancel obligation (agent runs). Set — in the SAME CAS
-     * statement that settles the row `canceled` — by every no-tail Stop
-     * (`POST /runs/:id/cancel` on a queued/waiting run, the pipeline cancel
-     * sweep over child runs, the live-tail Stop that could not take the
-     * session's dispatch lock), and cleared once the guarded remote cancel
-     * (`cancelEveTurnGuarded`) has run under the session's dispatch lock:
-     * issued to eve, skipped because a successor already owns the session
-     * (eve serializes turns, so the settled turn is over), or found nothing
-     * to chase. A control-plane crash between the settle and the deferred
-     * remote leg used to leave the accepted eve turn running forever; boot
-     * reconciliation now sweeps canceled runs carrying this marker and
-     * finishes the cancel. NULL = nothing owed.
+     * statement that settles the row `canceled` — by every Stop (the live
+     * tail's own finalize, `POST /runs/:id/cancel` on a queued/waiting run,
+     * the pipeline cancel sweep over child runs, the post-eve recheck), and
+     * cleared ONLY on a CONFIRMED outcome: eve's OWN stream showed the run's
+     * turn boundary after its own `turn.started` (`turn.cancelled` /
+     * `turn.completed` / the following `session.waiting`/`session.completed`
+     * — observed by the tail that stays on the stream after a Stop, or by
+     * the sweeper-reopened observation tail), eve answered session-terminal
+     * (`session_not_active` / `no_active_turn` / `session.failed`), a NEWER
+     * run on the session carries `turn_id` (superseded — eve serializes
+     * turns), or the run provably never reached eve. Eve's 202 on an
+     * unqualified cancel is NOT confirmation (it is consumed as a no-op
+     * before `turn.started`). NULL = nothing owed.
      */
     remoteCancelPendingAt: timestamp("remote_cancel_pending_at", {
+      withTimezone: true,
+    }),
+    /**
+     * eve's OWN acceptance proof for this run's latest send: the `turnId` of
+     * the run's own `turn.started`, written by the tail the moment it
+     * observes that event on eve's stream (turn attribution runs in send
+     * order, so a `turn.started` drained before the run's own is a pending
+     * predecessor's). NULL until then — and reset to NULL by every
+     * dispatch-attempt CAS (`armDispatchAttempt`), so "marker set + turn_id
+     * NULL" reads "sent, not yet started (or never)". This column is the ONLY
+     * evidence that eve accepted a turn: a `running` status can be
+     * synthesized by reconciliation tailing an unsent continuation, and
+     * persisted `run_events` can be a predecessor's leftovers, so neither
+     * proves anything — a settled run's remote-cancel obligation is
+     * "superseded" only by a NEWER run whose `turn_id` is set.
+     */
+    turnId: text("turn_id"),
+    /**
+     * The remote-cancel obligation's HONEST residual: set (with the pending
+     * marker left in place) when `REMOTE_CANCEL_OBSERVE_MS` elapsed after
+     * `remote_cancel_pending_at` without eve's own stream confirming the
+     * settled turn ended — no `turn.cancelled`/`turn.completed`/session
+     * boundary observed for it, no session-terminal answer, no proven
+     * successor. The sweeper stops re-opening observation for such a run
+     * (logged at warn); a late confirmation still clears BOTH columns.
+     * Never a silent clear. NULL = not (yet) unresolved.
+     */
+    remoteCancelUnresolvedAt: timestamp("remote_cancel_unresolved_at", {
       withTimezone: true,
     }),
     error: text("error"),
@@ -763,6 +793,8 @@ export const runs = pgTable(
     index("runs_remote_cancel_pending_idx")
       .on(table.remoteCancelPendingAt)
       .where(sql`${table.remoteCancelPendingAt} IS NOT NULL`),
+    // Successor proof + turn attribution scan a session's runs by turn_id.
+    index("runs_agent_session_turn_idx").on(table.agentSessionId, table.turnId),
     // Workspace cap + list scans for pipeline runs, which have no session row
     // to reach organization scope through.
     index("runs_organization_id_idx").on(table.organizationId),

@@ -9,9 +9,11 @@
  * 1. CANCEL-DURING-CREATE (post-eve recheck): a Stop that settles the child
  *    run terminal WHILE createEveSession is in flight must not leave the
  *    accepted eve turn running unobserved — the dispatch persists the
- *    just-minted session id, re-reads the run, remote-cancels the accepted
- *    turn, closes the brand-new session (releasing its Slack thread claim),
- *    starts no tail, and reports a non-dispatched outcome. And while that
+ *    just-minted session id, re-reads the run, records the remote-cancel
+ *    obligation and hands the accepted turn to an OBSERVATION tail (never an
+ *    unqualified cancel — eve consumes a pre-turn cancel as a no-op), closes
+ *    the brand-new session (releasing its Slack thread claim), starts no
+ *    normal tail, and reports a non-dispatched outcome. And while that
  *    create is STILL in flight, a concurrent dispatch for the same thread
  *    must NOT evict the claim (the holder's newest run carries the marker —
  *    it may be mid-dispatch) — it 409s `session_busy` instead of minting a
@@ -204,6 +206,8 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
   const HASH = "c".repeat(64);
   const fakeWorker = new FakeWorkerClient();
   const tailStarts: string[] = [];
+  /** Observation tails the recheck / settlement asked for (run ids). */
+  const observeStarts: string[] = [];
   let runStore: RunStore;
   let deps: RuntimeDeps;
   let ready: ReadyAgentVersion;
@@ -308,8 +312,14 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
         start: (options: { runId: string }) => {
           tailStarts.push(options.runId);
         },
+        observe: (options: { runId: string }) => {
+          observeStarts.push(options.runId);
+          return null;
+        },
+        hasSessionTail: () => false,
         get: () => undefined,
         cancelRun: async () => false,
+        cancelRunGuarded: async () => null,
       } as unknown as RunTailerManager,
       metrics: new MetricsRegistry(),
       logger,
@@ -432,13 +442,17 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       expect(await threadSessions(threadKey)).toHaveLength(1);
 
       // The create returns: the POST-EVE RECHECK sees the terminal run,
-      // remote-cancels the accepted turn with the just-minted id, closes the
-      // session (releasing the claim), and reports non-dispatched.
+      // records the obligation and hands the accepted turn to observation
+      // with the just-minted id (NO unqualified cancel), closes the session
+      // (releasing the claim), and reports non-dispatched.
       createGate.resolve();
       const result = await dispatching;
       expect(result.dispatched).toBeFalse();
       expect(result.canceledBeforeDispatch).toBeTrue();
-      expect(fakeWorker.cancelCalls).toEqual([{ eveSessionId: "eve-fresh-1" }]);
+      expect(fakeWorker.cancelCalls).toEqual([]);
+      expect(observeStarts).toContain(childRunId!);
+      const childRows = await handle.db.select().from(schema.runs).where(eq(schema.runs.id, childRunId!));
+      expect(childRows[0]!.remoteCancelPendingAt).not.toBeNull();
       const closed = await sessionRow(result.session.id);
       expect(closed.status).toBe("closed");
       expect(closed.slackThreadKey).toBeNull();
@@ -668,17 +682,18 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       expect(injected).toBeTrue();
       const eveId = result.session.eveSessionId;
       expect(eveId).toBeTruthy();
-      // THE invariant: the accepted turn is remote-canceled — by the Stop's
-      // own chase, deferred past the dispatch's lock hold, finding the
-      // persisted id — never left running unobserved.
+      // THE invariant: the accepted turn is never left running unobserved —
+      // the Stop's own settlement, deferred past the dispatch's lock hold,
+      // finds the persisted id and hands the run to observation (no
+      // unqualified cancel ever goes out).
       await until(
-        () =>
-          fakeWorker.cancelCalls
-            .slice(cancelsBefore)
-            .some((c) => c.eveSessionId === eveId!) || undefined,
-        "the deferred remote cancel to reach eve",
+        () => (observeStarts.includes(childRunId!) ? true : undefined),
+        "the deferred settlement to open observation",
       );
-      expect((await runStore.getRunStatus(childRunId!))?.status).toBe("canceled");
+      expect(fakeWorker.cancelCalls.slice(cancelsBefore)).toEqual([]);
+      const child = (await handle.db.select().from(schema.runs).where(eq(schema.runs.id, childRunId!)))[0]!;
+      expect(child.status).toBe("canceled");
+      expect(child.remoteCancelPendingAt).not.toBeNull();
       // Hygiene: settle the session so later tests see no live claim.
       await runStore.markSession(result.session.id, "closed");
     },
@@ -731,17 +746,16 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       expect(isRuntimeApiError(busyError)).toBeTrue();
       expect((busyError as { code: string }).code).toBe("session_busy");
 
-      // The create returns: A's abandon persists the id, remote-cancels the
-      // accepted turn (no newer run was admitted), and closes the session —
-      // the busy state resolves.
+      // The create returns: A's abandon persists the id, hands the accepted
+      // turn to observation (no newer run was admitted), and closes the
+      // session — the busy state resolves.
       const cancelsBefore = fakeWorker.cancelCalls.length;
       createGate.resolve();
       const result = await dispatching;
       expect(result.dispatched).toBeFalse();
       expect(result.canceledBeforeDispatch).toBeTrue();
-      expect(
-        fakeWorker.cancelCalls.slice(cancelsBefore).map((c) => c.eveSessionId),
-      ).toContain(result.session.eveSessionId!);
+      expect(fakeWorker.cancelCalls.slice(cancelsBefore)).toEqual([]);
+      expect(observeStarts).toContain(childRunId!);
       expect((await sessionRow(result.session.id)).status).toBe("closed");
 
       // B's retry now lands a CLEAN session (fresh claim under the released
@@ -779,7 +793,7 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
   }
 
   test(
-    "leak closed (D7): while a canceled continuation's dispatch is unresolved, a successor is REFUSED (session_busy) — so the abandon always remote-cancels the accepted turn instead of skipping it",
+    "leak closed (D7): while a canceled continuation's dispatch is unresolved, a successor is REFUSED (session_busy) — so the abandon always hands the accepted turn to observation instead of skipping it",
     async () => {
       const threadKey = `int-dcw:C6:${randomUUID().slice(0, 8)}`;
       const eveId = `eve-cont-${randomUUID().slice(0, 8)}`;
@@ -828,12 +842,17 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       expect((busyError as { code: string }).code).toBe("session_busy");
 
       // A's continue returns: with no successor possible, the abandon ALWAYS
-      // remote-cancels A's accepted turn — the leak is closed.
+      // owns A's accepted turn — obligation recorded, observation opened —
+      // the leak is closed (and no unqualified cancel is ever sent).
+      const cancelsBefore = fakeWorker.cancelCalls.length;
       continueGate.resolve();
       const a = await dispatchingA;
       expect(a.dispatched).toBeFalse();
       expect(a.canceledBeforeDispatch).toBeTrue();
-      expect(fakeWorker.cancelCalls.map((c) => c.eveSessionId)).toContain(eveId);
+      expect(observeStarts).toContain(aRunId!);
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsBefore);
+      const aRow = (await handle.db.select().from(schema.runs).where(eq(schema.runs.id, aRunId!)))[0]!;
+      expect(aRow.remoteCancelPendingAt).not.toBeNull();
       // The thread's session stays open (a continuation's session belongs to
       // its thread) and the busy was transient: B's retry lands cleanly.
       const after = await sessionRow(thread.id);
@@ -856,7 +875,7 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
   );
 
   test(
-    "wrong-turn kill closed (D7): admission stays refused while the abandon's unqualified cancel is still in flight — the cancel can only ever reach the canceled run's own turn",
+    "wrong-turn kill closed (D7): the abandon sends NO unqualified cancel at all — nothing can ever land on a successor's turn; B, admitted after settlement, is untouched and A's obligation waits for A's own turn",
     async () => {
       const threadKey = `int-dcw:C7:${randomUUID().slice(0, 8)}`;
       const eveId = `eve-cont-${randomUUID().slice(0, 8)}`;
@@ -885,46 +904,32 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
         }),
       ).toBeTrue();
 
-      // Hold A's SETTLEMENT open at the exact window: the abandon counted
-      // successors (none) and its unqualified session-level cancel is now in
-      // flight to eve.
-      const cancelGate = deferred();
-      const cancelEntered = deferred();
-      fakeWorker.cancelGate = cancelGate;
-      fakeWorker.cancelEntered = cancelEntered;
+      // A's continue returns: the abandon settles under the lock — the
+      // obligation is recorded, observation opened, and NOTHING is sent to
+      // eve (pre-fix: an unqualified `{}` cancel was airborne here and, once
+      // admission reopened, could stop B's turn instead of A's).
+      const cancelsBefore = fakeWorker.cancelCalls.length;
       continueGate.resolve();
-      await cancelEntered.promise; // the unqualified cancel is airborne
-
-      // THE FIX: the lock is held through settlement, so B still cannot be
-      // admitted — its turn can never start under the airborne cancel.
-      // (Pre-fix, B was admitted in exactly this window and the late cancel
-      // killed B's turn instead of A's.)
-      let busyError: unknown;
-      try {
-        await dispatchRenderedRun(
-          deps,
-          dispatchInput(threadKey, { existingSession: thread }),
-        );
-      } catch (error) {
-        busyError = error;
-      }
-      expect(isRuntimeApiError(busyError)).toBeTrue();
-      expect((busyError as { code: string }).code).toBe("session_busy");
-
-      cancelGate.resolve();
       const a = await dispatchingA;
       expect(a.dispatched).toBeFalse();
       expect(a.canceledBeforeDispatch).toBeTrue();
-      // The cancel that landed was A's own turn's — and B, admitted only
-      // after settlement, is untouched by it.
-      expect(fakeWorker.cancelCalls.map((c) => c.eveSessionId)).toContain(eveId);
-      const cancelsAfterA = fakeWorker.cancelCalls.length;
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsBefore);
+      expect(observeStarts).toContain(aRunId!);
+
+      // B is admitted cleanly and nothing ever reaches eve on its account.
       const b = await dispatchRenderedRun(
         deps,
         dispatchInput(threadKey, { existingSession: await sessionRow(thread.id) }),
       );
       expect(b.dispatched).toBeTrue();
-      expect(fakeWorker.cancelCalls.length).toBe(cancelsAfterA);
+      expect(tailStarts).toContain(b.run.id);
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsBefore);
+      // A's obligation is still open — only A's OWN turn boundary (observed
+      // by B's tail through its leftover drain) or a proven successor meets
+      // it; B's mere admission is not proof.
+      const aRow = (await handle.db.select().from(schema.runs).where(eq(schema.runs.id, aRunId!)))[0]!;
+      expect(aRow.remoteCancelPendingAt).not.toBeNull();
+      expect(aRow.turnId).toBeNull();
 
       await runStore.markRun(b.run.id, {
         status: "canceled",

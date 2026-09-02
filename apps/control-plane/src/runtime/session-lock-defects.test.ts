@@ -169,6 +169,7 @@ class FakeWorkerClient {
     _startIndex: number,
     signal: AbortSignal,
   ): Promise<Response> {
+    if (signal.aborted) throw new Error("aborted before connect");
     const encoder = new TextEncoder();
     const emitTurn = this.streamTurnStarted;
     const stream = new ReadableStream<Uint8Array>({
@@ -320,6 +321,8 @@ describe.skipIf(!GATE)("session dispatch lock defects (D1, D3, D4, D6)", () => {
         start: (options: { runId: string }) => {
           tailStarts.push(options.runId);
         },
+        observe: () => null,
+        hasSessionTail: () => false,
         get: () => undefined,
         cancelRun: async () => false,
         cancelRunGuarded: async () => null,
@@ -490,14 +493,14 @@ describe.skipIf(!GATE)("session dispatch lock defects (D1, D3, D4, D6)", () => {
   );
 
   test(
-    "D3 — a Stop on a live tail is AWAITED under the session lock before the row finalizes: a follow-up during the airborne cancel is refused, never admitted under it",
+    "D3 — a Stop on a live tail before turn.started sends NO cancel and holds NO lock: the row finalizes with its obligation, the tail observes, and a follow-up is admitted at once without any cancel ever reaching eve on its account",
     async () => {
       await freshHeartbeat();
       const threadKey = `int-sld:D3:${randomUUID().slice(0, 8)}`;
       const thread = await insertThreadSession(threadKey);
       // A REAL tailer this time: the run must be `running` with a live tail
-      // that has NOT observed `turn.started` (so the cancel is unqualified —
-      // exactly the shape that could kill a successor's turn).
+      // that has NOT observed `turn.started` (pre-fix: the shape whose
+      // unqualified cancel could kill a successor's turn).
       const tailers = new RunTailerManager({
         store: runStore,
         bus: deps.bus,
@@ -514,40 +517,23 @@ describe.skipIf(!GATE)("session dispatch lock defects (D1, D3, D4, D6)", () => {
         "A's tail to adopt the run",
       );
 
-      // Hold the remote cancel in flight and Stop A through the child-run
-      // cancel path (the same primitive the cancel route uses).
-      const cancelGate = deferred();
-      const cancelEntered = deferred();
-      fakeWorker.cancelGate = cancelGate;
-      fakeWorker.cancelEntered = cancelEntered;
-      const stopping = cancelChildRun(liveDeps, a.run.id, "stopped by user");
-      await cancelEntered.promise; // A's unqualified cancel is airborne
+      const cancelsBefore = fakeWorker.cancelCalls.length;
+      await cancelChildRun(liveDeps, a.run.id, "stopped by user");
+      // The row is finalized at once, WITH the obligation, and nothing went
+      // to eve (an unqualified cancel is a no-op there and a hazard here).
+      const settled = (await handle.db.select().from(schema.runs).where(eq(schema.runs.id, a.run.id)))[0]!;
+      expect(settled.status).toBe("canceled");
+      expect(settled.remoteCancelPendingAt).not.toBeNull();
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsBefore);
+      expect(tailers.get(a.run.id)?.observing).toBeTrue();
 
-      // THE FIX, two halves. (1) The row is NOT finalized yet — the cancel is
-      // awaited first (pre-fix: canceled already, admission open).
-      expect((await runStore.getRunStatus(a.run.id))?.status).toBe("running");
-      // (2) A follow-up B on the same session is refused while the cancel is
-      // airborne — the Stop holds the session lock (pre-fix: B was admitted
-      // here and A's late `{}` cancel would have stopped B's turn).
-      let busyError: unknown;
-      try {
-        await dispatchRenderedRun(deps, dispatchInput(threadKey, { existingSession: await sessionRow(thread.id) }));
-      } catch (error) {
-        busyError = error;
-      }
-      expect(isRuntimeApiError(busyError)).toBeTrue();
-      expect((busyError as { code: string }).code).toBe("session_busy");
-
-      // The cancel lands; only THEN does A finalize and admission reopen.
-      cancelGate.resolve();
-      await stopping;
-      expect((await runStore.getRunStatus(a.run.id))?.status).toBe("canceled");
-      const cancelsAfterA = fakeWorker.cancelCalls.length;
+      // A follow-up B is admitted immediately — no lock was held across the
+      // Stop, and no cancel is airborne that could reach B's turn.
       const b = await dispatchRenderedRun(deps, dispatchInput(threadKey, { existingSession: await sessionRow(thread.id) }));
       expect(b.dispatched).toBeTrue();
-      // No further cancel ever reached eve after B was admitted.
-      expect(fakeWorker.cancelCalls.length).toBe(cancelsAfterA);
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsBefore);
 
+      await tailers.detach(a.run.id);
       await settle(b.run.id);
       await runStore.markSession(thread.id, "closed");
     },

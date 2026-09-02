@@ -1600,7 +1600,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       }, "the dispatch's queued run row");
     }
 
-    test("fresh chat create: a Stop while the create is in flight remote-cancels the accepted turn and starts no tail", async () => {
+    test("fresh chat create: a Stop while the create is in flight hands the accepted turn to observation — turn-qualified cancel once eve starts it, obligation cleared on the boundary — and starts no normal tail", async () => {
       await freshWorkerHeartbeat();
       const gate = deferred();
       const entered = deferred();
@@ -1631,7 +1631,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       expect(body.run.status).toBe("canceled");
       expect(body.session.status).toBe("closed");
 
-      // The accepted turn was told to stop, with the id persisted first.
+      // The accepted turn is OBSERVED, never guessed at: with the id
+      // persisted first, the post-eve recheck records the obligation and
+      // opens an observation tail (no unqualified cancel — eve consumes a
+      // pre-turn cancel as a no-op behind a 202). The fake eve starts the
+      // turn at once, so the observation attributes it, issues the
+      // turn-QUALIFIED cancel, and clears the obligation on the boundary.
       const row = await db
         .select()
         .from(schema.agentSessions)
@@ -1639,12 +1644,25 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       const eveId = row[0]!.eveSessionId;
       expect(eveId).toBeTruthy();
       expect(row[0]!.status).toBe("closed");
+      await until(async () => {
+        const runs = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+        return runs[0]?.remoteCancelPendingAt === null && runs[0]?.turnId !== null
+          ? true
+          : undefined;
+      }, "the observation to confirm the accepted turn's boundary");
       expect(fixture.controlCalls).toContainEqual({
         sessionId: eveId!,
         action: "cancel",
       });
-      // …and no tail ever followed the canceled run.
-      expect(fixture.streamCalls.map((c) => c.sessionId)).not.toContain(eveId!);
+      // The observation read the stream; no NORMAL tail ever adopted the
+      // canceled run (its status never left canceled).
+      expect(fixture.streamCalls.map((c) => c.sessionId)).toContain(eveId!);
+      const finalRun = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+      expect(finalRun[0]!.status).toBe("canceled");
+      await until(
+        async () => (stack.runtime!.tailers.get(runId) ? undefined : true),
+        "the observation to close",
+      );
     }, 20_000);
 
     test("post-reset create: the same Stop race is caught, a racing message gets session_busy, and the thread recovers", async () => {
@@ -1709,8 +1727,9 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       const body = (await res.json()) as PostMessageResponse;
       expect(body.run.status).toBe("canceled");
 
-      // The accepted turn was remote-canceled; the id persisted; the session
-      // belongs to the user's thread and stays OPEN.
+      // The accepted turn was handed to observation and confirmed from eve's
+      // own stream (qualified cancel, boundary); the id persisted; the
+      // session belongs to the user's thread and stays OPEN.
       const row = await db
         .select()
         .from(schema.agentSessions)
@@ -1718,11 +1737,23 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       const eveId = row[0]!.eveSessionId;
       expect(eveId).toBeTruthy();
       expect(row[0]!.status).toBe("active");
+      await until(async () => {
+        const runs = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+        return runs[0]?.remoteCancelPendingAt === null && runs[0]?.turnId !== null
+          ? true
+          : undefined;
+      }, "the observation to confirm the accepted turn's boundary");
       expect(fixture.controlCalls).toContainEqual({
         sessionId: eveId!,
         action: "cancel",
       });
-      expect(fixture.streamCalls.map((c) => c.sessionId)).not.toContain(eveId!);
+      expect((await db.select().from(schema.runs).where(eq(schema.runs.id, runId)))[0]!.status).toBe(
+        "canceled",
+      );
+      await until(
+        async () => (stack.runtime!.tailers.get(runId) ? undefined : true),
+        "the observation to close",
+      );
 
       // session_busy was transient: with the abandon settled the retry is
       // admitted and continues the persisted eve session.

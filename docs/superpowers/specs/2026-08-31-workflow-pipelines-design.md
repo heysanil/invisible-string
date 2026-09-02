@@ -325,7 +325,18 @@ the full scope; the child receives that string as its task message.
   marker is provably undispatched (stillborn recovery re-dispatches fresh);
   a crash between marker and eve-session-id persist is undecidable and
   fails honest (`agent_run_failed`) — at-most-once, never a double
-  dispatch. The executor then returns `{status: "waiting", childRunId}` and
+  dispatch. A Stop on the child (the pipeline cancel sweep, the
+  post-dispatch fence) settles its row `canceled` at once WITH a
+  remote-cancel obligation (`runs.remote_cancel_pending_at`) that is met
+  only by eve's own stream — the child's turn boundary observed after its
+  own `turn.started` (`runs.turn_id`, the acceptance proof; a turn-qualified
+  cancel is issued the moment it is known), a session-terminal answer, or a
+  newer run on the session whose `turn_id` is set — never by eve's 202 to a
+  pre-turn cancel; the child's tail stays on the stream in observation mode
+  (re-opened by the remote-cancel sweep after a crash, never a normal tail),
+  and past `REMOTE_CANCEL_OBSERVE_MS` an unconfirmed obligation is declared
+  unresolved on the row rather than silently cleared (runtime contract).
+  The executor then returns `{status: "waiting", childRunId}` and
   the runner re-invokes with `ctx.childRunId`. While
   the child runs the executor waits on a RunEventBus subscription plus a
   `PIPELINE_CHILD_POLL_MS` poll; a child parking `waiting` (HITL) parks the

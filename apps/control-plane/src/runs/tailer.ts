@@ -67,26 +67,57 @@
  *   durably recorded THIS run's own `turn.started` before we attach, so the
  *   bound alone would swallow our own turn.
  *
+ * TURN ATTRIBUTION AND THE ACCEPTANCE PROOF (`runs.turn_id`). Every
+ * `turn.started` a tail consumes is attributed to exactly one run, in SEND
+ * order — eve serializes turns and the platform sends one message per run
+ * under the session's dispatch lock, so the k-th unattributed turn on the
+ * stream belongs to the k-th run sent. The tail therefore loads the
+ * session's OPEN remote-cancel obligations (canceled runs still owing eve a
+ * confirmation, oldest first — {@link RunStore.listPendingRemoteCancels})
+ * and hands each `turn.started` it drains BEFORE its own turn to the first
+ * obligation whose turn has not started; only once none is left is a
+ * `turn.started` the tail's OWN. The attributed id is written to that run's
+ * `turn_id` (`setRunTurnId`) BEFORE the event is persisted — that column is
+ * the ONLY evidence eve accepted a turn. Nothing local proves it: a
+ * `running` status is synthesized when reconciliation re-tails an unsent
+ * continuation, `run_events` under a run can be a predecessor's leftovers,
+ * and eve's 202 on a pre-turn cancel is consumed as a no-op. A resuming tail
+ * reads its own turn from the column (never from `seq > 0`).
+ *
+ * THE CONFIRMED CANCEL (observation mode). A user Stop no longer aborts the
+ * tail: the row is finalized `canceled` at once — WITH the durable
+ * obligation `remote_cancel_pending_at` in the same CAS — and the tail stays
+ * on eve's stream in OBSERVATION mode, owing eve's own confirmation that the
+ * turn ended. If the run's turn had already started, the Stop issues a
+ * turn-QUALIFIED cancel (`{turnId}`) first; if not, nothing is sent yet
+ * (eve would consume it as a no-op) and the qualified cancel goes out the
+ * moment the run's own `turn.started` is attributed. The obligation clears
+ * ONLY on the run's own turn boundary (`turn.cancelled` / `turn.completed`
+ * carrying its turn id, or the following `session.waiting` /
+ * `session.completed`), a session-terminal answer from eve
+ * (`session_not_active` / `no_active_turn` on the cancel, `session.failed`
+ * on the stream), or — outside this tail — a NEWER run on the session whose
+ * `turn_id` is set. A tail that finds a successor's turn starting while it
+ * still holds owned obligations knows they are over (serialization) and
+ * clears them. Observation is wall-clock bounded (`REMOTE_CANCEL_OBSERVE_MS`
+ * from the obligation's timestamp): on expiry the run is declared
+ * UNRESOLVED (`remote_cancel_unresolved_at`, marker retained, logged at
+ * warn) — an honest, visible residual, never a silent clear. A crash ends
+ * the observation but not the obligation: the periodic remote-cancel
+ * sweeper re-opens an observation tail (`observe`) from the run's persisted
+ * seq for any pending run with no live tail on its session — the SAME
+ * primitive, with the same attribution rules — and a successor's normal tail
+ * on that session takes the obligations over through its leftover drain (the
+ * manager detaches an observation tail when a normal tail starts on the same
+ * session: ONE reader per eve stream, always).
+ *
  * WALL-CLOCK CAP (task 6): MAX_RUN_WALL_CLOCK_MS starts when tailing starts;
  * expiry marks the run failed and aborts the tail. It is no longer merely
  * platform-side bookkeeping: eve 0.31 ships `POST /eve/v1/session/:id/cancel`,
  * so the tail issues a REAL remote cancel (`cancelRemoteTurn`) before it stops
- * reading — for the wall-clock cap and for a user Stop alike. That cancel is
- * cooperative (it lands at the next durable step boundary, and an in-flight
- * tool call still runs to completion); eve's trailing `turn.cancelled` /
- * `session.waiting` are drained by the next tail on this session.
- *
- * AWAITED vs FIRED (the wrong-turn race). A user Stop through the cancel
- * route holds the session's dispatch lock and asks the tail to AWAIT its
- * remote cancel before finalizing the row (`cancel(…, {awaitRemote: true})`):
- * finalizing reopens admission, and an unqualified cancel (no `turn.started`
- * observed yet, so no turnId to scope it) still airborne when a follow-up's
- * turn started would kill THAT turn instead. When the route could not take
- * the lock, it asks for a turn-QUALIFIED cancel only
- * (`allowUnqualifiedRemote: false`) — safe without the lock — and an
- * unqualified one is SKIPPED and reported, so the route can record the
- * obligation durably for the guarded chase. Shutdown and the wall-clock cap
- * keep the fire-and-forget shape (the row is finalized immediately).
+ * reading — for the wall-clock cap and for shutdown alike (fire-and-forget,
+ * qualified when the turn id is known; those finalize `failed` and owe eve
+ * nothing further — the obligation is a user-cancel concept).
  */
 import {
   EVE_STREAM_TAIL_INDEX_HEADER,
@@ -330,25 +361,30 @@ export type OpenRunStream = (
 ) => Promise<Response>;
 
 /**
- * Ask eve to cancel this session's in-flight turn (`POST .../cancel`).
- * Fire-and-forget: it is cooperative and its response never proves a turn was
- * stopped, so the tail neither awaits its effect nor fails on its error.
+ * eve's answer to a remote cancel, as far as the tail cares: `terminal` when
+ * eve declared the SESSION dead (409 `session_not_active`, or 200
+ * `no_active_turn` — eve's one dead-session rendering, REPORT finding 24) —
+ * nothing can be running, so the obligation is met; anything else (202
+ * `accepted`, or a seam that returns nothing) is `accepted` and proves
+ * NOTHING about the turn — only eve's stream does.
+ */
+export type RemoteCancelReply = "accepted" | "terminal";
+
+/**
+ * Ask eve to cancel a turn on this session (`POST .../cancel`). Rejects on a
+ * transport failure (the request provably never reached eve).
  */
 export type CancelRemoteTurn = (options?: {
   /**
-   * The turn this tail actually observed (`turn.started.data.turnId`), used as
-   * eve's stale-request guard.
-   *
-   * REQUIRED for correctness, not merely nice: the cancel is fire-and-forget
-   * and the run is finalized without awaiting it, so the request can still be
-   * in flight after the turn ends. Finalizing frees the session's one run
-   * slot, so a follow-up message can legitimately start a NEW turn in that
-   * window — and an unguarded cancel arriving then would stop the user's new
-   * turn instead of the one they asked to stop. With the guard, a late
-   * request is a no-op.
+   * The turn to cancel (`turn.started.data.turnId`), used as eve's
+   * stale-request guard: a late request naming a finished turn is a no-op,
+   * so a qualified cancel can never stop a successor's turn. The tail only
+   * ever issues UNQUALIFIED cancels for shutdown / the wall-clock cap (where
+   * the row is finalized `failed` and admission does not matter); a user
+   * Stop waits for the run's own turn id instead.
    */
   turnId?: string;
-}) => Promise<void>;
+}) => Promise<RemoteCancelReply | void>;
 
 export interface TailRunOptions {
   runId: string;
@@ -360,6 +396,28 @@ export interface TailRunOptions {
   bus: RunEventBus;
   /** Per-run wall-clock cap in ms (MAX_RUN_WALL_CLOCK_MS). */
   maxWallClockMs: number;
+  /**
+   * Observation window in ms after a live Stop (REMOTE_CANCEL_OBSERVE_MS):
+   * how long the tail keeps following the stream for eve's confirmation
+   * before declaring the obligation unresolved. Default 10 minutes.
+   */
+  remoteCancelObserveMs?: number;
+  /**
+   * Start directly in OBSERVATION mode for an already-canceled run carrying
+   * its obligation (the sweeper / boot reconciliation re-opening a crashed
+   * observation, or the post-eve recheck handing a canceled dispatch to
+   * observation). No adoption CAS, no status frames; the tail persists
+   * events from the run's persisted seq and follows the session's open
+   * obligations (this run's among them) to their boundaries. `deadlineAt`
+   * is the absolute epoch-ms bound (obligation timestamp + observe window).
+   */
+  observe?: { deadlineAt: number };
+  /**
+   * Chained start: resolve before reading anything. The manager passes the
+   * `done` of a detached observation tail on the same session so the two
+   * never read eve's stream at once (one cursor owner per stream).
+   */
+  waitFor?: Promise<void>;
   /** Reconnect attempts after unexpected drops (default 5). */
   maxReconnectAttempts?: number;
   /** Base reconnect backoff in ms (default 500; ×2 per attempt). */
@@ -380,62 +438,85 @@ export interface TailRunOptions {
   logger?: Logger;
 }
 
+export const DEFAULT_REMOTE_CANCEL_OBSERVE_MS = 10 * 60 * 1000;
+
+/** Retries of a failed (transport) qualified cancel issued by observation. */
+const QUALIFIED_CANCEL_RETRY_ATTEMPTS = 3;
+const QUALIFIED_CANCEL_RETRY_DELAY_MS = 5_000;
+
 export interface CancelOptions {
   /**
-   * Terminal status to mark the run with when the tail stops. Default
-   * `failed` (wall-clock expiry / shutdown interruption); the run-cancel API
-   * passes `canceled` so a user abort is recorded as a clean cancellation,
-   * not a failure.
+   * Terminal status to mark the run with. Default `failed` (wall-clock
+   * expiry / shutdown interruption — the tail aborts at once); the run-cancel
+   * API passes `canceled` so a user Stop is recorded as a clean cancellation
+   * AND the tail stays on the stream in observation mode.
    */
   status?: "failed" | "canceled";
   /**
-   * AWAIT the remote cancel's request before aborting the tail (and so
-   * before the row finalizes). Used by the cancel route while it holds the
-   * session's dispatch lock, so admission cannot reopen under an airborne
-   * cancel. Default false: fire-and-forget (shutdown, wall-clock cap).
+   * AWAIT the turn-qualified remote cancel's request (when the turn id is
+   * known) before the row finalizes, so the returned outcome reports what
+   * eve answered. Default false: fire-and-forget.
    */
   awaitRemote?: boolean;
-  /**
-   * Whether an UNQUALIFIED remote cancel (no `turn.started` observed yet —
-   * no turnId to scope it to) may be issued. Default true. The cancel route
-   * passes false when it does NOT hold the session lock: unscoped, a late
-   * cancel can stop a successor's turn; the outcome `skipped` tells the
-   * route to record the obligation durably instead.
-   */
-  allowUnqualifiedRemote?: boolean;
 }
 
 /**
- * What became of the remote cancel: `issued` (request completed, or fired
- * when not awaited), `failed` (awaited and rejected — logged, best-effort),
- * `skipped` (unqualified and not allowed), `unavailable` (no remote seam).
- * A user cancel ending `failed` or `skipped` finalizes the row WITH
- * `remote_cancel_pending_at` in the same CAS (the durable obligation the
- * guarded chase / sweep / boot reconciliation finish) — the caller never
- * needs, and must never add, a second statement for it.
+ * What became of a user Stop's remote leg at the moment the row finalized:
+ * `issued` (a turn-qualified cancel reached eve — 202; the turn boundary is
+ * still owed and observation follows it), `pending` (the run's turn has not
+ * started yet, so nothing was sent — observation issues the qualified cancel
+ * when the turn starts), `failed` (the qualified cancel failed in transport —
+ * observation retries it and still owes the boundary), `terminal` (eve
+ * answered session-dead — nothing can be running; nothing owed),
+ * `unavailable` (no remote seam — unit fixtures; nothing owed). Only
+ * `terminal` and `unavailable` finalize WITHOUT the durable obligation.
  */
-export type RemoteCancelOutcome = "issued" | "failed" | "skipped" | "unavailable";
+export type RemoteCancelOutcome =
+  | "issued"
+  | "pending"
+  | "failed"
+  | "terminal"
+  | "unavailable";
 
 export interface RunTailHandle {
   runId: string;
-  /** Resolves when the tail has fully stopped (terminal, canceled, or dead). */
+  agentSessionId: string;
+  /** True while the tail is in observation mode (its run is already canceled). */
+  readonly observing: boolean;
+  /** Resolves when the tail has fully stopped (terminal, observation closed, or dead). */
   done: Promise<void>;
   /**
-   * Stop tailing and mark the run (`canceled` UI action or shutdown). The
-   * abort is immediate unless `awaitRemote` is set, in which case the remote
-   * cancel request is awaited first; the returned promise resolves with the
-   * remote outcome once the abort has been issued. Callers that do not care
-   * (shutdown) may ignore it.
+   * Stop the run. `status: "canceled"` (a user Stop) finalizes the row NOW —
+   * with its obligation — and switches the tail to observation; the promise
+   * resolves with the remote outcome once the row is finalized (NOT once
+   * observation ends — that is `done`). Any other status aborts the tail
+   * immediately (shutdown / wall clock). On an observation tail a non-user
+   * cancel is a detach (the obligation survives for the sweeper).
    */
   cancel(reason?: string, options?: CancelOptions): Promise<RemoteCancelOutcome>;
   /**
    * Stop tailing WITHOUT marking the run terminal — used by the dead-worker
    * sweeper to detach a stale tail (its worker died) so the run can be
-   * re-tailed against a freshly scheduled worker. The run keeps its current
-   * DB status (e.g. `running`); the durable eve turn continues and the new
-   * tail resumes from the persisted seq.
+   * re-tailed against a freshly scheduled worker, and by the manager to hand
+   * an observation tail's session over to a successor's normal tail. The run
+   * keeps its current DB status; an observation's obligation stays on the
+   * row.
    */
   detach(): void;
+}
+
+/** One open remote-cancel obligation this tail is following. */
+interface Obligation {
+  runId: string;
+  turnId: string | null;
+  /** This tail's own run (observation mode). */
+  self: boolean;
+}
+
+function isTurnBoundaryEvent(
+  event: EveStreamEvent,
+): event is Extract<EveStreamEvent, { type: "turn.cancelled" | "turn.completed" }> {
+  return event.type === "turn.cancelled" || event.type === "turn.completed";
 }
 
 export function tailRun(options: TailRunOptions): RunTailHandle {
@@ -447,6 +528,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     store,
     bus,
     maxWallClockMs,
+    remoteCancelObserveMs = DEFAULT_REMOTE_CANCEL_OBSERVE_MS,
     maxReconnectAttempts = 5,
     reconnectDelayMs = 500,
     onFinish,
@@ -458,31 +540,35 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const tailStartedAt = Date.now();
   const abort = new AbortController();
   let cancelReason: string | null = null;
+  /** `follow` = a live run's tail; `observe` = owing eve a confirmation only. */
+  let mode: "follow" | "observe" = options.observe ? "observe" : "follow";
   /**
-   * `turn.started.data.turnId` for the turn THIS tail is following, kept at
-   * function scope so it survives reconnects (the per-connection flags below
-   * are rebuilt on each attach). Null until the turn boundary is seen — a
-   * cancel fired before then is correctly unguarded, since there is no
-   * observed turn it could be confused with.
+   * `turn.started.data.turnId` of THIS run's own latest turn — loaded from
+   * `runs.turn_id` at start (a resume), written there the moment it is
+   * attributed. Function scope so it survives reconnects.
    */
-  let observedTurnId: string | null = null;
+  let ownTurnId: string | null = null;
+  // TERMINAL GATE: terminals only count once this run's own turn boundary
+  // (`turn.started`) has been seen — everything before it is a previous
+  // turn's leftover (see the module doc). Derived from the durable column,
+  // never from `seq > 0` (leftovers persisted under this run satisfy that).
+  let sawOwnTurn = false;
+  /** The session's open obligations this tail follows (send order). */
+  let obligations: Obligation[] = [];
   // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
   // unless a user cancel flipped this flag, which marks it "canceled".
   let canceledByUser = false;
-  // A user cancel whose remote leg did NOT reach eve (`skipped`: unqualified
-  // and disallowed; `failed`: awaited and rejected in transport). The
-  // obligation is then written INTO the finalizing CAS (`finishRun`) as
-  // `remoteCancelPendingAt` — never as a second statement after it, which is
-  // exactly the crash window that left an accepted turn with no owner.
-  let remoteCancelObligation = false;
-  let finished = false;
+  let finished = mode === "observe";
+  let observationClosed = false;
   // Final assistant reply of THIS run (see RunFinishedHook). Only tracked
   // once the run's own turn boundary has been seen — a leftover stop-message
   // drained from a previous turn must never be delivered as this run's reply.
   let lastAssistantMessage: string | null = null;
-  // Detach (dead-worker failover) aborts the loop but leaves the run's status
-  // untouched so a re-tail on another worker can pick it up.
+  // Detach (dead-worker failover / session handover) aborts the loop but
+  // leaves the run's status and obligations untouched.
   let detaching = false;
+  let observeTimer: ReturnType<typeof setTimeout> | null = null;
+  const retryTimers = new Set<ReturnType<typeof setTimeout>>();
 
   const publishStatus = (status: RunStatus, error?: string | null) => {
     bus.publish(runId, {
@@ -495,8 +581,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     status: Extract<RunStatus, "succeeded" | "failed" | "waiting" | "canceled">,
     sessionStatus: AgentSessionStatus | null,
     error?: string,
-  ) => {
-    if (finished) return;
+    extra: { remoteCancelPendingAt?: Date } = {},
+  ): Promise<boolean> => {
+    if (finished) return false;
     finished = true;
     // Compare-and-swap: markRun refuses to overwrite a terminal status. When
     // another actor (run-cancel API, sweeper) already finalized this run, the
@@ -506,17 +593,14 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       status,
       error: error ?? null,
       ...(status === "waiting" ? {} : { completedAt: now }),
-      // ONE statement: a canceled row whose remote cancel never reached eve
-      // is born carrying its obligation (see `remoteCancelObligation`).
-      ...(status === "canceled" && remoteCancelObligation
-        ? { remoteCancelPendingAt: now }
-        : {}),
+      // ONE statement: a canceled row is born carrying its obligation.
+      ...extra,
     });
     if (!marked) {
       log?.info("run.finish_skipped", {
         fields: { attemptedStatus: status, reason: "run already terminal" },
       });
-      return;
+      return false;
     }
     if (sessionStatus) await store.markSession(agentSessionId, sessionStatus);
     publishStatus(status, error ?? null);
@@ -527,19 +611,17 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       durationMs,
       ...(error !== undefined ? { fields: { reason: error } } : {}),
     });
+    return true;
   };
 
   /**
-   * Fire eve's real turn cancel and forget it. Cooperative + idempotent, and
-   * its response cannot distinguish "stopped a turn" from "this session is
-   * dead", so nothing downstream may branch on it. Never allowed to reject
-   * into the tail: a Stop must not become a failure.
+   * Fire eve's turn cancel and forget it — shutdown and the wall-clock cap
+   * (the row finalizes `failed`; nothing is owed afterwards). Qualified when
+   * the turn id is known. Never allowed to reject into the tail.
    */
   const requestRemoteCancel = (why: string): void => {
     if (!cancelRemoteTurn) return;
-    // Scope it to the turn we actually observed. Read at CALL time, not
-    // capture time, so a cancel fired after the turn boundary carries the id.
-    const turnId = observedTurnId;
+    const turnId = ownTurnId;
     void cancelRemoteTurn(turnId === null ? undefined : { turnId }).catch(
       (error: unknown) => {
         log?.warn("run.remote_cancel_failed", {
@@ -553,15 +635,167 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     );
   };
 
-  const wallClockTimer = setTimeout(() => {
-    cancelReason ??= `run exceeded the wall-clock cap (${maxWallClockMs}ms)`;
-    // Real enforcement now: stop eve's turn instead of only stopping to read
-    // it (which used to leave the turn burning tokens against nobody).
-    requestRemoteCancel("wall-clock cap");
+  const closeObservation = () => {
+    if (observationClosed) return;
+    observationClosed = true;
     abort.abort();
-  }, maxWallClockMs);
+  };
+
+  /** An obligation is MET: clear the durable marker, drop it from the list. */
+  const confirmObligation = async (obligation: Obligation, why: string) => {
+    obligations = obligations.filter((o) => o !== obligation);
+    try {
+      await store.clearRemoteCancelPending(obligation.runId);
+      log?.info("run.remote_cancel_confirmed", {
+        fields: { obligationRunId: obligation.runId, turnId: obligation.turnId, why },
+      });
+    } catch (error) {
+      // The marker stays; the sweeper retries. Never a stream error.
+      log?.warn("run.remote_cancel_confirm_failed", {
+        fields: {
+          obligationRunId: obligation.runId,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+    if (mode === "observe" && obligations.length === 0) closeObservation();
+  };
+
+  /**
+   * Issue the turn-QUALIFIED cancel for an obligation whose turn is known.
+   * Fire-and-forget with bounded transport retries; eve's session-terminal
+   * answer confirms the obligation on the spot.
+   */
+  const issueQualifiedCancel = (obligation: Obligation, attempt = 1): void => {
+    if (!cancelRemoteTurn || obligation.turnId === null) return;
+    const turnId = obligation.turnId;
+    void cancelRemoteTurn({ turnId })
+      .then(async (reply) => {
+        log?.info("run.remote_cancel_issued", {
+          fields: { obligationRunId: obligation.runId, turnId, reply: reply ?? "accepted" },
+        });
+        if (reply === "terminal" && obligations.includes(obligation)) {
+          await confirmObligation(obligation, "eve: session terminal");
+        }
+      })
+      .catch((error: unknown) => {
+        log?.warn("run.remote_cancel_failed", {
+          fields: {
+            why: "observation",
+            obligationRunId: obligation.runId,
+            turnId,
+            attempt,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        });
+        if (attempt >= QUALIFIED_CANCEL_RETRY_ATTEMPTS || abort.signal.aborted) return;
+        const timer = setTimeout(() => {
+          retryTimers.delete(timer);
+          if (!abort.signal.aborted && obligations.includes(obligation)) {
+            issueQualifiedCancel(obligation, attempt + 1);
+          }
+        }, QUALIFIED_CANCEL_RETRY_DELAY_MS * attempt);
+        retryTimers.add(timer);
+      });
+  };
+
+  const armObserveDeadline = (deadlineAt: number) => {
+    if (observeTimer) clearTimeout(observeTimer);
+    observeTimer = setTimeout(() => {
+      void (async () => {
+        const mine = obligations.find((o) => o.self);
+        if (mine) {
+          // Explicit, visible residual — never a silent clear. Predecessor
+          // obligations carried by this tail are bounded by the sweeper's
+          // own age check against their own timestamps.
+          let declared = false;
+          try {
+            declared = await store.markRemoteCancelUnresolved(runId);
+          } catch (error) {
+            log?.warn("run.remote_cancel_unresolved_write_failed", {
+              fields: { reason: error instanceof Error ? error.message : String(error) },
+            });
+          }
+          if (declared) {
+            log?.warn("run.remote_cancel_unresolved", {
+              fields: {
+                turnId: mine.turnId,
+                observeMs: remoteCancelObserveMs,
+                reason:
+                  "observation window elapsed with no confirmation from eve's stream — obligation left open and marked unresolved",
+              },
+            });
+          } else {
+            // Met by another actor (a proven successor, a session-terminal
+            // answer on a route) while this tail was still watching.
+            log?.info("run.observation_closed", {
+              fields: { reason: "obligation already met or declared elsewhere" },
+            });
+          }
+        }
+        closeObservation();
+      })();
+    }, Math.max(0, deadlineAt - Date.now()));
+  };
+
+  /**
+   * Attribute a `turn.started` (see the module doc): a re-read of a known
+   * id is idempotent; otherwise the oldest obligation whose turn has not
+   * started owns it; otherwise (follow mode) it is this run's own turn; an
+   * observation tail seeing a turn nobody pending owns has seen a SUCCESSOR
+   * start, which proves every owned obligation over.
+   */
+  const attributeTurnStarted = async (
+    turnId: string,
+  ): Promise<"own" | "obligation" | "successor"> => {
+    if (ownTurnId === turnId) return "own";
+    if (obligations.some((o) => o.turnId === turnId)) return "obligation";
+    const unowned = obligations.find((o) => o.turnId === null);
+    if (unowned) {
+      unowned.turnId = turnId;
+      const written = await store.setRunTurnId(unowned.runId, turnId);
+      log?.info("run.remote_cancel_turn_attributed", {
+        fields: { obligationRunId: unowned.runId, turnId, written },
+      });
+      issueQualifiedCancel(unowned);
+      return "obligation";
+    }
+    if (mode === "follow") {
+      // Written BEFORE the event is persisted (crash-safe: the proof lands
+      // first, the event is re-read on resume and recognized as own).
+      const written = await store.setRunTurnId(runId, turnId);
+      if (!written) {
+        log?.warn("run.turn_id_refused", {
+          fields: { turnId, reason: "a different turn id is already on the row" },
+        });
+      }
+      ownTurnId = turnId;
+      return "own";
+    }
+    log?.info("run.observation_superseded", {
+      fields: { turnId, owned: obligations.map((o) => o.runId) },
+    });
+    for (const obligation of [...obligations]) {
+      await confirmObligation(obligation, "a successor's turn started");
+    }
+    return "successor";
+  };
+
+  const wallClockTimer =
+    mode === "follow"
+      ? setTimeout(() => {
+          cancelReason ??= `run exceeded the wall-clock cap (${maxWallClockMs}ms)`;
+          // Real enforcement now: stop eve's turn instead of only stopping
+          // to read it (which used to leave the turn burning tokens against
+          // nobody).
+          requestRemoteCancel("wall-clock cap");
+          abort.abort();
+        }, maxWallClockMs)
+      : null;
 
   const done = (async () => {
+    if (options.waitFor) await options.waitFor;
+    if (detaching) return;
     // Resume points derived from what is already persisted (crash-safe).
     let seq = await store.countRunEvents(runId);
     let startIndex = await store.countSessionEvents(agentSessionId);
@@ -578,40 +812,106 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // Tail index eve reported at attach (null = header absent/not requested).
     let requestTailIndex = true;
     let catchUpBound: number | null = null;
-    // TERMINAL GATE: a FRESH run's tail may first drain leftover events of
-    // the session's PREVIOUS turn (early-stopped tail: wall-clock abort,
-    // cancel, reconnect exhaustion, crash — eve durably finishes the turn
-    // anyway and startIndex therefore undercounts). Those leftovers include
-    // the old turn's `turn.completed`/`session.waiting`, which must be
-    // persisted (keeping counts aligned) but NOT classified as THIS run's
-    // terminal — otherwise the new run is instantly marked succeeded before
-    // its own turn emits anything. Terminals only count once this run's own
-    // turn boundary (`turn.started`) has been seen; a resuming tail
-    // (seq > 0) already consumed its own turn.started. `session.failed` is
-    // session-fatal and always classified.
-    let sawOwnTurn = seq > 0;
 
-    // CAS: a run another actor already finalized (sweeper failed it while the
-    // dispatch was still in flight, or the user canceled it) must NOT be
-    // resurrected to `running` — the tail simply never starts.
-    const adopted = await store.markRun(runId, {
-      status: "running",
-      ...(seq === 0 ? { startedAt: new Date() } : {}),
-    });
-    if (!adopted) {
-      finished = true;
-      clearTimeout(wallClockTimer);
-      log?.info("run.tail_refused", {
-        fields: { reason: "run already terminal — not resurrecting" },
+    // The durable turn state: this run's own turn (a resume), and the
+    // session's open obligations in send order (see the module doc).
+    const turnState = await store.getRunTurnState(runId);
+    ownTurnId = turnState?.turnId ?? null;
+    const pending = await store.listPendingRemoteCancels(agentSessionId);
+    obligations = pending.map((p) => ({
+      runId: p.runId,
+      turnId: p.turnId,
+      self: p.runId === runId,
+    }));
+    if (mode === "observe") {
+      const mine = obligations.find((o) => o.self);
+      if (!mine) {
+        log?.info("run.observation_skipped", {
+          fields: { reason: "no open obligation on the row — met by another actor" },
+        });
+        return;
+      }
+      ownTurnId = mine.turnId ?? ownTurnId;
+      mine.turnId = ownTurnId;
+      // The turn is already known (a crashed observation, or a transport
+      // failure the sweeper is retrying): (re)issue the qualified cancel.
+      if (mine.turnId !== null) issueQualifiedCancel(mine);
+      armObserveDeadline(options.observe!.deadlineAt);
+      log?.info("run.observing", {
+        fields: {
+          resumedSeq: seq,
+          turnId: mine.turnId,
+          obligations: obligations.map((o) => o.runId),
+        },
       });
-      return;
+    } else {
+      obligations = obligations.filter((o) => !o.self);
+      sawOwnTurn = ownTurnId !== null;
+      if (!sawOwnTurn && seq > 0) {
+        // Rows persisted before the column existed, or a tail that persisted
+        // its own `turn.started` under a pre-column build: the own turn is
+        // the last persisted `turn.started` that no obligation owns.
+        const persisted = await store.listEventsAfter(runId, -1);
+        const known = new Set(obligations.map((o) => o.turnId));
+        for (const stored of persisted) {
+          if (
+            stored.event.type === "turn.started" &&
+            !known.has(stored.event.data.turnId)
+          ) {
+            ownTurnId = stored.event.data.turnId;
+          }
+        }
+        if (ownTurnId !== null) {
+          await store.setRunTurnId(runId, ownTurnId);
+          sawOwnTurn = true;
+        }
+      }
+      // CAS: a run another actor already finalized (sweeper failed it while
+      // the dispatch was still in flight, or the user canceled it) must NOT
+      // be resurrected to `running` — the tail simply never starts.
+      const adopted = await store.markRun(runId, {
+        status: "running",
+        ...(seq === 0 ? { startedAt: new Date() } : {}),
+      });
+      if (!adopted) {
+        finished = true;
+        if (wallClockTimer) clearTimeout(wallClockTimer);
+        log?.info("run.tail_refused", {
+          fields: { reason: "run already terminal — not resurrecting" },
+        });
+        return;
+      }
+      publishStatus("running");
+      log?.info("run.started", {
+        fields: {
+          resumed: seq > 0,
+          ownTurnId,
+          obligations: obligations.map((o) => o.runId),
+        },
+      });
     }
-    publishStatus("running");
-    log?.info("run.started", { fields: { resumed: seq > 0 } });
+
+    /** The abort landed (Stop on a follow tail, close/expiry on observation, shutdown). */
+    const finishAborted = async (): Promise<void> => {
+      if (mode === "observe") return; // closed (confirmed / unresolved / detached)
+      await finishRun(
+        canceledByUser ? "canceled" : "failed",
+        canceledByUser ? "active" : null,
+        cancelReason ?? "run tail aborted",
+      );
+    };
 
     let attempt = 0;
     try {
       for (;;) {
+        // An abort that landed BEFORE this connect (a detach or close during
+        // the preamble's awaits): opening the stream with an already-aborted
+        // signal would never be told to stop.
+        if (detaching) return;
+        if (abort.signal.aborted) {
+          await finishAborted();
+          return;
+        }
         let consumedThisConnect = 0;
         try {
           const response = await openStream(
@@ -664,6 +964,14 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             // written or published twice.
             const duplicate = eventId !== undefined && seenEventIds.has(eventId);
 
+            // TURN ATTRIBUTION runs BEFORE the persist: the acceptance proof
+            // (`turn_id`) must be on the row before the event that proves it
+            // is durable, so a crash in between keeps the proof.
+            const attribution =
+              event.type === "turn.started"
+                ? await attributeTurnStarted(event.data.turnId)
+                : null;
+
             if (!duplicate) {
               // Persist FIRST, count after: if appendEvent throws (transient
               // Postgres error), the reconnect resumes from the same
@@ -686,7 +994,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             consumedThisConnect += 1;
             startIndex += 1;
 
-            if (event.type === "turn.started") {
+            if (attribution === "own") {
               // This run's own turn boundary: leftover pending-input state
               // from a drained previous turn is historical, not ours — and it
               // ends the catch-up drain even if eve's tail index reached
@@ -696,9 +1004,6 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               pendingAuthorization = false;
               canceledTurn = false;
               catchUpBound = null;
-              // Remember which turn we are following so a late remote cancel
-              // cannot land on a later one (see CancelRemoteTurn).
-              observedTurnId = event.data.turnId;
             }
             pendingInput = nextPendingInputRequest(pendingInput, event);
             pendingAuthorization = nextPendingAuthorization(
@@ -735,6 +1040,30 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               typeof event.data.message === "string"
             ) {
               lastAssistantMessage = event.data.message;
+            }
+
+            // OBLIGATION BOUNDARIES (eve's OWN confirmation): a turn boundary
+            // carrying an owned obligation's turn id meets it; a session
+            // boundary means no turn is in flight, so every OWNED obligation
+            // is over — and a dead session (`session.completed`/`failed`)
+            // can never start an unowned one either.
+            if (isTurnBoundaryEvent(event)) {
+              const owned = obligations.find((o) => o.turnId === event.data.turnId);
+              if (owned) await confirmObligation(owned, event.type);
+            } else if (
+              event.type === "session.waiting" ||
+              event.type === "session.completed" ||
+              event.type === "session.failed"
+            ) {
+              for (const obligation of [...obligations]) {
+                if (obligation.turnId !== null || event.type !== "session.waiting") {
+                  await confirmObligation(obligation, event.type);
+                }
+              }
+            }
+            if (mode === "observe") {
+              if (observationClosed) return;
+              continue;
             }
 
             // The catch-up window closes either at eve's attach-time tail
@@ -775,17 +1104,25 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           // Stream ended without a terminal event → treat like a drop.
           throw new Error("stream ended before a terminal event");
         } catch (error) {
-          if (detaching) return; // failover: leave the run for a re-tail
+          if (detaching) return; // failover / handover: leave the row alone
           if (abort.signal.aborted) {
-            await finishRun(
-              canceledByUser ? "canceled" : "failed",
-              canceledByUser ? "active" : null,
-              cancelReason ?? "run tail aborted",
-            );
+            await finishAborted();
             return;
           }
           attempt = consumedThisConnect > 0 ? 1 : attempt + 1;
           if (attempt > maxReconnectAttempts) {
+            if (mode === "observe") {
+              // The obligation stays on the row; the sweeper re-opens the
+              // observation (a dead agent/worker cannot be observed here).
+              log?.warn("run.observation_lost", {
+                fields: {
+                  reconnectAttempts: maxReconnectAttempts,
+                  obligations: obligations.map((o) => o.runId),
+                  reason: error instanceof Error ? error.message : String(error),
+                },
+              });
+              return;
+            }
             await finishRun(
               "failed",
               null,
@@ -801,74 +1138,107 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           );
           if (detaching) return; // failover during backoff
           if (abort.signal.aborted) {
-            await finishRun(
-              canceledByUser ? "canceled" : "failed",
-              canceledByUser ? "active" : null,
-              cancelReason ?? "run tail aborted",
-            );
+            await finishAborted();
             return;
           }
         }
       }
     } finally {
-      clearTimeout(wallClockTimer);
+      if (wallClockTimer) clearTimeout(wallClockTimer);
+      if (observeTimer) clearTimeout(observeTimer);
+      for (const timer of retryTimers) clearTimeout(timer);
+      retryTimers.clear();
     }
   })();
 
+  const detach = () => {
+    detaching = true;
+    abort.abort();
+  };
+
   return {
     runId,
+    agentSessionId,
+    get observing() {
+      return mode === "observe";
+    },
     done,
     async cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
-      if (options?.status === "canceled") canceledByUser = true;
-      const why = options?.status === "canceled" ? "user cancel" : "shutdown";
-      // Stop eve's turn for real (0.31), not just our reading of it. Issued
-      // BEFORE the abort so the request goes out even though the tail stops
-      // immediately; the trailing `turn.cancelled` → `session.waiting` are
-      // drained by the next tail on this session. Read the turn id at CALL
-      // time so a cancel after the turn boundary is scoped to it.
-      const turnId = observedTurnId;
+      if (mode === "observe") {
+        // A duplicate Stop on an observation tail has nothing left to
+        // finalize; shutdown DETACHES it — the obligation is durable and the
+        // next boot's sweeper re-opens the observation.
+        if (options?.status !== "canceled") detach();
+        return "pending";
+      }
+      if (options?.status !== "canceled") {
+        // Shutdown / wall clock: stop eve's turn (qualified when known) and
+        // abort; the row finalizes `failed` and owes nothing further.
+        requestRemoteCancel("shutdown");
+        abort.abort();
+        return cancelRemoteTurn ? "issued" : "unavailable";
+      }
+      // USER STOP. The remote leg is turn-QUALIFIED or not sent at all: an
+      // unqualified cancel before `turn.started` is consumed as a no-op by
+      // eve and could only ever hit a successor's turn if it arrived late.
+      canceledByUser = true;
+      const turnId = ownTurnId;
       let outcome: RemoteCancelOutcome;
       if (!cancelRemoteTurn) {
         outcome = "unavailable";
-      } else if (turnId === null && options?.allowUnqualifiedRemote === false) {
-        // Unscoped and the caller holds no lock: a late delivery could stop
-        // a successor's turn. Leave it to the guarded chase.
-        outcome = "skipped";
-        log?.info("run.remote_cancel_skipped", {
-          fields: { why, reason: "unqualified cancel without the session lock" },
+      } else if (turnId === null) {
+        outcome = "pending";
+        log?.info("run.remote_cancel_pending", {
+          fields: { reason: "turn not started yet — qualified cancel follows its turn.started" },
         });
       } else if (options?.awaitRemote) {
         try {
-          await cancelRemoteTurn(turnId === null ? undefined : { turnId });
-          outcome = "issued";
+          const reply = await cancelRemoteTurn({ turnId });
+          outcome = reply === "terminal" ? "terminal" : "issued";
         } catch (error) {
           outcome = "failed";
           log?.warn("run.remote_cancel_failed", {
             fields: {
-              why,
+              why: "user cancel",
               turnId,
               reason: error instanceof Error ? error.message : String(error),
             },
           });
         }
       } else {
-        requestRemoteCancel(why);
+        requestRemoteCancel("user cancel");
         outcome = "issued";
       }
-      // Record the unmet obligation BEFORE the abort so the finalizing CAS
-      // the abort triggers carries it (see `finishRun`). An `unavailable`
-      // seam has nothing to owe.
-      if (options?.status === "canceled" && (outcome === "skipped" || outcome === "failed")) {
-        remoteCancelObligation = true;
+      // Finalize NOW, with the obligation in the same statement unless eve
+      // (or the absence of a seam) says nothing can be running.
+      const owes = outcome !== "unavailable" && outcome !== "terminal";
+      const now = new Date();
+      const marked = await finishRun(
+        "canceled",
+        "active",
+        cancelReason,
+        owes ? { remoteCancelPendingAt: now } : {},
+      );
+      if (!marked || !owes) {
+        // Nothing to observe: another actor already finalized the row (its
+        // own obligation, if any, is on it), or nothing is owed.
+        abort.abort();
+        return outcome;
       }
-      abort.abort();
+      // OBSERVATION: stay on the stream for eve's own confirmation.
+      mode = "observe";
+      const mine: Obligation = { runId, turnId, self: true };
+      obligations = [...obligations, mine];
+      if (wallClockTimer) clearTimeout(wallClockTimer);
+      armObserveDeadline(now.getTime() + remoteCancelObserveMs);
+      if (outcome === "failed") issueQualifiedCancel(mine, 2);
+      log?.info("run.observing", {
+        fields: { turnId, outcome, observeMs: remoteCancelObserveMs },
+      });
       return outcome;
     },
-    detach() {
-      detaching = true;
-      abort.abort();
-    },
+    detach,
   };
 }
 
@@ -889,14 +1259,26 @@ async function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
 
 // ── Manager: one tail per active run + graceful shutdown ───────────────────
 
+export interface StartTailOptions {
+  runId: string;
+  agentSessionId: string;
+  openStream: OpenRunStream;
+  cancelRemoteTurn?: CancelRemoteTurn;
+  /** Per-run health seam (see {@link TailRunOptions.onAuthorizationRequired}). */
+  onAuthorizationRequired?: (info: { connectionName: string }) => void;
+}
+
 export class RunTailerManager {
   private readonly handles = new Map<string, RunTailHandle>();
+  /** ONE reader per eve stream: the live tail (any mode) per session. */
+  private readonly sessionHandles = new Map<string, RunTailHandle>();
 
   constructor(
     private readonly defaults: {
       store: RunStore;
       bus: RunEventBus;
       maxWallClockMs: number;
+      remoteCancelObserveMs?: number;
       maxReconnectAttempts?: number;
       reconnectDelayMs?: number;
       /** Metrics seam propagated to every tail (run-duration histogram). */
@@ -906,26 +1288,75 @@ export class RunTailerManager {
     },
   ) {}
 
-  start(options: {
-    runId: string;
-    agentSessionId: string;
-    openStream: OpenRunStream;
-    cancelRemoteTurn?: CancelRemoteTurn;
-    /** Per-run health seam (see {@link TailRunOptions.onAuthorizationRequired}). */
-    onAuthorizationRequired?: (info: { connectionName: string }) => void;
-  }): RunTailHandle {
+  private register(handle: RunTailHandle): void {
+    this.handles.set(handle.runId, handle);
+    this.sessionHandles.set(handle.agentSessionId, handle);
+    void handle.done.finally(() => {
+      if (this.handles.get(handle.runId) === handle) this.handles.delete(handle.runId);
+      if (this.sessionHandles.get(handle.agentSessionId) === handle) {
+        this.sessionHandles.delete(handle.agentSessionId);
+      }
+    });
+  }
+
+  /**
+   * Start (or return) the live tail for a run. A session may have ONE
+   * reader: an observation tail already on this session is detached and the
+   * new tail waits for it to stop before reading — it inherits the session's
+   * open obligations through its leftover drain (tailer module doc).
+   */
+  start(options: StartTailOptions): RunTailHandle {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;
-    const handle = tailRun({ ...this.defaults, ...options });
-    this.handles.set(options.runId, handle);
-    void handle.done.finally(() => {
-      this.handles.delete(options.runId);
-    });
+    const prior = this.sessionHandles.get(options.agentSessionId);
+    let waitFor: Promise<void> | undefined;
+    if (prior) {
+      if (prior.observing) {
+        this.defaults.logger?.info("run.observation_handover", {
+          runId: options.runId,
+          sessionId: options.agentSessionId,
+          fields: { observedRunId: prior.runId },
+        });
+        prior.detach();
+      } else {
+        // Two live runs on one session is what admission forbids; chain
+        // rather than open a second cursor on the same stream.
+        this.defaults.logger?.warn("run.tail_chained", {
+          runId: options.runId,
+          sessionId: options.agentSessionId,
+          fields: { priorRunId: prior.runId },
+        });
+      }
+      waitFor = prior.done;
+    }
+    const handle = tailRun({ ...this.defaults, ...options, waitFor });
+    this.register(handle);
+    return handle;
+  }
+
+  /**
+   * Re-open OBSERVATION for a canceled run still owing eve a confirmation
+   * (the sweeper, boot reconciliation, the post-eve recheck). Null when the
+   * session already has a live tail — that tail carries the session's
+   * obligations — so the caller counts it `observing`, never a second reader.
+   */
+  observe(options: StartTailOptions & { deadlineAt: number }): RunTailHandle | null {
+    const existing = this.handles.get(options.runId);
+    if (existing) return existing;
+    if (this.sessionHandles.has(options.agentSessionId)) return null;
+    const { deadlineAt, ...rest } = options;
+    const handle = tailRun({ ...this.defaults, ...rest, observe: { deadlineAt } });
+    this.register(handle);
     return handle;
   }
 
   get(runId: string): RunTailHandle | undefined {
     return this.handles.get(runId);
+  }
+
+  /** Is any tail (follow or observation) live on this session in this process? */
+  hasSessionTail(agentSessionId: string): boolean {
+    return this.sessionHandles.has(agentSessionId);
   }
 
   /**
@@ -941,44 +1372,38 @@ export class RunTailerManager {
   }
 
   /**
-   * Cancel a specific run's live tail (user abort), marking it `canceled` and
-   * awaiting a clean stop. Returns true when a live tail was cancelled; false
-   * when the run had no active tail (parked/queued/terminal — the caller marks
-   * the row directly).
-   *
-   * eve's turn is genuinely cancelled too (0.31 `POST .../cancel`, issued by
-   * the tail before it stops reading) — but COOPERATIVELY, at the next durable
-   * step boundary, and a tool call already in flight still runs to completion.
-   * So "stopped" never means "undone", and the run row is finalized here
-   * without waiting for eve's `turn.cancelled`.
+   * Cancel a specific run's live tail (user abort), marking it `canceled`.
+   * Returns true once the row is finalized; false when the run had no active
+   * tail (parked/queued/terminal — the caller marks the row directly). The
+   * tail then OBSERVES eve's stream for the turn boundary (tailer doc) — the
+   * cancellation is cooperative at durable step boundaries, so "stopped"
+   * never means "undone", and the row is finalized without waiting for eve's
+   * `turn.cancelled`.
    */
   async cancelRun(runId: string, reason?: string): Promise<boolean> {
     const handle = this.handles.get(runId);
-    if (!handle) return false;
-    void handle.cancel(reason, { status: "canceled" });
-    await handle.done;
+    if (!handle || handle.observing) return false;
+    await handle.cancel(reason, { status: "canceled" });
     return true;
   }
 
   /**
-   * The cancel route's shape of {@link cancelRun}: the remote cancel is
-   * awaited (or skipped when unqualified and disallowed — see
-   * {@link CancelOptions}) BEFORE the tail aborts and the row finalizes, and
-   * the remote outcome is reported. Null when the run had no live tail.
+   * The cancel route's shape of {@link cancelRun}: the turn-qualified remote
+   * cancel (when the turn is known) is awaited BEFORE the row finalizes, and
+   * the remote outcome is reported once the row is finalized — NOT once the
+   * observation that follows has ended. Null when the run had no live tail.
    */
   async cancelRunGuarded(
     runId: string,
     reason: string,
-    options: Pick<CancelOptions, "awaitRemote" | "allowUnqualifiedRemote">,
+    options: Pick<CancelOptions, "awaitRemote"> = {},
   ): Promise<RemoteCancelOutcome | null> {
     const handle = this.handles.get(runId);
-    if (!handle) return null;
-    const outcome = await handle.cancel(reason, { status: "canceled", ...options });
-    await handle.done;
-    return outcome;
+    if (!handle || handle.observing) return null;
+    return handle.cancel(reason, { status: "canceled", ...options });
   }
 
-  /** Number of live tails (observability/tests). */
+  /** Number of live tails, observation tails included (observability/tests). */
   get activeCount(): number {
     return this.handles.size;
   }

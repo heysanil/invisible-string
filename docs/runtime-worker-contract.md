@@ -94,7 +94,8 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
   `no_active_session` (clear/compact/reset). So a 200 there carries the same
   terminal meaning as a 409 on send, and a 202 never proves a turn was
   stopped: a cancel against a live-but-idle session answers 202 `accepted`
-  (REPORT finding 24).
+  (REPORT finding 24) — which is why a Stop's remote obligation is met only
+  by eve's OWN stream (the confirmed cancel, below), never by that 202.
 - **Cancellation is cooperative**, at durable step boundaries: a tool call
   already in flight runs to completion and still emits its `action.result`;
   the turn then ends `turn.cancelled` → `session.waiting`, never
@@ -377,11 +378,13 @@ terminal-recheck/abandon settlement (never across the tail). Admission takes
 the same lock, so no successor can be admitted mid-decision: the abandon
 always remote-cancels its own accepted turn (nothing leaks), and its
 unqualified session-level cancel can never land after a successor's turn
-started. The cancel routes' remote leg (`cancelEveTurnGuarded`) try-acquires
-the lock and re-counts successors under it; when a dispatch holds the lock
-the chase is DEFERRED into the background (never dropped — the holder's
-recheck may have read the run before the Stop settled it) and re-runs the
-same under-lock successor check once the holder releases. The boot sweep
+started. The no-tail Stop's obligation settlement
+(`settleRemoteCancelGuarded`) try-acquires the lock and decides under it;
+when a dispatch holds the lock the settlement is DEFERRED into the
+background (never dropped — the holder's recheck may have read the run
+before the Stop settled it) and re-runs the same under-lock decision once
+the holder releases. The lock is never held across a tail — the observation
+that follows a Stop included. The boot sweep
 skips a candidate whose lock is held and its guarded UPDATE re-asserts the
 ledger (`NOT EXISTS` a live run) atomically. Contention answers the
 transient `session_busy`; the lock dies with its connection on a crash, and
@@ -425,61 +428,83 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   happened to find the lock free. The busy predicate's
   canceled+marker-set+eveless arm therefore only bites callers that do NOT
   hold the lock, and the sweep skipping a held lock is harmless.
-- **The remote cancel is awaited or durable — never an untracked promise.**
-  A Stop on a LIVE tail (`POST /runs/:id/cancel`, the pipeline child sweep —
-  `cancelAgentRun`) takes the session lock (bounded) and, holding it, has
-  the tail issue and AWAIT the remote cancel (turn-qualified when the tail
-  has observed `turn.started`) BEFORE finalizing the row, so admission
-  cannot reopen under an airborne unqualified cancel that would kill the
-  successor's turn. If the lock cannot be had, only a turn-qualified cancel
-  is issued (scoped, so safe without the lock) and an unqualified one is
-  SKIPPED and recorded — and so is a cancel the tail AWAITED that FAILED in
-  transport (a refused connection, a dead or absent worker, an HTTP error):
-  `failed` sets the obligation exactly like `skipped`. In BOTH shapes the
-  tail writes `runs.remote_cancel_pending_at` INSIDE the CAS that finalizes
-  the row `canceled` (`runs/tailer.ts` `finishRun` →
-  `RunStatusPatch.remoteCancelPendingAt`) — one statement, the same shape as
-  the no-tail path's `settleRunCanceledPendingRemote` — never as a second
-  UPDATE after the finalize: the instant a row reads canceled (admission
-  reopened, the lock released) the obligation is already on it, so a crash
-  there leaves an owner for the accepted turn. Every no-tail Stop sets the
-  marker in the SAME CAS that settles the row `canceled`;
-  `cancelEveTurnGuarded` clears it ONLY on a CONFIRMED outcome under the
-  lock — eve acknowledged the cancel (202, or 200 `no_active_turn`, eve's
-  one dead-session rendering), eve answered 409 `session_not_active`
-  (provably terminal for that id, so nothing can be running), a newer run
-  PROVABLY owns the session (superseded — eve serializes turns, so the
-  settled turn is over), or there is nothing to chase (no eve session).
-  "Provably" is load-bearing (`classifySessionSuccessor`, routes.ts): the
-  successor must have REACHED eve — `running`/`waiting` (its tail was
-  started, which the dispatch path does only after eve's 202), or terminal
-  with persisted `run_events` beyond its first seq (its tail observed eve's
-  stream). A successor that is merely `queued` — a row committed by a
-  dispatch that never armed or sent it — is NO evidence the settled turn
-  ended: the old any-live-successor rule cleared the marker on it, another
-  replica's sweep dropped the obligation, the settled turn ran on, and the
-  queued row later failed undispatched. A queued successor therefore
-  RETAINS the marker without cancelling (the unqualified cancel could land
-  on its turn if it is sent) and the chase retries — once it is running,
-  superseded is proven; once it has failed undispatched, no successor exists
-  and the cancel proceeds. The post-eve recheck (`recheckCanceledDuringEve`)
-  applies the same rule: `superseded` only behind a proven successor,
-  otherwise `deferred` — the cancel withheld and the obligation re-asserted
-  on the run. A transport/HTTP failure before the cancel reached eve RETAINS
-  the marker (the pre-fix best-effort swallow cleared it and recorded a
-  cancel that never left the process as done, leaving the accepted turn
-  running with nobody owing it). Retained and deferred obligations are
-  finished by three actors, all idempotent under the
-  session lock (the marker is re-read under the lock before any cancel, so a
-  met obligation is never cancelled twice): the in-process deferred chase
-  (the fast path, bounded at `SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS` and
-  retried with backoff across a saturated lock pool), the PERIODIC
-  remote-cancel sweep (`createRemoteCancelSweeper`, `REMOTE_CANCEL_SWEEP_MS`,
-  default 60 s — reconciliation's sweep 2b re-run by a healthy process with
-  `defer: false`, so a held lock or exhausted pool is simply retried next
-  tick and no replica fans out background chases; its candidate scan is
-  advisory-try-locked), and boot reconciliation (sweep 2b with the deferral
-  on). A Stop is therefore never stranded until a restart.
+- **The remote cancel is CONFIRMED by eve's own stream — never inferred
+  locally, never taken from a 202.** Every local signal is forgeable: a
+  `running` status is synthesized when reconciliation re-tails an unsent
+  continuation; `run_events` under a run can be a predecessor's leftovers
+  drained by its first connect; and eve answers an UNQUALIFIED pre-turn
+  cancel with 202 while consuming it as a no-op (above). So the platform no
+  longer infers "eve accepted this turn" or "the turn was stopped" from any
+  of them. The proof is `runs.turn_id`: the tail attributes every
+  `turn.started` it consumes in SEND order — eve serializes turns and the
+  platform sends one message per run under the session lock — handing each
+  one drained before its own turn to the session's oldest open obligation
+  whose turn has not started (`RunStore.listPendingRemoteCancels`), and
+  only then claiming one as its OWN; the id is written to that run's
+  `turn_id` BEFORE the event is persisted (`runs/tailer.ts`). The
+  dispatch-attempt CAS resets the column, so it always describes the latest
+  send. A Stop on a LIVE tail (`POST /runs/:id/cancel`, the pipeline child
+  sweep — `cancelAgentRun`) issues a turn-QUALIFIED cancel if the turn is
+  known (awaited, so its outcome is reported), sends NOTHING if not (the
+  no-op 202 above; the qualified cancel goes out the moment the run's own
+  `turn.started` is attributed), finalizes the row `canceled` WITH
+  `runs.remote_cancel_pending_at` in the SAME CAS (`finishRun` →
+  `RunStatusPatch.remoteCancelPendingAt` — one statement, never a second
+  UPDATE after the finalize, so a crash the instant the row reads canceled
+  finds the obligation already on it), and then STAYS on eve's stream in
+  OBSERVATION mode. No session lock is taken for a live-tail Stop any more:
+  the hold existed so an unqualified cancel could not land on a successor's
+  turn, and the live tail never sends one now; admission may reopen the
+  instant the row reads canceled. The obligation clears ONLY on: **(a)** the
+  run's own turn boundary after its own `turn.started` — `turn.cancelled` /
+  `turn.completed` carrying its turn id, or the following `session.waiting`
+  / `session.completed` (a `session.failed` is session-terminal and clears
+  every obligation); **(b)** a session-terminal answer from eve — 409
+  `session_not_active` / 200 `no_active_turn` on the cancel (the tail's
+  seam classifies both `terminal`), 409 `session_not_active` on a send
+  (`failEveDispatch`), 200 `no_active_session` on a context control
+  (`settleSessionRemoteCancelsTerminal`); **(c)** a PROVEN successor — a
+  NEWER run on the session whose `turn_id` is set (`classifySessionSuccessor`:
+  that and nothing else; a `queued`/`running`/`waiting` status, a terminal
+  status, or persisted events without a `turn_id` are all unproven and
+  RETAIN the marker); **(d)** evidence already on disk — the send provably
+  never happened (marker null), the run's own turn boundary is already
+  persisted under it (a parked `waiting` run), or the eveless session was
+  closed. A transport failure of the qualified cancel RETAINS the marker
+  (observation retries it, and the boundary still confirms). Observation is
+  wall-clock bounded by `REMOTE_CANCEL_OBSERVE_MS` (default 10 min) from
+  `remote_cancel_pending_at`: on expiry the run is declared UNRESOLVED —
+  `runs.remote_cancel_unresolved_at` set, the pending marker KEPT, a warn
+  logged (`run.remote_cancel_unresolved`) — an explicit, visible residual,
+  never a silent clear; a late confirmation still resolves it (both columns
+  cleared). ONE reader per eve stream, always: the manager keys tails by
+  session, detaches an observation tail when a successor's normal tail
+  starts on the same session (that tail carries the session's obligations
+  through its leftover drain — attributing the predecessor's turn, issuing
+  its qualified cancel, clearing on its boundary — before it claims its own
+  turn), and refuses to open an observation on a session that already has
+  a tail. A crash ends the observation, not the obligation: the no-tail
+  settlement (`settleRemoteCancelGuarded`, under the session lock) applies
+  (b)–(d) and otherwise RE-OPENS an observation tail from the run's
+  persisted seq on the session's affinity worker (`startObservation` — the
+  same primitive, never a normal tail, which would re-drive/misclassify a
+  canceled run), counted `observing`; nothing to act on (an armed eveless
+  session, no live worker) is `retained`; a held lock is `deferred`. The
+  post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a
+  run settled canceled while its eve call was in flight is `superseded`
+  only behind a proven successor, otherwise `observing` — obligation
+  re-asserted (`markRemoteCancelPending`, keeping the first timestamp) and
+  observation opened with the just-persisted session id; the old unqualified
+  cancel there is gone. Three actors finish what a live process could not,
+  all idempotent under the session lock via the under-lock marker re-read:
+  the in-process deferred settlement (bounded at
+  `SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS`, backing off across a saturated
+  lock pool), the PERIODIC remote-cancel sweep (`createRemoteCancelSweeper`,
+  `REMOTE_CANCEL_SWEEP_MS`, default 60 s — sweep 2b re-run with `defer:
+  false`, advisory-try-locked scan, skipping unresolved rows and declaring
+  aged ones unresolved), and boot reconciliation (sweep 2b after sweep 1's
+  normal re-tails and sweep 2's eveless closes). A Stop is therefore never
+  stranded until a restart — and never recorded as done on a guess.
 
 **Eveless create failed after arming (at-most-once residual):** when the eve
 call for a session with NO persisted eve id fails AFTER the dispatch-attempt
@@ -500,7 +525,7 @@ untouched — a failed follow-up never costs the user their thread.
 
 | Code | Origin | Meaning | Recovery |
 |---|---|---|---|
-| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, a just-canceled run's dispatch may still be in flight on an eveless session (as seen by a caller that does NOT hold the session lock), another dispatch holds the session's dispatch critical section (its eve call, settlement, or an awaited live-tail Stop is in flight this instant), or the lock pool is saturated | wait, retry; a racing Slack twin is logged and dropped |
+| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, a just-canceled run's dispatch may still be in flight on an eveless session (as seen by a caller that does NOT hold the session lock), another dispatch holds the session's dispatch critical section (its eve call or settlement is in flight this instant), or the lock pool is saturated | wait, retry; a racing Slack twin is logged and dropped |
 | `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` — and the platform's own verdict when a continuation's session is re-read closed UNDER the dispatch lock, or a lock-holding dispatch heals an abandoned eveless session it was asked to continue (the chat route surfaces the same verdict as `session_not_continuable`) | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
 
 `session_not_active` is a semantic *widening* of the 0.19 busy 409, not a
@@ -756,6 +781,8 @@ Settings → Models says so on the panel. Design:
 `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
 (default 30000 — the schedule ticker's scan cadence), `REMOTE_CANCEL_SWEEP_MS`
 (default 60000 — the periodic pending-remote-cancel sweep's cadence),
+`REMOTE_CANCEL_OBSERVE_MS` (default 600000 — how long a Stop's obligation
+may await eve's own confirmation before it is declared unresolved),
 `PIPELINE_RECOVERY_SWEEP_MS` (default 60000 — the periodic interrupted-
 pipeline adoption sweep's cadence), the product-DB pools `DB_POOL_SIZE` (default 10), `DB_LOCK_POOL_SIZE` (default 8
 — the session-dispatch lock pool) and `DB_PIPELINE_LOCK_POOL_SIZE` (default

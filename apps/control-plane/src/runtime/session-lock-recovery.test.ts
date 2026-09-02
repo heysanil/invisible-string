@@ -7,18 +7,21 @@
  * the extracted route bodies, proven against a real Postgres with a fake
  * worker client whose eve calls can be held in flight.
  *
- * D2 — DEFERRED CANCEL LOST ON CRASH: a Stop that could not remote-cancel
- *      synchronously (a dispatch held the session lock) scheduled an
- *      untracked promise; a crash before it ran left the accepted eve turn
- *      running forever. Now `runs.remote_cancel_pending_at` is set in the
- *      SAME CAS that settles the row, cleared once the guarded chase has run
- *      under the lock (issued / superseded / nothing to chase), and boot
- *      reconciliation finishes any marker it finds.
+ * D2 — DEFERRED CANCEL LOST ON CRASH: a Stop that could not settle its
+ *      remote obligation synchronously (a dispatch held the session lock)
+ *      scheduled an untracked promise; a crash before it ran left the
+ *      accepted eve turn running forever. Now `runs.remote_cancel_pending_at`
+ *      is set in the SAME CAS that settles the row, cleared ONLY on eve's own
+ *      evidence (a newer run's `turn_id`, the run's persisted turn boundary,
+ *      a send that never happened) and otherwise handed to an OBSERVATION
+ *      tail — by the guarded settlement under the lock, the deferred attempt
+ *      once the lock frees, and boot reconciliation for any marker it finds.
  *
- * D3 — LIVE-TAIL STOP without the lock: only a turn-QUALIFIED cancel may be
- *      issued (safe without the lock); an unqualified one is skipped, the
- *      obligation recorded, and the guarded chase finishes it once the lock
- *      frees — never an unscoped cancel that could reach a successor's turn.
+ * D3 — LIVE-TAIL STOP: no session lock is needed any more — the live tail
+ *      NEVER sends an unqualified cancel (eve consumes a pre-turn cancel as
+ *      a no-op); a turn-QUALIFIED cancel is issued when the turn is known,
+ *      the row finalizes with the obligation, and the tail stays on the
+ *      stream in observation mode for eve's confirmation.
  *
  * D4 — the chat follow-up route heals an abandoned eveless session it holds
  *      the lock for (closing it, permanent 409) instead of `session_busy`.
@@ -133,6 +136,7 @@ class FakeWorkerClient {
     _startIndex: number,
     signal: AbortSignal,
   ): Promise<Response> {
+    if (signal.aborted) throw new Error("aborted before connect");
     const encoder = new TextEncoder();
     const emitTurn = this.streamTurnStarted;
     const stream = new ReadableStream<Uint8Array>({
@@ -263,6 +267,8 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
         start: (options: { runId: string }) => {
           tailStarts.push(options.runId);
         },
+        observe: () => null,
+        hasSessionTail: () => false,
         get: () => undefined,
         cancelRun: async () => false,
         cancelRunGuarded: async () => null,
@@ -358,47 +364,53 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
 
   const cancelsFor = (eveId: string) => fakeWorker.cancelCalls.filter((c) => c.eveSessionId === eveId);
 
-  test("D2 — a no-tail Stop settles the row AND its remote-cancel obligation in one CAS; with the lock free the chase runs synchronously and clears it", async () => {
+  test("D2 — a no-tail Stop settles the row AND its remote-cancel obligation in one CAS; with the lock free the settlement runs synchronously — no unqualified cancel, the confirmation is owed to observation", async () => {
     await freshHeartbeat();
     const session = await insertSession();
     const run = await insertRun(session.id);
-    await cancelAgentRun(deps, run, session, "stopped by user");
+    await cancelAgentRun(liveDeps, run, session, "stopped by user");
     const after = await runRow(run.id);
     expect(after.status).toBe("canceled");
-    expect(after.remoteCancelPendingAt).toBeNull(); // issued ⇒ cleared
-    expect(cancelsFor(session.eveSessionId!)).toHaveLength(1);
+    // Pre-fix: an unqualified `{}` cancel, eve's 202 taken as done, marker cleared.
+    expect(after.remoteCancelPendingAt).not.toBeNull();
+    expect(cancelsFor(session.eveSessionId!)).toHaveLength(0);
+    await until(
+      () => (liveDeps.tailers.get(run.id)?.observing ? true : undefined),
+      "the observation tail",
+    );
+    await liveDeps.tailers.detach(run.id);
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
-  test("D2 — with a dispatch holding the lock the obligation stays DURABLE on the row until the deferred chase completes", async () => {
+  test("D2 — with a dispatch holding the lock the obligation stays DURABLE on the row; the deferred attempt opens observation once the lock frees", async () => {
     await freshHeartbeat();
     const session = await insertSession();
     const run = await insertRun(session.id);
     const held = await testLocks().acquire(session.id);
     expect(held).not.toBeNull();
     try {
-      await cancelAgentRun(deps, run, session, "stopped by user");
+      await cancelAgentRun(liveDeps, run, session, "stopped by user");
       const settled = await runRow(run.id);
       expect(settled.status).toBe("canceled");
       // The obligation is on the row — a crash here is finished at boot.
       expect(settled.remoteCancelPendingAt).not.toBeNull();
       expect(cancelsFor(session.eveSessionId!)).toHaveLength(0);
+      expect(liveDeps.tailers.get(run.id)).toBeUndefined();
     } finally {
       await held!.release();
     }
-    // The in-process deferred chase (the fast path) finishes it.
+    // The in-process deferred attempt (the fast path) opens observation.
     await until(
-      () => (cancelsFor(session.eveSessionId!).length > 0 ? true : undefined),
-      "the deferred remote cancel",
+      () => (liveDeps.tailers.get(run.id)?.observing ? true : undefined),
+      "the deferred settlement to open observation",
     );
-    await until(
-      async () => ((await runRow(run.id)).remoteCancelPendingAt === null ? true : undefined),
-      "the obligation to clear",
-    );
+    expect(cancelsFor(session.eveSessionId!)).toHaveLength(0);
+    expect((await runRow(run.id)).remoteCancelPendingAt).not.toBeNull();
+    await liveDeps.tailers.detach(run.id);
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
-  test("D2 — boot reconciliation finishes a pending remote cancel a crash left behind, and clears a SUPERSEDED one without touching eve", async () => {
+  test("D2 — boot reconciliation re-opens observation for a pending remote cancel a crash left behind, and clears a SUPERSEDED one (a newer run's turn_id) without touching eve", async () => {
     await freshHeartbeat();
     // (a) crash residue: canceled + obligation set, nothing else on the session.
     const orphaned = await insertSession();
@@ -407,25 +419,24 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
       completedAt: new Date(),
       remoteCancelPendingAt: new Date(),
     });
-    // (b) superseded: the same residue, but a newer run PROVABLY owns the
-    // session — it is `running`, i.e. its tail started, which the dispatch
-    // path does only after eve's 202 — and eve serializes turns, so the
-    // settled turn is over. The obligation clears WITHOUT an unqualified
-    // cancel that could hit the successor's turn. (A merely QUEUED successor
-    // is no such proof and RETAINS the marker — remote-cancel-durability
-    // .test.ts, G2.)
+    // (b) superseded: the same residue, but a newer run's tail OBSERVED its
+    // own `turn.started` (`turn_id` set) — eve's proof it moved on; eve
+    // serializes turns, so the settled turn is over. The obligation clears
+    // WITHOUT a cancel. (A `running` successor with no turn_id is no such
+    // proof — remote-cancel-durability.test.ts, P2.)
     const superseded = await insertSession();
     const supersededRun = await insertRun(superseded.id, {
       status: "canceled",
       completedAt: new Date(),
       remoteCancelPendingAt: new Date(),
     });
-    const successor = await insertRun(superseded.id, { status: "running" });
+    const successor = await insertRun(superseded.id, { status: "running", turnId: "turn_succ" });
 
     const outcome = await reconcileInterruptedRuns(deps);
-    expect(outcome.remoteCancels.settled).toBeGreaterThanOrEqual(2);
-    expect(cancelsFor(orphaned.eveSessionId!)).toHaveLength(1);
-    expect((await runRow(orphanRun.id)).remoteCancelPendingAt).toBeNull();
+    expect(outcome.remoteCancels.settled).toBeGreaterThanOrEqual(1);
+    expect(outcome.remoteCancels.observing).toBeGreaterThanOrEqual(1);
+    expect(cancelsFor(orphaned.eveSessionId!)).toHaveLength(0);
+    expect((await runRow(orphanRun.id)).remoteCancelPendingAt).not.toBeNull(); // owed to observation
     expect(cancelsFor(superseded.eveSessionId!)).toHaveLength(0);
     expect((await runRow(supersededRun.id)).remoteCancelPendingAt).toBeNull();
 
@@ -434,7 +445,7 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
     await runStore.markSession(superseded.id, "closed");
   }, 20_000);
 
-  test("D3 — a live-tail Stop that cannot take the lock issues NO unqualified cancel: the obligation is recorded and finished by the guarded chase once the lock frees", async () => {
+  test("D3 — a live-tail Stop before turn.started issues NO unqualified cancel (with or without the lock): the obligation is recorded in the finalizing CAS and the tail observes for eve's confirmation", async () => {
     await freshHeartbeat();
     const session = await insertSession();
     const run = await insertRun(session.id, { status: "queued", startedAt: null });
@@ -459,25 +470,23 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
       await cancelAgentRun(liveDeps, { id: run.id, status: "running" }, session, "stopped by user");
       const settled = await runRow(run.id);
       expect(settled.status).toBe("canceled");
-      // No unscoped cancel went out without the lock…
+      // No unscoped cancel went out (the lock is irrelevant to that now)…
       expect(cancelsFor(session.eveSessionId!)).toHaveLength(0);
-      // …and the obligation is durable.
+      // …the obligation is durable, in the same CAS…
       expect(settled.remoteCancelPendingAt).not.toBeNull();
+      expect(settled.remoteCancelPendingAt).toEqual(settled.completedAt);
+      // …and the tail is still on the stream, owing eve's confirmation.
+      expect(liveDeps.tailers.get(run.id)?.observing).toBeTrue();
     } finally {
       await held!.release();
     }
-    await until(
-      () => (cancelsFor(session.eveSessionId!).length > 0 ? true : undefined),
-      "the guarded chase after the lock freed",
-    );
-    await until(
-      async () => ((await runRow(run.id)).remoteCancelPendingAt === null ? true : undefined),
-      "the obligation to clear",
-    );
+    await Bun.sleep(300);
+    expect(cancelsFor(session.eveSessionId!)).toHaveLength(0); // still nothing unqualified
+    await liveDeps.tailers.detach(run.id);
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
-  test("D3 — a live-tail Stop that cannot take the lock may still issue a turn-QUALIFIED cancel (scoped, so safe without the lock)", async () => {
+  test("D3 — a live-tail Stop after turn.started issues the turn-QUALIFIED cancel (scoped, so safe without any lock) and still owes the boundary", async () => {
     await freshHeartbeat();
     const session = await insertSession();
     const run = await insertRun(session.id, { status: "queued", startedAt: null });
@@ -510,10 +519,14 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
       ]);
       const settled = await runRow(run.id);
       expect(settled.status).toBe("canceled");
-      expect(settled.remoteCancelPendingAt).toBeNull(); // issued ⇒ nothing owed
+      expect(settled.turnId).toBe("turn_observed");
+      // eve's 202 to the qualified cancel is NOT confirmation: the boundary is owed.
+      expect(settled.remoteCancelPendingAt).not.toBeNull();
+      expect(liveDeps.tailers.get(run.id)?.observing).toBeTrue();
     } finally {
       await held!.release();
     }
+    await liveDeps.tailers.detach(run.id);
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
@@ -599,10 +612,14 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
-  test("D5 (window 2) — a Stop landing during the resume's ensure-agent boot is caught by the pre-eve fence: no continue is sent, the run stays canceled, the obligation is finished", async () => {
+  test("D5 (window 2) — a Stop landing during the resume's ensure-agent boot is caught by the pre-eve fence: no continue is sent, the run stays canceled, the obligation settles on the parked turn's persisted boundary", async () => {
     await freshHeartbeat();
     const session = await insertSession({ status: "waiting" });
-    const run = await insertRun(session.id, { status: "waiting" });
+    // A parked run as its tail left it: own turn known, boundary persisted.
+    const run = await insertRun(session.id, { status: "waiting", turnId: "turn_parked" });
+    await runStore.appendEvent(run.id, 0, { type: "turn.started", data: { sequence: 0, turnId: "turn_parked" } } as never);
+    await runStore.appendEvent(run.id, 1, { type: "turn.completed", data: { sequence: 0, turnId: "turn_parked" } } as never);
+    await runStore.appendEvent(run.id, 2, { type: "session.waiting", data: { wait: "next-user-message" } } as never);
     const ensureGate = deferred();
     const ensureEntered = deferred();
     fakeWorker.ensureGate = ensureGate;
@@ -627,16 +644,13 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
     // The pre-eve fence held: no answer went to eve for a canceled run.
     expect(fakeWorker.continueCalls.length).toBe(continuesBefore);
     expect(tailStarts.length).toBe(tailsBefore);
-    // …and the deferred chase (lock freed by the resume's finally) finished
-    // the obligation.
-    await until(
-      () => (cancelsFor(session.eveSessionId!).length > 0 ? true : undefined),
-      "the deferred remote cancel",
-    );
+    // …and the deferred settlement (lock freed by the resume's finally)
+    // found the parked turn's boundary already persisted: met, no cancel.
     await until(
       async () => ((await runRow(run.id)).remoteCancelPendingAt === null ? true : undefined),
       "the obligation to clear",
     );
+    expect(cancelsFor(session.eveSessionId!)).toHaveLength(0);
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 });

@@ -63,10 +63,15 @@
  *
  * Scope discipline: the lock is held across the eve call and its settlement
  * ONLY — never across a tail (startTail registers and returns; the tail runs
- * lock-free). The one exception is the live-tail STOP: the cancel route
- * holds the lock while the tail's remote cancel is AWAITED and the row
- * finalized, so admission stays closed until the settled turn's cancel has
- * reached eve (routes.ts `cancelAgentRun`).
+ * lock-free), and never across the OBSERVATION that follows a Stop
+ * (runs/tailer.ts). There is no live-tail-Stop exception any more: that hold
+ * existed so an UNQUALIFIED cancel could not land on a successor's turn once
+ * admission reopened, and the live tail never sends one now — it issues a
+ * turn-QUALIFIED cancel when it knows the turn and nothing otherwise, so a
+ * late cancel can only ever name the settled run's own turn. The no-tail
+ * Stop's obligation settlement (`settleRemoteCancelGuarded`) still
+ * try-acquires the lock, purely to decide against a fresh session/run read
+ * that no dispatch is mutating mid-flight.
  */
 import type postgres from "postgres";
 import type { Logger } from "@invisible-string/shared";
@@ -109,8 +114,8 @@ export const SESSION_LOCK_ADMISSION_WAIT_MS = 250;
 export const SESSION_LOCK_FRESH_SESSION_WAIT_MS = 2_000;
 
 /**
- * How long a DEFERRED guarded remote cancel keeps trying in the background
- * when a dispatch holds the session (routes.ts `cancelEveTurnGuarded`). Must
+ * How long a DEFERRED obligation settlement keeps trying in the background
+ * when a dispatch holds the session (routes.ts `settleRemoteCancelGuarded`). Must
  * outlast the longest lock hold: ensure-agent (2 × 60 s cold boot) + the eve
  * call (60 s) + settlement. The obligation is ALSO durable
  * (`runs.remote_cancel_pending_at`), so a crash mid-deferral is finished by

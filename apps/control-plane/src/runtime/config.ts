@@ -102,6 +102,16 @@ export interface RuntimeConfig {
    */
   remoteCancelSweepMs: number;
   /**
+   * Remote-cancel OBSERVATION window (REMOTE_CANCEL_OBSERVE_MS, default 10
+   * min — keep in sync with runs/tailer.ts DEFAULT_REMOTE_CANCEL_OBSERVE_MS):
+   * how long, from `runs.remote_cancel_pending_at`, a Stop's obligation may
+   * wait for eve's OWN confirmation on the session stream (the run's turn
+   * boundary after its own `turn.started`) before it is declared unresolved
+   * (`runs.remote_cancel_unresolved_at`, logged at warn, marker retained).
+   * Bounds both the live tail's observation and the sweeper's re-opened one.
+   */
+  remoteCancelObserveMs: number;
+  /**
    * Pipeline-recovery sweep cadence (PIPELINE_RECOVERY_SWEEP_MS, default 60 s
    * — keep in sync with pipeline/recovery.ts
    * DEFAULT_PIPELINE_RECOVERY_SWEEP_MS): how often a HEALTHY process re-runs
@@ -268,6 +278,12 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     60_000,
     problems,
   );
+  const remoteCancelObserveMs = parsePositiveInt(
+    env.REMOTE_CANCEL_OBSERVE_MS,
+    "REMOTE_CANCEL_OBSERVE_MS",
+    600_000,
+    problems,
+  );
   const pipelineRecoverySweepMs = parsePositiveInt(
     env.PIPELINE_RECOVERY_SWEEP_MS,
     "PIPELINE_RECOVERY_SWEEP_MS",
@@ -331,6 +347,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     workerSweepIntervalMs,
     scheduleTickMs,
     remoteCancelSweepMs,
+    remoteCancelObserveMs,
     pipelineRecoverySweepMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),

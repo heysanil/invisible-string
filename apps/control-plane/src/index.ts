@@ -377,6 +377,7 @@ export function createRuntimeDeps(opts: {
     store: runStore,
     bus,
     maxWallClockMs: runtime.maxRunWallClockMs,
+    remoteCancelObserveMs: runtime.remoteCancelObserveMs,
     logger,
     // Feed the run-duration histogram from every completed run (parked
     // `waiting` runs are not finished, so they are excluded), then settle any
@@ -801,13 +802,15 @@ if (import.meta.main) {
           remoteCancels.settled > 0 ||
           remoteCancels.deferred > 0 ||
           remoteCancels.retained > 0 ||
+          remoteCancels.observing > 0 ||
+          remoteCancels.unresolved > 0 ||
           pipelines.resumed > 0 ||
           pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.deferred} deferred, ${remoteCancels.retained} retained), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.observing} observing, ${remoteCancels.deferred} deferred, ${remoteCancels.retained} retained, ${remoteCancels.unresolved} unresolved), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
             fields: { resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries },
           });
         }
@@ -833,10 +836,12 @@ if (import.meta.main) {
     });
     scheduleTicker.start();
     // Remote-cancel sweeper: re-runs boot reconciliation's pending-remote-
-    // cancel sweep every REMOTE_CANCEL_SWEEP_MS so a Stop whose eve leg was
-    // refused (saturated lock pool, unreachable worker, transport failure)
-    // is finished by a HEALTHY process, not the next restart. Replica-safe:
-    // advisory-try-locked scan, per-session dispatch lock per candidate.
+    // cancel sweep every REMOTE_CANCEL_SWEEP_MS so a Stop whose confirmation
+    // is still owed (a crashed observation tail, an unreachable worker, a
+    // held lock) is re-observed by a HEALTHY process, not the next restart —
+    // and so an obligation past REMOTE_CANCEL_OBSERVE_MS is declared
+    // unresolved. Replica-safe: advisory-try-locked scan, per-session
+    // dispatch lock per candidate, one observation tail per session.
     remoteCancelSweeper = createRemoteCancelSweeper(stack.runtime, {
       intervalMs: stack.runtime.runtime.remoteCancelSweepMs,
     });

@@ -3,7 +3,7 @@
  * Interface-first so the tailer unit-tests against an in-memory fake; the
  * drizzle implementation is the production path.
  */
-import { and, asc, count, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type {
   AgentSessionStatus,
@@ -27,14 +27,38 @@ export interface RunStatusPatch {
   /**
    * The run's DURABLE remote-cancel obligation (`runs.remote_cancel_pending_at`),
    * written in the SAME statement that settles the row `canceled` — the
-   * live-tail Stop whose remote leg was skipped or failed in transport
-   * records it here so no window exists in which the row reads canceled
-   * while nobody owes eve the cancel (a crash between two statements used
-   * to leave the accepted turn with no obligation at all). Only meaningful
-   * with `status: "canceled"`; cleared by the guarded chase
-   * (runtime/routes.ts `cancelEveTurnGuarded`) on a confirmed outcome.
+   * live-tail Stop records it here so no window exists in which the row
+   * reads canceled while nobody owes eve the confirmation (a crash between
+   * two statements used to leave the accepted turn with no obligation at
+   * all). Only meaningful with `status: "canceled"`; cleared by
+   * {@link RunStore.clearRemoteCancelPending} on a CONFIRMED outcome only —
+   * the run's own turn boundary on eve's stream, a session-terminal answer,
+   * a proven successor, or a send that provably never happened.
    */
   remoteCancelPendingAt?: Date;
+  /**
+   * `runs.turn_id` — eve's acceptance proof for the run's LATEST send.
+   * `null` here is the dispatch-attempt CAS resetting it before a (re)send
+   * (`armDispatchAttempt`), so the column always describes the turn of the
+   * most recent message; the tail writes the id itself through
+   * {@link RunStore.setRunTurnId} when it observes the run's own
+   * `turn.started`.
+   */
+  turnId?: string | null;
+}
+
+/** One open remote-cancel obligation on a session (see listPendingRemoteCancels). */
+export interface PendingRemoteCancel {
+  runId: string;
+  /**
+   * The settled run's own turn id, when its `turn.started` has already been
+   * observed (a turn-QUALIFIED cancel can be issued for it); null when the
+   * turn has not been seen to start — the next unattributed `turn.started`
+   * on the session's stream is this run's, in send order.
+   */
+  turnId: string | null;
+  /** When the obligation was recorded (the observation clock starts here). */
+  pendingAt: Date;
 }
 
 export interface RunStore {
@@ -71,6 +95,55 @@ export interface RunStore {
   getRunStatus(
     runId: string,
   ): Promise<{ status: RunStatus; error: string | null } | null>;
+  /**
+   * The run's turn/obligation state as persisted: its `turn_id` (eve's
+   * acceptance proof for the latest send, null until the tail observed the
+   * run's own `turn.started`) and whether a remote-cancel obligation is
+   * still open on it. Read by a starting tail to decide whether its own
+   * turn boundary has already been seen (a resume after a crash) — the
+   * durable column, never `seq > 0`, which a predecessor's drained leftovers
+   * also satisfy.
+   */
+  getRunTurnState(runId: string): Promise<{
+    status: RunStatus;
+    turnId: string | null;
+    remoteCancelPendingAt: Date | null;
+  } | null>;
+  /**
+   * Record eve's acceptance proof: the run's own `turn.started.data.turnId`.
+   * CAS — writes only while `turn_id` is NULL or already this id (a
+   * re-read after a reconnect/crash is idempotent); a different id already
+   * present is refused and reported false. Written BEFORE the event itself
+   * is persisted, so a crash in between leaves the proof (the event is
+   * re-read on resume and recognized as the run's own).
+   */
+  setRunTurnId(runId: string, turnId: string): Promise<boolean>;
+  /**
+   * The session's OPEN remote-cancel obligations — canceled runs carrying
+   * `remote_cancel_pending_at` and not yet declared unresolved — oldest
+   * first (`created_at`, i.e. send order). A tail attributes every
+   * `turn.started` it drains before its own turn to these, in order: the
+   * first obligation whose `turnId` is null owns the next unattributed turn
+   * (eve serializes turns and the platform sends in run order). A tail
+   * started in observation mode for one of these runs handles the whole
+   * list the same way.
+   */
+  listPendingRemoteCancels(agentSessionId: string): Promise<PendingRemoteCancel[]>;
+  /**
+   * Meet a run's remote-cancel obligation: clears `remote_cancel_pending_at`
+   * AND `remote_cancel_unresolved_at` (a late confirmation resolves an
+   * honest residual). Only on a CONFIRMED outcome (see the schema doc);
+   * returns whether a pending row was cleared.
+   */
+  clearRemoteCancelPending(runId: string): Promise<boolean>;
+  /**
+   * Declare a run's obligation UNRESOLVED (`remote_cancel_unresolved_at`):
+   * the observation window elapsed with no confirmation from eve. The
+   * pending marker is left in place (the obligation is honestly unmet), but
+   * the sweeper stops re-opening observation for it. CAS on a still-pending,
+   * not-yet-unresolved row; returns whether this call did it.
+   */
+  markRemoteCancelUnresolved(runId: string): Promise<boolean>;
   /**
    * Settle a run's outbound-reply obligation (Slack today): flips
    * `delivery_status` from `pending` to delivered/failed. CAS like markRun —
@@ -195,6 +268,7 @@ export function createDrizzleRunStore(db: Db): RunStore {
           ...(patch.remoteCancelPendingAt !== undefined
             ? { remoteCancelPendingAt: patch.remoteCancelPendingAt }
             : {}),
+          ...(patch.turnId !== undefined ? { turnId: patch.turnId } : {}),
         })
         .where(
           and(
@@ -232,6 +306,83 @@ export function createDrizzleRunStore(db: Db): RunStore {
         .where(eq(schema.runs.id, runId))
         .limit(1);
       return rows[0] ?? null;
+    },
+
+    async getRunTurnState(runId) {
+      const rows = await db
+        .select({
+          status: schema.runs.status,
+          turnId: schema.runs.turnId,
+          remoteCancelPendingAt: schema.runs.remoteCancelPendingAt,
+        })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, runId))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
+    async setRunTurnId(runId, turnId) {
+      const updated = await db
+        .update(schema.runs)
+        .set({ turnId })
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            or(isNull(schema.runs.turnId), eq(schema.runs.turnId, turnId)),
+          ),
+        )
+        .returning({ id: schema.runs.id });
+      return updated.length > 0;
+    },
+
+    async listPendingRemoteCancels(agentSessionId) {
+      const rows = await db
+        .select({
+          runId: schema.runs.id,
+          turnId: schema.runs.turnId,
+          pendingAt: schema.runs.remoteCancelPendingAt,
+        })
+        .from(schema.runs)
+        .where(
+          and(
+            eq(schema.runs.agentSessionId, agentSessionId),
+            eq(schema.runs.status, "canceled"),
+            isNotNull(schema.runs.remoteCancelPendingAt),
+            isNull(schema.runs.remoteCancelUnresolvedAt),
+          ),
+        )
+        .orderBy(asc(schema.runs.createdAt));
+      return rows.map((row) => ({
+        runId: row.runId,
+        turnId: row.turnId,
+        pendingAt: row.pendingAt ?? new Date(0),
+      }));
+    },
+
+    async clearRemoteCancelPending(runId) {
+      const updated = await db
+        .update(schema.runs)
+        .set({ remoteCancelPendingAt: null, remoteCancelUnresolvedAt: null })
+        .where(
+          and(eq(schema.runs.id, runId), isNotNull(schema.runs.remoteCancelPendingAt)),
+        )
+        .returning({ id: schema.runs.id });
+      return updated.length > 0;
+    },
+
+    async markRemoteCancelUnresolved(runId) {
+      const updated = await db
+        .update(schema.runs)
+        .set({ remoteCancelUnresolvedAt: new Date() })
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            isNotNull(schema.runs.remoteCancelPendingAt),
+            isNull(schema.runs.remoteCancelUnresolvedAt),
+          ),
+        )
+        .returning({ id: schema.runs.id });
+      return updated.length > 0;
     },
 
     async markSession(agentSessionId, status) {

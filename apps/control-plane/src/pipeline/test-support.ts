@@ -85,6 +85,25 @@ export function createMemoryRunStore(): MemoryRunStore {
     async markSession(sessionId, status) {
       store.sessionMarks.push({ sessionId, status });
     },
+    // Pipeline runs are sessionless: no turn attribution, no obligations.
+    async getRunTurnState(runId) {
+      const current = store.statuses.get(runId);
+      return current
+        ? { status: current.status, turnId: null, remoteCancelPendingAt: null }
+        : null;
+    },
+    async setRunTurnId() {
+      return true;
+    },
+    async listPendingRemoteCancels() {
+      return [];
+    },
+    async clearRemoteCancelPending() {
+      return false;
+    },
+    async markRemoteCancelUnresolved() {
+      return false;
+    },
   };
   return store;
 }
@@ -156,6 +175,8 @@ export function makeRunRow(overrides: Partial<RunRow> = {}): RunRow {
     startedAt: null,
     completedAt: null,
     remoteCancelPendingAt: null,
+    turnId: null,
+    remoteCancelUnresolvedAt: null,
     error: null,
     createdAt: new Date(),
     updatedAt: new Date(),

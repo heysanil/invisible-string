@@ -29,7 +29,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
@@ -113,6 +113,18 @@ const TERMINAL_TYPES = new Set([
   "session.failed",
 ]);
 
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 class FakeWorker {
   readonly sessions = new Map<string, FakeEveSession>();
   readonly ensureCalls: EnsureCall[] = [];
@@ -121,6 +133,9 @@ class FakeWorker {
   readonly continueBodies: unknown[] = [];
   /** Control-route calls: "cancel" | "clear" | "compact" | "reset". */
   readonly controlCalls: Array<{ sessionId: string; action: string }> = [];
+  /** Set to hold the NEXT session create in flight; `createEntered` resolves on entry. */
+  holdNextCreate: Deferred | null = null;
+  createEntered: Deferred | null = null;
   jwtFailures = 0;
   private server: ReturnType<typeof Bun.serve> | null = null;
   private counter = 0;
@@ -272,6 +287,13 @@ class FakeWorker {
     if (sub === "session" && req.method === "POST") {
       const parsed = parseCreateBody(await req.json().catch(() => ({})));
       if (parsed instanceof Response) return parsed;
+      // Crash-window tests: hold the accepted create in flight so a Stop can
+      // race the control plane's id persist.
+      this.createEntered?.resolve();
+      this.createEntered = null;
+      const gate = this.holdNextCreate;
+      this.holdNextCreate = null;
+      if (gate) await gate.promise;
       const id = `eve-sess-${++this.counter}`;
       const session: FakeEveSession = {
         id,
@@ -1458,6 +1480,204 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("agent_not_published");
+  });
+
+  // ── cancel racing an in-flight eve create (persist-then-recheck) ──────────
+
+  describe("cancel during an in-flight eve create", () => {
+    let raceCookie: string;
+    let raceOrgId: string;
+    let raceAgentId: string;
+
+    beforeAll(async () => {
+      // A FRESH workspace: the shared org's run cap is saturated by the caps
+      // test's held runs, and these tests need real dispatch admission.
+      const fresh = await signUpWithOrg("Create Race");
+      raceCookie = fresh.cookie;
+      raceOrgId = fresh.orgId;
+      await seedWorkspace(db, raceOrgId, fresh.userId);
+      raceAgentId = await createAgent(raceCookie, raceOrgId, "Race agent", {
+        persona: "Hi.",
+        model: { preset: "balanced", reasoning: "medium" },
+        context: { mcpConnectionIds: [], skillIds: [] },
+      });
+      const publish = await api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/publish`,
+        { cookie: raceCookie },
+      );
+      expect(publish.status).toBe(200);
+      const publishBody = (await publish.json()) as PublishAgentResponse;
+      await stack.runtime!.buildService.waitFor(publishBody.contentHash);
+      await until(async () => {
+        const record = await stack.runtime!.buildStore.get(publishBody.contentHash);
+        return record?.status === "succeeded" || undefined;
+      }, "race agent build");
+    }, 60_000);
+
+    /** The newest queued run of this workspace (inserted before the eve call). */
+    async function queuedRun(): Promise<{ runId: string; sessionId: string }> {
+      return until(async () => {
+        const rows = await db
+          .select({ runId: schema.runs.id, sessionId: schema.runs.agentSessionId })
+          .from(schema.runs)
+          .where(
+            and(
+              eq(schema.runs.organizationId, raceOrgId),
+              eq(schema.runs.status, "queued"),
+            ),
+          );
+        const row = rows[0];
+        return row?.sessionId
+          ? { runId: row.runId, sessionId: row.sessionId }
+          : undefined;
+      }, "the dispatch's queued run row");
+    }
+
+    test("fresh chat create: a Stop while the create is in flight remote-cancels the accepted turn and starts no tail", async () => {
+      await freshWorkerHeartbeat();
+      const gate = deferred();
+      const entered = deferred();
+      fixture.holdNextCreate = gate;
+      fixture.createEntered = entered;
+
+      const creating = api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/sessions`,
+        { cookie: raceCookie, body: { message: "doomed first message" } },
+      );
+      await entered.promise; // eve has ACCEPTED the create; the 202 is held
+      const { runId, sessionId } = await queuedRun();
+
+      // The Stop: no tail exists yet and the session row has no eve id, so
+      // the route's own best-effort remote chase has nothing to target — the
+      // window the post-eve recheck exists for.
+      const cancel = await api("POST", `/runs/${runId}/cancel`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(cancel.status).toBe(200);
+
+      gate.resolve();
+      const res = await creating;
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as CreateSessionResponse;
+      expect(body.run.status).toBe("canceled");
+      expect(body.session.status).toBe("closed");
+
+      // The accepted turn was told to stop, with the id persisted first.
+      const row = await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, sessionId));
+      const eveId = row[0]!.eveSessionId;
+      expect(eveId).toBeTruthy();
+      expect(row[0]!.status).toBe("closed");
+      expect(fixture.controlCalls).toContainEqual({
+        sessionId: eveId!,
+        action: "cancel",
+      });
+      // …and no tail ever followed the canceled run.
+      expect(fixture.streamCalls.map((c) => c.sessionId)).not.toContain(eveId!);
+    }, 20_000);
+
+    test("post-reset create: the same Stop race is caught, a racing message gets session_busy, and the thread recovers", async () => {
+      await freshWorkerHeartbeat();
+      // Seed a session, let its run settle, then reset — leaving the
+      // replacement row EVELESS (its next message opens a fresh eve session).
+      const seeded = await api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/sessions`,
+        { cookie: raceCookie, body: { message: "seed" } },
+      );
+      expect(seeded.status).toBe(201);
+      const seededBody = (await seeded.json()) as CreateSessionResponse;
+      await until(async () => {
+        const rows = await db
+          .select({ status: schema.runs.status })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, seededBody.run.id));
+        const status = rows[0]?.status;
+        return (status === "succeeded" || status === "failed") || undefined;
+      }, "the seed run to settle");
+      const reset = await api("POST", `/sessions/${seededBody.session.id}/reset`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(reset.status).toBe(200);
+      const resetBody = (await reset.json()) as ResetSessionResponse;
+      if (resetBody.status !== "reset") throw new Error("expected a reset");
+      const replacementId = resetBody.session.id;
+
+      const gate = deferred();
+      const entered = deferred();
+      fixture.holdNextCreate = gate;
+      fixture.createEntered = entered;
+      const sending = api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "doomed follow-up" },
+      });
+      await entered.promise;
+      const { runId } = await queuedRun();
+      const cancel = await api("POST", `/runs/${runId}/cancel`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(cancel.status).toBe(200);
+
+      // Admission fence: the canceled run's dispatch may still be in flight
+      // (marker set, session still eveless) — a racing message must be
+      // refused with the TRANSIENT session_busy, not open a second eve
+      // session on the row.
+      const racing = await api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "impatient retry" },
+      });
+      expect(racing.status).toBe(409);
+      const racingBody = (await racing.json()) as { error: { code: string } };
+      expect(racingBody.error.code).toBe("session_busy");
+
+      gate.resolve();
+      const res = await sending;
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as PostMessageResponse;
+      expect(body.run.status).toBe("canceled");
+
+      // The accepted turn was remote-canceled; the id persisted; the session
+      // belongs to the user's thread and stays OPEN.
+      const row = await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, replacementId));
+      const eveId = row[0]!.eveSessionId;
+      expect(eveId).toBeTruthy();
+      expect(row[0]!.status).toBe("active");
+      expect(fixture.controlCalls).toContainEqual({
+        sessionId: eveId!,
+        action: "cancel",
+      });
+      expect(fixture.streamCalls.map((c) => c.sessionId)).not.toContain(eveId!);
+
+      // session_busy was transient: with the abandon settled the retry is
+      // admitted and continues the persisted eve session.
+      const retry = await api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "clean retry" },
+      });
+      expect(retry.status).toBe(201);
+      const retryBody = (await retry.json()) as PostMessageResponse;
+      await until(async () => {
+        const rows = await db
+          .select({ status: schema.runs.status })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, retryBody.run.id));
+        const status = rows[0]?.status;
+        return (
+          (status === "succeeded" || status === "failed" || status === "canceled") ||
+          undefined
+        );
+      }, "the retried run to settle");
+    }, 30_000);
   });
 
   // ── boot reconciliation ───────────────────────────────────────────────────

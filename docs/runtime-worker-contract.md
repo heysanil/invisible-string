@@ -311,7 +311,13 @@ double-dispatching.
 counts as busy alongside queued/running — a new message into a parked session
 is 409 `session_busy` ("answer the pending approval first"), and
 `POST /runs/:id/input` refuses while any OTHER run of the session is
-dispatching. Exactly one tail per eve NDJSON stream at any instant.
+dispatching. A CANCELED run whose dispatch may still be in flight also counts
+as busy on an EVELESS session (dispatch-attempt marker set, no eve id
+persisted yet): a Stop can settle a run terminal while its `createEveSession`
+is airborne, and admitting a new run in that window would open a second eve
+session on the row. The state resolves fast — the in-flight dispatch persists
+the id (persist-then-recheck), a failed call closes the session, and the boot
+sweep handles a crash. Exactly one tail per eve NDJSON stream at any instant.
 
 **Two 409s with OPPOSITE recoveries — never collapse them** (constants:
 `SESSION_BUSY_ERROR_CODE` / `SESSION_NOT_ACTIVE_ERROR_CODE` in
@@ -319,7 +325,7 @@ dispatching. Exactly one tail per eve NDJSON stream at any instant.
 
 | Code | Origin | Meaning | Recovery |
 |---|---|---|---|
-| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting | wait, retry; a racing Slack twin is logged and dropped |
+| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, or a just-canceled run's dispatch may still be in flight on an eveless session | wait, retry; a racing Slack twin is logged and dropped |
 | `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
 
 `session_not_active` is a semantic *widening* of the 0.19 busy 409, not a

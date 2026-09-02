@@ -35,7 +35,19 @@
  * (existence-hiding; the macro itself 403s callers addressing a workspace
  * path that is not their active workspace).
  */
-import { and, asc, count, desc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import { Elysia } from "elysia";
 import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
@@ -95,6 +107,7 @@ import type { RuntimeConfig } from "./config";
 import {
   armDispatchAttempt,
   publishedPipelineConfigOf,
+  recheckCanceledDuringEve,
   PIPELINE_TRIGGER_AGENT_ID,
 } from "./dispatch";
 import { getAccessToken, type TokenLifecycleDeps } from "../oauth/tokens";
@@ -573,6 +586,29 @@ export async function failEveDispatch(
     });
     return failDispatch(deps, runId, errors.sessionNotActive());
   }
+  // CANCELED WHILE IN FLIGHT, CALL FAILED: a Stop settled the run terminal
+  // while the eve call was airborne (so `countDispatchingRuns` counts it as
+  // busy on an eveless session — the canceled-mid-dispatch arm) and the call
+  // itself then failed. No accepted turn exists and no eve id will ever be
+  // persisted for this session, so a STILL-EVELESS session must be closed
+  // here or that busy-arm would hold `session_busy` until the next boot
+  // sweep — the same terminal outcome the pre-eve cancel fence gives an
+  // eveless session, reached one step later. Sessions that already carry an
+  // eve id (continuations, post-persist) are untouched.
+  const current = await deps.runStore.getRunStatus(runId);
+  if (current?.status === "canceled") {
+    const sessions = await deps.db
+      .select({ eveSessionId: schema.agentSessions.eveSessionId })
+      .from(schema.agentSessions)
+      .where(eq(schema.agentSessions.id, agentSessionId))
+      .limit(1);
+    if (sessions[0] && sessions[0].eveSessionId === null) {
+      await deps.runStore.markSession(agentSessionId, "closed");
+      deps.logger.warn("dispatch.canceled_dispatch_failed", {
+        fields: { runId, sessionId: agentSessionId, closed: true },
+      });
+    }
+  }
   return failDispatch(deps, runId, error, options);
 }
 
@@ -754,6 +790,18 @@ async function requireQuietControllableSession(
  * same NDJSON stream once the approval resumes it (double-persisted events,
  * corrupted startIndex resume points). One writer per eve session at a time;
  * answer the pending approval (or cancel the run) first.
+ *
+ * A CANCELED run whose dispatch may still be in flight ALSO counts as busy:
+ * dispatch-attempt marker set (`started_at` non-null) on a session with NO
+ * eve id persisted yet. A Stop can settle a run terminal while its
+ * createEveSession is still in flight; admitting a new run into the session
+ * during that window would open a SECOND eve session for the row (the
+ * in-flight create then clobbers or races the id) and expose the new turn to
+ * the old dispatch's unqualified session-level cancel. `session_busy` is the
+ * right code (two-409s rule): the state is transient — the in-flight
+ * dispatch persists the id (persist-then-recheck) or closes the session
+ * (`failEveDispatch` on a failed call, boot reconciliation's eveless sweep
+ * after a crash) — so the caller's retry lands in a clean session.
  */
 export async function countDispatchingRuns(
   db: DbClient,
@@ -763,10 +811,25 @@ export async function countDispatchingRuns(
   const rows = await db
     .select({ value: count() })
     .from(schema.runs)
+    .innerJoin(
+      schema.agentSessions,
+      eq(schema.runs.agentSessionId, schema.agentSessions.id),
+    )
     .where(
       and(
         eq(schema.runs.agentSessionId, agentSessionId),
-        inArray(schema.runs.status, ["queued", "running", "waiting"]),
+        or(
+          inArray(schema.runs.status, ["queued", "running", "waiting"]),
+          // The canceled-mid-dispatch arm (see the doc above). Scoped to
+          // EVELESS sessions on purpose: once an eve id is on the row, a
+          // racing cancel finds it and chases eve itself, and the post-eve
+          // recheck's newer-run guard protects continuations.
+          and(
+            eq(schema.runs.status, "canceled"),
+            isNotNull(schema.runs.startedAt),
+            isNull(schema.agentSessions.eveSessionId),
+          ),
+        ),
         ...(options.excludeRunId ? [ne(schema.runs.id, options.excludeRunId)] : []),
       ),
     );
@@ -1279,11 +1342,46 @@ export function runtimePlugin(deps: RuntimeDeps) {
           throw error; // unreachable — failDispatch always throws
         }
 
+        // PERSIST-THEN-RECHECK (dispatch.ts's post-eve ordering): the eve id
+        // lands on the session row BEFORE the terminal recheck, so a Stop
+        // landing from here on finds it and chases eve itself.
         await db
           .update(schema.agentSessions)
           .set({ eveSessionId: created.sessionId })
           .where(eq(schema.agentSessions.id, session.id));
         session.eveSessionId = created.sessionId;
+
+        // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal while
+        // the create was in flight (the cancel route had no eve id to chase
+        // at the time) — the accepted turn is remote-canceled with the
+        // just-persisted id and NO tail starts on the terminal row.
+        const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+          workerAddress: worker.address,
+          hash,
+          jwt,
+          eveSessionId: created.sessionId,
+        });
+        if (recheck !== "live") {
+          // The session was born in this request; unless a newer run was
+          // admitted onto it, close it — the same outcome as the pre-eve
+          // fence above, reached after the remote cancel.
+          if (recheck === "canceled") {
+            await deps.runStore.markSession(session.id, "closed");
+          }
+          const current = await deps.runStore.getRunStatus(run.id);
+          set.status = 201;
+          return {
+            session: sessionDto({
+              ...session,
+              status: recheck === "canceled" ? "closed" : session.status,
+            }),
+            run: runDto({
+              ...run,
+              status: current?.status ?? "canceled",
+              error: current?.error ?? run.error,
+            }),
+          };
+        }
 
         startTail(deps, worker.address, hash, created.sessionId, run.id, session.id);
         deps.metrics.recordTrigger("manual", "dispatched");
@@ -1485,6 +1583,9 @@ export function runtimePlugin(deps: RuntimeDeps) {
               { message },
             );
             eveSessionId = created.sessionId;
+            // PERSIST-THEN-RECHECK (dispatch.ts's post-eve ordering): the id
+            // lands BEFORE the recheck below, so a Stop landing from here on
+            // finds it on the row and chases eve itself.
             await db
               .update(schema.agentSessions)
               .set({ eveSessionId })
@@ -1503,6 +1604,29 @@ export function runtimePlugin(deps: RuntimeDeps) {
           .update(schema.agentSessions)
           .set({ status: "active", affinityWorkerId: worker.id })
           .where(eq(schema.agentSessions.id, session.id));
+
+        // POST-EVE CANCEL RECHECK (both forms — the continue above, and the
+        // post-reset create): a Stop that settled the run terminal while the
+        // eve call was in flight means the accepted turn is remote-canceled
+        // here and NO tail starts. The session belongs to the user's thread
+        // and stays open either way.
+        const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+          workerAddress: worker.address,
+          hash,
+          jwt,
+          eveSessionId,
+        });
+        if (recheck !== "live") {
+          const current = await deps.runStore.getRunStatus(run.id);
+          set.status = 201;
+          return {
+            run: runDto({
+              ...run,
+              status: current?.status ?? "canceled",
+              error: current?.error ?? run.error,
+            }),
+          };
+        }
 
         startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
         deps.metrics.recordTrigger("manual", "dispatched");

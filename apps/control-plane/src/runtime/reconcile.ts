@@ -27,14 +27,17 @@
  * 2. ABANDONED EVELESS SESSIONS — non-terminal sessions with NO eve session
  *    id whose NEWEST run is terminal with the dispatch-attempt marker SET:
  *    the residue of a dispatch whose eve create raced a Stop or crashed
- *    between the marker write and the id persist. At boot no create can
- *    still be in flight (single control-plane instance), so the row is
- *    provably dead — close it, releasing any Slack thread-key claim the
- *    thread-claim eviction now deliberately refuses to evict for marker-SET
- *    holders (see dispatch.ts). Marker-NULL eveless holders are left alone:
- *    the claim eviction handles theirs lazily, and an eveless CHAT session
- *    (including a post-reset replacement row, which has no runs at all)
- *    stays continuable by design.
+ *    between the marker write and the id persist. No create from BEFORE the
+ *    crash can still be in flight, but reconciliation runs BESIDE live
+ *    traffic (index.ts fires it after listen), so the close is an atomic
+ *    guarded UPDATE ({@link closeEvelessSessionIfStillAbandoned}) that
+ *    re-asserts eveless + non-terminal in its WHERE — a candidate that
+ *    gained its eve id between snapshot and close stays untouched. Closing
+ *    releases any Slack thread-key claim the thread-claim eviction now
+ *    deliberately refuses to evict for marker-SET holders (see dispatch.ts).
+ *    Marker-NULL eveless holders are left alone: the claim eviction handles
+ *    theirs lazily, and an eveless CHAT session (including a post-reset
+ *    replacement row, which has no runs at all) stays continuable by design.
  *
  * 3. INTERRUPTED PIPELINE RUNS — `mode: 'pipeline'` runs (which have no
  *    session or worker to re-tail) are re-driven from their `run_steps`
@@ -54,6 +57,7 @@
 import { and, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
+import type { Db } from "../db";
 import {
   recoverPipelineRuns,
   type PipelineRecoveryOutcome,
@@ -62,6 +66,37 @@ import type { PipelineRunner } from "../pipeline/runner";
 import type { DeliveryService } from "../runs/delivery";
 import { startTail, type RuntimeDeps } from "./routes";
 import { isWorkerLive, toSchedulableWorker } from "./scheduler";
+
+/**
+ * Sweep-2 close as an ATOMIC GUARDED UPDATE. The snapshot that nominated the
+ * candidate is STALE by the time the close runs — boot reconciliation is
+ * fired after the server starts listening (index.ts), so live traffic can
+ * give a snapshotted session its eve id (and finish a run on it) between
+ * selection and close. Closing on the snapshot's say-so would kill a healthy
+ * session; instead the eveless + non-terminal predicate is re-asserted
+ * INSIDE the UPDATE's WHERE, so a now-healthy row is untouched by
+ * construction (the row is re-read under its lock, never trusted from the
+ * snapshot). The thread-key release rides the same statement, mirroring
+ * markSession's terminal transition. Returns true iff THIS call closed the
+ * row — callers count only rows actually updated.
+ */
+export async function closeEvelessSessionIfStillAbandoned(
+  db: Db,
+  agentSessionId: string,
+): Promise<boolean> {
+  const closed = await db
+    .update(schema.agentSessions)
+    .set({ status: "closed", slackThreadKey: null })
+    .where(
+      and(
+        eq(schema.agentSessions.id, agentSessionId),
+        isNull(schema.agentSessions.eveSessionId),
+        notInArray(schema.agentSessions.status, ["closed", "error"]),
+      ),
+    )
+    .returning({ id: schema.agentSessions.id });
+  return closed.length > 0;
+}
 
 export interface ReconcileOutcome {
   resumed: number;
@@ -172,8 +207,12 @@ export async function reconcileInterruptedRuns(
   // settled the interrupted runs, a non-terminal session with no eve id
   // whose newest run is terminal AND marker-set can only be the residue of a
   // dispatch that died (or was canceled) after arming but before the eve id
-  // persisted — at boot no create is still in flight, so close it and free
-  // its Slack thread-key claim.
+  // persisted — no create from BEFORE the crash is still in flight, so close
+  // it and free its Slack thread-key claim. Live traffic runs beside this
+  // sweep (index.ts fires it after listen), so the close itself is a guarded
+  // UPDATE ({@link closeEvelessSessionIfStillAbandoned}) — a candidate that
+  // gained its eve id after this snapshot is untouched, and only rows
+  // actually updated are counted.
   const evelessCandidates = await deps.db
     .select({ id: schema.agentSessions.id })
     .from(schema.agentSessions)
@@ -198,8 +237,9 @@ export async function reconcileInterruptedRuns(
         run.status === "failed" ||
         run.status === "canceled")
     ) {
-      await deps.runStore.markSession(candidate.id, "closed");
-      outcome.sessionsClosed += 1;
+      if (await closeEvelessSessionIfStillAbandoned(deps.db, candidate.id)) {
+        outcome.sessionsClosed += 1;
+      }
     }
   }
 

@@ -70,10 +70,14 @@
  * `canceledBeforeDispatch`). Callers may also pass an AbortSignal
  * (`input.signal`) that is honored at the same points. A Stop that lands
  * while the create/continue is ALREADY IN FLIGHT is caught one fence later:
- * the POST-EVE CANCEL RECHECK re-reads the run after the call returns and,
- * if it settled terminal, remote-cancels the accepted turn with the
- * just-obtained session id instead of tailing it (see
- * {@link abandonCanceledDuringEve}).
+ * the POST-EVE CANCEL RECHECK ({@link recheckCanceledDuringEve}) re-reads the
+ * run AFTER the eve id / session update has been persisted —
+ * persist-then-recheck, so a cancel landing after the persist finds the id on
+ * the row and chases eve itself, while one that landed earlier is caught by
+ * the recheck and the accepted turn remote-canceled with the just-obtained
+ * session id instead of tailed. The remote leg is skipped when a NEWER run
+ * already owns the session (an unqualified session-level cancel must never
+ * stop a turn that is not this run's).
  */
 import { and, desc, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -631,21 +635,15 @@ export async function dispatchRenderedRun(
         },
       );
       eveSessionId = created.sessionId;
-      // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal WHILE
-      // the create was in flight — the marker fence has already passed, the
-      // cancel route found no eve id to chase, and the caller's post-fence
-      // cancelChildRun would no-op on the already-terminal row. This is the
-      // only place that holds the just-minted session id, so the remote
-      // cancel happens here, before the id is treated as live.
-      const liveAfterCreate = await deps.runStore.getRunStatus(run.id);
-      if (!liveAfterCreate || TERMINAL_RUN_STATUSES.has(liveAfterCreate.status)) {
-        return await abandonCanceledDuringEve(deps, input, session, run, {
-          workerAddress: worker.address,
-          hash,
-          jwt,
-          eveSessionId,
-        });
-      }
+      // PERSIST-THEN-RECHECK (the post-eve ordering): the just-minted eve id
+      // lands on the session row STRICTLY BEFORE the terminal recheck. A
+      // Stop landing from here on always finds the id on the row, so its own
+      // remote leg (cancelEveTurnBestEffort via the cancel route /
+      // cancelChildRun) reaches eve; one that landed while the create was in
+      // flight is caught by the recheck below, which holds the id either
+      // way. The reverse order (read status, then persist) left a window
+      // where a cancel read an eveless session — its remote cancel no-oped —
+      // the id then persisted, and the accepted turn ran unobserved.
       await db
         .update(schema.agentSessions)
         .set({
@@ -655,6 +653,20 @@ export async function dispatchRenderedRun(
         })
         .where(eq(schema.agentSessions.id, session.id));
       session.eveSessionId = created.sessionId;
+      // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal WHILE
+      // the create was in flight — the marker fence has already passed and
+      // the cancel route found no eve id to chase at the time. The recheck
+      // remote-cancels the accepted turn with the just-persisted id, before
+      // it is treated as live.
+      const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+        workerAddress: worker.address,
+        hash,
+        jwt,
+        eveSessionId,
+      });
+      if (recheck !== "live") {
+        return await abandonCanceledDuringEve(deps, input, session, run, recheck);
+      }
     } else {
       // Continuation (Slack thread reply): the task message rides the SAME
       // eve session as a follow-up turn — continuity is native to eve's
@@ -669,23 +681,28 @@ export async function dispatchRenderedRun(
         eveSessionId,
         { message: input.taskMessage },
       );
-      // POST-EVE CANCEL RECHECK (the continuation twin of the create branch
-      // above): a Stop that landed while the continue was in flight means
-      // the accepted turn must be told to stop here — no tail will follow
-      // it, and the caller's cancelChildRun no-ops on the terminal row.
-      const liveAfterSend = await deps.runStore.getRunStatus(run.id);
-      if (!liveAfterSend || TERMINAL_RUN_STATUSES.has(liveAfterSend.status)) {
-        return await abandonCanceledDuringEve(deps, input, session, run, {
-          workerAddress: worker.address,
-          hash,
-          jwt,
-          eveSessionId,
-        });
-      }
+      // PERSIST-THEN-RECHECK (the continuation twin of the create branch
+      // above — same ordering discipline; here the session already carries
+      // its id, so only the liveness update precedes the recheck).
       await db
         .update(schema.agentSessions)
         .set({ status: "active", affinityWorkerId: worker.id })
         .where(eq(schema.agentSessions.id, session.id));
+      // POST-EVE CANCEL RECHECK: a Stop that landed while the continue was
+      // in flight means the accepted turn must be told to stop here — no
+      // tail will follow it, and the caller's cancelChildRun no-ops on the
+      // terminal row. The recheck skips the remote leg when a NEWER run was
+      // already admitted on the session (its turn must not be killed by this
+      // run's late, session-level cancel).
+      const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+        workerAddress: worker.address,
+        hash,
+        jwt,
+        eveSessionId,
+      });
+      if (recheck !== "live") {
+        return await abandonCanceledDuringEve(deps, input, session, run, recheck);
+      }
     }
   } catch (error) {
     deps.metrics.recordTrigger(input.triggerType, "failed");
@@ -756,31 +773,64 @@ async function abandonCanceledBeforeEve(
   };
 }
 
+/** The remote target of an accepted eve turn (post-eve recheck plumbing). */
+export interface EveTurnTarget {
+  workerAddress: string;
+  hash: string;
+  jwt: { secret: string; audience: string };
+  eveSessionId: string;
+}
+
 /**
- * Abandon a dispatch whose eve call ALREADY LANDED because the child run
- * settled terminal while the create/continue was in flight (a Stop racing
- * the dispatch): the cancel route had no eve id to chase and the caller's
- * post-dispatch fence no-ops on the terminal row, so the remote leg happens
- * HERE, with the just-obtained session id — best-effort, like every remote
- * cancel (an unreachable worker must not turn the Stop into an error). A
- * brand-NEW session records the eve id it minted and is closed (markSession
- * releases any Slack thread-key claim — the claim must not outlive the one
- * dispatch that owned it); a CONTINUATION's session belongs to its thread
- * and stays untouched. Reported as `canceledBeforeDispatch`: no tail starts,
- * and the turn eve accepted was told to stop.
+ * The post-eve recheck's verdict: `live` — the run is still non-terminal,
+ * proceed to tail; `canceled` — the run settled terminal while the eve call
+ * was in flight and the accepted turn was remote-canceled (best-effort);
+ * `superseded` — the run settled terminal but a NEWER run has already been
+ * admitted on the session, so the remote leg was deliberately SKIPPED.
  */
-async function abandonCanceledDuringEve(
+export type PostEveRecheck = "live" | "canceled" | "superseded";
+
+/**
+ * POST-EVE CANCEL RECHECK, shared by every dispatch path (dispatchRenderedRun
+ * and the chat routes' create branches): AFTER the eve id / session update
+ * has been persisted — persist-then-recheck, never the reverse — re-read the
+ * run. If it settled terminal while the create/continue was in flight (a
+ * Stop racing the dispatch: the cancel route had no eve id to chase at the
+ * time, and any later cancelChildRun no-ops on the terminal row), the remote
+ * cancel happens here with the just-obtained session id — best-effort, like
+ * every remote cancel (an unreachable worker must not turn a Stop into an
+ * error).
+ *
+ * BELT-AND-BRACES: this cancel is UNQUALIFIED (session-level — no turnId
+ * exists, since the tail that would learn one never starts), so it must
+ * never fire once a NEWER run owns the session: delivered late, it would
+ * reach eve after that run's turn started and kill it. Admission normally
+ * cannot happen while this run is unresolved (`countDispatchingRuns` counts
+ * a canceled run whose dispatch may still be in flight as busy), but a
+ * continuation's session carries an eve id from earlier turns and stays
+ * admittable — so the newer-run check here is what protects that path.
+ */
+export async function recheckCanceledDuringEve(
   deps: RuntimeDeps,
-  input: DispatchRenderedRunInput,
-  session: SessionRow,
-  run: RunRow,
-  target: {
-    workerAddress: string;
-    hash: string;
-    jwt: { secret: string; audience: string };
-    eveSessionId: string;
-  },
-): Promise<DispatchRenderedRunResult> {
+  runId: string,
+  agentSessionId: string,
+  target: EveTurnTarget,
+): Promise<PostEveRecheck> {
+  const current = await deps.runStore.getRunStatus(runId);
+  if (current && !TERMINAL_RUN_STATUSES.has(current.status)) return "live";
+  const newerLive = await countDispatchingRuns(deps.db, agentSessionId, {
+    excludeRunId: runId,
+  });
+  if (newerLive > 0) {
+    deps.logger.warn("dispatch.post_eve_cancel_skipped", {
+      runId,
+      fields: {
+        sessionId: agentSessionId,
+        reason: "a newer run was admitted on the session",
+      },
+    });
+    return "superseded";
+  }
   try {
     await deps.workerClient.cancelEveTurn(
       target.workerAddress,
@@ -790,22 +840,36 @@ async function abandonCanceledDuringEve(
     );
   } catch (error) {
     deps.logger.warn("dispatch.post_eve_cancel_failed", {
-      runId: run.id,
+      runId,
       fields: {
-        sessionId: session.id,
+        sessionId: agentSessionId,
         reason: error instanceof Error ? error.message : String(error),
       },
     });
   }
-  if (input.existingSession === undefined) {
-    // Record the id for the audit trail (the session DID reach eve, once),
-    // then close the row — markSession releases the thread-key claim so the
-    // next message in the thread can mint a fresh session.
-    await deps.db
-      .update(schema.agentSessions)
-      .set({ eveSessionId: target.eveSessionId })
-      .where(eq(schema.agentSessions.id, session.id));
-    session.eveSessionId = target.eveSessionId;
+  return "canceled";
+}
+
+/**
+ * Abandon a dispatch whose eve call ALREADY LANDED because the child run
+ * settled terminal while the create/continue was in flight (a Stop racing
+ * the dispatch). The remote leg already happened in
+ * {@link recheckCanceledDuringEve} — with the eve id ALREADY persisted on
+ * the session row (persist-then-recheck), so it doubles as the audit trail.
+ * A brand-NEW session is closed (markSession releases any Slack thread-key
+ * claim — the claim must not outlive the one dispatch that owned it) UNLESS
+ * a newer run superseded this one (the session is then live property of that
+ * run); a CONTINUATION's session belongs to its thread and stays untouched.
+ * Reported as `canceledBeforeDispatch`: no tail starts.
+ */
+async function abandonCanceledDuringEve(
+  deps: RuntimeDeps,
+  input: DispatchRenderedRunInput,
+  session: SessionRow,
+  run: RunRow,
+  recheck: Exclude<PostEveRecheck, "live">,
+): Promise<DispatchRenderedRunResult> {
+  if (input.existingSession === undefined && recheck === "canceled") {
     await deps.runStore.markSession(session.id, "closed");
   }
   const current = await deps.runStore.getRunStatus(run.id);

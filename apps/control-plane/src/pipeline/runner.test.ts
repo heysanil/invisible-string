@@ -1474,6 +1474,59 @@ describe("pipeline driver — for_each", () => {
     expect(h.stepStore.rows).toHaveLength(1); // no item instance ever claimed
   });
 
+  test("a recorded fan_out_exceeded verdict is AUTHORITATIVE even when the collection is no longer an array — never reclassified items_not_array", async () => {
+    const body = tool("body");
+    const loop = loopOver([body], { items: { $ref: "state.items" }, maxItems: 100 });
+    const config = cfg([loop]);
+    const toolExec = recording(async () => ({
+      status: "succeeded" as const,
+      output: {},
+    }));
+    const h = harness({
+      executors: { tool: toolExec.exec },
+      loadWorkflowConfig: async () => config,
+    });
+    const run = makeRunRow({ status: "running", startedAt: new Date() });
+    h.runStore.setStatus(run.id, "running");
+    await h.runStore.appendEvent(run.id, 0, {
+      type: "pipeline.started",
+      data: { stepCount: 1 },
+    } as never);
+    // First incarnation: a 101-item array earned fan_out_exceeded, the claim
+    // row recorded the verdict, and the process crashed before the failure
+    // row was written.
+    await h.stepStore.claim({
+      runId: run.id,
+      organizationId: run.organizationId!,
+      stepId: loop.id,
+      stepSlug: "loop",
+      path: loop.id,
+      parentPath: null,
+      iteration: null,
+      kind: "for_each",
+      status: "running",
+      input: { itemsRef: "state.items", count: 101, verdict: "fan_out_exceeded" },
+      startedAt: new Date(),
+    });
+    // The collection's SHAPE changed across the crash: @state.items is now a
+    // string. A fresh-resolution guard running first would report
+    // items_not_array — the wrong error class for a loop that had already
+    // earned fan_out_exceeded. The RECORDED verdict is authoritative.
+    h.stateStore.state.set(
+      run.workflowId!,
+      new Map([["items", "no longer an array"]]),
+    );
+
+    expect(await h.runner.resume(run)).toBe("resumed");
+    const terminal = await waitForTerminal(h.runStore, run.id);
+    expect(terminal.status).toBe("failed");
+    expect(toolExec.calls).toHaveLength(0);
+    const loopRow = h.stepStore.rows.find((r) => r.path === loop.id)!;
+    expect(loopRow.status).toBe("failed");
+    expect(loopRow.errorClass).toBe("fan_out_exceeded");
+    expect(loopRow.error).toContain("101");
+  });
+
   test("a crashed doomed for_each replays a recorded items_not_array verdict even after the ref became an array", async () => {
     const body = tool("body");
     const loop = loopOver([body], { items: { $ref: "state.items" } });

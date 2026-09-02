@@ -1480,7 +1480,15 @@ export class PipelineRunner {
     }
     dctx.executed += 1;
     await this.emitStarted(dctx, step, path, attempt);
-    if (verdict === "items_not_array" || !Array.isArray(itemsRaw)) {
+    // A verdict — RECORDED on replay, or the fresh resolution's own — is
+    // AUTHORITATIVE and checked BEFORE any fresh-shape guard: on replay the
+    // loop was doomed with THAT class before the crash, and the fresh
+    // resolution's shape (which may have moved across the crash — a
+    // fan_out_exceeded collection can now be a non-array) must never
+    // reclassify it. The shape guards below therefore fire only for the
+    // legacy fallback (a pre-verdict row re-resolving) — and as the type
+    // narrowing the item loop needs.
+    if (verdict === "items_not_array") {
       return this.finishFailed(
         dctx,
         step,
@@ -1491,14 +1499,13 @@ export class PipelineRunner {
         `for_each items (${step.items.$ref}) did not resolve to an array`,
       );
     }
-    if (verdict === "fan_out_exceeded" || itemsRaw.length > step.maxItems) {
+    if (verdict === "fan_out_exceeded") {
       // Silent truncation would corrupt cursor semantics — overflow FAILS.
       // A replayed verdict reports the RECORDED count (the fresh resolution
-      // may have moved), a fresh one the live length.
+      // may have moved — it may not even be an array any more), a fresh one
+      // the live length.
       const overCount =
-        verdict === "fan_out_exceeded"
-          ? (verdictCount ?? itemsRaw.length)
-          : itemsRaw.length;
+        verdictCount ?? (Array.isArray(itemsRaw) ? itemsRaw.length : null);
       return this.finishFailed(
         dctx,
         step,
@@ -1506,7 +1513,29 @@ export class PipelineRunner {
         claim.row.id,
         attempt,
         "fan_out_exceeded",
-        `for_each resolved ${overCount} items, over its maxItems of ${step.maxItems}`,
+        `for_each resolved ${overCount ?? "more than maxItems"} items, over its maxItems of ${step.maxItems}`,
+      );
+    }
+    if (!Array.isArray(itemsRaw)) {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "items_not_array",
+        `for_each items (${step.items.$ref}) did not resolve to an array`,
+      );
+    }
+    if (itemsRaw.length > step.maxItems) {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "fan_out_exceeded",
+        `for_each resolved ${itemsRaw.length} items, over its maxItems of ${step.maxItems}`,
       );
     }
     const records: {

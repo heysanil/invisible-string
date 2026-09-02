@@ -1,5 +1,0 @@
----
-"@invisible-string/control-plane": patch
----
-
-Close three in-process serialization races around a session's eve stream: a tail now attributes turns against the session's CURRENT remote-cancel obligations (re-read at every turn opening, boundary, settlement and on the manager's signal) so a continuation Stopped before its own tail started is cancelled turn-qualified and cleared on its boundary instead of being persisted as a foreign turn and aging out unresolved; attribution and settlement run on one per-tail serial queue so a Stop or wall-clock cap landing mid-attribution issues the qualified cancel with the attributed turn id rather than installing a null-id obligation the boundary can never match; and clear/compact/reset hold the session dispatch lock across their quiet check, eve call and drain, so a dispatch can no longer be admitted under a control's drain (a second reader on one stream) or a reset retire a session beneath a just-admitted dispatch (contention answers the transient `session_busy`).

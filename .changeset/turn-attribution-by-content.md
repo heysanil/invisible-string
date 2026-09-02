@@ -1,6 +1,0 @@
----
-"@invisible-string/control-plane": patch
-"@invisible-string/db": patch
----
-
-Attribute eve turns by CONTENT instead of send order: the dispatch-attempt CAS now records `runs.message_hash` (migration 0018 — the sha256 of the exact message sent, never the text; null for a content-less `inputResponses` resume, which eve opens with no `message.received`), the tail holds a `turn.started` until the next event and matches the turn's `message.received` against the session's open obligations (pending before unresolved, oldest first), then its own run, then a live successor — a turn nobody sent is foreign and is never attributed or cancelled, so a never-sent canceled run can no longer steal a successor's turn and get it cancelled unless the two texts are identical (the documented residual); unresolved obligations stay attributable and a late match clears both columns; the wall-clock cap and shutdown settle the row `failed` WITH the remote-cancel obligation and never send an unqualified cancel; clear/compact/reset answer `session_busy` while an observation tail is on the session (one reader per stream); and a `reset` — which retires the eve id — settles every obligation on the row as session-terminal.

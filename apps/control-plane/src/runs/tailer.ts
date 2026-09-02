@@ -185,6 +185,7 @@ import {
   type RunStatus,
 } from "@invisible-string/shared";
 
+import { DEFAULT_DB_STATEMENT_TIMEOUT_MS } from "../db";
 import type { RunEventBus } from "./bus";
 import { hashTurnMessage } from "./message-hash";
 import type { PendingRemoteCancel, RunStore, SessionClaimants } from "./store";
@@ -490,6 +491,32 @@ export interface TailRunOptions {
    * resolves must not wedge the session behind it.
    */
   streamTakeoverMs?: number;
+  /**
+   * The product DB's per-statement bound (`DB_STATEMENT_TIMEOUT_MS`; default
+   * {@link DEFAULT_DB_STATEMENT_TIMEOUT_MS}). The SECOND takeover wait —
+   * after a hung prior is seized while still inside an event's handling —
+   * is DERIVED from it ({@link seizedWriteBoundMs}): a statement the prior
+   * had already issued is landed or dead (`statement_timeout`) once this
+   * plus the margin has elapsed, and the seizure fence lets it issue no
+   * other, so only then may this tail read the persisted cursor and take
+   * the stream over — never after a fixed pause unrelated to the DB.
+   */
+  statementTimeoutMs?: number;
+  /**
+   * Margin added to `statementTimeoutMs` for the derived bound (default
+   * {@link DEFAULT_SEIZED_WRITE_MARGIN_MS}): the server-side cancel's trip
+   * back to the client plus the continuation that observes it. Tests shrink
+   * it together with the timeout.
+   */
+  seizedWriteMarginMs?: number;
+  /**
+   * Called ONCE, synchronously, when the tail is SEIZED (`seize`) — closed
+   * and fenced between statements. The manager starts the seized drain's
+   * eviction clock here: after the derived write bound the handle leaves
+   * the session's stream-holder list whether or not its `done` ever
+   * resolves, since its writes are guaranteed dead by then.
+   */
+  onSeized?: () => void;
   /** Reconnect attempts after unexpected drops (default 5). */
   maxReconnectAttempts?: number;
   /** Base reconnect backoff in ms (default 500; ×2 per attempt). */
@@ -530,6 +557,87 @@ export const DEFAULT_REMOTE_CANCEL_OBSERVE_MS = 10 * 60 * 1000;
  * session's stream before seizing it ({@link TailRunOptions.streamTakeoverMs}).
  */
 export const DEFAULT_STREAM_TAKEOVER_MS = 5_000;
+
+/**
+ * Margin over the DB statement timeout in the derived seized-write bound
+ * ({@link seizedWriteBoundMs}): the `57014 query_canceled` error's trip back
+ * from the server plus the client-side continuation that observes it.
+ */
+export const DEFAULT_SEIZED_WRITE_MARGIN_MS = 5_000;
+
+/**
+ * THE DERIVED BOUND: how long after a seizure a write the seized tail had
+ * already issued can still land. `statement_timeout` (db.ts — a startup
+ * parameter on every pool connection) kills a statement executing that
+ * long; the seizure fence (`seize`) refuses every FURTHER cursor- or
+ * attribution-affecting statement synchronously, so at most the one
+ * statement in flight at the seizure is outstanding, and it is landed or
+ * dead once this elapses. Both consumers take it from here, never from two
+ * unrelated numbers: the successor's second takeover wait, and the
+ * manager's eviction of a seized drain from the stream-holder list.
+ *
+ * Residual (documented, not guaranteed): a statement queued CLIENT-side
+ * behind an exhausted root pool for longer than this bound has not reached
+ * the server yet and is not bounded by it — a pool saturated for the whole
+ * statement timeout, while each statement is itself bounded by it.
+ */
+export function seizedWriteBoundMs(
+  statementTimeoutMs: number,
+  marginMs: number = DEFAULT_SEIZED_WRITE_MARGIN_MS,
+): number {
+  return statementTimeoutMs + marginMs;
+}
+
+/**
+ * Backstop cap on closed tails still draining ONE session's stream (the
+ * manager's per-session list): beyond it the OLDEST is evicted at once,
+ * with a warning — the eviction clock is the real bound, this only keeps a
+ * pathological run of hung drains from growing the list without limit.
+ */
+export const MAX_DRAINING_TAILS_PER_SESSION = 8;
+
+/** The error a seized tail's fenced store call throws (never persisted). */
+export class TailSeizedError extends Error {
+  constructor(what: string) {
+    super(`tail seized — fenced: ${what} refused, a successor owns the stream`);
+    this.name = "TailSeizedError";
+  }
+}
+
+/**
+ * The cursor- and attribution-affecting store calls, fenced AFTER a
+ * seizure: each is refused synchronously (never issued) once `seized()` is
+ * true, so a tail whose current event's handling was mid-flight at the
+ * seizure can complete at most the ONE statement it had already issued —
+ * the guarantee {@link seizedWriteBoundMs} rests on. The run's own terminal
+ * CAS (`markRun`) and session status are NOT fenced: they are the tail's
+ * own row, never the successor's cursor.
+ */
+const FENCED_STORE_CALLS = new Set<keyof RunStore>([
+  "appendEvent",
+  "setRunTurnId",
+  "clearRemoteCancelPending",
+  "listSessionClaimants",
+  "listUnownedContentTurns",
+]);
+
+function fencedRunStore(store: RunStore, seized: () => boolean): RunStore {
+  // A Proxy, not a spread copy: every call reaches the store's CURRENT
+  // method (fixtures swap methods on a live store), and only the fenced
+  // set pays the synchronous check.
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof value !== "function" || !FENCED_STORE_CALLS.has(property as keyof RunStore)) {
+        return value;
+      }
+      return (...args: unknown[]) => {
+        if (seized()) throw new TailSeizedError(String(property));
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+}
 
 /** Retries of a failed (transport) qualified cancel issued by observation. */
 const QUALIFIED_CANCEL_RETRY_ATTEMPTS = 3;
@@ -593,9 +701,14 @@ export interface RunTailHandle {
    * body it is stuck on later yields, and resolve once any event handling
    * already in flight has settled (the tail is between reads, or has
    * exited) — so the old reader's last write lands before a new reader
-   * takes the cursor. The hung connect/read itself is abandoned (`done`
-   * still trails it). A successor chained behind a drain that outlived
-   * `streamTakeoverMs` calls this before taking over.
+   * takes the cursor. The fence is BETWEEN STATEMENTS too: from the seizure
+   * on, every cursor- or attribution-affecting store call is refused before
+   * it is issued (`fencedRunStore`), so at most the one statement already
+   * in flight is outstanding — and the DB's `statement_timeout` bounds
+   * that one ({@link seizedWriteBoundMs}). The hung connect/read itself is
+   * abandoned (`done` still trails it). A successor chained behind a drain
+   * that outlived `streamTakeoverMs` calls this before taking over, and so
+   * does the manager for a drain nobody chained behind.
    */
   seize(): Promise<void>;
   /**
@@ -675,17 +788,29 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     agentSessionId,
     openStream,
     cancelRemoteTurn,
-    store,
+    store: rawStore,
     bus,
     maxWallClockMs,
     remoteCancelObserveMs = DEFAULT_REMOTE_CANCEL_OBSERVE_MS,
     streamTakeoverMs = DEFAULT_STREAM_TAKEOVER_MS,
+    statementTimeoutMs = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+    seizedWriteMarginMs = DEFAULT_SEIZED_WRITE_MARGIN_MS,
     maxReconnectAttempts = 5,
     reconnectDelayMs = 500,
     onFinish,
     onAuthorizationRequired,
     logger,
   } = options;
+  /**
+   * SEIZED: a successor (or the manager) owns the stream from here on. Set
+   * by `seize` only — strictly after `closed`, and unlike `closed` it fences
+   * BETWEEN statements: the store below refuses every further cursor- or
+   * attribution-affecting call synchronously, so the statement in flight
+   * at the seizure is the last one this tail can land.
+   */
+  let seized = false;
+  const store = fencedRunStore(rawStore, () => seized);
+  const writeBoundMs = seizedWriteBoundMs(statementTimeoutMs, seizedWriteMarginMs);
 
   const log = logger?.child({ runId, sessionId: agentSessionId });
   const tailStartedAt = Date.now();
@@ -847,6 +972,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
 
   /** An obligation is MET: clear the durable marker, drop it from the list. */
   const confirmObligation = async (obligation: Obligation, why: string) => {
+    // A seized tail confirms nothing: the successor re-reads the row and
+    // meets the obligation on its own reading (thrown OUTSIDE the retry
+    // swallow below — this is the fence, not a transient store error).
+    if (seized) throw new TailSeizedError("confirmObligation");
     obligations = obligations.filter((o) => o !== obligation);
     try {
       await store.clearRemoteCancelPending(obligation.runId);
@@ -1347,9 +1476,17 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * it is being torn down and owes nothing but its cursor: after
    * `streamTakeoverMs` without `done` its drain is hung (a reconnect or
    * store call that never resolves), so it is seized — closed and fenced,
-   * its in-flight handling awaited (bounded again) — and this tail takes
-   * the cursor over from the persisted counts. Own closure (the observation
-   * deadline, a detach, shutdown) ends the wait at once.
+   * its in-flight handling awaited — and this tail takes the cursor over
+   * from the persisted counts. That SECOND wait is not a second fixed
+   * pause: it is the DERIVED write bound (`seizedWriteBoundMs` — the DB's
+   * statement timeout plus a margin). Seizing fences the prior between
+   * statements, so the one statement it had in flight is the last it can
+   * land, and `statement_timeout` guarantees that one is landed or dead by
+   * the time the bound elapses; only then does the caller read the
+   * persisted counts (`run()` reads them strictly AFTER this returns), so a
+   * write that landed at the last instant is in the cursor, never
+   * duplicated. Own closure (the observation deadline, a detach, shutdown)
+   * ends the wait at once.
    */
   const awaitStreamRelease = async (prior: ChainedStream): Promise<void> => {
     const priorDone = prior.done.then(
@@ -1385,14 +1522,20 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           "the closed prior tail never released the session's stream — seizing it and taking its cursor over",
       },
     });
-    const seized = prior.seize().then(() => "seized" as const);
-    if ((await bounded(streamTakeoverMs, seized, ownClose)) === "timeout" && !closed) {
+    const priorSeized = prior.seize().then(() => "seized" as const);
+    // The prior is fenced from this instant; its handling settles either
+    // when its in-flight statement returns (idle → "seized", the write is
+    // on disk and the counts read next include it) or never — in which case
+    // the statement is dead by `writeBoundMs` and the counts read next are
+    // final either way.
+    if ((await bounded(writeBoundMs, priorSeized, ownClose)) === "timeout" && !closed) {
       log?.warn("run.tail_takeover_forced", {
         fields: {
           drainingRunId: prior.runId,
-          waitedMs: streamTakeoverMs,
+          waitedMs: writeBoundMs,
+          statementTimeoutMs,
           reason:
-            "the seized tail's in-flight event handling did not settle — proceeding; its stream is fenced, a write that lands later is the residual",
+            "the seized tail's in-flight event handling did not settle within the derived write bound — its one outstanding statement is dead (statement_timeout) and it is fenced from issuing another; taking the cursor over from the persisted counts",
         },
       });
     }
@@ -1408,7 +1551,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     if (options.chainBehind) await awaitStreamRelease(options.chainBehind);
     if (closed) return;
     setBusy(true);
-    // Resume points derived from what is already persisted (crash-safe).
+    // Resume points derived from what is already persisted (crash-safe) —
+    // read strictly AFTER the chain wait above returned: behind a seized
+    // prior that is after the derived write bound elapsed, so a last-instant
+    // write of the prior's is counted here, never re-read and duplicated.
     let seq = await store.countRunEvents(runId);
     let startIndex = await store.countSessionEvents(agentSessionId);
     // Stable eve event ids already persisted for THIS run. A reconnect that
@@ -1903,6 +2049,19 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
 
   const seize = (): Promise<void> => {
     close("seized by a successor tail");
+    if (!seized) {
+      // Fence between statements from this instant (store refuses every
+      // further cursor/attribution write), then tell the manager once so
+      // the eviction clock starts on the same derived bound.
+      seized = true;
+      try {
+        options.onSeized?.();
+      } catch (error) {
+        log?.warn("run.tail_seize_hook_failed", {
+          fields: { reason: error instanceof Error ? error.message : String(error) },
+        });
+      }
+    }
     if (!busy) return Promise.resolve();
     return new Promise<void>((resolve) => {
       idleWaiters.push(resolve);
@@ -2005,8 +2164,26 @@ export class RunTailerManager {
    * seized a hung drain and then closed itself is a second draining tail on
    * the same session (one slot would overwrite the first and lose its
    * still-held stream); chaining goes behind the latest.
+   *
+   * BOUNDED MEMBERSHIP (Z2). A drain whose `done` never resolves (a hung
+   * connect that ignores its abort, a store call that never returns) must
+   * not hold the session forever — `isSessionStreamHeld` is what the
+   * context controls answer `session_busy` on. So every entry runs on a
+   * clock: after `streamTakeoverMs` without release the manager SEIZES it
+   * itself (closed already; the seizure fences it between statements — a
+   * successor chaining behind it does the same, earlier or later), and a
+   * seized entry is EVICTED after the derived write bound
+   * (`seizedWriteBoundMs`: its writes are guaranteed dead by then) whether
+   * or not `done` ever resolves — warned, and dropped from `handles` too so
+   * shutdown never awaits it. `MAX_DRAINING_TAILS_PER_SESSION` backstops
+   * the list length on top.
    */
   private readonly drainingHandles = new Map<string, RunTailHandle[]>();
+  /** The per-drain clock (self-seize, then eviction) — one timer per handle. */
+  private readonly drainTimers = new Map<RunTailHandle, ReturnType<typeof setTimeout>>();
+  private readonly streamTakeoverMs: number;
+  private readonly statementTimeoutMs: number;
+  private readonly writeBoundMs: number;
 
   constructor(
     private readonly defaults: {
@@ -2015,6 +2192,9 @@ export class RunTailerManager {
       maxWallClockMs: number;
       remoteCancelObserveMs?: number;
       streamTakeoverMs?: number;
+      /** The DB's per-statement bound (see {@link TailRunOptions.statementTimeoutMs}). */
+      statementTimeoutMs?: number;
+      seizedWriteMarginMs?: number;
       maxReconnectAttempts?: number;
       reconnectDelayMs?: number;
       /** Metrics seam propagated to every tail (run-duration histogram). */
@@ -2022,7 +2202,77 @@ export class RunTailerManager {
       /** Structured run-lifecycle logger propagated to every tail. */
       logger?: Logger;
     },
-  ) {}
+  ) {
+    this.streamTakeoverMs = defaults.streamTakeoverMs ?? DEFAULT_STREAM_TAKEOVER_MS;
+    this.statementTimeoutMs = defaults.statementTimeoutMs ?? DEFAULT_DB_STATEMENT_TIMEOUT_MS;
+    this.writeBoundMs = seizedWriteBoundMs(this.statementTimeoutMs, defaults.seizedWriteMarginMs);
+  }
+
+  /** Is this handle in its session's draining list right now? */
+  private isDraining(handle: RunTailHandle): boolean {
+    return this.drainingHandles.get(handle.agentSessionId)?.includes(handle) ?? false;
+  }
+
+  /** Closed tails still holding this session's stream (observability/tests). */
+  drainingTailCount(agentSessionId: string): number {
+    return this.drainingHandles.get(agentSessionId)?.length ?? 0;
+  }
+
+  private clearDrainTimer(handle: RunTailHandle): void {
+    const timer = this.drainTimers.get(handle);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.drainTimers.delete(handle);
+  }
+
+  private armDrainTimer(handle: RunTailHandle, ms: number, fire: () => void): void {
+    this.clearDrainTimer(handle);
+    const timer = setTimeout(() => {
+      this.drainTimers.delete(handle);
+      if (this.isDraining(handle)) fire();
+    }, ms);
+    timer.unref?.();
+    this.drainTimers.set(handle, timer);
+  }
+
+  /**
+   * Drop a drain from the stream-holder list WITHOUT waiting for `done`:
+   * its writes are dead (the derived bound elapsed after its seizure) or it
+   * is the oldest beyond the cap. Also leaves `handles`, so a later
+   * `start()` for the same run never returns a dead handle and `stopAll`
+   * never awaits a `done` that may never resolve.
+   */
+  private evictDraining(handle: RunTailHandle, why: "write bound elapsed" | "cap"): void {
+    this.clearDrainTimer(handle);
+    const draining = this.drainingHandles.get(handle.agentSessionId);
+    if (!draining?.includes(handle)) return;
+    const remaining = draining.filter((h) => h !== handle);
+    if (remaining.length === 0) this.drainingHandles.delete(handle.agentSessionId);
+    else this.drainingHandles.set(handle.agentSessionId, remaining);
+    if (this.handles.get(handle.runId) === handle) this.handles.delete(handle.runId);
+    this.defaults.logger?.warn("run.tail_drain_evicted", {
+      runId: handle.runId,
+      sessionId: handle.agentSessionId,
+      fields: {
+        why,
+        writeBoundMs: this.writeBoundMs,
+        statementTimeoutMs: this.statementTimeoutMs,
+        stillDraining: remaining.length,
+        reason:
+          why === "cap"
+            ? "more hung drains on one session than the cap — the oldest leaves the stream-holder list now; it is fenced and its writes are bounded by the statement timeout"
+            : "a seized drain never released the stream within the derived write bound — its outstanding statement is dead and it can issue no other; the session is no longer stream-held by it",
+      },
+    });
+  }
+
+  /** The seizure hook: a seized drain leaves the list after the write bound, `done` or not. */
+  private onSeized(handle: RunTailHandle): void {
+    if (!this.isDraining(handle)) return;
+    this.armDrainTimer(handle, this.writeBoundMs, () =>
+      this.evictDraining(handle, "write bound elapsed"),
+    );
+  }
 
   /** The latest tail still draining the session's stream, if any. */
   private latestDraining(agentSessionId: string): RunTailHandle | undefined {
@@ -2035,18 +2285,43 @@ export class RunTailerManager {
     return this.sessionHandles.get(agentSessionId) ?? this.latestDraining(agentSessionId);
   }
 
-  /** Move a tail from the reader slot to the draining list (it closed). */
+  /**
+   * Move a tail from the reader slot to the draining list (it closed), and
+   * start its clock: unreleased after `streamTakeoverMs`, the manager seizes
+   * it itself (a session with no successor to chain behind it must not stay
+   * stream-held on a hung drain); the seizure then arms the eviction.
+   */
   private releaseReader(handle: RunTailHandle): void {
     if (this.sessionHandles.get(handle.agentSessionId) === handle) {
       this.sessionHandles.delete(handle.agentSessionId);
       const draining = this.drainingHandles.get(handle.agentSessionId) ?? [];
       draining.push(handle);
       this.drainingHandles.set(handle.agentSessionId, draining);
+      // Re-read per step: an eviction REPLACES the session's list.
+      for (;;) {
+        const current = this.drainingHandles.get(handle.agentSessionId);
+        if (!current || current.length <= MAX_DRAINING_TAILS_PER_SESSION) break;
+        this.evictDraining(current[0]!, "cap");
+      }
+      this.armDrainTimer(handle, this.streamTakeoverMs, () => {
+        this.defaults.logger?.warn("run.tail_drain_seized", {
+          runId: handle.runId,
+          sessionId: handle.agentSessionId,
+          fields: {
+            waitedMs: this.streamTakeoverMs,
+            writeBoundMs: this.writeBoundMs,
+            reason:
+              "a closed tail never released the session's stream — seized and fenced by the manager; evicted from the stream-holder list once the derived write bound elapses",
+          },
+        });
+        void handle.seize();
+      });
     }
   }
 
   /** The tail's `done` resolved: its stream is released. */
   private releaseStream(handle: RunTailHandle): void {
+    this.clearDrainTimer(handle);
     const draining = this.drainingHandles.get(handle.agentSessionId);
     if (!draining) return;
     const remaining = draining.filter((h) => h !== handle);
@@ -2063,6 +2338,9 @@ export class RunTailerManager {
       ...options,
       onClose: () => {
         if (handle) this.releaseReader(handle);
+      },
+      onSeized: () => {
+        if (handle) this.onSeized(handle);
       },
     });
     handle = opened;
@@ -2173,7 +2451,10 @@ export class RunTailerManager {
    * Is the session's eve stream HELD in this process — by a live tail, or
    * by a closed one whose `done` has not resolved (its cursor is not
    * released yet)? The context controls' quiet check: a second reader must
-   * not attach until the stream is released.
+   * not attach until the stream is released. BOUNDED: a drain evicted after
+   * its seizure's write bound (or beyond the cap) no longer counts — its
+   * writes are dead and it is fenced, so `session_busy` cannot be answered
+   * forever on a `done` that never resolves.
    */
   isSessionStreamHeld(agentSessionId: string): boolean {
     return this.streamHolder(agentSessionId) !== undefined;

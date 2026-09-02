@@ -23,6 +23,7 @@ import {
   lockPoolSizeFromEnv,
   pipelineLockPoolSizeFromEnv,
   poolSizeFromEnv,
+  statementTimeoutFromEnv,
   type DbHandle,
 } from "./db";
 import { healthPlugin, type DeepHealthDeps } from "./health";
@@ -378,6 +379,7 @@ export function createRuntimeDeps(opts: {
     bus,
     maxWallClockMs: runtime.maxRunWallClockMs,
     remoteCancelObserveMs: runtime.remoteCancelObserveMs,
+    statementTimeoutMs: runtime.dbStatementTimeoutMs,
     logger,
     // Feed the run-duration histogram from every completed run (parked
     // `waiting` runs are not finished, so they are excluded), then settle any
@@ -446,10 +448,14 @@ export function createAppStack(
   // pipeline run), and on a shared pool `max` such holders deadlock the
   // control plane waiting for a `max+1`th. The two lock families are kept
   // apart from each other too, so a pipeline burst never starves a Stop.
+  // Every statement on every pool is bounded (DB_STATEMENT_TIMEOUT_MS) —
+  // the run tailer's takeover bound derives from the same parser through
+  // `RuntimeConfig.dbStatementTimeoutMs`.
   const dbHandle = createDb(config.databaseUrl, {
     max: poolSizeFromEnv(env),
     lockMax: lockPoolSizeFromEnv(env),
     pipelineLockMax: pipelineLockPoolSizeFromEnv(env),
+    statementTimeoutMs: statementTimeoutFromEnv(env),
   });
   // The seeded-workspace publish kick needs the runtime graph, which is built
   // AFTER auth (workspace deps wrap the auth instance) — late-bind via a slot.

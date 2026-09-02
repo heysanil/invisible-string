@@ -598,17 +598,41 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   successor waits at most `streamTakeoverMs` (`DEFAULT_STREAM_TAKEOVER_MS`,
   5 s) for its `done`, then SEIZES it (`RunTailHandle.seize`: closed,
   fenced so it consumes, attributes and writes nothing more even if its
-  hung connect or body yields later, its in-flight event handling awaited
-  — bounded again) and takes the cursor over from the persisted counts
-  (`run.tail_takeover`, warn). Behind a LIVE prior the wait stays
-  unbounded — seizing a live reader would fail its run, and two live tails
-  on one session is what admission forbids. Before this, a tail exiting
-  through its natural terminal stayed in the reader slot until
-  `done.finally` (a settlement signal in that window was adopted by a tail
-  about to return, and the run had no reader until the next sweep), and a
-  chained observer awaited a hung drain with no bound and armed its
-  deadline only afterwards — the session's live tail slot wedged until
-  restart;
+  hung connect or body yields later — and fenced BETWEEN STATEMENTS: from
+  the seizure on, every cursor- or attribution-affecting store call
+  (`appendEvent`, `setRunTurnId`, `clearRemoteCancelPending`, the claimant
+  and unowned-turn reads) is refused before it is issued, so at most the
+  ONE statement already in flight is outstanding) and then waits for its
+  in-flight handling to settle — bounded by the DERIVED write bound, never
+  a second fixed pause: `seizedWriteBoundMs` = the product DB's
+  `statement_timeout` (`DB_STATEMENT_TIMEOUT_MS`, a startup parameter on
+  every pool connection, default 30 s) + a margin (`DEFAULT_SEIZED_WRITE_
+  MARGIN_MS`, 5 s), after which that one statement is landed or dead
+  (`57014`). Only then does the successor read the persisted counts and
+  take the cursor over (`run.tail_takeover`, then `run.tail_takeover_
+  forced` if the prior never went idle — warn), so a write landing at the
+  last instant is in its cursor, never re-read and duplicated. Behind a
+  LIVE prior the wait stays unbounded — seizing a live reader would fail
+  its run, and two live tails on one session is what admission forbids.
+  The draining list is bounded on the same clock: a drain unreleased after
+  `streamTakeoverMs` is seized by the manager itself (`run.tail_drain_
+  seized`, warn — a session with no successor to chain behind it must not
+  stay stream-held), and a seized drain is EVICTED from the stream-holder
+  list once the write bound elapses whether or not its `done` ever
+  resolves (`run.tail_drain_evicted`, warn; it leaves `handles` too, so
+  `stopAll` never awaits it) — `isSessionStreamHeld` stops counting it, so
+  the context controls cannot answer `session_busy` forever on a hung
+  drain, and `MAX_DRAINING_TAILS_PER_SESSION` (8) backstops the list's
+  length by evicting the oldest. Before this, a tail exiting through its
+  natural terminal stayed in the reader slot until `done.finally` (a
+  settlement signal in that window was adopted by a tail about to return,
+  and the run had no reader until the next sweep), a chained observer
+  awaited a hung drain with no bound and armed its deadline only
+  afterwards — the session's live tail slot wedged until restart — and
+  then, once bounded, the successor proceeded after a second fixed 5 s
+  while the seized tail's stalled `appendEvent`/`setRunTurnId` could still
+  land later (a duplicate session event, a drifted cursor), and a seized
+  drain whose `done` never resolved held the session's stream forever;
   nothing to act on (an armed eveless
   session, no live worker) is `retained`; a held lock is `deferred`. The
   post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a

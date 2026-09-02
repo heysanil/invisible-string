@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError } from "../config";
+import { statementTimeoutFromEnv } from "../db";
 import { publicAppUrlFromEnv } from "../integrations/config";
 import {
   loadSessionTitleConfig,
@@ -111,6 +112,17 @@ export interface RuntimeConfig {
    * Bounds both the live tail's observation and the sweeper's re-opened one.
    */
   remoteCancelObserveMs: number;
+  /**
+   * The product DB's per-statement bound (DB_STATEMENT_TIMEOUT_MS, default
+   * 30 s — ONE parser, `db.ts` `statementTimeoutFromEnv`, shared with the
+   * pool construction in index.ts so the two can never diverge). The run
+   * tailer DERIVES its takeover bound from it (`seizedWriteBoundMs`): a
+   * seized tail's in-flight write is landed or dead once this plus a margin
+   * has elapsed, so a successor waits exactly that long before taking a
+   * session's cursor over, and the manager evicts a seized drain from the
+   * stream-holder list on the same clock.
+   */
+  dbStatementTimeoutMs: number;
   /**
    * Pipeline-recovery sweep cadence (PIPELINE_RECOVERY_SWEEP_MS, default 60 s
    * — keep in sync with pipeline/recovery.ts
@@ -284,6 +296,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     600_000,
     problems,
   );
+  const dbStatementTimeoutMs = statementTimeoutFromEnv(env);
   const pipelineRecoverySweepMs = parsePositiveInt(
     env.PIPELINE_RECOVERY_SWEEP_MS,
     "PIPELINE_RECOVERY_SWEEP_MS",
@@ -348,6 +361,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     scheduleTickMs,
     remoteCancelSweepMs,
     remoteCancelObserveMs,
+    dbStatementTimeoutMs,
     pipelineRecoverySweepMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),

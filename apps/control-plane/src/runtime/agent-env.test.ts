@@ -36,6 +36,7 @@ const RUNTIME: RuntimeConfig = {
   scheduleTickMs: 30_000,
   remoteCancelSweepMs: 60_000,
   remoteCancelObserveMs: 600_000,
+  dbStatementTimeoutMs: 30_000,
   pipelineRecoverySweepMs: 60_000,
   npmCacheDir: "/tmp/npm-cache",
   buildRoot: "/var/lib/agents",

@@ -33,6 +33,24 @@
  * root-pool users never wait on a lock pool while holding a root connection
  * (every acquisition happens strictly OUTSIDE any transaction, with a
  * BOUNDED reserve wait — the lock factories' shared contract).
+ *
+ * EVERY STATEMENT IS BOUNDED. All three pools connect with a Postgres
+ * `statement_timeout` (`DB_STATEMENT_TIMEOUT_MS`, default 30 s — a startup
+ * parameter, so it is per connection and survives pool rotation). The
+ * bound is a LIVENESS guarantee the run tailer builds on (runs/tailer.ts
+ * `seizedWriteBoundMs`): a write a seized tail had already issued is either
+ * landed or DEAD (`57014 query_canceled`) once the timeout plus a margin
+ * has elapsed, so a successor that waited that long can take the session's
+ * cursor over from the persisted counts without a late write drifting it.
+ * The lock pools carry it too — harmlessly: they run nothing but
+ * `pg_try_advisory_lock`/`pg_advisory_unlock`, which never wait (both lock
+ * families poll the TRY variant; runner.ts, runtime/session-lock.ts). The
+ * transaction-scoped `pg_advisory_xact_lock` waits on the root pool (caps,
+ * the Slack thread-key claim, the schedule claim, the workflow-state write)
+ * are bounded by their holders' own short transactions, whose every
+ * statement is itself bounded — a wait outlasting the timeout means a
+ * pathological pile-up, and failing it loudly beats wedging. Migrations run
+ * on `packages/db`'s own client and are deliberately NOT bounded.
  */
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -91,6 +109,26 @@ export const DEFAULT_DB_LOCK_POOL_SIZE = 8;
  * plausible sum, not at it.
  */
 export const DEFAULT_DB_PIPELINE_LOCK_POOL_SIZE = 32;
+/**
+ * Per-statement bound when `DB_STATEMENT_TIMEOUT_MS`/`options.statementTimeoutMs`
+ * is absent (module doc). Generous for any statement the control plane
+ * issues (single-row CAS writes, a few-row reads by session id, short
+ * advisory-locked transactions) while still bounding a seized tail's last
+ * write to well under a minute.
+ */
+export const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000;
+
+/**
+ * `DB_STATEMENT_TIMEOUT_MS` from an environment map — a positive integer,
+ * else the default. There is deliberately no "off" value: the run tailer's
+ * takeover bound is DERIVED from this number, and an unbounded statement
+ * would void the guarantee it derives.
+ */
+export function statementTimeoutFromEnv(
+  env: Record<string, string | undefined>,
+): number {
+  return positiveIntOr(env.DB_STATEMENT_TIMEOUT_MS, DEFAULT_DB_STATEMENT_TIMEOUT_MS);
+}
 
 /**
  * `DB_LOCK_POOL_SIZE` from an environment map — a positive integer, else the
@@ -134,22 +172,38 @@ function positiveIntOr(raw: string | undefined, fallback: number): number {
 
 /**
  * Create a drizzle client over postgres-js. Connections open lazily on ALL
- * three pools; `close()` ends them together.
+ * three pools; `close()` ends them together. Every connection of every pool
+ * carries the `statement_timeout` startup parameter (module doc).
  */
 export function createDb(
   databaseUrl: string,
-  options?: { max?: number; lockMax?: number; pipelineLockMax?: number },
+  options?: {
+    max?: number;
+    lockMax?: number;
+    pipelineLockMax?: number;
+    statementTimeoutMs?: number;
+  },
 ): DbHandle {
+  const statementTimeoutMs =
+    options?.statementTimeoutMs ?? DEFAULT_DB_STATEMENT_TIMEOUT_MS;
+  // A startup parameter, not a per-session SET: postgres-js sends it in the
+  // StartupMessage of every connection it opens, so a rotated or re-opened
+  // pool connection is bounded from its first statement (milliseconds — a
+  // bare integer is what Postgres reads the GUC as).
+  const connection = { statement_timeout: statementTimeoutMs };
   const sql = postgres(databaseUrl, {
     max: options?.max ?? DEFAULT_DB_POOL_SIZE,
+    connection,
     onnotice: () => {}, // silence NOTICE chatter (e.g. from migrations)
   });
   const lockSql = postgres(databaseUrl, {
     max: options?.lockMax ?? DEFAULT_DB_LOCK_POOL_SIZE,
+    connection,
     onnotice: () => {},
   });
   const pipelineLockSql = postgres(databaseUrl, {
     max: options?.pipelineLockMax ?? DEFAULT_DB_PIPELINE_LOCK_POOL_SIZE,
+    connection,
     onnotice: () => {},
   });
   const db = Object.assign(drizzle(sql, { schema }), {

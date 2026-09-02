@@ -13,9 +13,10 @@
  * name→agent lookup here.
  *
  * Agents carry the context slugs of their published version's definition
- * (not their mutable draft): workflow instructions render at dispatch against
- * the agent's PUBLISHED context, so that is what workflow-surface @reference
- * validation must check (validate.ts).
+ * (not their mutable draft): a workflow AGENT STEP's instructions render at
+ * dispatch against the bound agent's PUBLISHED context, so that is what
+ * workflow-surface @reference validation must check (validate.ts /
+ * pipeline-draft.ts).
  *
  * The model rows additionally carry REASONING data — each preset's inherited
  * effort and each allowlisted model's catalog-advertised efforts. The copilot
@@ -30,7 +31,9 @@ import { schema } from "@invisible-string/db";
 import {
   agentDefinitionSchema,
   type ConnectionHealth,
+  type ConnectionTool,
   type ReasoningEffort,
+  type ResourceScope,
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
@@ -54,6 +57,12 @@ export interface InventoryConnection {
   slug: string;
   description: string | null;
   enabled: boolean;
+  /**
+   * Row scope. Pipeline `tool` steps run unattended on WORKSPACE authority,
+   * so validate.ts rejects user-scoped connections there (publish-gate
+   * parity); agent-surface context attachment still allows both.
+   */
+  scope: ResourceScope;
   /** Probe-classified health (spec §7); `unknown` until the first probe. */
   health: ConnectionHealth;
   /**
@@ -65,6 +74,15 @@ export interface InventoryConnection {
   tools: string[];
   /** Full cached tool count — exceeds `tools.length` when the cap truncated. */
   toolCount: number;
+  /**
+   * The FULL cached `tools/list` entries (probe cap 200) — the corpus the
+   * workflow surface's read tools (searchConnectionTools/getConnectionTool)
+   * search server-side. `tools` above is its name-only prompt-capped view;
+   * detail (descriptions, params, trimmed inputSchema when the probe cached
+   * one) deliberately stays OUT of the system prompt and behind the read
+   * tools.
+   */
+  cachedTools: ConnectionTool[];
 }
 
 export interface InventorySkill {
@@ -79,7 +97,7 @@ export interface InventoryAgent {
   id: string;
   name: string;
   description: string | null;
-  /** True when the agent has a published version (setAgent requires it). */
+  /** True when the agent has a published version (agent steps require it). */
   published: boolean;
   /**
    * `@<slug>` connection refs available to workflow instructions when this
@@ -255,18 +273,23 @@ export function createInventoryLoader(
 
     return {
       connections: connections.map((row) => {
-        const cached = row.toolsCache ?? [];
+        // Rows probed before the inputSchema widening carry only
+        // name/description/params — `ConnectionTool` keeps the extra field
+        // optional, so old cache entries degrade to name/params checks.
+        const cached: ConnectionTool[] = row.toolsCache ?? [];
         return {
           id: row.id,
           name: row.name,
           slug: slugifyName(row.name),
           description: row.description,
           enabled: row.enabled,
+          scope: row.scope,
           health: row.health,
           tools: cached
             .slice(0, INVENTORY_TOOL_NAME_CAP)
             .map((tool) => tool.name),
           toolCount: cached.length,
+          cachedTools: cached,
         };
       }),
       skills: skills.map((row) => ({

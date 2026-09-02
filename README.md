@@ -37,25 +37,31 @@ app where you build **Agents** — a persona, a model, and the tools they can us
 </div>
 
 You **chat with Agents directly**. For standing work, delegate with a
-**Workflow**:
+**Workflow** — a pipeline of steps:
 
 <div align="center">
 
-| ⚡ TRIGGER | → 🤖 AGENT → | 📝 INSTRUCTIONS |
-|:---:|:---:|:---:|
-| webhook, form, Slack event, or schedule | which Agent handles it | what to do when it fires, with `@trigger` references |
+| ⚡ TRIGGER | → 🪜 STEPS |
+|:---:|:---:|
+| webhook, form, Slack event, or schedule | `tool` (a deterministic MCP call) · `infer` (a cheap direct model call) · `agent` (a real Agent session) · `for_each` / `branch` / `filter` / `state` |
 
 </div>
 
+The control plane **interprets** the pipeline when the trigger fires: prior
+step outputs, trigger data, and durable per-workflow state flow between steps
+as `@references`, so the deterministic 90% of a job (search Slack, dedupe
+against a cursor, call the Linear API) runs without burning a model turn —
+and only the steps that need judgment are agentic.
+
 Every **published Agent** compiles to a real, self-hosted
 [eve](https://eve.dev) agent (`packages/compiler` → `eve build` → tarball in
-object storage). A workflow builds nothing of its own — when it fires, the
-platform renders the trigger event *and its instructions* into the task
-message for the bound agent version. Compiled agents run on a stateless worker
-pool with Postgres-backed durability (`@workflow/world-postgres`), so runs
-survive worker death and stream back to the browser over resumable SSE.
-Multi-tenancy rides on Better Auth organizations (email/password + OIDC SSO),
-and an AI copilot lives inside both editors.
+object storage). A workflow builds nothing of its own — its `agent` steps run
+as child runs on the bound Agent's compiled artifact. Compiled agents run on
+a stateless worker pool with Postgres-backed durability
+(`@workflow/world-postgres`), so runs survive worker death and stream back to
+the browser over resumable SSE. Multi-tenancy rides on Better Auth
+organizations (email/password + OIDC SSO), and an AI copilot lives inside
+both editors.
 
 ## How it works
 
@@ -86,10 +92,12 @@ flowchart LR
   CRUD, compiler invocation + `eve build` + artifact upload (cache keyed by
   content hash), scheduler (session affinity → artifact-warm → any live
   worker, with dead-worker sweep + fencing), trigger ingress + schedule
-  ticker → dispatcher (renders the workflow's instructions + trigger event
-  into the task message and delivers it to the bound agent version over
-  eve's session API, version-bound JWTs), outbound Slack reply delivery,
-  NDJSON tailer → resumable SSE, the connections domain (curated connector
+  ticker → the pipeline runner (interprets the workflow's step tree against
+  a durable `run_steps` ledger — crash recovery replays it — with `tool`
+  steps calling MCP servers directly, `infer` steps calling workspace model
+  presets, and `agent` steps dispatching child runs to the bound agent
+  version over eve's session API, version-bound JWTs), explicit
+  `onComplete.slackReply` delivery, NDJSON tailer → resumable SSE, the connections domain (curated connector
   catalog + a registry→Meilisearch sync job backing community search, MCP
   health probes over an SSRF-guarded egress path that cache each server's
   tool list, and an MCP OAuth 2.1 broker — popup consent, envelope-encrypted
@@ -235,15 +243,21 @@ content hash keys on the agent's stable id, so two agents may share a name.
 ![Agent editor](docs/screenshots/agents.png)
 
 ### ⚡ Workflows — `/workflows`, `/workflows/:id`
-Standing delegations: **trigger → Agent → instructions**. One focused column
-with three sections — Trigger ("When this runs": webhook, form, Slack, or
-schedule), Agent ("Who does the work": a published Agent), Instructions
-("What they should do": a rich markdown editor where `@trigger.*` and the
-bound Agent's `@skill.*` become atomic reference chips, with a Markdown
-source toggle). Publishing is **instant** — validate + snapshot, no
-build (blocking diagnostics answer 422 and route onto the section cards) —
-and the header's Run popover fires the published snapshot through the real
-trigger-dispatch path.
+Standing delegations: **trigger → steps**, authored conversationally. The
+editor is two panes: the **copilot composer** (describe the job; the copilot
+proposes trigger and step edits as reviewable cards, searching the workspace's
+real MCP tool lists before it ever proposes a tool step) beside the
+**pipeline pane** — a trigger card and a vertical step strip where each card
+expands into an inline inspector (connection + searchable tool picker with
+schema-aware arg fields, prompt editors with `@reference` chips, condition
+rows, loop/branch lanes) and tool/infer steps can be **test-run in place**
+against a sample scope. Pending copilot suggestions render as dashed ghost
+cards at their target position and solidify on apply. Publishing is
+**instant** — validate + snapshot, no build (blocking diagnostics answer 422
+and route onto the offending step) — and a **Runs** tab replays every run as
+the same strip: live per-step status from the event stream, a drawer with
+each step's rendered input and output, and agent steps embedding their child
+run's full chat transcript (approvals included).
 
 ![Workflow editor](docs/screenshots/workflow.png)
 
@@ -290,11 +304,17 @@ name and description as the editor currently holds them — unsaved edits
 included — plus the workspace inventory (published Agents, MCP connections,
 skills, model presets, allowlist), and proposes edits as **typed mutations** — `setName`,
 `setDescription`, `setPersona`, `setModel`, `addContext`, `removeContext` on
-the agent surface; `setTrigger`, `setAgent`, `setInstructions` on the workflow
-surface — streamed over `WS /workspaces/:workspaceId/copilot` (shared frame
-protocol in `packages/shared/src/copilot.ts`; each turn names its surface).
-The turn is not a black box: reasoning and tool steps stream as their own
-frames and render in the same rail-in-box grammar the chat thread uses.
+the agent surface; `setTrigger` plus granular step mutations (`addStep`,
+`updateStep`, `removeStep`, `moveStep` — step ids are minted server-side,
+never by the model) on the workflow surface — streamed over
+`WS /workspaces/:workspaceId/copilot` (shared frame protocol in
+`packages/shared/src/copilot.ts`; each turn names its surface). The workflow
+surface also carries two server-executed **read tools**
+(`searchConnectionTools`, `getConnectionTool`) over the health probes' cached
+tool lists, so the copilot looks up real MCP tool names and arg schemas
+instead of inventing them. The turn is not a black box: reasoning and tool
+steps stream as their own frames and render in the same rail-in-box grammar
+the chat thread uses.
 
 ![Copilot dock in the workflow editor — suggestion cards with inline diff preview](docs/screenshots/copilot.png)
 
@@ -308,7 +328,8 @@ card says so and the model is told the edit was rejected rather than being
 handed a receipt for something that never landed. A session-scoped **allow
 edits** toggle skips the accept gate: mutations apply as they arrive and the
 card still renders, marked applied, so the turn stays an audit trail. It is deliberately not remembered
-across sittings. Invalid tool calls (unknown inventory ids, non-allowlisted
+across sittings; its starting value is surface-aware — on for a
+never-published workflow draft, off once published. Invalid tool calls (unknown inventory ids, non-allowlisted
 models, out-of-scope `@` references) bounce back to the model server-side and
 are never offered as a proposal — they surface only as a failed step in the
 rail, so a self-correction loop is visible rather than a stall.
@@ -327,7 +348,7 @@ Config knobs (all optional):
 | `COPILOT_PROVIDER` | `openrouter` | `openrouter` or `anthropic` |
 | `COPILOT_MAX_SESSIONS` | `2` | per-workspace concurrent session cap |
 | `COPILOT_MAX_OUTPUT_TOKENS` | `8192` | per-turn budget |
-| `COPILOT_MAX_STEPS` | `12` | tool-loop round-trip cap |
+| `COPILOT_MAX_STEPS` | workflow `24`, agent `12` | per-turn tool-loop round-trip cap (per surface; setting it overrides both) |
 | `COPILOT_REASONING_EFFORT` | `provider-default` | reasoning effort for copilot turns; the default sends no reasoning block at all, since these tokens bill to the platform key on every turn |
 | `COPILOT_FAKE_SCRIPT` | — | deterministic scripted LLM for tests |
 
@@ -383,8 +404,9 @@ apps/
                    compiler invocation, eve build + artifact upload,
                    affinity/warm scheduler with dead-worker failover,
                    trigger ingress (webhook/form/Slack) + schedule ticker
-                   + dispatcher, outbound Slack delivery, SSE,
-                   /internal/metrics + deep health
+                   + the pipeline runner (src/pipeline: interpreter,
+                   run_steps ledger, tool/infer/agent executors), explicit
+                   Slack delivery, SSE, /internal/metrics + deep health
   worker/          Stateless worker: supervisor (boots compiled agents under
                    Node 24), reverse proxy, idle + sandbox reapers,
                    per-worker token identity
@@ -411,6 +433,7 @@ docs/              Design specs, master plan, runtime contract (+ screenshots/)
 | [`AGENTS.md`](AGENTS.md) | Operational contract: commands, test lanes, conventions, constraints |
 | [`docs/superpowers/specs/2026-07-10-agents-first-redesign.md`](docs/superpowers/specs/2026-07-10-agents-first-redesign.md) | Agents-first redesign: concept model, IA, technical decisions, supersessions, vocabulary standard |
 | [`docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md`](docs/superpowers/specs/2026-08-08-reasoning-effort-and-model-defaults.md) | The model layer today: seeded presets, preset-carries-effort + inheritance, the effort vocabulary, the OpenRouter passthrough fix |
+| [`docs/superpowers/specs/2026-08-31-workflow-pipelines-design.md`](docs/superpowers/specs/2026-08-31-workflow-pipelines-design.md) | Workflows today: the pipeline config, the interpreter + run ledger, step mechanics, dispatch + delivery, the copilot step tools, and the composer/strip editor |
 | [`docs/PLAN.md`](docs/PLAN.md) | Master phase plan |
 | [`docs/runtime-worker-contract.md`](docs/runtime-worker-contract.md) | Control-plane ↔ worker protocol |
 | [`packages/compiler/README.md`](packages/compiler/README.md) | Codegen contract & versioning discipline |

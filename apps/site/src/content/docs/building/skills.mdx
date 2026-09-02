@@ -42,7 +42,7 @@ Three different things equip an Agent, and it's easy to reach for the wrong one:
 
 ## Deleting a skill
 
-Deleting a skill removes it and its attachments outright — unlike a connection, it isn't blocked while something still references it. Nothing fails immediately, and the two kinds of dependent degrade differently. An Agent that still has it attached reports it as missing in the agent editor's Context section, and can't publish again until the reference is removed or replaced. A Workflow whose instructions name it with `@skill.` keeps an amber warning that doesn't block publish, and still dispatches — the reference just resolves to nothing, the same degradation [Agents](/docs/concepts/agents#renaming-deleting-and-dependents) describes for any stale reference.
+Deleting a skill removes it and its attachments outright — unlike a connection, it isn't blocked while something still references it. Nothing fails immediately: an Agent that still has it attached reports it as missing in the agent editor's Context section, and can't publish again until the reference is removed or replaced — but every already-published version keeps the copy that was baked in at its publish. Prose that merely *names* the skill — a persona, a workflow step's instructions — is never checked against the library, so nothing flags it; it just goes quietly out of date.
 
 ## Changes land on the next publish
 

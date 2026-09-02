@@ -17,38 +17,50 @@ of what a term means.
 |---|---|
 | [Agent](/docs/concepts/agents) | The product entity you build: a persona, a model, and the context it's equipped with. |
 | [agent editor](/docs/building/agent-editor) | The UI surface for building an Agent — its Persona, Model, Context, and Access sections. |
+| [agent step](/docs/concepts/workflows) | A pipeline step that delegates to a published Agent, dispatched as a child run. |
 | agent version | An immutable published snapshot of an Agent, identified by a content hash. |
 | [allowlist](/docs/building/settings) | The workspace's list of provider-and-model pairs Agents are permitted to use. |
 | artifact | The compiled build output (a tarball) of a published agent version — also called a compiled agent. |
 | [catalog](/docs/building/context-mcp) | The curated, checked-in list of one-click connectors offered in the Add connection dialog. |
+| child run | The agent run an `agent` step dispatches — a real session, linked from its parent pipeline run's step. |
 | compiled agent | See artifact. |
 | [connection](/docs/building/context-mcp) | A configured link to an MCP server, at workspace or personal scope. |
 | content hash | The digest of an Agent's identity and definition — persona, resolved model and effort, context, compiler and eve versions, build environment — that identifies its published artifact. An unchanged definition never rebuilds, and two Agents never share an artifact, however alike they look. |
 | [context](/docs/concepts/agents) | What an Agent is equipped with: MCP connections and skills. |
-| [copilot](/docs/building/copilot) | The AI assistant docked in both editors that proposes edits as typed, reviewable mutations. |
+| [copilot](/docs/building/copilot) | The AI assistant in both editors that proposes edits as typed, reviewable mutations. |
 | [cron expression](/docs/building/triggers) | The five-field, UTC-evaluated schedule string that drives a Schedule trigger. |
 | draft | The editable, autosaving version of an Agent or Workflow before it's published. |
 | [eve](https://eve.dev) | The open-source agent runtime invisible-string compiles Agents into and runs on. |
 | [form trigger](/docs/building/triggers) | A Workflow trigger that renders a shareable field-schema form. |
+| [infer step](/docs/concepts/workflows) | A pipeline step that makes one direct model call on a workspace preset — text or declared structured output. |
 | ingress token | The per-Workflow secret its webhook URL — and its form's submit URL — is authenticated by, shown once at generation. |
 | MCP | Model Context Protocol — the standard invisible-string's connections speak to reach external tools. |
-| [model preset](/docs/building/models) | A workspace-level pointer — provider, model, and reasoning effort — that Agents select by name (`powerful`, `balanced`, `quick`). |
+| [model preset](/docs/building/models) | A workspace-level pointer — provider, model, and reasoning effort — that Agents and infer steps select by name (`powerful`, `balanced`, `quick`). |
+| `onComplete` reply | A Workflow's declared end-of-run Slack reply template — rendered against the final run scope; nothing posts when none is declared. |
+| overlap policy | Whether a trigger firing mid-run starts a second run. The default, `skip`, refuses it — protecting cursor state. |
 | persona | The durable, natural-language description of an Agent's role and working style. |
 | personal scope | A connection or skill visible only to the member who added it, across every workspace they belong to. |
+| [pipeline](/docs/concepts/workflows) | A Workflow's step tree, interpreted by the platform when its trigger fires — no build, no compilation. |
 | probe | The platform's automated health check of an MCP connection. |
-| publish | For an Agent, compiling and building a new immutable version; for a Workflow, validating and snapshotting it — no build. |
+| publish | For an Agent, compiling and building a new immutable version; for a Workflow, validating and snapshotting its pipeline — no build. |
 | [reasoning effort](/docs/building/models) | How much a model reasons before answering, from `provider-default`/`none` through `max`. |
+| [reference](/docs/building/workflow-editor) | An `@` token in a step's prompt, arguments, or conditions — `@trigger.*`, `@steps.<slug>.*`, `@state.*`, `@item`, `@now` — resolved against the run scope at run time. |
 | registry | The official MCP server registry that invisible-string's community search mirrors and install-time verification checks against. |
-| run | One execution within a session. |
+| run | One execution: an agent run within a session, or a pipeline run of a Workflow. |
 | run-as user | The workspace member whose credentials an Agent uses on every dispatch. |
 | session | A conversation with a published Agent. |
 | [skill](/docs/building/skills) | Authored markdown-plus-attachments knowledge equipped onto an Agent. |
 | [Slack trigger](/docs/guides/connect-slack) | A Workflow trigger fired by mentions or messages in a connected Slack workspace. |
+| [step](/docs/concepts/workflows) | One node of a pipeline: `tool`, `infer`, or `agent` does work; `for_each`, `branch`, `filter`, and `state` control the flow. |
+| step slug | A step's handle — the name `@steps.<slug>` references its output by, unique across the pipeline. |
+| step timeline | A pipeline run's record: one entry per executed step instance, with status, attempts, timing, and rendered input/output. |
+| [tool step](/docs/concepts/workflows) | A pipeline step that makes one deterministic MCP tool call on a workspace connection — no model involved. |
 | tool filter | A connection's allow- or block-list narrowing which of its tools an equipped Agent can call. |
 | [trigger](/docs/building/triggers) | What starts a Workflow: manual, webhook, form, Slack, or schedule. |
 | waiting | A run parked on a tool approval, a question, or a session-limit prompt — it still holds the session. |
 | worker | The stateless process pool that boots and runs compiled agents. |
-| [Workflow](/docs/concepts/workflows) | A standing delegation: trigger → Agent → instructions. |
+| [Workflow](/docs/concepts/workflows) | A standing delegation: a trigger and a pipeline of steps the platform interprets. |
+| [workflow state](/docs/concepts/workflows) | A Workflow's durable key-value store — written by state steps, read as `@state.*`, surviving across runs. |
 | [workspace](/docs/concepts/workspaces) | The multi-tenant boundary every Agent, Workflow, connection, and session belongs to. |
 | world database | The per-agent-version Postgres database holding that version's durable execution state. |
 
@@ -62,19 +74,24 @@ actual eve build output that snapshot produced. You edit the first, runs are
 pinned to the second, and workers run the third.
 
 **A session vs. a run.** A session is the whole conversation with a published
-Agent; a run is one execution within it. A session can contain many runs over
-its life — one per message you send, roughly — and a run finishing doesn't
-end the session it happened in.
+Agent; an agent run is one execution within it. A session can contain many
+runs over its life — one per message you send, roughly — and a run finishing
+doesn't end the session it happened in.
+
+**A pipeline run vs. its child runs.** A Workflow firing produces one
+pipeline run — the step timeline. Each `agent` step inside it produces a
+child run of its own — a real agent run with a session. The parent holds the
+ledger; the children hold the transcripts.
 
 **A connection vs. the tools it exposes.** A [connection](/docs/building/context-mcp)
 is the MCP server itself — its URL, its credentials, its health. The tools
 are what that server advertises once connected, narrowed further by the
-connection's own tool filter. A connection can be healthy with zero tools
-visible to an Agent if its filter excludes all of them.
+connection's own tool filter for equipped Agents — while a Workflow's tool
+step names exactly one of them per call.
 
 **Publishing an Agent (which builds) vs. publishing a Workflow (which
 doesn't).** An Agent publish compiles its definition into a real eve project,
 builds it, and uploads the resulting artifact — a real build pipeline with
 real failure modes. A [Workflow](/docs/concepts/workflows) publish only
-validates and snapshots the delegation between trigger, Agent, and
-instructions — it never builds anything, so it's effectively instant.
+validates the pipeline and snapshots it — it never builds anything, so it's
+effectively instant.

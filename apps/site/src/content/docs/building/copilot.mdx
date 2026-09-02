@@ -2,14 +2,14 @@
 title: Copilot
 section: Building
 order: 33
-description: "An AI copilot docked in both editors. It reads your draft and workspace inventory and proposes typed edits, on the platform's credentials rather than your own key."
+description: "An AI copilot in both editors. It reads your draft and workspace inventory and proposes typed edits, on the platform's credentials rather than your own key."
 ---
 
 # Copilot
 
-Both editors dock an AI copilot on the right. It reads the current draft plus the workspace inventory — MCP connections, skills, published Agents, model presets, and the allowlist — and proposes edits as typed mutations, streamed over a WebSocket. It runs on the platform's own credentials by default, so using it costs you nothing extra and needs no API key of your own.
+Both editors carry the same AI copilot. It reads the current draft plus the workspace inventory — MCP connections, skills, published Agents, model presets, and the allowlist — and proposes edits as typed mutations, streamed over a WebSocket. It runs on the platform's own credentials by default, so using it costs you nothing extra and needs no API key of your own.
 
-The panel opens as a glass dock headed "Copilot" with a collapse chevron, or collapses to a narrow pill; either state persists per workspace across sessions. At 1179px of viewport width or narrower it auto-collapses on its own — the copilot must never out-size the editor it's meant to help you edit.
+Where it lives differs by editor. The [agent editor](/docs/building/agent-editor) docks it on the right — a glass panel with a collapse chevron that shrinks to a narrow pill, either state persisting per workspace, auto-collapsing at 1179px of viewport width or narrower. The [workflow editor](/docs/building/workflow-editor) goes further: the copilot *is* the primary pane, a full-height composer on the left beside the pipeline, with no collapse at all — describing the job is the intended way to author one.
 
 ## Using it well
 
@@ -20,8 +20,8 @@ Copilot works from plain instructions, not a command syntax. In the agent editor
 
 In the workflow editor:
 
-- "Add a Slack trigger for the #support channel."
-- "Reference the submitted email in the instructions."
+- "Every morning, search Slack for #support questions and file the real bugs in Linear."
+- "Add a step that summarizes each message before the issue is created."
 
 ## What it can change
 
@@ -34,33 +34,37 @@ In the workflow editor:
 | agent editor | `addContext` | Attaches a connection or skill |
 | agent editor | `removeContext` | Detaches a connection or skill |
 | workflow editor | `setTrigger` | The trigger type and its configuration |
-| workflow editor | `setAgent` | Which Agent the Workflow delegates to |
-| workflow editor | `setInstructions` | The workflow instructions text |
+| workflow editor | `addStep` | Inserts a new step at a position — top level, inside a loop body, or in a branch lane |
+| workflow editor | `updateStep` | Replaces one step's configuration |
+| workflow editor | `removeStep` | Deletes a step (and, for a loop or branch, its whole subtree) |
+| workflow editor | `moveStep` | Relocates a step to a new position |
 
-`setModel` picks from the same presets and allowlist described in [Models](/docs/building/models) — copilot can't propose a model the workspace hasn't sanctioned any more than the Model section can.
+`setModel` picks from the same presets and allowlist described in [Models](/docs/building/models) — copilot can't propose a model the workspace hasn't sanctioned any more than the Model section can. Step ids are minted server-side, never by the model, so a proposal can only ever address steps that really exist.
+
+On the workflow surface, copilot also holds two **read tools** it runs on its own, without stopping for you: searching the workspace connections' cached MCP tool lists, and pulling one tool's detail — its description and argument schema. That's what lets it propose a tool step with the server's real tool name and correctly shaped arguments instead of invented ones; the lookups appear as steps on the work rail like any other tool call.
 
 ## Working with a proposal
 
-Every proposal renders as a structured card: an icon, a title, an optional rationale, a preview — an inline diff for text, a compact before-and-after row otherwise — and **Apply** / **Dismiss** buttons. The card is focusable; Enter applies it, Delete or Backspace dismisses it. Either decision collapses the card to a one-line receipt — a check and "Applied — *title*," or a muted "Dismissed — *title*" — and applying flashes the section of the editor it touched, so you can see exactly what moved.
+Every proposal renders as a structured card: an icon, a title, an optional rationale, a preview — an inline diff for text, a compact before-and-after row otherwise — and **Apply** / **Dismiss** buttons. The card is focusable; Enter applies it, Delete or Backspace dismisses it. Either decision collapses the card to a one-line receipt — a check and "Applied — *title*," or a muted "Dismissed — *title*" — and applying flashes the part of the editor it touched, so you can see exactly what moved. In the workflow editor, pending step proposals additionally render as dashed **ghost cards** on the pipeline strip at the position they'd land, so you can judge a suggestion in place before accepting it.
 
 The server never mutates your draft directly: accepted mutations are applied client-side through the same controller manual edits use, so autosave and diagnostics all just work.
 
 ## Allow edits
 
-A switch in the dock's header turns the accept gate off. With **allow edits** on, copilot's changes apply as they arrive and it keeps working instead of stopping to wait for you — the cards still render, marked "Applied automatically", so the turn remains a record of what changed rather than a black box. Everything else is unchanged: the same typed mutations, the same validation, the same client-side write path, and Undo is still your editor's own draft history plus the fact that nothing is live until you publish.
+A switch in the copilot's header turns the accept gate off. With **allow edits** on, copilot's changes apply as they arrive and it keeps working instead of stopping to wait for you — the cards still render, marked as applied automatically, so the turn remains a record of what changed rather than a black box. Everything else is unchanged: the same typed mutations, the same validation, the same client-side write path, and Undo is still your editor's own draft history plus the fact that nothing is live until you publish.
 
-The switch is scoped to this sitting. It starts off every time you open the dock, and is deliberately not remembered across tabs or sessions — "the copilot may edit without asking" is a decision worth making on purpose each time.
+The switch is scoped to this sitting and deliberately not remembered across tabs or sessions. Its starting value is surface-aware: **on** for a workflow draft that has never been published — a blank pipeline is exactly where you want the copilot building freely — and **off** everywhere else, including the agent editor and any published Workflow, where "the copilot may edit without asking" is a decision worth making on purpose.
 
 ## Watching it work
 
-The dock shows the turn, not just its conclusions. Copilot's reasoning streams into a collapsible work box as it thinks, and each tool call it makes appears as a step on the box's rail with its own state — the same rail-in-box grammar the [chat](/docs/building/chat) timeline uses, one size down. Steps that already have a suggestion card of their own aren't repeated in the rail; what shows up there is the work that would otherwise be invisible, including a call copilot got wrong and had to correct. If a turn is interrupted — you stop it, the socket drops — anything still in flight settles as canceled rather than spinning forever.
+The copilot shows the turn, not just its conclusions. Its reasoning streams into a collapsible work box as it thinks, and each tool call it makes appears as a step on the box's rail with its own state — the same rail-in-box grammar the [chat](/docs/building/chat) timeline uses, one size down. Steps that already have a suggestion card of their own aren't repeated in the rail; what shows up there is the work that would otherwise be invisible — a tool-list lookup, or a call copilot got wrong and had to correct. If a turn is interrupted — you stop it, the socket drops — anything still in flight settles as canceled rather than spinning forever.
 
 ## Connection
 
-The dock talks to the server over a WebSocket. While it's opening, a small "Connecting…" status line appears below the thread — it's deliberately not the composer's placeholder, since changing that would tear down and re-create the editor mid-draft. If the socket drops, a banner reads "Reconnecting — your draft will resync automatically." While copilot is generating, a pulsing "Thinking…" indicator shows, or "More suggestions may follow — respond to the card above." if a proposal is already waiting on you. Errors render inline as red-bordered alert text; an empty thread shows clickable prompt-starter chips to get you going. Enter sends your message and Shift+Enter starts a new line, as in chat — though unlike chat's composer, there's no Escape shortcut here, because there's no run to stop. See [keyboard & accessibility](/docs/reference/keyboard-and-accessibility) for the full shortcut list.
+The copilot talks to the server over a WebSocket. While it's opening, a small "Connecting…" status line appears below the thread — it's deliberately not the composer's placeholder, since changing that would tear down and re-create the editor mid-draft. If the socket drops, a banner reads "Reconnecting — your draft will resync automatically." While copilot is generating, a pulsing "Thinking…" indicator shows, or "More suggestions may follow — respond to the card above." if a proposal is already waiting on you. Errors render inline as red-bordered alert text; an empty thread shows clickable prompt-starter chips to get you going. Enter sends your message and Shift+Enter starts a new line, as in chat — though unlike chat's composer, there's no Escape shortcut here, because there's no run to stop. See [keyboard & accessibility](/docs/reference/keyboard-and-accessibility) for the full shortcut list.
 
 ## What it will not do
 
-- **It never edits your draft directly.** Every change arrives as a proposal you apply or dismiss — nothing lands until you accept it.
+- **It never bypasses the proposal system.** Every change is a typed mutation rendered as a card — reviewed by you, or auto-applied only while the allow-edits switch you control is on — and applied through the editor's own draft machinery either way.
 - **It never publishes on its own.** Publishing is always a deliberate action you take from the [agent editor](/docs/building/agent-editor) or [workflow editor](/docs/building/workflow-editor).
-- **It can't select a model the workspace hasn't allowlisted**, and it can't reference a connection, skill, or Agent that doesn't exist. Invalid tool calls — unknown ids, non-allowlisted models, dangling references — bounce back to the model server-side and never reach you as a proposal.
+- **It can't select a model the workspace hasn't allowlisted**, and it can't reference a connection, skill, Agent, or step that doesn't exist. Invalid tool calls — unknown ids, non-allowlisted models, dangling references — bounce back to the model server-side and never reach you as a proposal.

@@ -2,29 +2,30 @@
 title: Build a webhook Workflow
 section: Guides
 order: 47
-description: "Wire a support form's POST to a Workflow that triages the submission and files a Linear issue through the Agent's connector."
+description: "Wire a support form's POST to a three-step pipeline that triages the submission with a cheap model and files real bugs in Linear — no Agent required."
 ---
 
 # Build a webhook Workflow
 
-Say your site's support form POSTs a JSON submission somewhere. This guide wires that POST to a Workflow that triages the submission and files a Linear issue through the Agent's connector — the request lands, a run starts, and the result shows up in the run's history.
+Say your site's support form POSTs a JSON submission somewhere. This guide wires that POST to a three-step pipeline: a cheap model call triages the submission, a filter drops anything that isn't a real bug, and a tool step files the rest in Linear — deterministically, with no Agent in the loop at all.
 
 ## Before you start
 
-- A published Agent already equipped with whatever the Workflow needs it to do — for this scenario, a Linear connector. See [Equip an Agent with a connector](/docs/guides/equip-an-agent).
-- Familiarity with how a Workflow's three parts fit together — see [Workflows](/docs/concepts/workflows).
+- A workspace-scoped Linear [connection](/docs/building/context-mcp), healthy enough to have cached its tool list — tool steps run on workspace connections.
+- Familiarity with how a Workflow's trigger and steps fit together — see [Workflows](/docs/concepts/workflows).
 - A way to send a JSON POST for testing (`curl` is enough).
 
 ## Steps
 
-1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor).
-2. In the Trigger section, pick **Webhook**. The draft shows a note that a signing token is minted at publish — there's nothing live to copy yet.
-3. Choose the Agent — it must already be published; the picker only lists published Agents.
-4. Write the instructions, referencing the submitted fields with `@trigger.email`, `@trigger.subject`, and `@trigger.body`. The entire submitted JSON body becomes the event's data verbatim — there's no schema, so whatever top-level keys the POST body has are the keys you can reference.
-5. Click **Publish**. It's instant — a Workflow builds nothing — and publish is what unlocks the token: an Agent and non-empty instructions are both required before it will go through.
-6. The Trigger section now shows a live "Ingress token" card. Click **Generate token**. The plaintext token appears exactly once, in an amber card: "Copy this now — we store only a hash, so it won't be shown again." The card also shows the live ingress URL. Copy the token now — there is no way to retrieve it again later, only to rotate it for a new one.
+1. Create a Workflow and open [the workflow editor](/docs/building/workflow-editor). Describing the job to the copilot composer will draft all of this for you; the steps below are the direct route.
+2. On the Trigger card, pick **Webhook**. The draft shows a note that the token card goes live at publish — there's nothing to copy yet. Every top-level key of whatever JSON gets POSTed will be addressable as `@trigger.<key>`.
+3. Add an **Infer** step, slugged `triage`: the `quick` preset, a prompt referencing `@trigger.email`, `@trigger.subject`, and `@trigger.body`, and a declared output schema — say `{is_bug, title, summary}` — so the next steps get fields rather than prose.
+4. Add a **Filter** step on the condition `@steps.triage.result.is_bug` is true. A top-level filter that comes up false skips every remaining step and the run still counts as succeeded — a non-bug submission is a successful triage, not a failure.
+5. Add a **Tool** step: the Linear connection, its create-issue tool from the searchable picker, args templated from `@steps.triage.result.title` and `@steps.triage.result.summary` plus `@trigger.email` for attribution. **Test step** runs it for real against a sample scope — real side effects included, so expect a real test issue.
+6. Click **Publish**. It's instant — a Workflow builds nothing — and publish is what unlocks the token: a runnable pipeline is required before it goes through.
+7. The trigger's live **Ingress token** card now appears. Click **Generate token**. The plaintext token appears exactly once, in an amber card: "Copy this now — we store only a hash, so it won't be shown again." The card also shows the live ingress URL. Copy the token now — there is no way to retrieve it again later, only to rotate it for a new one.
 
-Send a request to the ingress URL from step 6:
+Send a request to the ingress URL from step 7:
 
 ```bash
 curl -X POST https://your-domain.example/t/whk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
@@ -34,12 +35,13 @@ curl -X POST https://your-domain.example/t/whk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## What you should see
 
-The response to that `curl` is only an acknowledgement that the trigger was accepted — it is never the Agent's answer. Read the actual result in the Workflow's run history: a new run appears, its instructions rendered with `@trigger.email`, `@trigger.subject`, and `@trigger.body` resolved against the JSON you posted, followed by whatever the Agent did with it (a tool call to file the Linear issue, then its summary).
+The response to that `curl` is only an acknowledgement — `{"accepted": true, "runId": …}` — never the result. Open the Workflow's **Runs** tab: a new run replays the pipeline as a step timeline — the triage step with its rendered prompt and structured output, the filter's verdict, and the tool step with the created issue in its output. A submission the triage judged not-a-bug shows the filter false and the tool step skipped, with the run still succeeded.
 
 ## Operational notes
 
 - Request bodies are capped at 256 KiB — larger requests are rejected before a run starts.
 - Both the token and the caller's IP are rate-limited independently; sending too fast gets a `429` with a `Retry-After` header rather than queuing.
+- A POST that arrives while a previous run of this Workflow is still live is **skipped**, not queued — the response still says 2xx, with `{"accepted": false, "reason": "overlap_skipped"}`, since the caller did nothing wrong.
 - If you lose the token, there's no way to reveal it again — mint a new one instead. Rotating immediately invalidates the old token; every caller still using it starts failing until it switches to the new one.
 
 ## If it doesn't work
@@ -47,6 +49,6 @@ The response to that `curl` is only an acknowledgement that the trigger was acce
 - **`401` on the request** — the token is wrong, expired, or was rotated out from under you. Mint a fresh one and update the caller.
 - **`413` on the request** — the body is over the 256 KiB cap. Trim the payload; the platform doesn't accept partial or streamed bodies.
 - **`429` on the request** — you're sending faster than the per-token or per-IP limit allows. Back off for the number of seconds in the `Retry-After` header.
-- **A run starts but the Agent's tool call fails** — the Agent isn't actually equipped with the connector the instructions assume. Revisit [Equip an Agent with a connector](/docs/guides/equip-an-agent) and republish the Agent.
+- **The tool step fails with a tool or argument error** — the tool name or arg shape doesn't match what the Linear server actually exposes. Re-pick the tool from the picker (it reads the server's own list) and re-check the args against its schema; a tool error is the server answering, so it's never retried for you.
 
 See [Triggers](/docs/building/triggers) for how the other trigger kinds compare, [limits & defaults](/docs/reference/limits-and-defaults) for the platform's other ceilings, and [troubleshooting](/docs/reference/troubleshooting) for anything not covered above.

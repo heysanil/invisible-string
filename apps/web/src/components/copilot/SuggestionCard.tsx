@@ -1,7 +1,7 @@
 /**
  * Copilot suggestion card — icon + human title + rationale + preview
- * (inline diff when the adapter provides one, compact before→after
- * otherwise), with Apply / Dismiss capsules. Applied cards collapse to a ✓
+ * (step-card diff for step mutations, inline diff when the adapter provides
+ * one, compact before→after otherwise), with Apply / Dismiss capsules. Applied cards collapse to a ✓
  * receipt line; dismissed ones to a muted receipt. Keyboard: the card is
  * focusable and Enter applies, Delete/Backspace dismisses.
  *
@@ -25,6 +25,7 @@ import type { SuggestionStatus } from "../../lib/copilot/useCopilot";
 import { cn } from "../../lib/cn";
 import { DiffView } from "../builder/DiffView";
 import { Spinner } from "../ui/Spinner";
+import { StepDiffPreview } from "./StepDiffPreview";
 
 export interface SuggestionCardProps {
   proposal: CopilotProposal;
@@ -176,7 +177,10 @@ function SuggestionPreview({
 }: {
   description: ProposalDescription;
 }) {
-  // A full-text diff wins over the compact row when the adapter provides one.
+  // Richest available preview wins: step-card diff → full-text diff → row.
+  if (description.stepPreview) {
+    return <StepDiffPreview preview={description.stepPreview} />;
+  }
   if (description.diff) {
     return (
       <DiffView before={description.diff.before} after={description.diff.after} />

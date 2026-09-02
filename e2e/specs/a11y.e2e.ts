@@ -1,8 +1,9 @@
 /**
  * Accessibility smoke: axe-core scans of the primary surfaces — /login,
- * /agents, /agents/:id (the agent editor), /workflows/:id (the delegation
- * editor), /chat, /context, /settings — with no serious or critical
- * violations.
+ * /agents, /agents/:id (the agent editor), /workflows/:id (the two-pane
+ * pipeline editor: copilot pane + strip, with the TriggerCard expanded and a
+ * step inspector open), /chat, /context, /settings — with no serious or
+ * critical violations.
  *
  * color-contrast is disabled: axe computes contrast against the nearest opaque
  * DOM background, which cannot see through the E1 `backdrop-filter` glass
@@ -12,7 +13,12 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
-import { openNewAgent, openNewWorkflow } from "../support/builder.ts";
+import {
+  addFirstStep,
+  expandTrigger,
+  openNewAgent,
+  openNewWorkflow,
+} from "../support/builder.ts";
 import { gotoSection } from "../support/authoring.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
 
@@ -55,10 +61,15 @@ test("no serious or critical a11y violations on the primary surfaces", async ({
   ).toBeVisible();
   await scan(page, "/agents/:id");
 
-  // ── /workflows/:id (the three-section delegation editor) ───────────────────
+  // ── /workflows/:id (the two-pane pipeline editor) ──────────────────────────
+  // Scan with real content on both panes: the strip holding a step with its
+  // inline inspector open, then the expanded TriggerCard (selecting a step
+  // and expanding the trigger are mutually exclusive accordions).
   await openNewWorkflow(page, "A11y workflow");
-  await expect(page.getByRole("heading", { name: "Trigger", level: 2 })).toBeVisible();
-  await scan(page, "/workflows/:id");
+  await addFirstStep(page, "State");
+  await scan(page, "/workflows/:id (step inspector)");
+  await expandTrigger(page);
+  await scan(page, "/workflows/:id (trigger expanded)");
 
   // ── /chat ──────────────────────────────────────────────────────────────────
   await gotoSection(page, "Chat");

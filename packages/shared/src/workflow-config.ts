@@ -1,21 +1,24 @@
 /**
- * WorkflowConfig — a standing delegation (TRIGGER → AGENT → INSTRUCTIONS)
- * stored on `workflows.draft` and snapshotted into `workflows.published` at
- * publish. Workflows compile nothing: the agent is the compile unit
- * (agent-definition.ts); publish validates and snapshots, and dispatch
- * renders `instructions` + the trigger event into the task message
- * (render.ts) for the agent's current published version.
+ * WorkflowConfig — a standing PIPELINE (TRIGGER → STEPS) stored on
+ * `workflows.draft` and snapshotted into `workflows.published` at publish
+ * (pipeline redesign spec; `version: 2` is the one and only shape — the
+ * platform ships no v1 compatibility). Workflows compile nothing: the control
+ * plane INTERPRETS the step tree (pipeline-config.ts), agent steps ride the
+ * bound agent's current published version as child runs, and publish
+ * validates + snapshots + syncs the trigger row.
  *
- * Draft-lenient by design: a draft may name no agent yet and carry empty
- * instructions. Publish requires an existing PUBLISHED `agentId`, non-empty
- * instructions, `@trigger` refs legal for the trigger type, and
- * `@connection`/`@skill` refs within the agent's published context. This
- * schema guards SHAPE, not publishability.
+ * Draft-lenient by design: an empty pipeline, empty tool/connection strings,
+ * and null agent-step agentIds all parse. Publish requires runnable steps
+ * (published agents, real connections/tools, non-empty unique slugs, legal
+ * `@references`). This schema guards SHAPE plus tree integrity (unique
+ * ids/slugs, no nested for_each) — not publishability.
  *
  * Trigger `type` values mirror the packages/db pgEnum `trigger_type` — keep
  * them in lockstep.
  */
 import { z } from "zod";
+
+import { pipelineStepSchema, walkSteps } from "./pipeline-config";
 
 // ── TRIGGER ─────────────────────────────────────────────────────────────────
 
@@ -164,10 +167,10 @@ export type TriggerConfig = z.infer<typeof triggerConfigSchema>;
 // ── @reference parsing ──────────────────────────────────────────────────────
 
 /**
- * `@trigger.<path>` — resolved at DISPATCH time against `TriggerEvent.data`
+ * `@trigger.<path>` — resolved at RUN time against the trigger event's data
  * (dot path, e.g. `@trigger.customer.email` → `data.customer.email`; see
- * `renderTaskMessage` in render.ts). A bare `@trigger` parses with
- * `path: ""` so validators can flag it.
+ * `renderMarkdownTemplate` in pipeline-template.ts). A bare `@trigger`
+ * parses with `path: ""` so validators can flag it.
  */
 export interface TriggerReference {
   kind: "trigger";
@@ -176,6 +179,61 @@ export interface TriggerReference {
   /** Dot path into TriggerEvent.data ("" when the ref is a bare `@trigger`). */
   path: string;
   /** [start, end) character offsets into the markdown (editor spans). */
+  start: number;
+  end: number;
+}
+
+/**
+ * `@steps.<slug>.<path>` — a prior pipeline step's output, resolved against
+ * the run scope (`scope.steps[slug]`). A bare `@steps` parses with
+ * `slug: ""`; `@steps.<slug>` alone (empty `path`) names the whole output
+ * record.
+ */
+export interface StepReference {
+  kind: "step";
+  raw: string;
+  /** The referenced step's slug ("" when the ref is a bare `@steps`). */
+  slug: string;
+  /** Dot path into that step's output ("" = the whole output). */
+  path: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * `@state.<key>` — a workflow state value. `key` is the dot path into the
+ * state record (first segment = the state key, later segments walk into the
+ * value). A bare `@state` parses with `key: ""` so validators can flag it.
+ */
+export interface StateReference {
+  kind: "state";
+  raw: string;
+  key: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * `@item` / `@item.<path>` — the current for_each item. Legal only inside a
+ * loop body (validators enforce; the parser is lexical).
+ */
+export interface ItemReference {
+  kind: "item";
+  raw: string;
+  /** Dot path into the item ("" = the item itself). */
+  path: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * `@now` — the run's ISO timestamp. Takes no path: like connection refs, the
+ * span truncates to the bare head (`@now.date` yields `@now` + literal
+ * ".date").
+ */
+export interface NowReference {
+  kind: "now";
+  raw: string;
   start: number;
   end: number;
 }
@@ -210,14 +268,22 @@ export interface SkillReference {
 
 export type ParsedReference =
   | TriggerReference
+  | StepReference
+  | StateReference
+  | ItemReference
+  | NowReference
   | ConnectionReference
   | SkillReference;
 
-/** Parsed `@reference` inventory of an instructions document, grouped by kind. */
+/** Parsed `@reference` inventory of a markdown document, grouped by kind. */
 export interface ReferenceInventory {
   /** Every reference in document order. */
   all: ParsedReference[];
   trigger: TriggerReference[];
+  steps: StepReference[];
+  state: StateReference[];
+  items: ItemReference[];
+  now: NowReference[];
   connections: ConnectionReference[];
   skills: SkillReference[];
 }
@@ -235,19 +301,23 @@ const REFERENCE_PATTERN =
   /(?<![A-Za-z0-9_.@-])@([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)/g;
 
 /**
- * Extract every `@reference` from instructions markdown, in document order.
+ * Extract every `@reference` from a markdown surface, in document order.
  *
  * Classification (first segment):
  * - `trigger` → {@link TriggerReference} (path = remaining segments)
+ * - `steps`   → {@link StepReference} (slug = second segment, path = rest)
+ * - `state`   → {@link StateReference} (key = remaining segments)
+ * - `item`    → {@link ItemReference} (path = remaining segments)
+ * - `now`     → {@link NowReference}; the span truncates to `@now`
  * - `skill`   → {@link SkillReference} (slug = remaining segments)
  * - anything else → {@link ConnectionReference}; the span is truncated to
  *   the first segment (`@linear.issues` yields connection "linear" spanning
  *   only "@linear")
  *
  * Purely lexical: matches inside code fences/inline code too, and does NOT
- * validate that referenced connections/skills/fields exist — that is the
- * compiler's (agent publish), workflow validator's (workflow publish), and
- * editor validation's (draft) job.
+ * validate that referenced steps/connections/skills/fields exist — that is
+ * the compiler's (agent publish), workflow validator's (workflow publish),
+ * and editor validation's (draft) job.
  */
 export function parseReferences(markdown: string): ParsedReference[] {
   const refs: ParsedReference[] = [];
@@ -258,23 +328,28 @@ export function parseReferences(markdown: string): ParsedReference[] {
     const segments = dottedName.split(".");
     const head = segments[0] ?? "";
     const rest = segments.slice(1).join(".");
+    const end = start + match[0].length;
 
     if (head === "trigger") {
+      refs.push({ kind: "trigger", raw: match[0], path: rest, start, end });
+    } else if (head === "steps") {
       refs.push({
-        kind: "trigger",
+        kind: "step",
         raw: match[0],
-        path: rest,
+        slug: segments[1] ?? "",
+        path: segments.slice(2).join("."),
         start,
-        end: start + match[0].length,
+        end,
       });
+    } else if (head === "state") {
+      refs.push({ kind: "state", raw: match[0], key: rest, start, end });
+    } else if (head === "item") {
+      refs.push({ kind: "item", raw: match[0], path: rest, start, end });
+    } else if (head === "now") {
+      const raw = "@now";
+      refs.push({ kind: "now", raw, start, end: start + raw.length });
     } else if (head === "skill") {
-      refs.push({
-        kind: "skill",
-        raw: match[0],
-        slug: rest,
-        start,
-        end: start + match[0].length,
-      });
+      refs.push({ kind: "skill", raw: match[0], slug: rest, start, end });
     } else {
       const raw = `@${head}`;
       refs.push({
@@ -295,6 +370,10 @@ export function buildReferenceInventory(markdown: string): ReferenceInventory {
   return {
     all,
     trigger: all.filter((ref) => ref.kind === "trigger"),
+    steps: all.filter((ref) => ref.kind === "step"),
+    state: all.filter((ref) => ref.kind === "state"),
+    items: all.filter((ref) => ref.kind === "item"),
+    now: all.filter((ref) => ref.kind === "now"),
     connections: all.filter((ref) => ref.kind === "connection"),
     skills: all.filter((ref) => ref.kind === "skill"),
   };
@@ -302,22 +381,80 @@ export function buildReferenceInventory(markdown: string): ReferenceInventory {
 
 // ── The full workflow config ────────────────────────────────────────────────
 
-export const workflowConfigSchema = z.object({
-  trigger: triggerConfigSchema,
-  /**
-   * The `agents` row that handles dispatched runs. FLOATING binding: dispatch
-   * resolves the agent's CURRENT published version; sessions/runs pin the
-   * exact version used. Null while drafting — publish requires a published
-   * agent.
-   */
-  agentId: z.uuid().nullable().default(null),
-  /**
-   * What the agent should do per run — markdown with inline `@references`,
-   * rendered into the task message at dispatch (render.ts). Empty is a valid
-   * DRAFT; publish requires non-empty markdown.
-   */
-  instructions: z.object({ markdown: z.string().default("") }),
+/** The one supported config shape. Kept as a literal for future evolution. */
+export const WORKFLOW_CONFIG_VERSION = 2;
+
+/**
+ * Overlap policy for trigger dispatch: `skip` (default) refuses to start a
+ * run while another run of the workflow is live — protecting cursor
+ * semantics against a slow run overlapping the next window; `allow` runs
+ * them concurrently.
+ */
+export const workflowOverlapSchema = z.enum(["skip", "allow"]);
+export type WorkflowOverlapPolicy = z.infer<typeof workflowOverlapSchema>;
+
+/**
+ * Explicit end-of-run delivery. Pipelines have no well-defined "final
+ * assistant message", so nothing is delivered unless configured: the
+ * template renders against the final run scope (pipeline-template.ts) and
+ * posts through the DeliveryService.
+ */
+export const workflowOnCompleteSchema = z.object({
+  slackReply: z
+    .object({ template: z.object({ markdown: z.string().default("") }) })
+    .optional(),
 });
+export type WorkflowOnComplete = z.infer<typeof workflowOnCompleteSchema>;
+
+export const workflowConfigSchema = z
+  .object({
+    version: z.literal(WORKFLOW_CONFIG_VERSION),
+    trigger: triggerConfigSchema,
+    /** The pipeline. Empty is a valid DRAFT; publish requires ≥1 step. */
+    steps: z.array(pipelineStepSchema).default([]),
+    onComplete: workflowOnCompleteSchema.optional(),
+    overlap: workflowOverlapSchema.default("skip"),
+  })
+  .superRefine((config, ctx) => {
+    // Tree integrity — shape-level like the trigger schemas' duplicate-key
+    // checks: ids/slugs are addressing handles, and a duplicate corrupts
+    // `@steps.<slug>` refs and the run_steps claim keys no matter how
+    // unfinished the draft is. Empty slugs stay legal (draft-lenient);
+    // publish requires them non-empty.
+    const seenIds = new Set<string>();
+    const seenSlugs = new Set<string>();
+    for (const entry of walkSteps(config.steps)) {
+      const { step, ancestors, configPath } = entry;
+      if (seenIds.has(step.id)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["steps", ...configPath, "id"],
+          message: `duplicate step id "${step.id}"`,
+        });
+      }
+      seenIds.add(step.id);
+      if (step.slug.length > 0) {
+        if (seenSlugs.has(step.slug)) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["steps", ...configPath, "slug"],
+            message: `duplicate step slug "${step.slug}"`,
+          });
+        }
+        seenSlugs.add(step.slug);
+      }
+      if (
+        step.kind === "for_each" &&
+        ancestors.some((ancestor) => ancestor.kind === "for_each")
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["steps", ...configPath],
+          message: "for_each steps cannot nest inside another for_each",
+        });
+      }
+    }
+  });
 
 /** Parsed (defaults applied) config — what publish/dispatch consume. */
 export type WorkflowConfig = z.infer<typeof workflowConfigSchema>;

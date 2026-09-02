@@ -6,18 +6,34 @@ import {
   COPILOT_MAX_IDENTITY_NAME_CHARS,
   COPILOT_MUTATION_TOOLS,
   WORKFLOW_COPILOT_MUTATION_TOOLS,
+  WORKFLOW_COPILOT_READ_TOOLS,
   agentCopilotMutationParamSchemas,
   copilotClientFrameSchema,
   copilotMutationParamSchemas,
   copilotProposalSchema,
   copilotServerFrameSchema,
+  mintStepIds,
   parseCopilotClientFrame,
   parseCopilotServerFrame,
+  stepPositionSchema,
+  workflowCopilotReadParamSchemas,
   type CopilotAgentIdentity,
   type CopilotServerFrame,
 } from "./copilot";
+import { STEP_ID_PATTERN } from "./pipeline-config";
 
 const UUID = "11111111-2222-4333-8444-555555555555";
+const STEP_ID = "st_0000000000000001";
+const STEP_ID_2 = "st_0000000000000002";
+
+const toolStep = {
+  id: STEP_ID,
+  slug: "search",
+  kind: "tool",
+  connectionId: "cn_a1b2c3d4e5f6a7b8",
+  tool: "slack_search",
+  args: { query: { $tpl: "@team-exec after:@state.cursor" } },
+} as const;
 
 describe("workflow-surface mutation param schemas", () => {
   test("setTrigger accepts a full trigger config and rejects malformed ones", () => {
@@ -38,26 +54,236 @@ describe("workflow-surface mutation param schemas", () => {
     ).toBe(false);
   });
 
-  test("setAgent requires an agent uuid", () => {
-    expect(copilotMutationParamSchemas.setAgent.safeParse({ agentId: UUID }).success).toBe(
-      true,
-    );
-    expect(copilotMutationParamSchemas.setAgent.safeParse({}).success).toBe(false);
+  test("addStep takes a full step + position and validates the step per kind", () => {
     expect(
-      copilotMutationParamSchemas.setAgent.safeParse({ agentId: "general" }).success,
+      copilotMutationParamSchemas.addStep.safeParse({
+        step: toolStep,
+        position: { after: null },
+      }).success,
+    ).toBe(true);
+    expect(
+      copilotMutationParamSchemas.addStep.safeParse({
+        step: toolStep,
+        position: {
+          after: STEP_ID_2,
+          parent: { stepId: STEP_ID_2, slot: "body" },
+        },
+      }).success,
+    ).toBe(true);
+    // Position is required — "wherever" is not a proposal a client can apply.
+    expect(
+      copilotMutationParamSchemas.addStep.safeParse({ step: toolStep }).success,
+    ).toBe(false);
+    // The step union still guards per-kind shape (unknown kind, malformed id).
+    expect(
+      copilotMutationParamSchemas.addStep.safeParse({
+        step: { ...toolStep, kind: "shell" },
+        position: { after: null },
+      }).success,
+    ).toBe(false);
+    expect(
+      copilotMutationParamSchemas.addStep.safeParse({
+        step: { ...toolStep, id: "step-1" },
+        position: { after: null },
+      }).success,
     ).toBe(false);
   });
 
-  test("setInstructions requires non-empty markdown", () => {
+  test("updateStep is whole-step replacement addressed by stepId", () => {
     expect(
-      copilotMutationParamSchemas.setInstructions.safeParse({ markdown: "" })
-        .success,
-    ).toBe(false);
-    expect(
-      copilotMutationParamSchemas.setInstructions.safeParse({
-        markdown: "Triage @trigger.subject",
+      copilotMutationParamSchemas.updateStep.safeParse({
+        stepId: STEP_ID,
+        step: { ...toolStep, tool: "slack_search_messages" },
       }).success,
     ).toBe(true);
+    expect(
+      copilotMutationParamSchemas.updateStep.safeParse({
+        stepId: STEP_ID,
+        step: { patch: { tool: "x" } },
+      }).success,
+    ).toBe(false);
+    expect(
+      copilotMutationParamSchemas.updateStep.safeParse({ step: toolStep }).success,
+    ).toBe(false);
+  });
+
+  test("removeStep/moveStep address existing steps by minted id", () => {
+    expect(
+      copilotMutationParamSchemas.removeStep.safeParse({ stepId: STEP_ID }).success,
+    ).toBe(true);
+    expect(
+      copilotMutationParamSchemas.removeStep.safeParse({ stepId: "search" }).success,
+    ).toBe(false);
+    expect(
+      copilotMutationParamSchemas.moveStep.safeParse({
+        stepId: STEP_ID,
+        position: { after: STEP_ID_2 },
+      }).success,
+    ).toBe(true);
+    expect(
+      copilotMutationParamSchemas.moveStep.safeParse({ stepId: STEP_ID }).success,
+    ).toBe(false);
+  });
+
+  test("stepPosition: after is nullable, parent slots are the walk vocabulary", () => {
+    expect(stepPositionSchema.safeParse({ after: null }).success).toBe(true);
+    expect(
+      stepPositionSchema.safeParse({
+        after: null,
+        parent: { stepId: STEP_ID, slot: "then" },
+      }).success,
+    ).toBe(true);
+    expect(
+      stepPositionSchema.safeParse({
+        after: STEP_ID,
+        parent: { stepId: STEP_ID_2, slot: "else" },
+      }).success,
+    ).toBe(true);
+    // No free-form slots, and `after` may not be omitted (null is explicit).
+    expect(
+      stepPositionSchema.safeParse({
+        after: null,
+        parent: { stepId: STEP_ID, slot: "lane-2" },
+      }).success,
+    ).toBe(false);
+    expect(stepPositionSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe("workflow-surface read tools", () => {
+  test("registry exposes exactly the two lookups", () => {
+    expect([...WORKFLOW_COPILOT_READ_TOOLS].sort()).toEqual([
+      "getConnectionTool",
+      "searchConnectionTools",
+    ]);
+  });
+
+  test("searchConnectionTools: query bounded; empty query browses a connection", () => {
+    expect(
+      workflowCopilotReadParamSchemas.searchConnectionTools.safeParse({
+        query: "create issue",
+      }).success,
+    ).toBe(true);
+    expect(
+      workflowCopilotReadParamSchemas.searchConnectionTools.safeParse({
+        query: "",
+        connectionId: "cn_a1b2c3d4e5f6a7b8",
+      }).success,
+    ).toBe(true);
+    expect(
+      workflowCopilotReadParamSchemas.searchConnectionTools.safeParse({
+        query: "x".repeat(201),
+      }).success,
+    ).toBe(false);
+    expect(
+      workflowCopilotReadParamSchemas.searchConnectionTools.safeParse({}).success,
+    ).toBe(false);
+  });
+
+  test("getConnectionTool requires both coordinates", () => {
+    expect(
+      workflowCopilotReadParamSchemas.getConnectionTool.safeParse({
+        connectionId: UUID,
+        toolName: "create_issue",
+      }).success,
+    ).toBe(true);
+    expect(
+      workflowCopilotReadParamSchemas.getConnectionTool.safeParse({
+        connectionId: "cn_a1b2c3d4e5f6a7b8",
+        toolName: "",
+      }).success,
+    ).toBe(false);
+    expect(
+      workflowCopilotReadParamSchemas.getConnectionTool.safeParse({
+        toolName: "create_issue",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("read tools never collide with mutation tool names", () => {
+    for (const tool of WORKFLOW_COPILOT_READ_TOOLS) {
+      expect(COPILOT_MUTATION_TOOLS).not.toContain(tool);
+    }
+  });
+});
+
+describe("mintStepIds", () => {
+  test("mints missing/malformed ids and preserves valid ones", () => {
+    const minted = mintStepIds({
+      slug: "search",
+      kind: "tool",
+    }) as Record<string, unknown>;
+    expect(minted.id).toMatch(STEP_ID_PATTERN);
+
+    const kept = mintStepIds(toolStep) as Record<string, unknown>;
+    expect(kept.id).toBe(STEP_ID);
+
+    const repaired = mintStepIds({ ...toolStep, id: "step-1" }) as Record<
+      string,
+      unknown
+    >;
+    expect(repaired.id).toMatch(STEP_ID_PATTERN);
+    expect(repaired.id).not.toBe("step-1");
+  });
+
+  test("walks for_each bodies and branch lanes, and re-mints duplicates", () => {
+    const minted = mintStepIds({
+      slug: "per-message",
+      kind: "for_each",
+      items: { $ref: "steps.search.result.messages" },
+      steps: [
+        { slug: "summarize", kind: "infer", prompt: { markdown: "x" } },
+        // Duplicate of the OUTER id — must be re-minted, not kept.
+        { ...toolStep, slug: "file" },
+      ],
+      id: STEP_ID,
+    }) as {
+      id: string;
+      steps: { id: string }[];
+    };
+    expect(minted.id).toBe(STEP_ID);
+    expect(minted.steps[0]?.id).toMatch(STEP_ID_PATTERN);
+    expect(minted.steps[1]?.id).toMatch(STEP_ID_PATTERN);
+    expect(minted.steps[1]?.id).not.toBe(STEP_ID);
+
+    const branch = mintStepIds({
+      slug: "route",
+      kind: "branch",
+      branches: [
+        {
+          when: { truthy: { $ref: "trigger.urgent" } },
+          steps: [{ slug: "page", kind: "tool" }],
+        },
+      ],
+      else: [{ slug: "log", kind: "state", set: {} }],
+    }) as {
+      id: string;
+      branches: { steps: { id: string }[] }[];
+      else: { id: string }[];
+    };
+    expect(branch.id).toMatch(STEP_ID_PATTERN);
+    expect(branch.branches[0]?.steps[0]?.id).toMatch(STEP_ID_PATTERN);
+    expect(branch.else[0]?.id).toMatch(STEP_ID_PATTERN);
+  });
+
+  test("re-mints ids already taken by the caller's seen set", () => {
+    const minted = mintStepIds(toolStep, new Set([STEP_ID])) as Record<
+      string,
+      unknown
+    >;
+    expect(minted.id).toMatch(STEP_ID_PATTERN);
+    expect(minted.id).not.toBe(STEP_ID);
+  });
+
+  test("does not touch non-step values or unknown keys", () => {
+    expect(mintStepIds("hello")).toBe("hello");
+    expect(mintStepIds(null)).toBeNull();
+    const minted = mintStepIds({
+      ...toolStep,
+      args: { nested: { $ref: "steps.search.result" } },
+    }) as { args: Record<string, unknown> };
+    // args objects are NOT step nodes — no ids sprout inside them.
+    expect(minted.args).toEqual({ nested: { $ref: "steps.search.result" } });
   });
 });
 
@@ -183,11 +409,13 @@ describe("agent-surface mutation param schemas", () => {
 });
 
 describe("tool registries", () => {
-  test("workflow surface exposes exactly its three mutations", () => {
+  test("workflow surface exposes setTrigger + the four granular step mutations", () => {
     expect([...WORKFLOW_COPILOT_MUTATION_TOOLS].sort()).toEqual([
-      "setAgent",
-      "setInstructions",
+      "addStep",
+      "moveStep",
+      "removeStep",
       "setTrigger",
+      "updateStep",
     ]);
   });
 
@@ -205,14 +433,16 @@ describe("tool registries", () => {
   test("the combined registry is the disjoint union of both surfaces", () => {
     expect([...COPILOT_MUTATION_TOOLS].sort()).toEqual([
       "addContext",
+      "addStep",
+      "moveStep",
       "removeContext",
-      "setAgent",
+      "removeStep",
       "setDescription",
-      "setInstructions",
       "setModel",
       "setName",
       "setPersona",
       "setTrigger",
+      "updateStep",
     ]);
   });
 });
@@ -242,6 +472,35 @@ describe("copilot proposal schema", () => {
       rationale: "",
     });
     expect(unknownTool.success).toBe(false);
+  });
+
+  test("step mutations ride the proposal union (recursive params included)", () => {
+    expect(
+      copilotProposalSchema.safeParse({
+        id: "call_5",
+        tool: "addStep",
+        params: {
+          step: {
+            id: STEP_ID_2,
+            slug: "per-message",
+            kind: "for_each",
+            items: { $ref: "steps.search.result.messages" },
+            steps: [toolStep],
+          },
+          position: { after: null },
+        },
+        rationale: "loop over the search hits",
+      }).success,
+    ).toBe(true);
+    // The memo-era tools are GONE — a stale server proposing one is a bug.
+    expect(
+      copilotProposalSchema.safeParse({
+        id: "call_6",
+        tool: "setInstructions",
+        params: { markdown: "do the thing" },
+        rationale: "",
+      }).success,
+    ).toBe(false);
   });
 });
 

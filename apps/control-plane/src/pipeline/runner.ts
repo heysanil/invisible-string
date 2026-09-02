@@ -1,0 +1,2278 @@
+/**
+ * Pipeline runner — the control-plane interpreter for v2 workflow configs
+ * (TRIGGER → STEPS). One `runs` row per pipeline run (`mode: 'pipeline'`, no
+ * eve session); one `run_steps` row per step INSTANCE; `pipeline.*` events
+ * beside eve events under one monotonic seq (events.ts). The workflow itself
+ * still builds nothing — agent steps spawn CHILD runs through the ordinary
+ * dispatch machinery.
+ *
+ * Ordering guarantees mirror dispatchTriggerRun: the run row lands inside an
+ * advisory-locked cap transaction BEFORE any execution (a crash mid-run
+ * leaves a visible, recoverable row — never untracked work), and slack-origin
+ * runs with an `onComplete.slackReply` are born owing a reply
+ * (`delivery_status = pending`) that the DeliveryService settles off the
+ * terminal status.
+ *
+ * DRIVER SHAPE. Sequential, `for_each` concurrency 1. Per instance: claim the
+ * `(run_id, path)` ledger row → render input against the scope (shared
+ * pipeline-template) → execute (tool/infer/agent via the injected
+ * StepExecutor registry; filter/branch/for_each/state interpreted HERE) →
+ * persist output → extend the scope → append events. The driver holds a
+ * SESSION-level `pg_advisory_lock('pipeline:'||run_id)` for its lifetime, so
+ * boot recovery adopts only runs whose lock is free (schedule-ticker
+ * pattern; no new single-instance dependency).
+ *
+ * LOCK POOL DISCIPLINE (the N3 deadlock). A session-level lock pins one
+ * physical connection for the driver's whole lifetime (up to
+ * `PIPELINE_MAX_WALL_CLOCK_MS`), so it NEVER rides the root pool: ten long
+ * concurrent pipelines used to reserve all ten default root connections and
+ * every driver then blocked on its own ledger/status query — the whole
+ * control plane wedged. The lock reserves from the DEDICATED pipeline lock
+ * pool (`Db.$pipelineLockClient`, `DB_PIPELINE_LOCK_POOL_SIZE`, db.ts) —
+ * separate from the root pool AND from the session-dispatch lock pool, so a
+ * pipeline burst can never starve a chat Stop's lock chase. The reserve wait
+ * is BOUNDED (`PIPELINE_LOCK_RESERVE_TIMEOUT_MS`), and exhaustion is a
+ * typed, transient, FAST refusal: the lock is taken BEFORE the run row is
+ * created (lock-before-claim on a PRE-MINTED run id — the session-lock
+ * doctrine), so `start` answers `{started:false, reason:"lock_pool_exhausted"}`
+ * with nothing created (no row, no cap slot, no delivery obligation), and
+ * boot adoption of an orphan simply waits for the next recovery sweep. The
+ * runner refuses to fall back onto `$client`.
+ *
+ * CRASH RECOVERY is replay: a rebooted driver walks the config from the top
+ * and every claim that returns an existing row is ADOPTED — terminal outputs
+ * rebuild the scope without re-execution, and only the frontier truly runs.
+ * Interrupted `tool` steps retry (the at-least-once stance of runs/delivery)
+ * unless `sideEffect: "at_most_once"`, which fails `interrupted` — the
+ * honest option; `infer` retries; `agent` steps re-attach to their child run
+ * by `child_run_id`.
+ *
+ * CANCELLATION is cooperative at step boundaries (eve's stance): cancel sets
+ * a flag + aborts the in-flight attempt's signal; remaining steps are left
+ * unwritten and the run lands `canceled` — a user decision, never an error.
+ */
+import { randomUUID } from "node:crypto";
+
+import { and, count, eq, inArray } from "drizzle-orm";
+import type postgres from "postgres";
+import { schema } from "@invisible-string/db";
+import {
+  evaluateCondition,
+  renderMarkdownTemplate,
+  renderTemplateRecord,
+  resolveScopePath,
+  buildStepOutputPreview,
+  workflowConfigSchema,
+  type Logger,
+  type PipelineScope,
+  type PipelineStep,
+  type SessionOrigin,
+  type TriggerEvent,
+  type WorkflowConfig,
+} from "@invisible-string/shared";
+
+import type { Db } from "../db";
+import type { RunEventBus } from "../runs/bus";
+import type { DeliveryService } from "../runs/delivery";
+import type { RunStore } from "../runs/store";
+import { ACTIVE_RUN_STATUSES, assertUnderRunCap, lockWorkspaceRunCap } from "../runtime/caps";
+import type { MetricsRegistry } from "../runtime/metrics";
+import { reserveBounded } from "../runtime/session-lock";
+import {
+  createPipelineEventAppender,
+  publishRunStatus,
+  type PipelineEventAppender,
+} from "./events";
+import {
+  buildPipelinePlan,
+  stepInstancePath,
+  type StepParentFrame,
+} from "./plan";
+import type {
+  RunStepRow,
+  RunStepStore,
+  WorkflowStateStore,
+} from "./step-store";
+import {
+  WORKFLOW_STATE_MAX_KEYS,
+  WORKFLOW_STATE_MAX_VALUE_BYTES,
+  WorkflowStateCapError,
+} from "./step-store";
+import type {
+  PipelineExecutorDeps,
+  StepExecuteContext,
+  StepExecutor,
+  StepOutcome,
+} from "./types";
+
+export type RunRow = typeof schema.runs.$inferSelect;
+
+// ── Config knobs ────────────────────────────────────────────────────────────
+
+/** PIPELINE_MAX_WALL_CLOCK_MS default — the whole run's budget. */
+export const DEFAULT_PIPELINE_MAX_WALL_CLOCK_MS = 30 * 60 * 1000;
+
+/** PIPELINE_MAX_STEPS_PER_RUN default — executed step INSTANCES per run. */
+export const DEFAULT_MAX_EXECUTED_STEPS_PER_RUN = 200;
+
+/** PIPELINE_MAX_STEP_OUTPUT_BYTES default — serialized per-step output cap. */
+export const DEFAULT_MAX_STEP_OUTPUT_BYTES = 256 * 1024;
+
+/** PIPELINE_CHILD_POLL_MS default — parked agent-step child-run poll cadence. */
+export const DEFAULT_PIPELINE_CHILD_POLL_MS = 5_000;
+
+export interface PipelineRunnerConfig {
+  maxWallClockMs: number;
+  maxExecutedStepsPerRun: number;
+  maxStepOutputBytes: number;
+  childPollMs: number;
+}
+
+/**
+ * Parse the pipeline knobs from env (PIPELINE_MAX_WALL_CLOCK_MS,
+ * PIPELINE_MAX_STEPS_PER_RUN, PIPELINE_MAX_STEP_OUTPUT_BYTES,
+ * PIPELINE_CHILD_POLL_MS). Unset/invalid values fall back to defaults —
+ * these are tuning knobs, not required config (runtime/config.ts owns the
+ * fail-fast set).
+ */
+export function loadPipelineRunnerConfig(
+  env: Record<string, string | undefined> = process.env,
+): PipelineRunnerConfig {
+  const parse = (raw: string | undefined, fallback: number): number => {
+    const value = raw?.trim();
+    if (!value) return fallback;
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  return {
+    maxWallClockMs: parse(
+      env.PIPELINE_MAX_WALL_CLOCK_MS,
+      DEFAULT_PIPELINE_MAX_WALL_CLOCK_MS,
+    ),
+    maxExecutedStepsPerRun: parse(
+      env.PIPELINE_MAX_STEPS_PER_RUN,
+      DEFAULT_MAX_EXECUTED_STEPS_PER_RUN,
+    ),
+    maxStepOutputBytes: parse(
+      env.PIPELINE_MAX_STEP_OUTPUT_BYTES,
+      DEFAULT_MAX_STEP_OUTPUT_BYTES,
+    ),
+    childPollMs: parse(
+      env.PIPELINE_CHILD_POLL_MS,
+      DEFAULT_PIPELINE_CHILD_POLL_MS,
+    ),
+  };
+}
+
+// ── Retry policy ────────────────────────────────────────────────────────────
+
+export const BACKOFF_BASE_MS = 2_000;
+export const BACKOFF_CAP_MS = 60_000;
+
+/**
+ * Exponential backoff before retry `attempt + 1`: 2s·2^(attempt−1) capped at
+ * 60s, with half-jitter (deterministic under an injected `random`).
+ */
+export function backoffDelayMs(attempt: number, random: () => number): number {
+  const exp = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
+  return Math.round(exp / 2 + random() * (exp / 2));
+}
+
+/** Default attempt timeout for tool steps (config `timeoutMs` overrides). */
+export const DEFAULT_TOOL_STEP_TIMEOUT_MS = 60_000;
+
+/** Fixed attempt timeout for infer steps. */
+export const DEFAULT_INFER_STEP_TIMEOUT_MS = 120_000;
+
+/**
+ * Per-kind attempt budgets: tool 3 (config `retry.maxAttempts` overrides),
+ * infer 2 (its internal schema-repair retry is the EXECUTOR's), agent 2 —
+ * but the runner only retries outcomes the executor classified `retryable`,
+ * which for agent steps means dispatch-phase failures (`session_busy`) and
+ * never a failed turn. Control verbs are deterministic: 1.
+ */
+export function attemptBudget(step: PipelineStep): number {
+  switch (step.kind) {
+    case "tool":
+      return step.retry?.maxAttempts ?? 3;
+    case "infer":
+      return 2;
+    case "agent":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function stepAttemptTimeoutMs(step: PipelineStep): number | null {
+  switch (step.kind) {
+    case "tool":
+      return step.timeoutMs ?? DEFAULT_TOOL_STEP_TIMEOUT_MS;
+    case "infer":
+      return DEFAULT_INFER_STEP_TIMEOUT_MS;
+    default:
+      // Agent steps are bounded by the child run's own wall clock plus the
+      // pipeline's remaining wall clock (applied by the attempt runner).
+      return null;
+  }
+}
+
+// ── Advisory run lock (session-level, driver lifetime) ──────────────────────
+
+export interface PipelineRunLock {
+  release(): Promise<void>;
+}
+
+/**
+ * The pipeline lock pool could not hand out a connection within the bound —
+ * every connection is pinned by a live driver. TRANSIENT (drivers release at
+ * settlement) and thrown rather than folded into `null`, because null means
+ * "another driver holds THIS run" (contention, permanent for the caller) and
+ * the two have opposite recoveries: a held lock is left alone, an exhausted
+ * pool is retried later (the next dispatch, the next recovery sweep).
+ */
+export class PipelineLockPoolExhaustedError extends Error {
+  override readonly name = "PipelineLockPoolExhaustedError";
+  readonly code = "lock_pool_exhausted";
+  constructor(readonly runId: string, readonly reserveTimeoutMs: number) {
+    super(
+      `pipeline lock pool exhausted: no connection within ${reserveTimeoutMs}ms for run ${runId}`,
+    );
+  }
+}
+
+export function isPipelineLockPoolExhaustedError(
+  value: unknown,
+): value is PipelineLockPoolExhaustedError {
+  return value instanceof PipelineLockPoolExhaustedError;
+}
+
+export interface PipelineLockFactory {
+  /**
+   * Null when another driver (this or another instance) holds the run.
+   * Throws {@link PipelineLockPoolExhaustedError} when the lock pool cannot
+   * hand out a connection within its bound (production factory only).
+   */
+  tryAcquire(runId: string): Promise<PipelineRunLock | null>;
+}
+
+/**
+ * Bound on ONE `reserve()` against the pipeline lock pool. Exhaustion is
+ * transient — drivers release at settlement — so a caller refuses fast
+ * (`lock_pool_exhausted`) rather than queueing behind minutes-long holds.
+ */
+export const PIPELINE_LOCK_RESERVE_TIMEOUT_MS = 2_000;
+
+/**
+ * `pg_try_advisory_lock(hashtext('pipeline:'||run_id))` on a RESERVED
+ * postgres-js connection: session-level locks live on one physical
+ * connection, and the pool rotates connections per query — so the lock (and
+ * its unlock) must ride a connection reserved for the driver's lifetime.
+ * `sql` MUST be the dedicated pipeline lock pool (`Db.$pipelineLockClient`)
+ * — never the root pool (module doc, lock pool discipline) — and the
+ * reservation is bounded: an exhausted pool throws
+ * {@link PipelineLockPoolExhaustedError} instead of queueing.
+ */
+export function createPgPipelineLockFactory(
+  sql: postgres.Sql,
+  options: { reserveTimeoutMs?: number; logger?: Logger } = {},
+): PipelineLockFactory {
+  const reserveTimeoutMs =
+    options.reserveTimeoutMs ?? PIPELINE_LOCK_RESERVE_TIMEOUT_MS;
+  return {
+    async tryAcquire(runId) {
+      const key = `pipeline:${runId}`;
+      const reserved = await reserveBounded(sql, reserveTimeoutMs);
+      if (!reserved) {
+        options.logger?.warn("pipeline.lock_pool_exhausted", {
+          runId,
+          fields: { reserveTimeoutMs },
+        });
+        throw new PipelineLockPoolExhaustedError(runId, reserveTimeoutMs);
+      }
+      let locked = false;
+      try {
+        const rows =
+          await reserved`select pg_try_advisory_lock(hashtext(${key})::bigint) as locked`;
+        locked = rows[0]?.["locked"] === true;
+      } finally {
+        if (!locked) reserved.release();
+      }
+      if (!locked) return null;
+      let released = false;
+      return {
+        async release() {
+          if (released) return;
+          released = true;
+          try {
+            await reserved`select pg_advisory_unlock(hashtext(${key})::bigint)`;
+          } finally {
+            reserved.release();
+          }
+        },
+      };
+    },
+  };
+}
+
+// ── Run creation (overlap + cap, dispatchTriggerRun's ordering) ─────────────
+
+export interface CreatePipelineRunInput {
+  /**
+   * The PRE-MINTED run id the creator MUST insert under — the runner already
+   * holds the run's advisory lock on it (lock-before-claim), so a creator
+   * that minted its own id would leave the driver locking a key nobody
+   * else's lock names.
+   */
+  runId: string;
+  organizationId: string;
+  workflowId: string;
+  overlap: WorkflowConfig["overlap"];
+  triggerEvent: TriggerEvent;
+  /** True ⇒ the run is born owing a reply (`delivery_status = pending`). */
+  deliveryPending: boolean;
+}
+
+export type CreatePipelineRunResult =
+  | { run: RunRow }
+  | { skippedOverlap: true };
+
+export interface PipelineRunCreator {
+  create(input: CreatePipelineRunInput): Promise<CreatePipelineRunResult>;
+}
+
+/**
+ * The production run creator: one advisory-locked transaction takes the
+ * workspace cap lock, applies `overlap: "skip"` (another live run of THIS
+ * workflow ⇒ skip — protects cursor semantics against a slow run overlapping
+ * the next trigger window), asserts the workspace run cap, and inserts the
+ * sessionless pipeline run row — all BEFORE any execution.
+ */
+export function createDrizzlePipelineRunCreator(
+  db: Db,
+  opts: { workspaceRunCap: number },
+): PipelineRunCreator {
+  return {
+    async create(input) {
+      return db.transaction(async (tx) => {
+        await lockWorkspaceRunCap(tx, input.organizationId);
+        if (input.overlap === "skip") {
+          const live = await tx
+            .select({ value: count() })
+            .from(schema.runs)
+            .where(
+              and(
+                eq(schema.runs.workflowId, input.workflowId),
+                eq(schema.runs.mode, "pipeline"),
+                inArray(schema.runs.status, [...ACTIVE_RUN_STATUSES]),
+              ),
+            );
+          if ((live[0]?.value ?? 0) > 0) return { skippedOverlap: true };
+        }
+        await assertUnderRunCap(tx, input.organizationId, opts.workspaceRunCap);
+        const inserted = await tx
+          .insert(schema.runs)
+          .values({
+            id: input.runId,
+            agentSessionId: null,
+            organizationId: input.organizationId,
+            workflowId: input.workflowId,
+            mode: "pipeline",
+            triggerEvent: input.triggerEvent as unknown as Record<
+              string,
+              unknown
+            >,
+            taskMessage: null,
+            deliveryStatus: input.deliveryPending ? "pending" : null,
+            status: "queued",
+          })
+          .returning();
+        return { run: inserted[0]! };
+      });
+    },
+  };
+}
+
+// ── Runner surface ──────────────────────────────────────────────────────────
+
+/** By-kind executor registry — tool/infer/agent live in `pipeline/steps/`. */
+export type StepExecutorRegistry = Partial<
+  Record<"tool" | "infer" | "agent", StepExecutor>
+>;
+
+export interface PipelineRunHandle {
+  readonly runId: string;
+  readonly workflowId: string;
+  /** Settles when the driver exits (any terminal, or a shutdown interrupt). */
+  readonly done: Promise<void>;
+}
+
+export interface StartPipelineRunInput {
+  organizationId: string;
+  workflow: { id: string; config: WorkflowConfig };
+  /** The normalized envelope (provenance; `data` is the `@trigger.*` scope). */
+  triggerEvent: TriggerEvent;
+  origin: SessionOrigin;
+}
+
+/**
+ * Why `start` refused to create a run. Both are policy/capacity refusals
+ * with NOTHING created: `overlap_skipped` (a run of this workflow is still
+ * live — `overlap: "skip"`) and `lock_pool_exhausted` (every pipeline lock
+ * connection is pinned by a live driver — transient; retry later, or raise
+ * `DB_PIPELINE_LOCK_POOL_SIZE`).
+ */
+export type PipelineStartSkipReason = "overlap_skipped" | "lock_pool_exhausted";
+
+export type StartPipelineRunResult =
+  | { started: true; run: RunRow }
+  | { started: false; reason: PipelineStartSkipReason };
+
+export interface PipelineRunnerDeps {
+  /**
+   * Product DB — required unless EVERY drizzle-backed seam below
+   * (`runCreator`, `locks`, `loadWorkflowConfig`) is injected (unit tests).
+   */
+  db?: Db;
+  runStore: RunStore;
+  stepStore: RunStepStore;
+  stateStore: WorkflowStateStore;
+  bus: RunEventBus;
+  logger: Logger;
+  executors: StepExecutorRegistry;
+  /** What `StepExecuteContext.deps` carries into every executor call. */
+  executorDeps: PipelineExecutorDeps;
+  config: PipelineRunnerConfig;
+  /** MAX_CONCURRENT_RUNS_PER_WORKSPACE (runtime config). */
+  workspaceRunCap: number;
+  /** Settles `onComplete.slackReply` obligations; optional in fixtures. */
+  delivery?: DeliveryService;
+  /** Fleet metrics — the dispatch-outcome counters; optional in fixtures. */
+  metrics?: MetricsRegistry;
+  // Seams (production defaults derive from `db`):
+  runCreator?: PipelineRunCreator;
+  locks?: PipelineLockFactory;
+  loadWorkflowConfig?: (workflowId: string) => Promise<WorkflowConfig | null>;
+  /** Backoff/park sleeper (tests inject an instant fake). */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => Date;
+  /** Jitter source (tests pin it). */
+  random?: () => number;
+}
+
+// ── Internals ───────────────────────────────────────────────────────────────
+
+interface InternalHandle extends PipelineRunHandle {
+  cancelRequested: boolean;
+  /** Shutdown drain: exit WITHOUT terminal writes; boot recovery re-adopts. */
+  interrupted: boolean;
+  activeController: AbortController | null;
+  /** Wakes the current backoff/park pause early (cancel/shutdown). */
+  wake: (() => void) | null;
+  resolveDone: () => void;
+}
+
+interface DriveCtx {
+  run: RunRow;
+  organizationId: string;
+  workflowId: string;
+  config: WorkflowConfig;
+  handle: InternalHandle;
+  events: PipelineEventAppender;
+  logger: Logger;
+  /** Epoch ms after which the run fails `wall_clock_exceeded`. */
+  deadlineMs: number;
+  /** Executed instance count vs `maxExecutedStepsPerRun`. */
+  executed: number;
+  /**
+   * Resume only (null on a fresh run): every instance path a previous
+   * incarnation claimed. The pre-execution budget check in `runSequence`
+   * waves these paths through — an adopted terminal row executes nothing
+   * (no increment), and a resumed frontier row's budget slot is the one the
+   * seed deliberately left uncounted, charged at its re-execution instead.
+   * Without the bypass, a seed that exactly consumed the budget would fail
+   * recovery `step_budget_exceeded` before replaying rows that owe nothing.
+   */
+  priorLedgerPaths: Set<string> | null;
+  /**
+   * Resume only (null on a fresh run): instance paths whose TERMINAL step
+   * event already reached the persisted stream. Adoption of a terminal
+   * ledger row whose path is absent here backfills the missing event — the
+   * normal path persists the row BEFORE emitting, so a crash in between
+   * otherwise leaves the timeline showing the step running forever.
+   */
+  priorTerminalEventPaths: Set<string> | null;
+}
+
+type StepResult =
+  | { kind: "ok" }
+  | { kind: "filtered" }
+  | { kind: "failed"; error: string; errorClass: string }
+  | { kind: "canceled" };
+
+type SequenceOutcome =
+  | { kind: "completed" }
+  | { kind: "filtered" }
+  | { kind: "halted"; error: string; errorClass: string }
+  | { kind: "canceled" };
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : "unexpected non-Error failure";
+}
+
+function extractTriggerData(
+  triggerEvent: Record<string, unknown>,
+): Record<string, unknown> {
+  const data = triggerEvent["data"];
+  return typeof data === "object" && data !== null && !Array.isArray(data)
+    ? (data as Record<string, unknown>)
+    : {};
+}
+
+function serializedByteLength(value: unknown): number | null {
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) return null;
+    return Buffer.byteLength(json, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The pipeline interpreter service — one per control-plane process, carried
+ * on the runtime graph as `pipelines`. Live drivers register in {@link
+ * PipelineRunner.handles} (the tailers-map analogue); `start` is the
+ * dispatch entry, `resume` boot recovery's, `cancel` the routes layer's.
+ */
+export class PipelineRunner {
+  readonly config: PipelineRunnerConfig;
+
+  private readonly deps: PipelineRunnerDeps;
+  private readonly logger: Logger;
+  private readonly runCreator: PipelineRunCreator;
+  private readonly locks: PipelineLockFactory;
+  private readonly loadConfig: (
+    workflowId: string,
+  ) => Promise<WorkflowConfig | null>;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => Date;
+  private readonly random: () => number;
+  private readonly internalHandles = new Map<string, InternalHandle>();
+
+  constructor(deps: PipelineRunnerDeps) {
+    this.deps = deps;
+    this.config = deps.config;
+    this.logger = deps.logger;
+    this.sleep = deps.sleep ?? defaultSleep;
+    this.now = deps.now ?? (() => new Date());
+    this.random = deps.random ?? Math.random;
+
+    const db = deps.db;
+    const missing = (seam: string): never => {
+      throw new Error(
+        `PipelineRunner needs either \`db\` or an injected \`${seam}\``,
+      );
+    };
+    this.runCreator =
+      deps.runCreator ??
+      (db
+        ? createDrizzlePipelineRunCreator(db, {
+            workspaceRunCap: deps.workspaceRunCap,
+          })
+        : missing("runCreator"));
+    // The per-run lock rides the DEDICATED pipeline lock pool — deliberately
+    // NO fallback onto `db.$client` (module doc: locks on the root pool are
+    // the N3 deadlock). A `Db` built without one must inject `locks`.
+    const pipelineLockClient = db?.$pipelineLockClient;
+    this.locks =
+      deps.locks ??
+      (pipelineLockClient
+        ? createPgPipelineLockFactory(pipelineLockClient, { logger: this.logger })
+        : db
+          ? (() => {
+              throw new Error(
+                "PipelineRunner needs a `db` with a pipeline lock pool (createDb attaches `$pipelineLockClient`) or an injected `locks` — it never locks on the root pool",
+              );
+            })()
+          : missing("locks"));
+    this.loadConfig =
+      deps.loadWorkflowConfig ??
+      (db
+        ? async (workflowId) => {
+            const rows = await db
+              .select({ published: schema.workflows.published })
+              .from(schema.workflows)
+              .where(eq(schema.workflows.id, workflowId))
+              .limit(1);
+            const published = rows[0]?.published;
+            if (!published) return null;
+            const parsed = workflowConfigSchema.safeParse(published);
+            return parsed.success ? parsed.data : null;
+          }
+        : missing("loadWorkflowConfig"));
+  }
+
+  /** Live drivers by run id (read-only outside the runner). */
+  get handles(): ReadonlyMap<string, PipelineRunHandle> {
+    return this.internalHandles;
+  }
+
+  /**
+   * Dispatch one trigger event as a pipeline run. The run row (and its
+   * delivery obligation) is committed before this resolves; interpretation
+   * proceeds in-process (the handle map tracks it, `runs.status` is truth).
+   */
+  async start(input: StartPipelineRunInput): Promise<StartPipelineRunResult> {
+    const config = input.workflow.config;
+    const deliveryPending =
+      input.origin === "slack" && Boolean(config.onComplete?.slackReply);
+    // LOCK-BEFORE-CLAIM (module doc): the run id is minted here, so nobody
+    // else can name its lock before the row commits — the acquire is
+    // uncontended by construction, and only lock-POOL pressure can refuse
+    // it. Taking it first means a refusal creates NOTHING: no row, no cap
+    // slot, no delivery obligation — the same "typed skip with nothing to
+    // undo" shape as `overlap_skipped`.
+    const runId = randomUUID();
+    let lock: PipelineRunLock | null;
+    try {
+      lock = await this.locks.tryAcquire(runId);
+    } catch (error) {
+      if (!isPipelineLockPoolExhaustedError(error)) throw error;
+      lock = null;
+    }
+    if (!lock) {
+      this.logger.warn("pipeline.lock_pool_exhausted_skipped", {
+        workspaceId: input.organizationId,
+        workflowId: input.workflow.id,
+        msg: "pipeline lock pool exhausted: every connection is pinned by a live run — the dispatch was refused (transient; nothing was created)",
+        fields: { origin: input.origin },
+      });
+      this.deps.metrics?.recordPipelineDispatch("lock_pool_exhausted");
+      return { started: false, reason: "lock_pool_exhausted" };
+    }
+    let created: CreatePipelineRunResult;
+    try {
+      created = await this.runCreator.create({
+        runId,
+        organizationId: input.organizationId,
+        workflowId: input.workflow.id,
+        overlap: config.overlap,
+        triggerEvent: input.triggerEvent,
+        deliveryPending,
+      });
+    } catch (error) {
+      await lock.release();
+      throw error;
+    }
+    if ("skippedOverlap" in created) {
+      await lock.release();
+      this.logger.info("pipeline.overlap_skipped", {
+        workspaceId: input.organizationId,
+        workflowId: input.workflow.id,
+        msg: "overlap policy 'skip': a run of this workflow is still live",
+      });
+      this.deps.metrics?.recordPipelineDispatch("overlap_skipped");
+      return { started: false, reason: "overlap_skipped" };
+    }
+    const run = created.run;
+    if (run.id !== runId) {
+      // A creator that ignored the pre-minted id would leave the driver
+      // locking a key nobody else's lock names — fail loudly, never drive.
+      await lock.release();
+      const error = "pipeline run creator ignored the pre-minted run id";
+      await this.failOutright(run.id, error, "invalid_run");
+      return { started: true, run: { ...run, status: "failed", error } };
+    }
+    this.deps.metrics?.recordPipelineDispatch("started");
+    this.launch(run, config, extractTriggerData(run.triggerEvent), lock);
+    return { started: true, run };
+  }
+
+  /**
+   * Boot-recovery adoption of an orphaned pipeline run (queued/running/
+   * waiting): acquire its advisory lock ("locked" when another driver holds
+   * it — or when the pipeline lock pool is exhausted, which leaves the run
+   * un-adopted for the next recovery sweep rather than queueing on a pool
+   * pinned by live drivers), reload the workflow's published config, and
+   * replay the ledger. A run whose workflow/config is gone fails outright
+   * ("failed").
+   */
+  async resume(run: RunRow): Promise<"resumed" | "locked" | "failed"> {
+    if (this.internalHandles.has(run.id)) return "locked";
+    let lock: PipelineRunLock | null;
+    try {
+      lock = await this.locks.tryAcquire(run.id);
+    } catch (error) {
+      if (!isPipelineLockPoolExhaustedError(error)) throw error;
+      this.logger.warn("pipeline.recovery_lock_pool_exhausted", {
+        runId: run.id,
+        msg: "pipeline lock pool exhausted: the orphaned run stays un-adopted until the next recovery sweep",
+      });
+      return "locked";
+    }
+    if (!lock) return "locked";
+    try {
+      if (!run.workflowId || !run.organizationId) {
+        await this.failOutright(
+          run.id,
+          "pipeline run row is missing its workflow/workspace scope",
+          "invalid_run",
+        );
+        await lock.release();
+        return "failed";
+      }
+      const config = await this.loadConfig(run.workflowId);
+      if (!config) {
+        await this.failOutright(
+          run.id,
+          "cannot resume: the workflow's published pipeline config is gone",
+          "workflow_missing",
+        );
+        await lock.release();
+        return "failed";
+      }
+      this.launch(run, config, extractTriggerData(run.triggerEvent), lock);
+      return "resumed";
+    } catch (error) {
+      await lock.release();
+      throw error;
+    }
+  }
+
+  /**
+   * Cooperative cancel — a user decision, never an error. Aborts the
+   * in-flight attempt's signal, wakes any backoff/park pause, and lets the
+   * driver settle the run `canceled` at the next boundary; remaining steps
+   * are never executed. False when no live driver holds the run here (the
+   * routes layer then falls back to a direct status CAS).
+   */
+  cancel(runId: string): boolean {
+    const handle = this.internalHandles.get(runId);
+    if (!handle) return false;
+    handle.cancelRequested = true;
+    handle.activeController?.abort();
+    handle.wake?.();
+    return true;
+  }
+
+  /**
+   * Graceful shutdown: interrupt every driver WITHOUT terminal writes (the
+   * runs stay queued/running/waiting for the next boot's recovery — a deploy
+   * must not cancel user work), then wait for them to unwind.
+   */
+  async stopAll(): Promise<void> {
+    const drains: Promise<void>[] = [];
+    for (const handle of this.internalHandles.values()) {
+      handle.interrupted = true;
+      handle.activeController?.abort();
+      handle.wake?.();
+      drains.push(handle.done);
+    }
+    await Promise.all(drains);
+  }
+
+  // ── driver ────────────────────────────────────────────────────────────────
+
+  private launch(
+    run: RunRow,
+    config: WorkflowConfig,
+    triggerData: Record<string, unknown>,
+    lock: PipelineRunLock,
+  ): void {
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const handle: InternalHandle = {
+      runId: run.id,
+      workflowId: run.workflowId ?? "",
+      done,
+      resolveDone,
+      cancelRequested: false,
+      interrupted: false,
+      activeController: null,
+      wake: null,
+    };
+    this.internalHandles.set(run.id, handle);
+    void this.drive(run, config, triggerData, lock, handle).catch((error) => {
+      // drive() is defensive; this is the last-resort belt.
+      this.logger.error("pipeline.driver_crashed", {
+        runId: run.id,
+        err: error,
+      });
+    });
+  }
+
+  private async drive(
+    run: RunRow,
+    config: WorkflowConfig,
+    triggerData: Record<string, unknown>,
+    lock: PipelineRunLock,
+    handle: InternalHandle,
+  ): Promise<void> {
+    const runId = run.id;
+    const logger = this.logger.child({
+      runId,
+      ...(run.workflowId ? { workflowId: run.workflowId } : {}),
+      ...(run.organizationId ? { workspaceId: run.organizationId } : {}),
+    });
+    let scope: PipelineScope | null = null;
+    let startedAt = this.now();
+    try {
+      const organizationId = run.organizationId;
+      const workflowId = run.workflowId;
+      if (!organizationId || !workflowId) {
+        await this.failOutright(
+          runId,
+          "pipeline run row is missing its workflow/workspace scope",
+          "invalid_run",
+        );
+        return;
+      }
+      const events = await createPipelineEventAppender({
+        runStore: this.deps.runStore,
+        bus: this.deps.bus,
+        runId,
+      });
+      // The wall-clock budget covers the WHOLE run, restarts included: a
+      // resumed driver keeps the ORIGINAL started_at (set only when null),
+      // and the deadline + the scope's `now` derive from it — a reboot must
+      // never re-grant the budget or shift `@now` under replayed templates.
+      const priorStartedAt = run.startedAt;
+      startedAt = priorStartedAt ?? this.now();
+      const live = await this.deps.runStore.markRun(runId, {
+        status: "running",
+        ...(priorStartedAt ? {} : { startedAt }),
+      });
+      if (!live) {
+        // Already terminal (e.g. canceled while queued) — nothing to drive.
+        logger.info("pipeline.run_not_startable", {
+          msg: "pipeline run already terminal before the driver started",
+        });
+        return;
+      }
+      publishRunStatus(this.deps.bus, runId, "running");
+      const plan = buildPipelinePlan(config);
+      if (events.baseSeq === 0) {
+        await events.emit({
+          type: "pipeline.started",
+          data: { stepCount: plan.topLevelStepCount },
+        });
+      }
+      scope = {
+        trigger: triggerData,
+        steps: {},
+        state: await this.deps.stateStore.snapshot(workflowId),
+        now: startedAt.toISOString(),
+      };
+      // Resume bookkeeping (baseSeq > 0 ⇔ a previous incarnation got as far
+      // as `pipeline.started`): the executed-step budget is seeded from the
+      // ledger's TERMINAL non-skipped rows so a crash loop cannot re-grant
+      // it — skipped rows never consumed budget, and a non-terminal frontier
+      // row (running/pending/waiting) is charged exactly once, at its
+      // re-execution, never in the seed as well (seeding it too would double
+      // count the same instance). The ledger's path set rides along so the
+      // pre-execution budget check can wave replayed rows through, and the
+      // persisted event stream is scanned once so adoption can backfill
+      // terminal step events a crash swallowed between persist and emit.
+      const resuming = events.baseSeq > 0;
+      let executedSeed = 0;
+      let priorLedgerPaths: Set<string> | null = null;
+      if (resuming) {
+        const ledger = await this.deps.stepStore.listForRun(runId);
+        executedSeed = ledger.filter(
+          (r) =>
+            r.status === "succeeded" ||
+            r.status === "failed" ||
+            r.status === "canceled",
+        ).length;
+        priorLedgerPaths = new Set(ledger.map((r) => r.path));
+      }
+      const dctx: DriveCtx = {
+        run,
+        organizationId,
+        workflowId,
+        config,
+        handle,
+        events,
+        logger,
+        deadlineMs: startedAt.getTime() + this.config.maxWallClockMs,
+        executed: executedSeed,
+        priorLedgerPaths,
+        priorTerminalEventPaths: resuming
+          ? await this.loadTerminalStepEventPaths(runId)
+          : null,
+      };
+      const outcome = await this.runSequence(dctx, config.steps, scope, null);
+      if (handle.interrupted) {
+        logger.info("pipeline.interrupted", {
+          msg: "shutdown drain — run left for boot recovery",
+        });
+        return;
+      }
+      const terminal =
+        outcome.kind === "canceled"
+          ? { status: "canceled" as const }
+          : outcome.kind === "halted"
+            ? { status: "failed" as const, error: outcome.error }
+            : { status: "succeeded" as const };
+      await this.settle(dctx, events, terminal, scope, startedAt);
+    } catch (error) {
+      if (handle.interrupted) return;
+      logger.error("pipeline.driver_error", { err: error });
+      try {
+        const message = safeErrorMessage(error);
+        await this.deps.runStore.markRun(runId, {
+          status: "failed",
+          error: message,
+          completedAt: this.now(),
+        });
+        publishRunStatus(this.deps.bus, runId, "failed", message);
+        await this.deliverOnComplete(run, config, scope, "failed");
+      } catch (settleError) {
+        logger.error("pipeline.settle_failed", { err: settleError });
+      }
+    } finally {
+      this.internalHandles.delete(runId);
+      try {
+        await lock.release();
+      } catch (releaseError) {
+        logger.warn("pipeline.lock_release_failed", { err: releaseError });
+      }
+      handle.resolveDone();
+    }
+  }
+
+  private async settle(
+    dctx: DriveCtx,
+    events: PipelineEventAppender,
+    terminal: { status: "succeeded" | "failed" | "canceled"; error?: string },
+    scope: PipelineScope,
+    startedAt: Date,
+  ): Promise<void> {
+    const completedAt = this.now();
+    const durationMs = completedAt.getTime() - startedAt.getTime();
+    await this.deps.runStore.markRun(dctx.run.id, {
+      status: terminal.status,
+      ...(terminal.error !== undefined ? { error: terminal.error } : {}),
+      completedAt,
+    });
+    try {
+      await events.emit({
+        type: "pipeline.completed",
+        data: { status: terminal.status, durationMs },
+      });
+    } catch (error) {
+      // The status row is truth; a lost completion event is only cosmetic.
+      dctx.logger.warn("pipeline.completed_event_failed", { err: error });
+    }
+    publishRunStatus(
+      this.deps.bus,
+      dctx.run.id,
+      terminal.status,
+      terminal.error ?? null,
+    );
+    await this.deliverOnComplete(dctx.run, dctx.config, scope, terminal.status);
+    dctx.logger.info("pipeline.run_finished", {
+      durationMs,
+      fields: { status: terminal.status, executedSteps: dctx.executed },
+    });
+  }
+
+  /**
+   * Explicit end-of-run delivery: `onComplete.slackReply` renders against
+   * the FINAL scope and rides the DeliveryService's CAS machinery (deliver()
+   * no-ops unless the run owes a `pending` delivery, so calling it
+   * unconditionally is safe; boot recovery re-renders from the replayed
+   * scope by construction).
+   */
+  private async deliverOnComplete(
+    run: RunRow,
+    config: WorkflowConfig,
+    scope: PipelineScope | null,
+    status: "succeeded" | "failed" | "canceled",
+  ): Promise<void> {
+    const delivery = this.deps.delivery;
+    if (!delivery) return;
+    const template = config.onComplete?.slackReply?.template.markdown;
+    if (template === undefined) return;
+    try {
+      const rendered =
+        scope && status === "succeeded"
+          ? renderMarkdownTemplate(template, scope)
+          : null; // failed/canceled runs settle the ledger without a reply
+      await delivery.deliver({
+        runId: run.id,
+        status,
+        lastAssistantMessage: rendered,
+      });
+    } catch (error) {
+      this.logger.warn("pipeline.delivery_failed", {
+        runId: run.id,
+        err: error,
+      });
+    }
+  }
+
+  /** Fail a run that never got (or can't get) a driver; settles delivery. */
+  private async failOutright(
+    runId: string,
+    error: string,
+    errorClass: string,
+  ): Promise<void> {
+    this.logger.warn("pipeline.run_failed_outright", {
+      runId,
+      msg: error,
+      fields: { errorClass },
+    });
+    await this.deps.runStore.markRun(runId, {
+      status: "failed",
+      error,
+      completedAt: this.now(),
+    });
+    publishRunStatus(this.deps.bus, runId, "failed", error);
+    try {
+      await this.deps.delivery?.deliver({
+        runId,
+        status: "failed",
+        lastAssistantMessage: null,
+      });
+    } catch {
+      // deliver() documents it never throws; belt only.
+    }
+  }
+
+  // ── sequences ─────────────────────────────────────────────────────────────
+
+  private async runSequence(
+    dctx: DriveCtx,
+    steps: readonly PipelineStep[],
+    scope: PipelineScope,
+    parent: StepParentFrame | null,
+  ): Promise<SequenceOutcome> {
+    for (let index = 0; index < steps.length; index += 1) {
+      const step = steps[index]!;
+      if (dctx.handle.interrupted || dctx.handle.cancelRequested) {
+        return { kind: "canceled" };
+      }
+      if (this.now().getTime() > dctx.deadlineMs) {
+        return {
+          kind: "halted",
+          errorClass: "wall_clock_exceeded",
+          error: `pipeline exceeded its wall clock (${this.config.maxWallClockMs}ms)`,
+        };
+      }
+      const path = stepInstancePath(parent, step.id);
+      // The budget gates NEW instances only. A path already in the ledger is
+      // replay: adoption executes nothing, and a resumed frontier row's
+      // budget charge is its re-execution's increment — the seed deliberately
+      // did not count it, so rejecting it here would starve the very
+      // instance the budget already admitted before the crash.
+      if (
+        dctx.executed >= this.config.maxExecutedStepsPerRun &&
+        !dctx.priorLedgerPaths?.has(path)
+      ) {
+        return {
+          kind: "halted",
+          errorClass: "step_budget_exceeded",
+          error: `pipeline exceeded ${this.config.maxExecutedStepsPerRun} executed step instances`,
+        };
+      }
+      const result = await this.executeStep(dctx, step, path, parent, scope);
+      switch (result.kind) {
+        case "ok":
+          continue;
+        case "filtered": {
+          // A false filter fences the rest of THIS scope. At the top level
+          // the remaining steps are visibly `skipped` and the run succeeds;
+          // nested scopes propagate up (a for_each body maps it to "item
+          // dropped", a branch lane hands it to its own parent).
+          if (parent === null) {
+            await this.skipRemaining(dctx, steps.slice(index + 1), parent);
+          }
+          return { kind: "filtered" };
+        }
+        case "failed":
+          return {
+            kind: "halted",
+            error: result.error,
+            errorClass: result.errorClass,
+          };
+        case "canceled":
+          return { kind: "canceled" };
+      }
+    }
+    return { kind: "completed" };
+  }
+
+  /** Ledger + timeline rows for steps a top-level filter fenced off. */
+  private async skipRemaining(
+    dctx: DriveCtx,
+    steps: readonly PipelineStep[],
+    parent: StepParentFrame | null,
+  ): Promise<void> {
+    for (const step of steps) {
+      const path = stepInstancePath(parent, step.id);
+      const at = this.now();
+      const { created, row } = await this.deps.stepStore.claim({
+        runId: dctx.run.id,
+        organizationId: dctx.organizationId,
+        stepId: step.id,
+        stepSlug: step.slug,
+        path,
+        parentPath: parent?.path ?? null,
+        iteration: parent?.iteration ?? null,
+        kind: step.kind,
+        status: "skipped",
+        input: null,
+        startedAt: at,
+        completedAt: at,
+      });
+      // Adopted rows (a previous incarnation already skipped/ran it) keep
+      // their history — no duplicate event, but a terminal event a crash
+      // swallowed is backfilled.
+      if (!created) {
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
+        continue;
+      }
+      await dctx.events.emit({
+        type: "pipeline.step.completed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          status: "skipped",
+          durationMs: 0,
+        },
+      });
+    }
+  }
+
+  private executeStep(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    switch (step.kind) {
+      case "tool":
+      case "infer":
+      case "agent":
+        return this.executeLeaf(dctx, step, path, parent, scope);
+      case "filter":
+        return this.executeFilter(dctx, step, path, parent, scope);
+      case "branch":
+        return this.executeBranch(dctx, step, path, parent, scope);
+      case "for_each":
+        return this.executeForEach(dctx, step, path, parent, scope);
+      case "state":
+        return this.executeState(dctx, step, path, parent, scope);
+    }
+  }
+
+  private claim(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    parent: StepParentFrame | null,
+    input: unknown,
+  ): Promise<{ created: boolean; row: RunStepRow }> {
+    return this.deps.stepStore.claim({
+      runId: dctx.run.id,
+      organizationId: dctx.organizationId,
+      stepId: step.id,
+      stepSlug: step.slug,
+      path,
+      parentPath: parent?.path ?? null,
+      iteration: parent?.iteration ?? null,
+      kind: step.kind,
+      status: "running",
+      input,
+      startedAt: this.now(),
+    });
+  }
+
+  private extendScope(
+    scope: PipelineScope,
+    step: PipelineStep,
+    output: Record<string, unknown>,
+  ): void {
+    if (step.slug.length > 0) scope.steps[step.slug] = output;
+  }
+
+  private async emitStarted(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    attempt: number,
+    childRunId?: string | null,
+  ): Promise<void> {
+    await dctx.events.emit({
+      type: "pipeline.step.started",
+      data: {
+        stepId: step.id,
+        slug: step.slug,
+        kind: step.kind,
+        path,
+        attempt,
+        ...(childRunId ? { childRunId } : {}),
+      },
+    });
+  }
+
+  private async finishFailed(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    rowId: string,
+    attempt: number,
+    errorClass: string,
+    error: string,
+  ): Promise<StepResult> {
+    await this.deps.stepStore.finish(rowId, {
+      status: "failed",
+      error,
+      errorClass,
+      completedAt: this.now(),
+    });
+    await dctx.events.emit({
+      type: "pipeline.step.failed",
+      data: {
+        stepId: step.id,
+        slug: step.slug,
+        kind: step.kind,
+        path,
+        attempt,
+        errorClass,
+        error,
+        willRetry: false,
+      },
+    });
+    return { kind: "failed", error, errorClass };
+  }
+
+  private async finishSucceeded(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    rowId: string,
+    scope: PipelineScope,
+    output: Record<string, unknown>,
+    startedAtMs: number,
+  ): Promise<void> {
+    await this.deps.stepStore.finish(rowId, {
+      status: "succeeded",
+      output,
+      completedAt: this.now(),
+    });
+    this.extendScope(scope, step, output);
+    const preview = buildStepOutputPreview(output);
+    await dctx.events.emit({
+      type: "pipeline.step.completed",
+      data: {
+        stepId: step.id,
+        slug: step.slug,
+        kind: step.kind,
+        path,
+        status: "succeeded",
+        durationMs: Math.max(0, this.now().getTime() - startedAtMs),
+        ...(preview !== undefined ? { outputPreview: preview } : {}),
+      },
+    });
+  }
+
+  /** Interruptible pause (backoff / child poll) — cancel/shutdown wake it. */
+  private pause(handle: InternalHandle, ms: number): Promise<void> {
+    if (handle.cancelRequested || handle.interrupted) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        handle.wake = null;
+        resolve();
+      };
+      handle.wake = done;
+      void this.sleep(ms).then(done);
+    });
+  }
+
+  // ── control verbs (interpreted in the driver) ─────────────────────────────
+
+  private async executeFilter(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "filter" }>,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    const claimStart = this.now().getTime();
+    const claim = await this.claim(dctx, step, path, parent, null);
+    let attempt = 1;
+    if (!claim.created) {
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
+      if (adopted) {
+        // An adopted filter decision must keep fencing on replay.
+        if (adopted.kind === "ok" && claim.row.status === "succeeded") {
+          const output = claim.row.output as { matched?: unknown } | null;
+          if (output?.matched === false) return { kind: "filtered" };
+        }
+        return adopted;
+      }
+      attempt = claim.row.attempt + 1;
+      await this.deps.stepStore.markRunning(claim.row.id, {
+        attempt,
+        startedAt: this.now(),
+      });
+    }
+    dctx.executed += 1;
+    await this.emitStarted(dctx, step, path, attempt);
+    let matched: boolean;
+    try {
+      matched = evaluateCondition(step.where, scope);
+    } catch (error) {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "condition_error",
+        safeErrorMessage(error),
+      );
+    }
+    await this.finishSucceeded(
+      dctx,
+      step,
+      path,
+      claim.row.id,
+      scope,
+      { matched },
+      claimStart,
+    );
+    return matched ? { kind: "ok" } : { kind: "filtered" };
+  }
+
+  private async executeState(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "state" }>,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    const startMs = this.now().getTime();
+    let entries = renderTemplateRecord(step.set, scope);
+    const claim = await this.claim(dctx, step, path, parent, { set: entries });
+    let attempt = 1;
+    if (!claim.created) {
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
+      if (adopted) {
+        if (adopted.kind === "ok") {
+          // The write was durable; fold the persisted values back into the
+          // scope so later refs see them on replay.
+          const input = claim.row.input as { set?: unknown } | null;
+          const set = input?.set;
+          if (set && typeof set === "object" && !Array.isArray(set)) {
+            Object.assign(scope.state, set as Record<string, unknown>);
+          }
+        }
+        return adopted;
+      }
+      // Interrupted mid-write: retry with the PERSISTED input snapshot, not
+      // a re-render — the first attempt's write may already have landed, so
+      // the replay snapshot can differ and a re-render would write
+      // DIFFERENT values on the second try (the leaf-step stance).
+      const persisted = (claim.row.input as { set?: unknown } | null)?.set;
+      if (
+        persisted &&
+        typeof persisted === "object" &&
+        !Array.isArray(persisted)
+      ) {
+        entries = persisted as Record<string, unknown>;
+      }
+      attempt = claim.row.attempt + 1;
+      await this.deps.stepStore.markRunning(claim.row.id, {
+        attempt,
+        startedAt: this.now(),
+      });
+    }
+    dctx.executed += 1;
+    await this.emitStarted(dctx, step, path, attempt);
+    // App caps (schema comment): ≤200 keys/workflow, ≤64KB per value.
+    for (const [key, value] of Object.entries(entries)) {
+      const bytes = serializedByteLength(value);
+      if (bytes === null || bytes > WORKFLOW_STATE_MAX_VALUE_BYTES) {
+        return this.finishFailed(
+          dctx,
+          step,
+          path,
+          claim.row.id,
+          attempt,
+          "state_value_too_large",
+          `state value "${key}" exceeds ${WORKFLOW_STATE_MAX_VALUE_BYTES} bytes (or is unserializable)`,
+        );
+      }
+    }
+    // The ≤200-key cap is enforced by the STORE, transactionally at write
+    // time (advisory xact lock + in-transaction count): the run's in-memory
+    // snapshot is stale by construction — two overlap:"allow" runs could
+    // both pass a snapshot check at 199 and exceed the cap together.
+    try {
+      await this.deps.stateStore.set({
+        workflowId: dctx.workflowId,
+        organizationId: dctx.organizationId,
+        runId: dctx.run.id,
+        entries,
+      });
+    } catch (error) {
+      if (error instanceof WorkflowStateCapError) {
+        return this.finishFailed(
+          dctx,
+          step,
+          path,
+          claim.row.id,
+          attempt,
+          "state_cap_exceeded",
+          `workflow state would exceed ${WORKFLOW_STATE_MAX_KEYS} keys`,
+        );
+      }
+      throw error;
+    }
+    Object.assign(scope.state, entries);
+    const keys = Object.keys(entries);
+    await dctx.events.emit({
+      type: "pipeline.state.updated",
+      data: { stepId: step.id, path, keys },
+    });
+    await this.finishSucceeded(
+      dctx,
+      step,
+      path,
+      claim.row.id,
+      scope,
+      { keys },
+      startMs,
+    );
+    return { kind: "ok" };
+  }
+
+  private async executeBranch(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "branch" }>,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    const startMs = this.now().getTime();
+    const claim = await this.claim(dctx, step, path, parent, null);
+    let lane: number | "else" | null;
+    if (!claim.created && claim.row.status === "succeeded") {
+      // The decision is on record — re-descend into the chosen lane (its
+      // children adopt-or-execute idempotently); no duplicate events, but a
+      // terminal event a crash swallowed is backfilled.
+      this.extendScope(scope, step, claim.row.output ?? {});
+      await this.backfillTerminalStepEvent(dctx, claim.row, step, path);
+      lane = readBranchLane(claim.row.output, step);
+    } else {
+      let attempt = 1;
+      if (!claim.created) {
+        const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
+        if (adopted) return adopted;
+        attempt = claim.row.attempt + 1;
+        await this.deps.stepStore.markRunning(claim.row.id, {
+          attempt,
+          startedAt: this.now(),
+        });
+      }
+      dctx.executed += 1;
+      await this.emitStarted(dctx, step, path, attempt);
+      try {
+        lane = null;
+        for (let index = 0; index < step.branches.length; index += 1) {
+          if (evaluateCondition(step.branches[index]!.when, scope)) {
+            lane = index;
+            break;
+          }
+        }
+        if (lane === null && step.else) lane = "else";
+      } catch (error) {
+        return this.finishFailed(
+          dctx,
+          step,
+          path,
+          claim.row.id,
+          attempt,
+          "condition_error",
+          safeErrorMessage(error),
+        );
+      }
+      await this.finishSucceeded(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        scope,
+        { lane },
+        startMs,
+      );
+    }
+    if (lane === null) return { kind: "ok" };
+    const laneSteps =
+      lane === "else" ? (step.else ?? []) : (step.branches[lane]?.steps ?? []);
+    const outcome = await this.runSequence(dctx, laneSteps, scope, {
+      path,
+      iteration: null,
+    });
+    switch (outcome.kind) {
+      case "completed":
+        return { kind: "ok" };
+      case "filtered":
+        return { kind: "filtered" };
+      case "halted":
+        return {
+          kind: "failed",
+          error: outcome.error,
+          errorClass: outcome.errorClass,
+        };
+      case "canceled":
+        return { kind: "canceled" };
+    }
+  }
+
+  private async executeForEach(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "for_each" }>,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    const startMs = this.now().getTime();
+    const resolved = resolveScopePath(scope, step.items.$ref);
+    // The resolution VERDICT is snapshotted into the loop row's persisted
+    // input on first claim (the leaf-step persisted-input discipline): the
+    // RESOLVED items array when it is iterable, or the failure CLASS
+    // (`verdict`) when it is not (non-array / over-`maxItems`). A valid
+    // snapshot is bounded like every other input snapshot: `maxItems` ≤ 100
+    // caps the element count and every source the ref can resolve is already
+    // capped (step outputs by maxStepOutputBytes, state values by the 64KB
+    // store cap, trigger data at ingress). Persisting the FAILED verdict
+    // matters as much as the snapshot: a crash after the claim but before
+    // the failure row is written must replay the RECORDED verdict on
+    // recovery — re-resolving against a scope that moved (state shrunk
+    // under overlap "allow") could turn a doomed loop into an executing
+    // one, running body side effects for a run that had already earned
+    // `fan_out_exceeded`.
+    const resolvedArray = Array.isArray(resolved) ? resolved : null;
+    const freshVerdict =
+      resolvedArray === null
+        ? ("items_not_array" as const)
+        : resolvedArray.length > step.maxItems
+          ? ("fan_out_exceeded" as const)
+          : null;
+    const claim = await this.claim(dctx, step, path, parent, {
+      itemsRef: step.items.$ref,
+      count: resolvedArray === null ? null : resolvedArray.length,
+      ...(freshVerdict === null
+        ? { items: resolvedArray }
+        : { verdict: freshVerdict }),
+    });
+    let itemsRaw: unknown = resolved;
+    let verdict: "items_not_array" | "fan_out_exceeded" | null = freshVerdict;
+    let verdictCount = resolvedArray === null ? null : resolvedArray.length;
+    let attempt = 1;
+    if (!claim.created) {
+      const adopted = await this.adoptTerminal(dctx, claim.row, step, path, scope);
+      if (adopted) return adopted;
+      // Interrupted mid-claim: replay the RECORDED verdict, never a fresh
+      // resolution. A persisted items snapshot resumes at the frontier —
+      // the body claims below adopt every finished item instance, over the
+      // PERSISTED array, verbatim (re-resolving the ref against the rebuilt
+      // scope can differ: state moved under overlap "allow", and items
+      // already processed from the original array must never be combined
+      // with the remainder of a new one). A persisted FAILURE verdict fails
+      // again with the same class below — the loop was doomed before the
+      // crash and must not execute now that the scope moved. Legacy rows
+      // claimed before the verdict existed (no `items`, no `verdict`) fall
+      // back to the fresh resolution and fail the same way again.
+      const persisted = claim.row.input as
+        | { items?: unknown; verdict?: unknown; count?: unknown }
+        | null;
+      if (Array.isArray(persisted?.items)) {
+        itemsRaw = persisted.items;
+        verdict = null;
+      } else if (
+        persisted?.verdict === "items_not_array" ||
+        persisted?.verdict === "fan_out_exceeded"
+      ) {
+        verdict = persisted.verdict;
+        verdictCount =
+          typeof persisted.count === "number" ? persisted.count : null;
+      }
+      attempt = claim.row.attempt + 1;
+      await this.deps.stepStore.markRunning(claim.row.id, {
+        attempt,
+        startedAt: this.now(),
+      });
+    }
+    dctx.executed += 1;
+    await this.emitStarted(dctx, step, path, attempt);
+    // A verdict — RECORDED on replay, or the fresh resolution's own — is
+    // AUTHORITATIVE and checked BEFORE any fresh-shape guard: on replay the
+    // loop was doomed with THAT class before the crash, and the fresh
+    // resolution's shape (which may have moved across the crash — a
+    // fan_out_exceeded collection can now be a non-array) must never
+    // reclassify it. The shape guards below therefore fire only for the
+    // legacy fallback (a pre-verdict row re-resolving) — and as the type
+    // narrowing the item loop needs.
+    if (verdict === "items_not_array") {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "items_not_array",
+        `for_each items (${step.items.$ref}) did not resolve to an array`,
+      );
+    }
+    if (verdict === "fan_out_exceeded") {
+      // Silent truncation would corrupt cursor semantics — overflow FAILS.
+      // A replayed verdict reports the RECORDED count (the fresh resolution
+      // may have moved — it may not even be an array any more), a fresh one
+      // the live length.
+      const overCount =
+        verdictCount ?? (Array.isArray(itemsRaw) ? itemsRaw.length : null);
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "fan_out_exceeded",
+        `for_each resolved ${overCount ?? "more than maxItems"} items, over its maxItems of ${step.maxItems}`,
+      );
+    }
+    if (!Array.isArray(itemsRaw)) {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "items_not_array",
+        `for_each items (${step.items.$ref}) did not resolve to an array`,
+      );
+    }
+    if (itemsRaw.length > step.maxItems) {
+      return this.finishFailed(
+        dctx,
+        step,
+        path,
+        claim.row.id,
+        attempt,
+        "fan_out_exceeded",
+        `for_each resolved ${itemsRaw.length} items, over its maxItems of ${step.maxItems}`,
+      );
+    }
+    const records: {
+      index: number;
+      status: "succeeded" | "failed" | "skipped";
+      error?: string;
+      errorClass?: string;
+    }[] = [];
+    for (let index = 0; index < itemsRaw.length; index += 1) {
+      if (dctx.handle.interrupted) return { kind: "canceled" };
+      if (dctx.handle.cancelRequested) {
+        await this.deps.stepStore.finish(claim.row.id, {
+          status: "canceled",
+          completedAt: this.now(),
+        });
+        return { kind: "canceled" };
+      }
+      // Item isolation: each item sees the shared run scope plus its own
+      // body outputs — a COPY of `steps`, so item N's body slugs never leak
+      // into item N+1. `state` is the same object on purpose (durable,
+      // shared); the loop's aggregate is the only body output that survives.
+      const itemScope: PipelineScope = {
+        trigger: scope.trigger,
+        steps: { ...scope.steps },
+        state: scope.state,
+        item: itemsRaw[index],
+        now: scope.now,
+      };
+      const outcome = await this.runSequence(dctx, step.steps, itemScope, {
+        path,
+        iteration: index,
+      });
+      if (outcome.kind === "completed") {
+        records.push({ index, status: "succeeded" });
+      } else if (outcome.kind === "filtered") {
+        // A false filter inside the body drops the CURRENT item only.
+        records.push({ index, status: "skipped" });
+      } else if (outcome.kind === "canceled") {
+        if (dctx.handle.interrupted) return { kind: "canceled" };
+        await this.deps.stepStore.finish(claim.row.id, {
+          status: "canceled",
+          completedAt: this.now(),
+        });
+        return { kind: "canceled" };
+      } else {
+        if (step.onItemError === "halt") {
+          return this.finishFailed(
+            dctx,
+            step,
+            path,
+            claim.row.id,
+            attempt,
+            outcome.errorClass,
+            `item ${index} failed: ${outcome.error}`,
+          );
+        }
+        records.push({
+          index,
+          status: "failed",
+          error: outcome.error,
+          errorClass: outcome.errorClass,
+        });
+      }
+    }
+    const aggregate: Record<string, unknown> = {
+      total: itemsRaw.length,
+      succeeded: records.filter((r) => r.status === "succeeded").length,
+      failed: records.filter((r) => r.status === "failed").length,
+      skipped: records.filter((r) => r.status === "skipped").length,
+      items: records,
+    };
+    await this.finishSucceeded(
+      dctx,
+      step,
+      path,
+      claim.row.id,
+      scope,
+      aggregate,
+      startMs,
+    );
+    return { kind: "ok" };
+  }
+
+  /**
+   * Adoption of a row a previous incarnation of this run already wrote:
+   * terminal rows short-circuit (success feeds the scope; failure/cancel
+   * propagate as if they just happened); null means "not terminal — the
+   * caller resumes execution" (running/pending/waiting). Adopted terminal
+   * rows whose terminal event never landed get it backfilled here.
+   */
+  private async adoptTerminal(
+    dctx: DriveCtx,
+    row: RunStepRow,
+    step: PipelineStep,
+    path: string,
+    scope: PipelineScope,
+  ): Promise<StepResult | null> {
+    switch (row.status) {
+      case "succeeded":
+        this.extendScope(scope, step, row.output ?? {});
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
+        return { kind: "ok" };
+      case "skipped":
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
+        return { kind: "ok" };
+      case "failed":
+        await this.backfillTerminalStepEvent(dctx, row, step, path);
+        return {
+          kind: "failed",
+          error: row.error ?? "step failed",
+          errorClass: row.errorClass ?? "failed",
+        };
+      case "canceled":
+        // Parity with the live path: a canceled step emits no step event
+        // (the run-level status frame carries the cancellation).
+        return { kind: "canceled" };
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Scan the persisted event stream once (resume only) for the paths whose
+   * terminal step event already landed: any `pipeline.step.completed`, or a
+   * `pipeline.step.failed` with `willRetry: false` (retry failures are not
+   * terminal for the step).
+   */
+  private async loadTerminalStepEventPaths(runId: string): Promise<Set<string>> {
+    const paths = new Set<string>();
+    const stored = await this.deps.runStore.listEventsAfter(runId, -1);
+    for (const record of stored) {
+      const event = record.event as unknown as {
+        type?: unknown;
+        data?: { path?: unknown; willRetry?: unknown };
+      };
+      const path = typeof event.data?.path === "string" ? event.data.path : null;
+      if (!path) continue;
+      if (event.type === "pipeline.step.completed") {
+        paths.add(path);
+      } else if (
+        event.type === "pipeline.step.failed" &&
+        event.data?.willRetry === false
+      ) {
+        paths.add(path);
+      }
+    }
+    return paths;
+  }
+
+  /**
+   * The normal path persists a step's terminal row BEFORE emitting its
+   * terminal event, so a crash in between leaves the ledger terminal while
+   * the event stream shows the step running forever. On adoption, re-emit
+   * the missing terminal event; rows whose event already landed are left
+   * alone (no duplicates). Fresh runs (`priorTerminalEventPaths` null) never
+   * adopt, so this is a no-op there.
+   */
+  private async backfillTerminalStepEvent(
+    dctx: DriveCtx,
+    row: RunStepRow,
+    step: PipelineStep,
+    path: string,
+  ): Promise<void> {
+    const seen = dctx.priorTerminalEventPaths;
+    if (!seen || seen.has(path)) return;
+    seen.add(path);
+    if (row.status === "succeeded" || row.status === "skipped") {
+      const durationMs =
+        row.completedAt && row.startedAt
+          ? Math.max(0, row.completedAt.getTime() - row.startedAt.getTime())
+          : 0;
+      const preview =
+        row.status === "succeeded"
+          ? buildStepOutputPreview(row.output ?? {})
+          : undefined;
+      await dctx.events.emit({
+        type: "pipeline.step.completed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          status: row.status,
+          durationMs,
+          ...(preview !== undefined ? { outputPreview: preview } : {}),
+        },
+      });
+    } else if (row.status === "failed") {
+      await dctx.events.emit({
+        type: "pipeline.step.failed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          attempt: row.attempt,
+          errorClass: row.errorClass ?? "failed",
+          error: row.error ?? "step failed",
+          willRetry: false,
+        },
+      });
+    }
+  }
+
+  // ── leaf steps (tool / infer / agent via the executor registry) ───────────
+
+  private async executeLeaf(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "tool" | "infer" | "agent" }>,
+    path: string,
+    parent: StepParentFrame | null,
+    scope: PipelineScope,
+  ): Promise<StepResult> {
+    const startMs = this.now().getTime();
+    const renderedInput = renderLeafInput(step, scope);
+    const claim = await this.claim(dctx, step, path, parent, renderedInput);
+    const row = claim.row;
+    // A resumed (adopted) row retries with its PERSISTED input snapshot,
+    // verbatim — never a re-render against the rebuilt scope, which can
+    // differ (state moved under overlap "allow", refs resolve differently):
+    // a retried tool call must execute with the SAME args as the original
+    // attempt. The snapshot is never overwritten below for the same reason.
+    const input = claim.created ? renderedInput : (row.input ?? renderedInput);
+    let attempt = 1;
+    let childRunId: string | undefined;
+    if (!claim.created) {
+      const adopted = await this.adoptTerminal(dctx, row, step, path, scope);
+      if (adopted) return adopted;
+      if (row.status === "waiting") {
+        // Agent step parked on its child when we crashed — re-attach.
+        attempt = row.attempt;
+        childRunId = row.childRunId ?? undefined;
+      } else {
+        // running/pending: interrupted mid-attempt. At-least-once retries;
+        // `sideEffect: "at_most_once"` fails honest (`interrupted`) instead
+        // — the side effect may or may not have happened.
+        if (step.kind === "tool" && step.sideEffect === "at_most_once") {
+          await this.emitStarted(dctx, step, path, row.attempt);
+          return this.finishFailed(
+            dctx,
+            step,
+            path,
+            row.id,
+            row.attempt,
+            "interrupted",
+            "interrupted by a control-plane restart mid-execution (sideEffect \"at_most_once\" forbids the retry)",
+          );
+        }
+        attempt = row.attempt + 1;
+        childRunId = row.childRunId ?? undefined;
+      }
+      await this.deps.stepStore.markRunning(row.id, {
+        attempt,
+        startedAt: this.now(),
+      });
+    }
+    dctx.executed += 1;
+    const budget = Math.max(attemptBudget(step), attempt);
+
+    while (true) {
+      if (dctx.handle.interrupted) return { kind: "canceled" };
+      if (dctx.handle.cancelRequested) {
+        await this.deps.stepStore.finish(row.id, {
+          status: "canceled",
+          completedAt: this.now(),
+        });
+        return { kind: "canceled" };
+      }
+      const remainingMs = dctx.deadlineMs - this.now().getTime();
+      if (remainingMs <= 0) {
+        return this.finishFailed(
+          dctx,
+          step,
+          path,
+          row.id,
+          attempt,
+          "wall_clock_exceeded",
+          `pipeline wall clock exhausted before the step could run`,
+        );
+      }
+      await this.emitStarted(dctx, step, path, attempt, childRunId);
+      const outcome = await this.runAttempt(
+        dctx,
+        step,
+        input,
+        scope,
+        path,
+        attempt,
+        childRunId,
+        remainingMs,
+      );
+      if (outcome === "interrupted") return { kind: "canceled" };
+      if (outcome === "canceled") {
+        await this.deps.stepStore.finish(row.id, {
+          status: "canceled",
+          completedAt: this.now(),
+        });
+        return { kind: "canceled" };
+      }
+      if (outcome.status === "waiting") {
+        childRunId = outcome.childRunId;
+        const parked = await this.parkOnChild(dctx, step, path, row.id, childRunId);
+        if (parked === "interrupted") return { kind: "canceled" };
+        if (parked === "canceled") {
+          await this.deps.stepStore.finish(row.id, {
+            status: "canceled",
+            completedAt: this.now(),
+          });
+          return { kind: "canceled" };
+        }
+        if (parked === "missing") {
+          return this.finishFailed(
+            dctx,
+            step,
+            path,
+            row.id,
+            attempt,
+            "child_run_missing",
+            "the agent step's child run disappeared while parked",
+          );
+        }
+        await this.deps.stepStore.markRunning(row.id, { attempt });
+        continue; // re-invoke with childRunId to extract the child's output
+      }
+      if (outcome.status === "succeeded") {
+        const bytes = serializedByteLength(outcome.output);
+        if (bytes === null || bytes > this.config.maxStepOutputBytes) {
+          return this.finishFailed(
+            dctx,
+            step,
+            path,
+            row.id,
+            attempt,
+            "output_too_large",
+            `step output exceeds ${this.config.maxStepOutputBytes} bytes (or is unserializable)`,
+          );
+        }
+        await this.finishSucceeded(
+          dctx,
+          step,
+          path,
+          row.id,
+          scope,
+          outcome.output,
+          startMs,
+        );
+        return { kind: "ok" };
+      }
+      // failed
+      const willRetry =
+        outcome.retryable &&
+        attempt < budget &&
+        !dctx.handle.cancelRequested &&
+        this.now().getTime() < dctx.deadlineMs;
+      await dctx.events.emit({
+        type: "pipeline.step.failed",
+        data: {
+          stepId: step.id,
+          slug: step.slug,
+          kind: step.kind,
+          path,
+          attempt,
+          errorClass: outcome.errorClass,
+          error: outcome.error,
+          willRetry,
+        },
+      });
+      if (!willRetry) {
+        await this.deps.stepStore.finish(row.id, {
+          status: "failed",
+          error: outcome.error,
+          errorClass: outcome.errorClass,
+          completedAt: this.now(),
+        });
+        return {
+          kind: "failed",
+          error: outcome.error,
+          errorClass: outcome.errorClass,
+        };
+      }
+      await this.pause(dctx.handle, backoffDelayMs(attempt, this.random));
+      attempt += 1;
+      await this.deps.stepStore.markRunning(row.id, { attempt });
+    }
+  }
+
+  /** One executor attempt under timeout + cancellation. */
+  private async runAttempt(
+    dctx: DriveCtx,
+    step: Extract<PipelineStep, { kind: "tool" | "infer" | "agent" }>,
+    input: unknown,
+    scope: PipelineScope,
+    path: string,
+    attempt: number,
+    childRunId: string | undefined,
+    remainingWallClockMs: number,
+  ): Promise<StepOutcome | "canceled" | "interrupted"> {
+    const executor: StepExecutor | undefined = this.deps.executors[step.kind];
+    if (!executor) {
+      return {
+        status: "failed",
+        errorClass: "executor_unavailable",
+        error: `no executor registered for "${step.kind}" steps`,
+        retryable: false,
+      };
+    }
+    const handle = dctx.handle;
+    const controller = new AbortController();
+    handle.activeController = controller;
+    const base = stepAttemptTimeoutMs(step);
+    const timeoutMs = Math.min(
+      base ?? Number.POSITIVE_INFINITY,
+      remainingWallClockMs,
+    );
+    let timedOut = false;
+    const timer = Number.isFinite(timeoutMs)
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs)
+      : null;
+    const ctx: StepExecuteContext = {
+      deps: this.deps.executorDeps,
+      orgId: dctx.organizationId,
+      run: { id: dctx.run.id, workflowId: dctx.workflowId },
+      step,
+      input,
+      scope,
+      signal: controller.signal,
+      attempt,
+      path,
+      ...(childRunId ? { childRunId } : {}),
+    };
+    try {
+      const execPromise: Promise<StepOutcome> = Promise.resolve()
+        .then(() => executor(ctx))
+        .catch((error): StepOutcome => {
+          // A THROW is an executor bug — outcomes are the contract. Log the
+          // real error (redaction-safe logger); persist only name+message.
+          dctx.logger.error("pipeline.executor_error", {
+            err: error,
+            fields: { stepId: step.id, path, kind: step.kind },
+          });
+          return {
+            status: "failed",
+            errorClass: "executor_error",
+            error: safeErrorMessage(error),
+            retryable: false,
+          };
+        });
+      const abortPromise = new Promise<"aborted">((resolve) => {
+        if (controller.signal.aborted) resolve("aborted");
+        else {
+          controller.signal.addEventListener("abort", () => resolve("aborted"), {
+            once: true,
+          });
+        }
+      });
+      const raced = await Promise.race([execPromise, abortPromise]);
+      if (raced === "aborted") {
+        // Non-cooperative executor: don't wait for it. The dangling promise
+        // must not surface as an unhandled rejection.
+        execPromise.catch(() => {});
+        if (handle.interrupted) return "interrupted";
+        if (handle.cancelRequested) return "canceled";
+        return {
+          status: "failed",
+          errorClass: "timeout",
+          error: `step attempt timed out after ${Math.round(timeoutMs)}ms`,
+          // Agent-step retries are dispatch-phase only (plan) — a timed-out
+          // child turn is not retried; tool/infer timeouts are.
+          retryable: step.kind !== "agent",
+        };
+      }
+      if (handle.interrupted) return "interrupted";
+      if (handle.cancelRequested && raced.status !== "succeeded") {
+        return "canceled";
+      }
+      void timedOut; // executor beat the abort listener — its outcome wins
+      return raced;
+    } finally {
+      if (timer) clearTimeout(timer);
+      handle.activeController = null;
+    }
+  }
+
+  /**
+   * The agent step's child run parked `waiting` — the parent step and run
+   * park with it. Wakes on any child bus frame or the poll cadence; returns
+   * once the child leaves `waiting` (running again, or terminal), marking
+   * the parent run back to `running`.
+   */
+  private async parkOnChild(
+    dctx: DriveCtx,
+    step: PipelineStep,
+    path: string,
+    rowId: string,
+    childRunId: string,
+  ): Promise<"resumed" | "canceled" | "interrupted" | "missing"> {
+    await this.deps.stepStore.markWaiting(rowId, childRunId);
+    await dctx.events.emit({
+      type: "pipeline.step.waiting",
+      data: { stepId: step.id, slug: step.slug, path, childRunId },
+    });
+    await this.deps.runStore.markRun(dctx.run.id, { status: "waiting" });
+    publishRunStatus(this.deps.bus, dctx.run.id, "waiting");
+    const handle = dctx.handle;
+    try {
+      while (true) {
+        if (handle.interrupted) return "interrupted";
+        if (handle.cancelRequested) return "canceled";
+        const status = await this.deps.runStore.getRunStatus(childRunId);
+        if (!status) return "missing";
+        if (status.status !== "waiting") return "resumed";
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const done = (): void => {
+            if (settled) return;
+            settled = true;
+            unsubscribe();
+            handle.wake = null;
+            resolve();
+          };
+          const unsubscribe = this.deps.bus.subscribe(childRunId, () => done());
+          handle.wake = done;
+          void this.sleep(this.config.childPollMs).then(done);
+        });
+      }
+    } finally {
+      // Whatever ended the park, the parent is active again from the
+      // platform's perspective (terminal transitions overwrite this later).
+      const resumed = await this.deps.runStore.markRun(dctx.run.id, {
+        status: "running",
+      });
+      if (resumed) publishRunStatus(this.deps.bus, dctx.run.id, "running");
+    }
+  }
+}
+
+/** Construct the runner (index.ts wiring; tests inject the seams). */
+export function createPipelineRunner(deps: PipelineRunnerDeps): PipelineRunner {
+  return new PipelineRunner(deps);
+}
+
+/**
+ * Decreed dispatch entry: trigger ingress, the schedule ticker, Slack
+ * routing and manual "Run now" all funnel here.
+ */
+export function startPipelineRun(
+  runner: PipelineRunner,
+  input: StartPipelineRunInput,
+): Promise<StartPipelineRunResult> {
+  return runner.start(input);
+}
+
+/**
+ * Decreed cancel entry for the routes layer. False ⇒ no live driver in this
+ * process (orphaned run) — the caller falls back to a direct status CAS and
+ * lets boot recovery reconcile the ledger.
+ */
+export function cancelPipelineRun(
+  runner: PipelineRunner,
+  runId: string,
+): boolean {
+  return runner.cancel(runId);
+}
+
+function renderLeafInput(
+  step: Extract<PipelineStep, { kind: "tool" | "infer" | "agent" }>,
+  scope: PipelineScope,
+): unknown {
+  // DECREED shapes — each executor validates its own
+  // (`toolStepRenderedInputSchema` / `inferStepRenderedInputSchema`; the
+  // agent step mirrors them with `{ instructions }`).
+  switch (step.kind) {
+    case "tool":
+      return { args: renderTemplateRecord(step.args, scope) };
+    case "infer":
+      return { prompt: renderMarkdownTemplate(step.prompt.markdown, scope) };
+    case "agent":
+      return {
+        instructions: renderMarkdownTemplate(step.instructions.markdown, scope),
+      };
+  }
+}
+
+function readBranchLane(
+  output: Record<string, unknown> | null,
+  step: Extract<PipelineStep, { kind: "branch" }>,
+): number | "else" | null {
+  const lane = output?.["lane"];
+  if (typeof lane === "number" && step.branches[lane] !== undefined) return lane;
+  if (lane === "else" && step.else) return "else";
+  return null;
+}

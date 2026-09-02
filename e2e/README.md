@@ -96,7 +96,7 @@ the stub MCP server twice over (loopback address, plain http).
   next call still succeeds (only a fresh refresh explains it); finally the
   AS flips to `invalid_grant` — the run surfaces a failed tool call (never a
   hang) and the connection lands `auth_error` with a Reconnect affordance.
-- **agent-workflow** (THE acceptance, agents-first) — author a skill (with a
+- **agent-workflow** (THE acceptance) — author a skill (with a
   file attachment) and two MCP connections (one installed through the
   dialog's community-search lane, one custom-URL) in `/context`; **build an
   agent** in `/agents` (persona typed in
@@ -105,12 +105,15 @@ the stub MCP server twice over (loopback address, plain http).
   wait for the ready chip); **chat with it** through the "New chat" agent
   picker and watch the working block stream a live step, collapse to a
   duration summary, and render the final prose; then **delegate**: build a
-  form-trigger workflow bound to that agent (instructions typed with a real
-  `@trigger.<field>` autocomplete pick), publish it **instantly** (validate +
-  snapshot — workflows have no builds), fire it through the header's Run
-  popover (the real trigger-dispatch path), and see the run land in Chat with
-  the workflow-provenance chip and the **resolved** `@trigger` value in the
-  rendered task message.
+  form-trigger PIPELINE whose single step is an **agent step** bound to that
+  agent (added through the strip's Add-a-step menu, its instructions typed
+  with a real `@trigger.<field>` autocomplete pick), publish it **instantly**
+  (validate + snapshot — workflows have no builds), fire it through the
+  header's Run popover (a pipeline run whose agent step spawns a CHILD run),
+  see the child session land in Chat with the workflow-provenance chip and
+  the **resolved** `@trigger` value in the rendered task message, and finish
+  on the workflow's Runs tab: the step timeline with the child transcript
+  embedded in the agent step's drawer.
 - **chat-approval** — an agent is equipped with an MCP connection gated
   "Always ask"; a chat run parks on an inline HITL card; responding to it
   resumes the run — exercising `POST /runs/:id/input` through the UI. Then the
@@ -122,20 +125,27 @@ the stub MCP server twice over (loopback address, plain http).
   straight off the session-actions menu (`POST /sessions/:id/clear`); and
   **Reset session** must ask first, because the retired eve session id can
   never take another message.
-- **webhook-trigger** — publish a minimal agent, bind a webhook workflow to
-  it, publish (instant), reveal the ingress token ONCE, fire `/t/:token` with
-  a plain HTTP POST, and watch the run surface in Chat as a webhook-origin
-  session (origin + workflow-provenance chips). Plus a Slack trigger-binding
-  UI smoke (routing controls + the connect-a-team nudge).
-- **copilot** — the surface-aware copilot on the scripted fake: (1) scaffold a
-  whole delegation from a one-liner — setTrigger / setAgent (the seeded
-  "General Purpose" agent, resolved from the prompt inventory) /
-  setInstructions land as Apply/Dismiss cards, each apply flashes its target
-  section and mutates the live editor, then the workflow publishes instantly
-  and runs; (2) apply-one/dismiss-one on an existing workflow — the dismissal
-  never touches the draft and verifiably reaches the model; (3) the agent
-  editor surface — a setPersona proposal previews as a diff card and applies
-  into the persona editor.
+- **webhook-trigger** — the direct-manipulation pipeline lane, no agent and
+  no build: a webhook trigger + one TOOL step on a custom stub-MCP
+  connection, configured through the inspector's connection select →
+  cached-tool picker → arg field with an embedded `@trigger.message`
+  template; publish (instant), reveal the ingress token ONCE, fire
+  `/t/:token` with a plain HTTP POST, watch the run's step timeline in the
+  Runs tab, and assert the stub really received the RENDERED `save_note`
+  call. Plus a Slack trigger-binding UI smoke (routing controls + the
+  connect-a-team nudge inside the expanded TriggerCard).
+- **copilot** — the surface-aware copilot on the scripted fake: (1) THE
+  pipeline story — from a one-liner the copilot proposes setTrigger(form),
+  calls the server-executed `searchConnectionTools` read tool, then proposes
+  two addSteps (a state cursor + a `save_note` tool step on the workspace's
+  stub connection); with auto-apply OFF each parks as an Apply/Dismiss card,
+  pending addSteps render dashed GHOSTS on the strip and Apply solidifies
+  them, then publish → run → the step timeline, with the stub asserting the
+  @trigger refs resolved; (2) apply-one/dismiss-one on an existing PUBLISHED
+  pipeline (allow-edits defaults OFF there) — the dismissal never touches
+  the draft and verifiably reaches the model; (3) the agent editor surface —
+  a setPersona proposal previews as a diff card and applies into the persona
+  editor.
 - **invite** — owner invites by email → a brand-new user signs up through the
   redirect and accepts → appears in members.
 - **a11y** — axe-core scan of `/login`, `/agents`, `/agents/:id`,
@@ -163,9 +173,10 @@ the stub MCP server twice over (loopback address, plain http).
 
 Note on builds: every fresh workspace also auto-publishes its seeded
 "General Purpose" agent in the background (a real eve build — content hashes
-are workspace-scoped, so it is never cache-shared across workspaces). Specs
-that need it (`copilot`, `screenshots`) explicitly wait for its Published
-chip; the others simply ignore it.
+are workspace-scoped, so it is never cache-shared across workspaces). A spec
+that needs it would wait for its Published chip via
+`waitForAgentPublished`; the current suite simply ignores it (the copilot
+pipeline specs run on tool/state steps, which need no agent at all).
 
 ## Driving helpers (`support/`)
 
@@ -179,11 +190,15 @@ chip; the others simply ignore it.
 - `builder.ts` — the agents-first spine: `openNewAgent` / `writePersona` /
   `setAgentModelPreset` / `attachAgentResource` / `setAgentConnectionApproval`
   / `publishAgentAndWaitReady` (real build) / `waitForAgentPublished` (seeded
-  auto-publish); the workflow editor (`openNewWorkflow`, trigger setters,
-  `selectWorkflowAgent`, instructions helpers, `publishWorkflow` — instant,
-  `runWorkflowFromHeader`, `revealWebhookToken`); and `startChatAndSend`
-  (the "New chat" **agent picker**).
-- `copilot.ts` — dock driving + section-flash/rail-card locators.
+  auto-publish); the PIPELINE editor (`openNewWorkflow`, `expandTrigger` +
+  trigger setters, `addFirstStep`, `configureToolStep`,
+  `selectWorkflowAgent`, the agent-step instructions helpers,
+  `publishWorkflow` — instant, `runWorkflowFromHeader`, `openRunsTab`,
+  `revealWebhookToken`); and `startChatAndSend` (the "New chat" **agent
+  picker**).
+- `copilot.ts` — both copilot surfaces: the agent editor's dock
+  (`openCopilotAndSend`), the workflow editor's always-open pane
+  (`sendWorkflowCopilotMessage`, `setAutoApply`), and the rail-card locator.
 - `copilot-script.ts` — the keyed fake-LLM conversations (`COPILOT_FAKE_SCRIPT`).
 
 All selectors are role-based with accessible names — the specs double as an

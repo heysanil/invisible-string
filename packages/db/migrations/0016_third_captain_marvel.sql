@@ -1,0 +1,2 @@
+ALTER TABLE "runs" ADD COLUMN "remote_cancel_pending_at" timestamp with time zone;--> statement-breakpoint
+CREATE INDEX "runs_remote_cancel_pending_idx" ON "runs" USING btree ("remote_cancel_pending_at") WHERE "runs"."remote_cancel_pending_at" IS NOT NULL;

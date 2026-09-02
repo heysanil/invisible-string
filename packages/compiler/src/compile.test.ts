@@ -583,6 +583,22 @@ describe("@reference edge cases through compile()", () => {
     );
   });
 
+  test("PIPELINE_REF_NOT_ALLOWED: @steps/@state/@item/@now — pipeline scope is workflow-only", () => {
+    for (const persona of [
+      "Summarize @steps.search.result first.",
+      "Compare against @state.cursor.",
+      "Handle @item.text carefully.",
+      "Stamp with @now.",
+    ]) {
+      const error = expectCompileError(
+        "PIPELINE_REF_NOT_ALLOWED",
+        withPersona(base.definition, persona),
+        base.deps,
+      );
+      expect(error.message).toContain("workflow pipelines");
+    }
+  });
+
   test("trailing dots and adjacent punctuation stay out of refs", () => {
     const { files } = compile(
       withPersona(mcpSkillFixture.definition, "Check @deepwiki. Then stop."),

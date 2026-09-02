@@ -46,9 +46,22 @@ const inventory: WorkspaceInventory = {
       slug: "gmail",
       description: "reads the support inbox and sends drafts",
       enabled: true,
+      scope: "workspace",
       health: "ok",
       tools: ["search_threads", "create_draft"],
       toolCount: 2,
+      cachedTools: [
+        {
+          name: "search_threads",
+          description: "Search Gmail threads",
+          params: ["query"],
+        },
+        {
+          name: "create_draft",
+          description: "Create a Gmail draft reply",
+          params: ["to", "body"],
+        },
+      ],
     },
   ],
   skills: [

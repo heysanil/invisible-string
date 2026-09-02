@@ -20,9 +20,12 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 
 import { referenceProblem, type ReferenceSources } from "../builder/references";
 
-/** Nothing attached, no dispatch data — every reference is unresolved. */
+/** Nothing attached, no prior steps, no dispatch data — only `@now` resolves. */
 export const EMPTY_REFERENCE_SOURCES: ReferenceSources = {
   trigger: { type: "manual" },
+  steps: [],
+  stateKeys: [],
+  item: false,
   connections: [],
   skills: [],
 };
@@ -70,7 +73,7 @@ export function referenceNodeProblem(
   const parsed = parseReferences(raw);
   const ref = parsed[0];
   if (parsed.length !== 1 || ref === undefined || ref.raw !== raw) {
-    return `"${raw}" is not a reference — @name, @trigger.<path> or @skill.<slug>.`;
+    return `"${raw}" is not a reference — @trigger.<path>, @steps.<slug>, @state.<key>, @item, @now, @skill.<slug> or @<connection>.`;
   }
   return referenceProblem(ref, sources);
 }

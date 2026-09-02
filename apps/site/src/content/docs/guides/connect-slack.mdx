@@ -2,50 +2,55 @@
 title: Connect Slack
 section: Guides
 order: 49
-description: "Connect a workspace to Slack once, then wire a Workflow to a team and channel so mentioning the app in a thread actually starts a run."
+description: "Connect a workspace to Slack once, then wire a Workflow to a team and channel so mentioning the app starts a pipeline run with real thread continuity."
 ---
 
 # Connect Slack
 
-Say you want to mention the platform's Slack app in a channel and get a threaded reply back from an Agent. This guide connects the workspace to Slack once, then wires a Workflow to a specific team and channel so a mention actually starts a run.
+Say you want to mention the platform's Slack app in a channel and have an Agent handle the conversation. This guide connects the workspace to Slack once, then wires a Workflow to a specific team and channel so a mention actually starts a run — with an agent step carrying the thread's continuity.
 
 ## Before you start
 
 - Owner or admin role in the workspace — connecting and disconnecting Slack is restricted to those roles.
-- A published Agent to bind the Slack-triggered Workflow to — see [Agents](/docs/concepts/agents).
-- Familiarity with how a Workflow's trigger and Agent binding fit together — see [Workflows](/docs/concepts/workflows).
+- A published Agent for the pipeline's agent step to delegate to — see [Agents](/docs/concepts/agents).
+- Familiarity with how a Workflow's trigger and steps fit together — see [Workflows](/docs/concepts/workflows).
 
 ## Steps
 
 1. Go to **Settings → Integrations**.
 2. Click **Connect Slack**. This is a full navigation to Slack's own consent page — not a popup — so the browser leaves the app briefly and comes back once you approve.
 3. Approve the install on Slack's page. You land back on the Integrations panel with the team listed as connected. The platform stores only an encrypted bot token; your Slack password never touches it.
-4. Create a Workflow (or open an existing one) and go to its Trigger section.
-5. Pick **Slack**. The routing rules appear below the trigger cards: optionally set a channel id to restrict the trigger to one channel — leave it blank and any channel the app is in can trigger it.
-6. Decide **Only @mentions of the app** — on by default, meaning only an explicit @-mention starts a new run. Thread replies always continue an existing run's session regardless of this setting, since a reply is part of a conversation already underway, not a new request.
+4. Create a Workflow (or open an existing one) and expand its Trigger card.
+5. Pick **Slack**. The routing rules appear: optionally set a channel id to restrict the trigger to one channel — leave it blank and any channel the app is in can trigger it.
+6. Decide **Only @mentions of the app** — on by default, meaning only an explicit @-mention starts a run in a fresh thread. Replies in a thread the Workflow is already conversing in dispatch regardless of this setting, since a reply is part of a conversation already underway.
 7. Decide **Include direct messages** — off by default; turn it on if DMs to the app should also trigger runs.
 8. In the binding card below, pick the connected team and click **Bind**. The rules above are draft state until you do; change them afterwards and the card asks you to **Update binding** before they apply to live events.
-9. Choose a published Agent, write the instructions, and click **Publish**.
+9. Build the pipeline — for a conversational bot, a single **Agent** step: pick the published Agent, write its instructions referencing the incoming message with `@trigger.text` (sender and channel are there too, as `@trigger.user` and `@trigger.channel`), and set its session mode to **thread**. That's what makes consecutive messages in one Slack thread continue one ongoing session, so the Agent remembers the conversation. Then click **Publish**.
 10. In Slack, invite the app to the channel you want it watching: `/invite @YourBot`. The app cannot see messages in a channel it hasn't been invited to, published Workflow or not — this step is easy to forget because nothing in the platform's UI prompts for it.
 
 ## What you should see
 
-Mention the app in a channel it's been invited to, for example `@YourBot summarize this thread`. A threaded reply from the bot appears in that same thread once the run finishes — replies always post into the thread (or the DM) they came from, using the connected team's bot token.
+Mention the app in a channel it's been invited to, for example `@YourBot summarize this thread`. Each message starts its own pipeline run — visible in the Workflow's **Runs** tab, with the agent step's full transcript embedded in the run's timeline — while the `thread` session mode keeps them one conversation from the Agent's point of view.
+
+A reply posts back into the thread only when the Workflow declares one: an `onComplete.slackReply` template in its configuration, rendered against the run's final scope when the run succeeds and posted with the connected team's bot token. **A Workflow that declares no reply posts nothing** — the run still happened, its record is the Runs tab.
 
 ## Operational notes
 
 - Incoming Slack requests are signature-verified within a replay window before anything is dispatched.
 - The workspace and Workflow are resolved from the Slack team id together with the trigger's binding — a team can be connected to only one workspace at a time.
-- Reply delivery is at-least-once: a rare crash between posting the reply and recording that it was delivered can cause a duplicate reply. That's expected behavior, not a bug.
-- A canceled run posts nothing to Slack at all — cancellation is a decision, not a failure, and there's no partial reply to send.
+- A DM conversation keys its continuity on the DM channel itself rather than a thread, so a 1:1 exchange stays one ongoing session too.
+- A message arriving while the previous run of the same Workflow is still live is skipped for overlap, not queued — see [Workflows](/docs/concepts/workflows).
+- Declared-reply delivery is at-least-once: a rare crash between posting the reply and recording it can cause a duplicate. That's expected behavior, not a bug.
+- A failed or canceled run posts nothing to Slack at all — there's no partial reply to send.
 
 ## Disconnecting
 
-**Settings → Integrations → Disconnect**, behind a confirmation. Disconnecting stops Workflows bound to that team from receiving Slack events — say plainly, that's the consequence, not something recoverable without reconnecting and rebinding.
+**Settings → Integrations → Disconnect**, behind a confirmation. Disconnecting stops Workflows bound to that team from receiving Slack events — said plainly, that's the consequence, not something recoverable without reconnecting and rebinding.
 
 ## If it doesn't work
 
-- **The bot doesn't respond to a mention** — check it's actually invited to the channel, check whether `mentionOnly` or a channel-id restriction on the binding is excluding it, and confirm the Workflow is published (a draft binding doesn't tick).
+- **The bot doesn't respond to a mention** — check it's actually invited to the channel, check whether `mentionOnly` or a channel-id restriction on the binding is excluding it, and confirm the Workflow is published (a draft binding doesn't fire).
+- **Runs start but nothing posts back** — the Workflow declares no `onComplete.slackReply`, which is the default: no declared reply, no post. Read the runs in the Runs tab.
 - **DMs don't trigger anything** — `includeDirectMessages` defaults to off; turn it on for that binding if you want DMs to start runs.
 - **A reply arrives twice** — expected at-least-once delivery behavior after a rare crash mid-delivery, not a bug to chase.
 

@@ -15,10 +15,13 @@ optional search index.
 The API host (Bun + Elysia): authentication and organizations, agent and
 workflow CRUD, connections and their health probes, the MCP OAuth broker,
 compiler invocation with `eve build` and artifact upload, the scheduler,
-trigger ingress and dispatch, outbound reply delivery, the SSE tailer, and the
-copilot WebSocket loop. Its scheduler routes work by session affinity first,
-then to an artifact-warm worker, then to any live worker, with a dead-worker
-sweep and fencing.
+trigger ingress, the **pipeline runner** — the interpreter that executes a
+[Workflow](/docs/concepts/workflows)'s steps against a durable per-step
+ledger, calling MCP tools directly, making preset model calls, and
+dispatching agent steps as child runs — outbound reply delivery, the SSE
+tailer, and the copilot WebSocket loop. Its scheduler routes agent work by
+session affinity first, then to an artifact-warm worker, then to any live
+worker, with a dead-worker sweep and fencing.
 
 Every outbound request the control plane makes on your behalf — probing an MCP
 server, discovering its authorization server, exchanging or refreshing tokens —
@@ -79,11 +82,25 @@ entirely and just confirms the existing artifact still exists. This is why
 republishing an Agent you haven't actually changed is instant: nothing was
 rebuilt, only reconfirmed.
 
+## Life of a workflow run
+
+A trigger fires — a webhook lands, the schedule ticks, a Slack mention
+arrives — and the control plane starts a **pipeline run**: a run row plus a
+step ledger, before any step executes. The runner then interprets the
+published pipeline in order, writing each step instance to the ledger as it
+goes: tool steps call the connection's MCP server directly over the same
+guarded egress path the health probes use, infer steps call a workspace
+preset, and an agent step dispatches a child run through exactly the chat
+machinery above — scheduler, worker, eve session, tailer. Step events append
+into the same durable event stream, so the Runs tab's timeline streams and
+resumes exactly like a chat run does. No worker is involved except where an
+agent step needs one.
+
 ## Where data lives
 
 | Data | Lives in |
 |---|---|
-| Agents, Workflows, sessions, runs, connections | Postgres (control-plane database) |
+| Agents, Workflows, sessions, runs, step ledgers, workflow state, connections | Postgres (control-plane database) |
 | Durable execution state for one agent version's runs | Postgres (that version's own world database) |
 | Compiled artifacts, skill attachments | Object store |
 | Mirror of the MCP registry, for community search | Search index (disposable) |

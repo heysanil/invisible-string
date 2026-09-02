@@ -2,156 +2,193 @@
  * COPILOT ACCEPTANCE through the real browser + stack, with the
  * control-plane's copilot on the scripted fake LLM (COPILOT_FAKE_SCRIPT —
  * see support/copilot-script.ts; no real model is ever called here). The
- * copilot is surface-aware: the workflow editor gets the
- * setTrigger/setAgent/setInstructions toolset, the agent editor gets
- * setPersona/setModel/add-removeContext.
+ * copilot is surface-aware: the workflow editor exposes the PIPELINE toolset
+ * (setTrigger + addStep/updateStep/removeStep/moveStep + the two read
+ * tools), the agent editor setPersona/setModel/add-removeContext.
  *
- * Spec 1 — scaffold a workflow from a one-liner: the copilot proposes
- * setTrigger(form, 2 fields) → setAgent(the seeded "General Purpose" agent,
- * resolved from the prompt inventory by the scripted fake exactly as a real
- * model would) → setInstructions(@trigger refs) — each an Apply/Dismiss
- * suggestion card. Applying flashes the target SECTION (the single-column
- * editor's live surface — the pillar rail is gone) and mutates the draft in
- * place; the instructions card renders a real diff preview. Then Publish
- * (INSTANT) and fire it through the Run popover → the delegated run streams
- * a working block in Chat.
+ * Spec 1 — THE PIPELINE STORY, conversational-first: from a one-liner the
+ * copilot proposes setTrigger(form) → calls searchConnectionTools (a
+ * server-executed read tool — the script only advances past it because the
+ * round-trip really completed) → proposes two addSteps (a state cursor and a
+ * save_note tool call on the workspace's stub-MCP connection). With
+ * auto-apply switched OFF each proposal parks as an Apply/Dismiss card;
+ * pending addSteps render dashed GHOST cards at their target strip position,
+ * and Apply solidifies them into real step cards (the trigger apply flashes
+ * the TriggerCard). Then: publish (INSTANT), fire through the header's Run
+ * popover, follow "View run" to the step timeline (the same strip in run
+ * density) and assert both steps ran — plus, outside the browser, that the
+ * stub MCP server really received the note with the @trigger refs RESOLVED.
  *
- * Spec 2 — edit an existing workflow: the copilot proposes an instructions
- * diff AND a trigger change; Apply the first, DISMISS the second; the
- * dismissed change never touches the draft (live sections + reload), and the
- * model verifiably received the rejection (the scripted fake's closing
- * message echoes the tool-result outcomes it was fed).
+ * Spec 2 — edit an existing published pipeline: allow-edits DEFAULTS OFF on
+ * the published surface (and publishing mid-session must not flip a live
+ * switch); the copilot proposes an addStep AND a trigger change in one turn.
+ * Apply the first, DISMISS the second; the dismissed change never touches
+ * the draft (live strip + reload), and the model verifiably received both
+ * outcomes (the scripted fake's closing message echoes the tool results).
  *
- * Spec 3 — the agent editor surface: the copilot proposes a setPersona
- * mutation, rendered as a diff card; applying it lands in the persona
- * editor and flashes the rail's Persona card. Cheap by design: no publish,
- * no build.
+ * Spec 3 — the agent editor surface keeps its docked rail: a setPersona
+ * proposal renders as a diff card; applying lands in the persona editor and
+ * the rail's Persona card. Cheap by design: no publish, no build.
  */
 import { expect, test } from "@playwright/test";
 
 import {
+  addCustomConnection,
+  waitForConnectionHealthy,
+} from "../support/authoring.ts";
+import {
+  addFirstStep,
   openNewAgent,
   openNewWorkflow,
   publishWorkflow,
   runWorkflowFromHeader,
-  startChatAndSend,
-  waitForAgentPublished,
-  writePlainInstructions,
   RUN_TIMEOUT_MS,
 } from "../support/builder.ts";
 import {
-  EDIT_BASE_INSTRUCTIONS,
+  EDIT_ADDED_STEP_NAME,
   EDIT_DISMISSED_CRON,
   EDIT_PROMPT,
   PERSONA_PROMPT,
-  SCAFFOLD_AGENT_NAME,
+  SCAFFOLD_CONNECTION,
   SCAFFOLD_PROMPT,
+  SCAFFOLD_STATE_STEP_NAME,
+  SCAFFOLD_TOOL_STEP_NAME,
 } from "../support/copilot-script.ts";
 import {
   agentRailCard,
-  expectWorkflowSectionFlash,
   openCopilotAndSend,
-  workflowSection,
+  sendWorkflowCopilotMessage,
+  setAutoApply,
 } from "../support/copilot.ts";
 import { signUpIntoWorkspace } from "../support/flows.ts";
+import { REGISTRY_STUB_BASE_URL } from "../config.ts";
 
-test("copilot scaffolds a runnable delegation from a one-liner", async ({
+const FORM_EMAIL = "casey@acme.dev";
+const FORM_MESSAGE = "Please reset my password";
+
+test("copilot composes a pipeline from a one-liner: ghosts solidify, publish, run, step timeline", async ({
   page,
 }) => {
   await signUpIntoWorkspace(page, "copilot");
 
-  // The scripted setAgent proposal targets the seeded "General Purpose"
-  // agent, which every fresh workspace auto-publishes in the background —
-  // wait for its build so the proposal validates AND the final run can
-  // dispatch. (This wait is also the seeded-auto-publish proof.)
-  await waitForAgentPublished(page, SCAFFOLD_AGENT_NAME);
+  // The scripted tool step calls the stub server through the `notes`
+  // connection — create it and wait for the probe's tools cache (the
+  // `{{connectionId:notes}}` placeholder and the read tool both key off it).
+  await addCustomConnection(page, { name: SCAFFOLD_CONNECTION });
+  await waitForConnectionHealthy(page, SCAFFOLD_CONNECTION);
 
-  await openNewWorkflow(page, "Copilot scaffold workflow");
-  const triggerTypes = page.getByRole("radiogroup", { name: "Trigger type" });
-  await expect(triggerTypes.getByRole("radio", { name: "Manual" })).toHaveAttribute(
-    "aria-checked",
-    "true",
-  );
+  await openNewWorkflow(page, "Copilot pipeline workflow");
 
-  await openCopilotAndSend(page, SCAFFOLD_PROMPT);
+  // Never-published draft ⇒ auto-apply defaults ON (surface-aware initial
+  // value); switch it OFF so every proposal parks on the accept gate.
+  await expect(
+    page.getByRole("switch", { name: "Auto-apply edits" }),
+  ).toHaveAttribute("aria-checked", "true");
+  await setAutoApply(page, false);
+
+  await sendWorkflowCopilotMessage(page, SCAFFOLD_PROMPT);
 
   // ── suggestion 1: form trigger with two fields ──────────────────────────────
-  const triggerCard = page.getByRole("group", {
+  const triggerSuggestion = page.getByRole("group", {
     name: /^Suggestion: Set trigger: Form/,
   });
-  await expect(triggerCard).toBeVisible();
-  // Structured before → after preview on the card.
-  await expect(triggerCard.getByTestId("before-after")).toContainText(
+  await expect(triggerSuggestion).toBeVisible();
+  await expect(triggerSuggestion.getByTestId("before-after")).toContainText(
     "Form · 2 fields",
   );
-  await triggerCard.getByRole("button", { name: "Apply" }).click();
-  // The applied mutation flashes its section and lands in the live editor.
-  await expectWorkflowSectionFlash(page, "trigger");
-  await expect(triggerTypes.getByRole("radio", { name: "Form" })).toHaveAttribute(
-    "aria-checked",
-    "true",
+  await triggerSuggestion.getByRole("button", { name: "Apply" }).click();
+  // The applied trigger flashes its card and updates the summary chip.
+  await expect(
+    page.locator('[data-testid="trigger-card"].pillar-flash'),
+  ).toBeVisible({ timeout: 2_000 });
+  await expect(page.getByTestId("trigger-card")).toContainText("Form");
+
+  // ── suggestion 2 (after the read-tool round trip): the state step ──────────
+  // A pending addStep renders a dashed ghost at its strip position.
+  const stateSuggestion = page.getByRole("group", {
+    name: `Suggestion: Add step: ${SCAFFOLD_STATE_STEP_NAME}`,
+  });
+  await expect(stateSuggestion).toBeVisible();
+  const stateGhost = page
+    .getByTestId("ghost-step-card")
+    .filter({ hasText: SCAFFOLD_STATE_STEP_NAME });
+  await expect(stateGhost).toBeVisible();
+  await stateSuggestion.getByRole("button", { name: "Apply" }).click();
+  // Ghost solidifies into the real card.
+  await expect(stateGhost).toHaveCount(0);
+  await expect(
+    page.locator('[data-testid="step-card"][data-step-kind="state"]'),
+  ).toBeVisible();
+
+  // ── suggestion 3: the save_note tool step (head-inserted above the state) ──
+  const toolSuggestion = page.getByRole("group", {
+    name: `Suggestion: Add step: ${SCAFFOLD_TOOL_STEP_NAME}`,
+  });
+  await expect(toolSuggestion).toBeVisible();
+  // Rich step preview: the args key-value table carries the template.
+  await expect(toolSuggestion.getByTestId("args-diff")).toContainText(
+    "@trigger.email",
   );
-  await expect(page.getByPlaceholder("key")).toHaveCount(2);
+  const toolGhost = page
+    .getByTestId("ghost-step-card")
+    .filter({ hasText: SCAFFOLD_TOOL_STEP_NAME });
+  await expect(toolGhost).toBeVisible();
+  await toolSuggestion.getByRole("button", { name: "Apply" }).click();
+  await expect(toolGhost).toHaveCount(0);
+  const stepCards = page.getByTestId("step-card");
+  await expect(stepCards).toHaveCount(2);
+  // Execution order: the tool call first, then the state write.
+  await expect(stepCards.nth(0)).toHaveAttribute("data-step-kind", "tool");
+  await expect(stepCards.nth(1)).toHaveAttribute("data-step-kind", "state");
 
-  // ── suggestion 2: delegate to the seeded published agent ────────────────────
-  const agentCard = page.getByRole("group", {
-    name: `Suggestion: Set agent: ${SCAFFOLD_AGENT_NAME}`,
-  });
-  await expect(agentCard).toBeVisible();
-  await agentCard.getByRole("button", { name: "Apply" }).click();
-  await expectWorkflowSectionFlash(page, "agent");
-  await expect(
-    workflowSection(page, "agent")
-      .getByRole("radiogroup", { name: "Agent" })
-      .getByRole("radio", { name: new RegExp(`^${SCAFFOLD_AGENT_NAME}\\b`) }),
-  ).toHaveAttribute("aria-checked", "true");
-
-  // ── suggestion 3: instructions with valid @trigger references ──────────────
-  const instructionsCard = page.getByRole("group", {
-    name: "Suggestion: Write instructions",
-  });
-  await expect(instructionsCard).toBeVisible();
-  // The instructions proposal renders an inline DIFF preview (all additions
-  // against the empty draft), including the @trigger reference line.
-  const diff = instructionsCard.getByTestId("diff-view");
-  await expect(diff).toBeVisible();
-  await expect(diff.locator('[data-diff="add"]').first()).toBeVisible();
-  await expect(diff).toContainText("@trigger.email");
-  await instructionsCard.getByRole("button", { name: "Apply" }).click();
-  await expectWorkflowSectionFlash(page, "instructions");
-  await expect(
-    page.getByRole("textbox", { name: "Instructions editor" }),
-  ).toContainText("Triage each form submission");
-
-  // Three applied receipts + the copilot's closing prose. Scoped to the
-  // thread log — the dock's sr-only announcer repeats settled messages.
+  // Three applied receipts + the copilot's closing prose, scoped to the
+  // thread log (the sr-only announcer repeats settled messages).
   await expect(
     page.getByTestId("suggestion-receipt").filter({ hasText: "Applied" }),
   ).toHaveCount(3);
   const thread = page.getByRole("log", { name: "Copilot conversation" });
   await expect(thread.getByText("Publish when ready")).toBeVisible();
 
-  // ── publish (INSTANT) and fire it through the Run popover ──────────────────
+  // ── publish (INSTANT) and fire through the Run popover ─────────────────────
   await publishWorkflow(page);
   await runWorkflowFromHeader(page, {
-    formValues: {
-      "Customer email": "casey@acme.dev",
-      Message: "Make a todo list for the triage steps.",
-    },
+    formValues: { "Customer email": FORM_EMAIL, Message: FORM_MESSAGE },
   });
 
-  // The delegated run streams in Chat (eve mock model → todo working block).
-  await page.goto("/chat");
-  const sessions = page.locator('[aria-label="Chat sessions"]');
-  await sessions
-    .getByRole("button", { name: new RegExp(SCAFFOLD_AGENT_NAME) })
-    .first()
-    .click();
-  const workingBlock = page.getByRole("button", { name: /Work(ing|ed)/ });
-  await expect(workingBlock.first()).toBeVisible({ timeout: RUN_TIMEOUT_MS });
-  await expect(page.getByText(/Used todo/i).first()).toBeVisible({
+  // ── the step timeline: the same strip in run density ───────────────────────
+  // Two "View run" affordances render after a start (the popover's confirm
+  // panel and the editor's run-overlay banner) — either leads to the run.
+  await page.getByRole("link", { name: "View run" }).first().click();
+  await page.waitForURL(/\/workflows\/[^/]+\/runs\/[^/]+$/);
+  await expect(page.getByText("succeeded").first()).toBeVisible({
     timeout: RUN_TIMEOUT_MS,
   });
+  // Both steps report Done on their run-density cards.
+  await expect(page.getByText("Done", { exact: true })).toHaveCount(2, {
+    timeout: 30_000,
+  });
+
+  // Step drawer: the tool step's ledger instance with its persisted snapshot.
+  await page
+    .locator('[data-testid="step-card"][data-step-kind="tool"] button')
+    .first()
+    .click();
+  const instance = page.getByTestId("step-instance");
+  await expect(instance.first()).toBeVisible();
+  await expect(instance.first()).toContainText("Done");
+  await page.keyboard.press("Escape");
+
+  // ── outside the browser: the stub MCP server really got the rendered call ──
+  const calls = (await (
+    await page.request.get(`${REGISTRY_STUB_BASE_URL}/__calls`)
+  ).json()) as { calls: { name: string; args: { note?: string } }[] };
+  const note = calls.calls.find(
+    (call) =>
+      call.name === "save_note" &&
+      (call.args.note ?? "").includes(FORM_EMAIL) &&
+      (call.args.note ?? "").includes(FORM_MESSAGE),
+  );
+  expect(note, "stub MCP never received the rendered save_note call").toBeTruthy();
 });
 
 test("copilot edit: apply one suggestion, dismiss the other — the dismissal never touches the draft and reaches the model", async ({
@@ -159,32 +196,36 @@ test("copilot edit: apply one suggestion, dismiss the other — the dismissal ne
 }) => {
   await signUpIntoWorkspace(page, "copilot-edit");
 
-  // An existing workflow: manual trigger + real instructions.
+  // An existing PUBLISHED pipeline: manual trigger + one state step.
   await openNewWorkflow(page, "Copilot edit workflow");
-  await writePlainInstructions(page, EDIT_BASE_INSTRUCTIONS);
-  const triggerTypes = page.getByRole("radiogroup", { name: "Trigger type" });
-  await expect(triggerTypes.getByRole("radio", { name: "Manual" })).toHaveAttribute(
-    "aria-checked",
-    "true",
-  );
+  await addFirstStep(page, "State");
+  await expect(page.getByText("Saving…")).toBeHidden();
+  await publishWorkflow(page);
 
-  await openCopilotAndSend(page, EDIT_PROMPT);
-
-  // ── proposal 1: instructions diff — APPLY ───────────────────────────────────
-  const instructionsCard = page.getByRole("group", {
-    name: "Suggestion: Rewrite instructions",
-  });
-  await expect(instructionsCard).toBeVisible();
-  const diff = instructionsCard.getByTestId("diff-view");
-  await expect(diff).toBeVisible();
-  await expect(diff.locator('[data-diff="add"]').last()).toContainText(
-    "explicit approval",
-  );
-  await instructionsCard.getByRole("button", { name: "Apply" }).click();
-  // Applied through the builder controller: the rich editor shows it.
+  // Publishing mid-session must not flip the live switch (it started ON for
+  // the never-published draft)…
   await expect(
-    page.getByRole("textbox", { name: "Instructions editor" }),
-  ).toContainText("explicit approval");
+    page.getByRole("switch", { name: "Auto-apply edits" }),
+  ).toHaveAttribute("aria-checked", "true");
+  // …but a fresh mount of the PUBLISHED surface defaults it OFF.
+  await page.reload();
+  await expect(
+    page.getByRole("switch", { name: "Auto-apply edits" }),
+  ).toHaveAttribute("aria-checked", "false");
+
+  await sendWorkflowCopilotMessage(page, EDIT_PROMPT);
+
+  // ── proposal 1: a new state step — APPLY ────────────────────────────────────
+  const addCard = page.getByRole("group", {
+    name: `Suggestion: Add step: ${EDIT_ADDED_STEP_NAME}`,
+  });
+  await expect(addCard).toBeVisible();
+  await addCard.getByRole("button", { name: "Apply" }).click();
+  await expect(
+    page.getByRole("button", {
+      name: `${EDIT_ADDED_STEP_NAME} — State step`,
+    }),
+  ).toBeVisible();
 
   // ── proposal 2: schedule trigger — DISMISS ──────────────────────────────────
   const scheduleCard = page.getByRole("group", {
@@ -199,40 +240,31 @@ test("copilot edit: apply one suggestion, dismiss the other — the dismissal ne
     page.getByTestId("suggestion-receipt").filter({ hasText: "Dismissed" }),
   ).toContainText("Set trigger: Schedule");
 
-  // The dismissed mutation did NOT touch the draft — the live Trigger section
-  // still shows Manual.
-  await expect(triggerTypes.getByRole("radio", { name: "Manual" })).toHaveAttribute(
-    "aria-checked",
-    "true",
-  );
-  await expect(triggerTypes.getByRole("radio", { name: "Schedule" })).toHaveAttribute(
-    "aria-checked",
-    "false",
-  );
+  // The dismissed mutation did NOT touch the draft — the TriggerCard summary
+  // still reads Manual.
+  await expect(page.getByTestId("trigger-card")).toContainText("Manual");
+  await expect(page.getByTestId("trigger-card")).not.toContainText("Schedule");
 
   // The model received both outcomes as tool results — the scripted fake's
-  // closing message echoes them verbatim. Scoped to the thread log — the
-  // dock's sr-only announcer repeats settled messages.
+  // closing message echoes them verbatim. Scoped to the thread log.
   const thread = page.getByRole("log", { name: "Copilot conversation" });
   await expect(
-    thread.getByText(/setInstructions: accepted — the user applied/),
+    thread.getByText(/addStep: accepted — the user applied/),
   ).toBeVisible();
   await expect(
     thread.getByText(/setTrigger: rejected — the user dismissed this proposal/),
   ).toBeVisible();
 
-  // Persisted state agrees: after autosave + reload, the applied instructions
-  // survive and the trigger is still Manual.
+  // Persisted state agrees: after autosave + reload, the applied step
+  // survives and the trigger is still Manual.
   await expect(page.getByText("Saving…")).toBeHidden();
   await page.reload();
   await expect(
-    page
-      .getByRole("radiogroup", { name: "Trigger type" })
-      .getByRole("radio", { name: "Manual" }),
-  ).toHaveAttribute("aria-checked", "true");
-  await expect(
-    page.getByRole("textbox", { name: "Instructions editor" }),
-  ).toContainText("explicit approval");
+    page.getByRole("button", {
+      name: `${EDIT_ADDED_STEP_NAME} — State step`,
+    }),
+  ).toBeVisible();
+  await expect(page.getByTestId("trigger-card")).toContainText("Manual");
 });
 
 test("copilot on the agent surface: a setPersona diff card applies into the persona editor", async ({

@@ -30,7 +30,10 @@ import { Route as AppSettingsMembersRouteImport } from './routes/_app.settings.m
 import { Route as AppSettingsIntegrationsRouteImport } from './routes/_app.settings.integrations'
 import { Route as AppSettingsAllowlistRouteImport } from './routes/_app.settings.allowlist'
 import { Route as AppAgentsAgentIdRouteImport } from './routes/_app.agents.$agentId'
+import { Route as AppWorkflowsWorkflowIdIndexRouteImport } from './routes/_app.workflows.$workflowId.index'
+import { Route as AppWorkflowsWorkflowIdRunsRouteImport } from './routes/_app.workflows.$workflowId.runs'
 import { Route as AppContextSkillsSkillIdRouteImport } from './routes/_app.context.skills.$skillId'
+import { Route as AppWorkflowsWorkflowIdRunsRunIdRouteImport } from './routes/_app.workflows.$workflowId.runs.$runId'
 
 const SignupRoute = SignupRouteImport.update({
   id: '/signup',
@@ -137,11 +140,29 @@ const AppAgentsAgentIdRoute = AppAgentsAgentIdRouteImport.update({
   path: '/$agentId',
   getParentRoute: () => AppAgentsRoute,
 } as any)
+const AppWorkflowsWorkflowIdIndexRoute =
+  AppWorkflowsWorkflowIdIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => AppWorkflowsWorkflowIdRoute,
+  } as any)
+const AppWorkflowsWorkflowIdRunsRoute =
+  AppWorkflowsWorkflowIdRunsRouteImport.update({
+    id: '/runs',
+    path: '/runs',
+    getParentRoute: () => AppWorkflowsWorkflowIdRoute,
+  } as any)
 const AppContextSkillsSkillIdRoute = AppContextSkillsSkillIdRouteImport.update({
   id: '/skills/$skillId',
   path: '/skills/$skillId',
   getParentRoute: () => AppContextRoute,
 } as any)
+const AppWorkflowsWorkflowIdRunsRunIdRoute =
+  AppWorkflowsWorkflowIdRunsRunIdRouteImport.update({
+    id: '/$runId',
+    path: '/$runId',
+    getParentRoute: () => AppWorkflowsWorkflowIdRunsRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -159,12 +180,15 @@ export interface FileRoutesByFullPath {
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
-  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRouteWithChildren
   '/agents/': typeof AppAgentsIndexRoute
   '/context/': typeof AppContextIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
   '/workflows/': typeof AppWorkflowsIndexRoute
   '/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
+  '/workflows/$workflowId/runs': typeof AppWorkflowsWorkflowIdRunsRouteWithChildren
+  '/workflows/$workflowId/': typeof AppWorkflowsWorkflowIdIndexRoute
+  '/workflows/$workflowId/runs/$runId': typeof AppWorkflowsWorkflowIdRunsRunIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -178,12 +202,14 @@ export interface FileRoutesByTo {
   '/settings/members': typeof AppSettingsMembersRoute
   '/settings/models': typeof AppSettingsModelsRoute
   '/settings/workspace': typeof AppSettingsWorkspaceRoute
-  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
   '/agents': typeof AppAgentsIndexRoute
   '/context': typeof AppContextIndexRoute
   '/settings': typeof AppSettingsIndexRoute
   '/workflows': typeof AppWorkflowsIndexRoute
   '/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
+  '/workflows/$workflowId/runs': typeof AppWorkflowsWorkflowIdRunsRouteWithChildren
+  '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdIndexRoute
+  '/workflows/$workflowId/runs/$runId': typeof AppWorkflowsWorkflowIdRunsRunIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -203,12 +229,15 @@ export interface FileRoutesById {
   '/_app/settings/members': typeof AppSettingsMembersRoute
   '/_app/settings/models': typeof AppSettingsModelsRoute
   '/_app/settings/workspace': typeof AppSettingsWorkspaceRoute
-  '/_app/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
+  '/_app/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRouteWithChildren
   '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/context/': typeof AppContextIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
   '/_app/workflows/': typeof AppWorkflowsIndexRoute
   '/_app/context/skills/$skillId': typeof AppContextSkillsSkillIdRoute
+  '/_app/workflows/$workflowId/runs': typeof AppWorkflowsWorkflowIdRunsRouteWithChildren
+  '/_app/workflows/$workflowId/': typeof AppWorkflowsWorkflowIdIndexRoute
+  '/_app/workflows/$workflowId/runs/$runId': typeof AppWorkflowsWorkflowIdRunsRunIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -234,6 +263,9 @@ export interface FileRouteTypes {
     | '/settings/'
     | '/workflows/'
     | '/context/skills/$skillId'
+    | '/workflows/$workflowId/runs'
+    | '/workflows/$workflowId/'
+    | '/workflows/$workflowId/runs/$runId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -247,12 +279,14 @@ export interface FileRouteTypes {
     | '/settings/members'
     | '/settings/models'
     | '/settings/workspace'
-    | '/workflows/$workflowId'
     | '/agents'
     | '/context'
     | '/settings'
     | '/workflows'
     | '/context/skills/$skillId'
+    | '/workflows/$workflowId/runs'
+    | '/workflows/$workflowId'
+    | '/workflows/$workflowId/runs/$runId'
   id:
     | '__root__'
     | '/'
@@ -277,6 +311,9 @@ export interface FileRouteTypes {
     | '/_app/settings/'
     | '/_app/workflows/'
     | '/_app/context/skills/$skillId'
+    | '/_app/workflows/$workflowId/runs'
+    | '/_app/workflows/$workflowId/'
+    | '/_app/workflows/$workflowId/runs/$runId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -436,12 +473,33 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAgentsAgentIdRouteImport
       parentRoute: typeof AppAgentsRoute
     }
+    '/_app/workflows/$workflowId/': {
+      id: '/_app/workflows/$workflowId/'
+      path: '/'
+      fullPath: '/workflows/$workflowId/'
+      preLoaderRoute: typeof AppWorkflowsWorkflowIdIndexRouteImport
+      parentRoute: typeof AppWorkflowsWorkflowIdRoute
+    }
+    '/_app/workflows/$workflowId/runs': {
+      id: '/_app/workflows/$workflowId/runs'
+      path: '/runs'
+      fullPath: '/workflows/$workflowId/runs'
+      preLoaderRoute: typeof AppWorkflowsWorkflowIdRunsRouteImport
+      parentRoute: typeof AppWorkflowsWorkflowIdRoute
+    }
     '/_app/context/skills/$skillId': {
       id: '/_app/context/skills/$skillId'
       path: '/skills/$skillId'
       fullPath: '/context/skills/$skillId'
       preLoaderRoute: typeof AppContextSkillsSkillIdRouteImport
       parentRoute: typeof AppContextRoute
+    }
+    '/_app/workflows/$workflowId/runs/$runId': {
+      id: '/_app/workflows/$workflowId/runs/$runId'
+      path: '/$runId'
+      fullPath: '/workflows/$workflowId/runs/$runId'
+      preLoaderRoute: typeof AppWorkflowsWorkflowIdRunsRunIdRouteImport
+      parentRoute: typeof AppWorkflowsWorkflowIdRunsRoute
     }
   }
 }
@@ -496,13 +554,44 @@ const AppSettingsRouteWithChildren = AppSettingsRoute._addFileChildren(
   AppSettingsRouteChildren,
 )
 
+interface AppWorkflowsWorkflowIdRunsRouteChildren {
+  AppWorkflowsWorkflowIdRunsRunIdRoute: typeof AppWorkflowsWorkflowIdRunsRunIdRoute
+}
+
+const AppWorkflowsWorkflowIdRunsRouteChildren: AppWorkflowsWorkflowIdRunsRouteChildren =
+  {
+    AppWorkflowsWorkflowIdRunsRunIdRoute: AppWorkflowsWorkflowIdRunsRunIdRoute,
+  }
+
+const AppWorkflowsWorkflowIdRunsRouteWithChildren =
+  AppWorkflowsWorkflowIdRunsRoute._addFileChildren(
+    AppWorkflowsWorkflowIdRunsRouteChildren,
+  )
+
+interface AppWorkflowsWorkflowIdRouteChildren {
+  AppWorkflowsWorkflowIdRunsRoute: typeof AppWorkflowsWorkflowIdRunsRouteWithChildren
+  AppWorkflowsWorkflowIdIndexRoute: typeof AppWorkflowsWorkflowIdIndexRoute
+}
+
+const AppWorkflowsWorkflowIdRouteChildren: AppWorkflowsWorkflowIdRouteChildren =
+  {
+    AppWorkflowsWorkflowIdRunsRoute:
+      AppWorkflowsWorkflowIdRunsRouteWithChildren,
+    AppWorkflowsWorkflowIdIndexRoute: AppWorkflowsWorkflowIdIndexRoute,
+  }
+
+const AppWorkflowsWorkflowIdRouteWithChildren =
+  AppWorkflowsWorkflowIdRoute._addFileChildren(
+    AppWorkflowsWorkflowIdRouteChildren,
+  )
+
 interface AppWorkflowsRouteChildren {
-  AppWorkflowsWorkflowIdRoute: typeof AppWorkflowsWorkflowIdRoute
+  AppWorkflowsWorkflowIdRoute: typeof AppWorkflowsWorkflowIdRouteWithChildren
   AppWorkflowsIndexRoute: typeof AppWorkflowsIndexRoute
 }
 
 const AppWorkflowsRouteChildren: AppWorkflowsRouteChildren = {
-  AppWorkflowsWorkflowIdRoute: AppWorkflowsWorkflowIdRoute,
+  AppWorkflowsWorkflowIdRoute: AppWorkflowsWorkflowIdRouteWithChildren,
   AppWorkflowsIndexRoute: AppWorkflowsIndexRoute,
 }
 

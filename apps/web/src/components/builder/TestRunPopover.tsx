@@ -16,10 +16,11 @@
 import { Link } from "@tanstack/react-router";
 import { Check, ExternalLink, Play, Rocket } from "lucide-react";
 import { useState } from "react";
+import { z } from "zod";
 import {
-  createSessionResponseSchema,
-  type CreateSessionResponse,
+  runDtoSchema,
   type FormField,
+  type RunDto,
   type RunWorkflowRequest,
   type TriggerConfig,
 } from "@invisible-string/shared";
@@ -35,21 +36,23 @@ import { Switch } from "../ui/Switch";
 import { Textarea } from "../ui/Textarea";
 import { useToast } from "../ui/Toast";
 
-// ── endpoint (Stage-3 route: POST .../workflows/:wfId/run) ──────────────────
+// ── endpoint (POST .../workflows/:wfId/run) ─────────────────────────────────
 //
-// Body: the shared `runWorkflowRequestSchema` contract. The server answers
-// the same `{session, run}` envelope as chat session creation
-// (`CreateSessionResponse` in packages/shared) — a test run IS a dispatched
-// run riding the shared trigger path.
+// Body: the shared `runWorkflowRequestSchema` contract. A pipeline run has NO
+// session, so the server answers `{run}` alone (201) — the step timeline
+// streams over `GET /runs/:id/stream` and renders in the Runs tab.
+
+const runWorkflowResponseSchema = z.object({ run: runDtoSchema });
+export type RunWorkflowResponse = z.infer<typeof runWorkflowResponseSchema>;
 
 export function runWorkflow(
   workspaceId: string,
   workflowId: string,
   body: RunWorkflowRequest,
-): Promise<CreateSessionResponse> {
+): Promise<RunWorkflowResponse> {
   return api.post(
     `/workspaces/${workspaceId}/workflows/${workflowId}/run`,
-    createSessionResponseSchema,
+    runWorkflowResponseSchema,
     { body },
   );
 }
@@ -68,6 +71,8 @@ export interface TestRunPopoverProps {
   canPublish: boolean;
   publishPending: boolean;
   onPublish: () => void | Promise<unknown>;
+  /** Fired with the created run (the editor overlays it on the strip). */
+  onStarted?: ((run: RunDto) => void) | undefined;
   /** Test seam — defaults to the real endpoint call. */
   runFn?: typeof runWorkflow;
 }
@@ -98,6 +103,7 @@ function TestRunBody({
   canPublish,
   publishPending,
   onPublish,
+  onStarted,
   runFn = runWorkflow,
 }: TestRunPopoverProps) {
   const { toast } = useToast();
@@ -106,7 +112,7 @@ function TestRunBody({
   const [fieldValues, setFieldValues] = useState<Record<string, unknown>>({});
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [started, setStarted] = useState<CreateSessionResponse | null>(null);
+  const [started, setStarted] = useState<RunWorkflowResponse | null>(null);
 
   const needsPublish = !isPublished || isDirty;
 
@@ -144,7 +150,11 @@ function TestRunBody({
     try {
       const response = await runFn(workspaceId, workflowId, body);
       setStarted(response);
-      toast({ variant: "success", message: "Run started — it streams in Chat." });
+      onStarted?.(response.run);
+      toast({
+        variant: "success",
+        message: "Run started — follow it on the pipeline.",
+      });
     } catch (cause) {
       setError(
         cause instanceof ApiError
@@ -164,15 +174,15 @@ function TestRunBody({
           <p className="text-[13px] font-medium text-ink">Run started</p>
         </div>
         <p className="text-[12.5px] leading-relaxed text-ink-3">
-          It's dispatching through the real trigger path — follow it live in
-          Chat.
+          It's dispatching through the real trigger path — follow the step
+          timeline in the Runs tab.
         </p>
         <Link
-          to="/chat"
-          search={{ session: started.session.id }}
+          to="/workflows/$workflowId/runs/$runId"
+          params={{ workflowId, runId: started.run.id }}
           className="lift inline-flex items-center justify-center gap-1.5 rounded-capsule bg-ink px-4 py-2 text-[13px] font-medium text-white"
         >
-          View in Chat <ExternalLink size={12} aria-hidden="true" />
+          View run <ExternalLink size={12} aria-hidden="true" />
         </Link>
       </div>
     );

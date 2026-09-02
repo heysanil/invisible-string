@@ -18,6 +18,7 @@
  * IS the agent's name and repeating it would be noise.
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, waitFor, within } from "@testing-library/react";
@@ -320,8 +321,11 @@ test("sending enters the thread while the session is still being created", async
       },
     }),
   );
+  // `expectAbsent`, not `expect(...).toBeNull()`: a failed poll must not
+  // hand a happy-dom node to bun's expect (src/test/dom.ts — 2.2 s per
+  // failed poll, which is how this test timed out on CI).
   await waitFor(() =>
-    expect(view.queryByText(/Starting Executive assistant/)).toBeNull(),
+    expectAbsent(() => view.queryByText(/Starting Executive assistant/), "the Starting affordance"),
   );
 });
 

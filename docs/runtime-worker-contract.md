@@ -7,10 +7,12 @@ packages/compiler). The end-to-end proof is
 
 Agents-first (2026-07-10 redesign): the **Agent is the compile unit** — an
 **agent version** (immutable published snapshot, identified by content hash)
-is what gets built, stored, ensured, and dispatched. Workflows are standing
-delegations (trigger → agent → instructions) and compile NOTHING; compiled
-agents expose only eve's default channel, and every dispatch path speaks
-eve's session API.
+is what gets built, stored, ensured, and dispatched. Workflows are pipelines
+(trigger → steps; the 2026-08-31 workflow-pipelines spec) and compile
+NOTHING: the control plane interprets them in-process, and only two things
+ever speak eve's session API against a worker — chat sessions and a
+pipeline's **`agent` steps**, which dispatch child runs through the machinery
+this document describes. Compiled agents expose only eve's default channel.
 
 ## Worker HTTP surface the control plane calls
 
@@ -56,8 +58,9 @@ is useless against any other agent version. Compiled channels verify via
 eve's `verifyJwtHmac`.
 
 Used today by the control plane (this is the ONLY dispatch surface — there
-are no per-trigger channels; chat, webhook, form, Slack, schedule, and manual
-"Run now" all speak eve's session API):
+are no per-trigger channels; chat sessions and pipeline `agent` steps are its
+two callers — webhook, form, Slack, schedule, and manual "Run now" reach it
+only through an `agent` step's child run):
 
 ### eve session API v2 — ID-addressed (eve 0.31)
 
@@ -71,7 +74,7 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
 
 | Call (through `<worker>/agents/<hash>`) | Body | Answer |
 |---|---|---|
-| `POST .../eve/v1/session` | `{message}` (+ optional `mode`, `capabilities`) | **202** `{ok, sessionId, status:"accepted"}` + `x-eve-session-id` |
+| `POST .../eve/v1/session` | `{message}` (+ optional `mode`, `capabilities`, `outputSchema`) | **202** `{ok, sessionId, status:"accepted"}` + `x-eve-session-id` |
 | `POST .../eve/v1/session/:id` | `{message}` **XOR** `{inputResponses:[{requestId,optionId?,text?}]}` | 202 `{ok, sessionId, status:"accepted"}` · **409** `{ok:false, code:"session_not_active"}` |
 | `POST .../eve/v1/session/:id/cancel` | optional `{turnId}` | 202 `{…status:"accepted"}` · 200 `{…status:"no_active_turn"}` |
 | `POST .../eve/v1/session/:id/clear` | optional, empty | 202 `accepted` · 200 `no_active_session` |
@@ -91,7 +94,8 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
   `no_active_session` (clear/compact/reset). So a 200 there carries the same
   terminal meaning as a 409 on send, and a 202 never proves a turn was
   stopped: a cancel against a live-but-idle session answers 202 `accepted`
-  (REPORT finding 24).
+  (REPORT finding 24) — which is why a Stop's remote obligation is met only
+  by eve's OWN stream (the confirmed cancel, below), never by that 202.
 - **Cancellation is cooperative**, at durable step boundaries: a tool call
   already in flight runs to completion and still emits its `action.result`;
   the turn then ends `turn.cancelled` → `session.waiting`, never
@@ -104,7 +108,15 @@ eve 0.31.3's shipped handlers); build bodies from them rather than by hand.
   `capabilities.requestInput` implies) parks on a deterministic Approve/Stop
   prompt carrying `kind: "session-limit"`; `task` skips the prompt and fails
   with `SESSION_TOKEN_LIMIT_REACHED`. A dispatch path with no human watching
-  wants the latter; a parked prompt nobody can answer hangs forever.
+  wants the latter; a parked prompt nobody can answer hangs forever. That is
+  exactly the split the platform ships: chat sessions and `session:"thread"`
+  continuations stay conversational, while a fresh `agent`-step child sends
+  `mode:"task"` — plus the step's declared `outputSchema`, which eve accepts
+  on create and answers with a `result.completed` event carrying the
+  schema-shaped payload (both live-proven, spike REPORT finding 36). Task
+  mode also TERMINATES the session on completion, and a follow-up send to a
+  completed task session is 202-and-dropped — never probe completion with a
+  send; read the child run row's status instead.
 - The **worker needs no change** for the four control routes: the proxy
   forwards all of `/eve/` generically, and the sandbox reaper's activity
   regex (`/^\/eve\/v1\/session\/([^/?]+)/`, `apps/worker/src/server.ts`)
@@ -221,7 +233,11 @@ authenticate by token/signature (no session):
   ONCE at mint) is SHA-256-hashed and matched against `triggers.token_hash`
   (constant-time indexed lookup; plaintext is never stored). Per-token +
   per-IP rate limits and a 256 KiB payload cap run BEFORE parsing. → 202
-  `{accepted, runId, sessionId}`.
+  `{accepted: true, runId}` (pipeline runs have no session) or 202
+  `{accepted: false, reason: "overlap_skipped"}` when the workflow's
+  `overlap: "skip"` policy dropped the event because a run is still live — a
+  2xx on purpose: the sender did nothing wrong. The idempotency cache stores
+  `{runId}`.
 - `POST /integrations/slack/events` — Slack Events API. Missing auth headers,
   per-IP rate limit, and a 256 KiB body cap are checked BEFORE the HMAC;
   signature (`v0` HMAC) + 5-min replay window next; `event_id` dedup makes
@@ -229,42 +245,424 @@ authenticate by token/signature (no session):
   mention arrives as BOTH, with different event_ids) is dropped whenever the
   message text contains the bot mention ANYWHERE (Slack fires `app_mention`
   for mid-text mentions too — a leading-only check would double-dispatch
-  them); routed by `team_id` → integration → bound workflows;
-  `thread_ts ↔ agent_session` continuation via the indexed
-  `agent_sessions.slack_thread_key` column (partial unique per workflow — two
-  racing first-messages of a new thread resolve to one session, the loser's
-  `session_busy` is logged and dropped). A session that reaches a TERMINAL
-  status (closed/error) RELEASES its thread key (`markSession` nulls it, and
-  the new-session re-check evicts any legacy terminal holder), so the next
+  them); routed by `team_id` → integration → bound workflows. **A Slack
+  event always starts a NEW pipeline run** — thread continuity is the `agent`
+  step's `session: "thread"`, keyed by the thread key the ingress stamps into
+  `TriggerEvent.data.slackThreadKey`. The thread GATE decides whether a
+  binding dispatches at all: a reply in a thread that already has a claimed
+  session dispatches regardless of the binding (thread replies continue
+  conversations); a fresh thread must pass the binding check. The session
+  claim itself — the indexed `agent_sessions.slack_thread_key` column,
+  partial unique per workflow, advisory-locked so two racing first-messages
+  of a new thread resolve to one session — now lives inside the `agent`
+  step's dispatch (`dispatchRenderedRun`): a claimed thread session's PINNED
+  version takes the step's message as a follow-up turn; no claim yet mints a
+  fresh conversational session. A session that reaches a TERMINAL status
+  (closed/error) RELEASES its thread key (`markSession` nulls it, and the
+  new-session re-check evicts any legacy terminal holder), so the next
   message in that thread mints a fresh session instead of being silently
   dropped forever. Since 0.31 that release has a SECOND trigger — an eve 409
   `session_not_active` on a continue (below) — because the platform row can
   lag eve's terminal truth indefinitely. DMs (`channel_type: im`) key the
   session on the IM channel itself, so a 1:1 conversation keeps one ongoing
-  session without threading.
+  session without threading. A workflow-level `overlap: "skip"` drop is
+  logged, never silent.
 - `GET /integrations/slack/callback` — single platform Slack app OAuth
   redirect-back (state-signed); per-team bot token stored envelope-encrypted,
   keyed by `team_id`. The install kickoff is workspace-scoped:
   `GET /workspaces/:id/integrations/slack/install`.
 
-**Dispatch (agents-first contract, `runtime/dispatch.ts`).** Every non-chat
-path (webhook / form / Slack / schedule / manual "Run now") resolves the
-workflow's published snapshot + the delegated agent's CURRENT published
-version (FLOATING binding — a new session runs the agent's current version;
-a continuation always runs the session's PINNED version), renders the
-workflow's instructions against the event (`renderTaskMessage`,
-`packages/shared`) and sends THAT string as the eve session message —
-`createEveSession` for a new session, `continueEveSession` for a thread
-reply. **The `TriggerEvent` envelope is never sent to the agent**; it is
-persisted on the run purely as provenance (`runs.trigger_event`, alongside
-the rendered `task_message`). There is no compiled trigger channel and no
-per-trigger agent env.
+**Dispatch (pipeline contract, `runtime/dispatch.ts` + `src/pipeline/`).**
+Every non-chat path (webhook / form / Slack / schedule / manual "Run now")
+resolves the workflow's published pipeline config and starts a PIPELINE run
+(`startPipelineRun`): a `mode: 'pipeline'` `runs` row with no eve session,
+inserted inside the advisory-locked workspace-cap transaction before any
+execution, then interpreted in-process by the runner — a sequential driver
+over the `run_steps` ledger, appending `pipeline.*` events into `run_events`
+under the same monotonic `seq` as eve events (so the SSE surface below
+carries step timelines unchanged). Nothing touches a worker until the driver
+reaches an **`agent` step**, which calls **`dispatchRenderedRun`** — the
+extracted spine of the old trigger dispatch: worker selection → cap-locked
+child session+run rows → allowlist re-check → ensure-agent →
+`createEveSession`/`continueEveSession` → `startTail`. It takes an
+ALREADY-RENDERED message (the runner renders the step's instructions against
+the full run scope via `renderMarkdownTemplate`); the agent binding stays
+FLOATING — a fresh child session runs the bound agent's CURRENT published
+version, a `session: "thread"` continuation always runs the session's PINNED
+version. Fresh children send `mode: "task"` (+ the step's declared
+`outputSchema`); thread continuations stay conversational. **The
+`TriggerEvent` envelope is never sent to any agent**; it is persisted on the
+parent run purely as provenance (`runs.trigger_event` — its `agentId` is the
+nil-uuid `PIPELINE_TRIGGER_AGENT_ID` placeholder, since a pipeline binds
+agents per step). There is no compiled trigger channel and no per-trigger
+agent env.
+
+A child run parking `waiting` (HITL) parks the parent step and run with it;
+`POST /runs/:id/input` on the CHILD resumes the chain (the sessionless
+parent answers 409 `no_pending_input`). `POST /runs/:id/cancel` on a
+pipeline run cancels the driver cooperatively at the next step boundary and
+cancels any live child run. Crash recovery (`reconcileInterruptedRuns` →
+`recoverPipelineRuns`) re-adopts orphaned pipeline runs whose per-run
+advisory lock is free and REPLAYS the config against the ledger — terminal
+`run_steps` outputs rebuild the scope, only the frontier re-executes, and an
+interrupted agent step re-attaches to its child by `child_run_id` instead of
+double-dispatching. That adoption is NOT boot-only: the PERIODIC
+pipeline-recovery sweeper (`createPipelineRecoverySweeper`,
+`PIPELINE_RECOVERY_SWEEP_MS`, default 60 s — `pipeline/recovery.ts`, wired
+beside the other tickers in `index.ts`) re-runs the same sweep in a healthy
+process, so a queued/running/waiting pipeline run with no live driver — an
+orphan boot counted `locked` because the pipeline lock pool was exhausted,
+or whose driver died in another replica — is re-driven without a restart
+instead of holding its workspace-cap slot indefinitely. It is safe to run
+repeatedly because adoption is lock-gated (an acquirable per-run lock proves
+no live driver owns the run, and a run this process drives is skipped by its
+handle before any lock probe); the scan itself is advisory-try-locked so one
+replica sweeps per instant.
+
+**The per-run driver lock rides its OWN pool.** A session-level advisory lock
+pins one physical connection for the driver's whole lifetime (up to
+`PIPELINE_MAX_WALL_CLOCK_MS`), so it never reserves from the root pool — ten
+long concurrent pipelines used to pin all ten default root connections and
+every driver then blocked on its own ledger/status query, wedging the whole
+control plane. The lock reserves from the dedicated PIPELINE LOCK pool
+(`Db.$pipelineLockClient`, `DB_PIPELINE_LOCK_POOL_SIZE`, default 32 —
+`apps/control-plane/src/db.ts`), separate from the root pool AND from the
+session-dispatch lock pool (a pipeline burst must never starve a chat Stop's
+lock chase), with a BOUNDED reserve (`PIPELINE_LOCK_RESERVE_TIMEOUT_MS`).
+The pool therefore bounds concurrent pipeline runs per control plane, and
+exhaustion is a typed, transient, FAST refusal: `startPipelineRun` takes the
+lock BEFORE the run row exists (lock-before-claim on a pre-minted run id —
+the session-lock doctrine) and answers `{started:false,
+reason:"lock_pool_exhausted"}` with NOTHING created (no row, no cap slot, no
+delivery obligation). Webhook/form ingress and the manual "Run now" surface
+it as 503 `pipeline_lock_pool_exhausted`; a Slack message is dropped with a
+warning and a `failed` trigger count; a schedule window counts as a failed
+dispatch (its cursor already advanced); every refusal lands in
+`is_pipeline_dispatches_total{outcome="lock_pool_exhausted"}`. Boot adoption
+of an orphan on an exhausted pool defers to the next PERIODIC recovery sweep
+(`PIPELINE_RECOVERY_SWEEP_MS`, above — counted `locked`, logged
+`pipeline.recovery_lock_pool_exhausted`) — never a queue, never a failed
+run, and never "until the next restart". The runner refuses to fall back
+onto `$client`.
 
 **One run per eve session at a time (hole closed):** `waiting` (parked HITL)
 counts as busy alongside queued/running — a new message into a parked session
 is 409 `session_busy` ("answer the pending approval first"), and
 `POST /runs/:id/input` refuses while any OTHER run of the session is
-dispatching. Exactly one tail per eve NDJSON stream at any instant.
+dispatching. The HITL resume's own waiting→queued flip is a CAS on
+`status = 'waiting'` (a Stop that settled the row first makes it a 0-row
+update and the answer is 409 `no_pending_input`, never a resurrected `queued`
+run with a tail), and the resume re-checks terminality through the
+dispatch-attempt marker CAS after its ensure-agent boot, strictly before the
+continue — the same pre-eve fence every dispatch path uses. A CANCELED run
+whose dispatch may still be in flight also counts as busy on an EVELESS
+session (dispatch-attempt marker set, no eve id persisted yet): a Stop can
+settle a run terminal while its `createEveSession` is airborne, and admitting
+a new run in that window would open a second eve session on the row. The
+state resolves fast — the in-flight dispatch persists the id
+(persist-then-recheck), a failed call closes the session, the boot sweep
+handles a crash, and a dispatch that HOLDS the session's lock heals it inline
+(below). Exactly one tail per eve NDJSON stream at any instant.
+
+**Per-session dispatch critical section**
+(`apps/control-plane/src/runtime/session-lock.ts`): the row predicates above
+are individually correct but used to race as separate read-then-acts —
+successor admission, a canceled dispatch's abandon (successor count → maybe
+an unqualified eve cancel), and the boot sweep's eveless close. Every
+dispatch that will call eve for a session (chat create, follow-up,
+post-reset create, `session:"thread"` continuation, HITL resume) now holds
+that session's SESSION-level Postgres advisory lock — on a reserved
+postgres-js connection, the pipeline runner's per-run-lock mechanics — from
+before its admission/busy check through eve-return + id persist +
+terminal-recheck/abandon settlement (never across the tail). Admission takes
+the same lock, so no successor can be admitted mid-decision: the abandon
+always remote-cancels its own accepted turn (nothing leaks), and its
+unqualified session-level cancel can never land after a successor's turn
+started. The no-tail Stop's obligation settlement
+(`settleRemoteCancelGuarded`) try-acquires the lock and decides under it;
+when a dispatch holds the lock the settlement is DEFERRED into the
+background (never dropped — the holder's recheck may have read the run
+before the Stop settled it) and re-runs the same under-lock decision once
+the holder releases. The three context controls (clear/compact/reset) hold
+the lock too — from their quiet check through the eve call and the
+drain/settlement — so admission and a control never interleave. The lock is
+never held across a tail — the observation that follows a Stop included.
+The boot sweep
+skips a candidate whose lock is held and its guarded UPDATE re-asserts the
+ledger (`NOT EXISTS` a live run) atomically. Contention answers the
+transient `session_busy`; the lock dies with its connection on a crash, and
+the marker/busy-arm predicates remain as its crash-safe shadow.
+
+Four disciplines the lock's first cut violated, all now load-bearing:
+
+- **Its own pool.** The lock reserves a connection from a DEDICATED lock
+  pool (`Db.$lockClient`, `DB_LOCK_POOL_SIZE`, default 8 — `apps/control-
+  plane/src/db.ts`), never the root pool: a holder pins its connection for
+  the whole eve round-trip while its own admission/marker/persist queries
+  keep drawing from the root pool, and on one shared pool `max` concurrent
+  dispatches reserved every connection and each then waited for a `max+1`th
+  that could never come. `acquire()` is always called OUTSIDE any root-pool
+  transaction, the reserve wait is bounded
+  (`SESSION_LOCK_RESERVE_TIMEOUT_MS`), and a saturated lock pool reads as
+  contention — the transient `session_busy` — never as a queue. A waiter
+  WITH a wait budget (the deferred remote-cancel chase, bounded at minutes)
+  does not give up on one reserve timeout: it backs off (up to 1 s) and
+  reserves again until its deadline, so a chase genuinely spans its bound.
+  The pipeline runner's per-run lock is the OTHER long-held family and has
+  its own, separate pool (`DB_PIPELINE_LOCK_POOL_SIZE`, above) — the two are
+  kept apart so neither burst can starve the other.
+- **Lock-before-claim, CAS everywhere.** A NEW session's id is pre-minted
+  app-side so its lock is taken BEFORE the claim transaction: a lock timeout
+  creates nothing (the old post-claim acquisition failed the run and closed
+  the session WITHOUT the lock, and a follow-up holding it could then insert
+  a run from a stale snapshot and write the closed row back to `active`). A
+  continuation re-reads its session UNDER the lock before admitting a run —
+  a closed row answers the permanent `session_not_active`
+  (`session_not_continuable` on the chat route) — and every session status
+  write on the dispatch path is a CAS against a still-live row, never a
+  blind snapshot write.
+- **A holder is the exclusive owner.** A dispatch that holds the lock and
+  finds the session eveless with a terminal, marker-set newest run KNOWS no
+  dispatch is in flight (the lock proves it) and closes the abandoned row
+  inline (`healAbandonedEvelessSession`, releasing the thread claim; a fresh
+  slack dispatch heals an abandoned claim HOLDER the same way under the
+  holder's try-acquired lock) — answering the permanent 409 so the caller
+  mints a fresh session, instead of `session_busy` until a boot sweep
+  happened to find the lock free. The busy predicate's
+  canceled+marker-set+eveless arm therefore only bites callers that do NOT
+  hold the lock, and the sweep skipping a held lock is harmless.
+- **The remote cancel is CONFIRMED by eve's own stream — never inferred
+  locally, never taken from a 202.** Every local signal is forgeable: a
+  `running` status is synthesized when reconciliation re-tails an unsent
+  continuation; `run_events` under a run can be a predecessor's leftovers
+  drained by its first connect; and eve answers an UNQUALIFIED pre-turn
+  cancel with 202 while consuming it as a no-op (above). So the platform no
+  longer infers "eve accepted this turn" or "the turn was stopped" from any
+  of them. The proof is `runs.turn_id`, and it is attributed by CONTENT —
+  never by send order. eve's 202 carries no turn id, but its stream does
+  carry an exact correlator: every content turn opens with `turn.started
+  {turnId}` immediately followed by `message.received {message: <the exact
+  text sent>, turnId}`. The dispatch-attempt CAS therefore records
+  `runs.message_hash` = sha256 of the exact message handed to eve (the
+  digest only — chat text is never persisted; pipeline task messages
+  already are) beside the marker and the `turn_id` reset, so the three
+  columns always describe one send. The tail HOLDS a `turn.started`
+  (unpersisted, cursor not advanced — a drop re-reads it) until the next
+  event, then attributes: a `message.received` for that turn makes it a
+  CONTENT turn whose correlator is the hash of its message; anything else
+  makes it CONTENT-LESS — a HITL `inputResponses` resume opens with NO
+  `message.received` (`turn.started` straight to `step.started`, spike
+  fixture `mocked-resumed-events.ndjson`), and its sender's `message_hash`
+  is null. The claimants consulted are the session's CURRENT ones, never
+  a start-of-tail snapshot, and they come from ONE store read
+  (`RunStore.listSessionClaimants` — a single statement returning both the
+  open obligations and the live runs still awaiting their proof, so a run
+  is in exactly one list and never in neither): the tail reads it at every
+  turn opening (before the claimant search — the same snapshot serves the
+  obligation match and the live-successor lookup), every turn/session
+  boundary (before the owner match), its own settlement, and on the
+  manager's signal (`RunTailerManager.refreshSessionObligations` — sent by
+  the guarded settlement and by an `observe()` that found a live reader on
+  the session) — adopting rows it did not follow (a continuation Stopped
+  before its own tail started, whose turn would otherwise have been
+  persisted as FOREIGN because the reader's list predated the Stop; an
+  adopted row whose turn is already known gets its qualified cancel at once)
+  and dropping rows another actor cleared. Two reads (obligations first,
+  live runs later) had a window: a no-tail Stop committing between them
+  flipped the run from live to settled so it was in NEITHER result, its
+  already-open turn was classified foreign, and the obligation adopted
+  afterwards with a null id could neither be cancelled qualified nor cleared
+  on its boundary. Adoption is also RETROACTIVE: an obligation loaded or
+  adopted with a null turn id is matched against the session's persisted
+  unowned CONTENT turns (`RunStore.listUnownedContentTurns` — a
+  `message.received` on disk under any run of the session whose id no run
+  carries as `turn_id`, i.e. one classified foreign when it opened — by an
+  earlier reader, a crashed one, or this tail before the obligation
+  existed) under the same priority rules; a match writes `turn_id` and
+  issues the qualified cancel, or — the turn's own boundary is on disk too —
+  meets the obligation on the spot, so an obligation never waits for an
+  opening that has already gone by. Attribution, settlement and that refresh run on ONE
+  per-tail serial queue: a Stop (or the wall-clock cap, or shutdown) never
+  snapshots `ownTurnId` while an attribution's `setRunTurnId` is in flight —
+  it settles after the attribution completes, re-reads the row's `turn_id`
+  after finalizing, and issues the qualified cancel immediately when the id
+  is known by then. The claimant, in order: **(1)** the session's open obligation
+  whose `message_hash` equals the correlator (content-less turns match null
+  hashes) and whose turn has not started — pending obligations before
+  UNRESOLVED ones, oldest first within each (`RunStore.listSessionClaimants`);
+  **(2)** in follow mode, the tail's own run iff ITS `message_hash` equals
+  the correlator; **(3)** for content turns, a LIVE run on the session with
+  that hash and no `turn_id` yet (a successor admitted while an observation
+  tail held the stream — it gets its proof written and reads it from the
+  column); **(4)** otherwise the turn is FOREIGN: persisted, never
+  attributed, never cancelled, never classified as anyone's own. Send order
+  attributes nothing any more, content-less turns aside (among content-less
+  senders only): a never-sent obligation cannot steal a successor's turn
+  unless the two texts are identical — the documented residual (then the
+  oldest matching obligation wins). The id is written to the claimant's
+  `turn_id` BEFORE the held opening is persisted (`runs/tailer.ts`). eve
+  serializes turns, so any turn starting proves every attributed obligation
+  with another id over, and a turn attributed to a NEWER run (own, or a live
+  successor) proves every obligation on the session over. A Stop on a LIVE tail (`POST /runs/:id/cancel`, the pipeline child
+  sweep — `cancelAgentRun`) issues a turn-QUALIFIED cancel if the turn is
+  known (awaited, so its outcome is reported), sends NOTHING if not (the
+  no-op 202 above; the qualified cancel goes out the moment the run's own
+  `turn.started` is attributed), finalizes the row `canceled` WITH
+  `runs.remote_cancel_pending_at` in the SAME CAS (`finishRun` →
+  `RunStatusPatch.remoteCancelPendingAt` — one statement, never a second
+  UPDATE after the finalize, so a crash the instant the row reads canceled
+  finds the obligation already on it), and then STAYS on eve's stream in
+  OBSERVATION mode. No session lock is taken for a live-tail Stop any more:
+  the hold existed so an unqualified cancel could not land on a successor's
+  turn, and the live tail never sends one now; admission may reopen the
+  instant the row reads canceled. The obligation clears ONLY on: **(a)** the
+  run's own turn boundary after its own turn was attributed — `turn.cancelled` /
+  `turn.completed` carrying its turn id, or the following `session.waiting`
+  / `session.completed` (a `session.failed` is session-terminal and clears
+  every obligation); **(b)** a session-terminal answer from eve — 409
+  `session_not_active` / 200 `no_active_turn` on the cancel (the tail's
+  seam classifies both `terminal`), 409 `session_not_active` on a send
+  (`failEveDispatch`), 200 `no_active_session` on a context control, and a
+  `reset` — which RETIRES the id — or `no_active_session` on it
+  (`settleSessionRemoteCancelsTerminal`, unresolved rows included: every
+  obligation on a retired session is met); **(c)** a PROVEN successor — a
+  NEWER run on the session whose `turn_id` is set (`classifySessionSuccessor`:
+  that and nothing else; a `queued`/`running`/`waiting` status, a terminal
+  status, or persisted events without a `turn_id` are all unproven and
+  RETAIN the marker); **(d)** evidence already on disk — the send provably
+  never happened (marker null), the run's own turn boundary is already
+  persisted under it (a parked `waiting` run), or the eveless session was
+  closed. A transport failure of the qualified cancel RETAINS the marker
+  (observation retries it, and the boundary still confirms). Observation is
+  wall-clock bounded by `REMOTE_CANCEL_OBSERVE_MS` (default 10 min) from
+  `remote_cancel_pending_at`: on expiry the run is declared UNRESOLVED —
+  `runs.remote_cancel_unresolved_at` set, the pending marker KEPT, a warn
+  logged (`run.remote_cancel_unresolved`) — an explicit, visible residual,
+  never a silent clear; an unresolved obligation STAYS attributable (ranked
+  after every pending one, content match still required), so a late turn
+  matching its content is still cancelled qualified and its boundary clears
+  BOTH columns. The wall-clock cap (`MAX_RUN_WALL_CLOCK_MS`) and shutdown
+  owe the same confirmation: the tail settles the row `failed` WITH the
+  obligation in the same CAS — a qualified cancel if the turn is known,
+  NOTHING if not; the tail never sends an unqualified cancel for any cause
+  — then observes (the cap) or aborts for the next boot's sweeper
+  (shutdown); the obligation predicates are keyed on the marker alone, not
+  on `canceled`. ONE reader per eve stream, always: the manager keys tails by
+  session, detaches an observation tail when a successor's normal tail
+  starts on the same session (that tail carries the session's obligations
+  through its leftover drain — attributing the predecessor's turn by
+  content, issuing its qualified cancel, clearing on its boundary — before
+  it claims its own turn), refuses to open an observation on a session that
+  already has a tail, and the context controls (clear/compact/reset) count a
+  live observation tail as NOT quiet — 409 `session_busy`, retry once the
+  Stop settles — so their drain is never a second reader. That quiet check
+  is a read, so the controls HOLD the session dispatch lock around it
+  (routes.ts `withQuietSessionControl`: lock → re-read the row under it →
+  quiet check → eve call → drain/settlement → release; a bounded
+  `SESSION_LOCK_ADMISSION_WAIT_MS` try, contended → 409 `session_busy`):
+  admission takes the same lock, so a follow-up can no longer be admitted
+  and sent between "the session is quiet" and the drain attaching (two
+  cursor owners on one stream, the same `(run_id, seq)` written twice), and
+  a reset can no longer retire a session underneath a dispatch it has just
+  admitted. A crash ends the
+  observation, not the obligation: the no-tail
+  settlement (`settleRemoteCancelGuarded`, under the session lock) applies
+  (b)–(d) and otherwise RE-OPENS an observation tail from the run's
+  persisted seq on the session's affinity worker (`startObservation` — the
+  same primitive, never a normal tail, which would re-drive/misclassify a
+  canceled run), counted `observing` — and when the session already has a
+  LIVE tail in this process, that tail is SIGNALED to re-read the session's
+  obligations (`refreshSessionObligations`) and counted `observing` too.
+  Liveness is checked AT the handoff, never assumed from the manager's map:
+  a tail leaves the session's reader slot the instant it CLOSES — `close`
+  is the ONE exit transition, taken synchronously at the start of every
+  path out of a tail (`onClose`: observation closed or expired, a detach, a
+  settlement that aborts, the run's natural terminal, reconnect
+  exhaustion, a seizure), never when its `done` resolves, which can trail
+  the close by arbitrarily long (a hung reconnect);
+  `refreshSessionObligations` resolves false for a closed tail
+  (`RunTailHandle.refreshObligations` re-reads nothing then, and re-checks
+  after its re-read), and every caller treats false as "no reader" and
+  opens its own observer — `observe()` awaits the signal and, refused, opens
+  the observation itself. The one-reader invariant holds across that
+  handoff because a closed tail keeps HOLDING the stream until `done` (its
+  cursor is not released before): the manager parks it in the session's
+  draining list, chains the successor's tail (`chainBehind`) behind the
+  latest drainer exactly as it chains behind a detached observation, and
+  the context controls' quiet check (`isSessionStreamHeld`) counts a
+  draining tail as a reader. That chain wait is BOUNDED and the observer's
+  window is armed up front: a chained observation tail arms its
+  `REMOTE_CANCEL_OBSERVE_MS` deadline at CREATION (before the wait, before
+  its loads), so an expiry during the wait still declares the run
+  unresolved and releases the handle; and once the prior is closed the
+  successor waits at most `streamTakeoverMs` (`DEFAULT_STREAM_TAKEOVER_MS`,
+  5 s) for its `done`, then SEIZES it (`RunTailHandle.seize`: closed,
+  fenced so it consumes, attributes and writes nothing more even if its
+  hung connect or body yields later — and fenced BETWEEN STATEMENTS: from
+  the seizure on, every cursor- or attribution-affecting store call
+  (`appendEvent`, `setRunTurnId`, `clearRemoteCancelPending`, the claimant
+  and unowned-turn reads) is refused before it is issued, so at most the
+  ONE statement already in flight is outstanding) and then waits for its
+  in-flight handling to settle — bounded by the DERIVED write bound, never
+  a second fixed pause: `seizedWriteBoundMs` = the product DB's
+  `statement_timeout` (`DB_STATEMENT_TIMEOUT_MS`, a startup parameter on
+  every pool connection, default 30 s) + a margin (`DEFAULT_SEIZED_WRITE_
+  MARGIN_MS`, 5 s), after which that one statement is landed or dead
+  (`57014`). Only then does the successor read the persisted counts and
+  take the cursor over (`run.tail_takeover`, then `run.tail_takeover_
+  forced` if the prior never went idle — warn), so a write landing at the
+  last instant is in its cursor, never re-read and duplicated. Behind a
+  LIVE prior the wait stays unbounded — seizing a live reader would fail
+  its run, and two live tails on one session is what admission forbids.
+  The draining list is bounded on the same clock: a drain unreleased after
+  `streamTakeoverMs` is seized by the manager itself (`run.tail_drain_
+  seized`, warn — a session with no successor to chain behind it must not
+  stay stream-held), and a seized drain is EVICTED from the stream-holder
+  list once the write bound elapses whether or not its `done` ever
+  resolves (`run.tail_drain_evicted`, warn; it leaves `handles` too, so
+  `stopAll` never awaits it) — `isSessionStreamHeld` stops counting it, so
+  the context controls cannot answer `session_busy` forever on a hung
+  drain, and `MAX_DRAINING_TAILS_PER_SESSION` (8) backstops the list's
+  length by evicting the oldest. Before this, a tail exiting through its
+  natural terminal stayed in the reader slot until `done.finally` (a
+  settlement signal in that window was adopted by a tail about to return,
+  and the run had no reader until the next sweep), a chained observer
+  awaited a hung drain with no bound and armed its deadline only
+  afterwards — the session's live tail slot wedged until restart — and
+  then, once bounded, the successor proceeded after a second fixed 5 s
+  while the seized tail's stalled `appendEvent`/`setRunTurnId` could still
+  land later (a duplicate session event, a drifted cursor), and a seized
+  drain whose `done` never resolved held the session's stream forever;
+  nothing to act on (an armed eveless
+  session, no live worker) is `retained`; a held lock is `deferred`. The
+  post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a
+  run settled canceled while its eve call was in flight is `superseded`
+  only behind a proven successor, otherwise `observing` — obligation
+  re-asserted (`markRemoteCancelPending`, keeping the first timestamp) and
+  observation opened with the just-persisted session id; the old unqualified
+  cancel there is gone. Three actors finish what a live process could not,
+  all idempotent under the session lock via the under-lock marker re-read:
+  the in-process deferred settlement (bounded at
+  `SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS`, backing off across a saturated
+  lock pool), the PERIODIC remote-cancel sweep (`createRemoteCancelSweeper`,
+  `REMOTE_CANCEL_SWEEP_MS`, default 60 s — sweep 2b re-run with `defer:
+  false`, advisory-try-locked scan, skipping unresolved rows and declaring
+  aged ones unresolved), and boot reconciliation (sweep 2b after sweep 1's
+  normal re-tails and sweep 2's eveless closes). A Stop is therefore never
+  stranded until a restart — and never recorded as done on a guess.
+
+**Eveless create failed after arming (at-most-once residual):** when the eve
+call for a session with NO persisted eve id fails AFTER the dispatch-attempt
+marker was armed — a thrown transport error, and specifically a client-side
+timeout that can race eve's 202 — the create MAY have been accepted with the
+id lost forever. `failEveDispatch` therefore closes a still-eveless session
+on ANY terminal outcome (failed too, not just canceled), releasing its
+thread claim; the next message mints a FRESH session, never a second live
+turn on the poisoned row, and the possibly accepted turn runs to completion
+unobserved exactly once (the same documented at-most-once residual as the
+crash between marker write and id persist). Marker-null failures (the call
+provably never issued) and sessions that already carry an eve id are
+untouched — a failed follow-up never costs the user their thread.
 
 **Two 409s with OPPOSITE recoveries — never collapse them** (constants:
 `SESSION_BUSY_ERROR_CODE` / `SESSION_NOT_ACTIVE_ERROR_CODE` in
@@ -272,24 +670,26 @@ dispatching. Exactly one tail per eve NDJSON stream at any instant.
 
 | Code | Origin | Meaning | Recovery |
 |---|---|---|---|
-| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting | wait, retry; a racing Slack twin is logged and dropped |
-| `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
+| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, a just-canceled run's dispatch may still be in flight on an eveless session (as seen by a caller that does NOT hold the session lock), another dispatch holds the session's dispatch critical section (its eve call or settlement is in flight this instant), or the lock pool is saturated | wait, retry; a racing Slack twin is logged and dropped |
+| `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` — and the platform's own verdict when a continuation's session is re-read closed UNDER the dispatch lock, or a lock-holding dispatch heals an abandoned eveless session it was asked to continue (the chat route surfaces the same verdict as `session_not_continuable`) | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
 
 `session_not_active` is a semantic *widening* of the 0.19 busy 409, not a
 rename, and it is why eve's truth can diverge from `agent_sessions.status`
 indefinitely: the default 30-day `sessionTimeoutMs` emits `session.completed`
-into a stream nobody is tailing, and a `reset` retires the id — in both the
-platform row stays `active`/`waiting`. (A task-mode token-budget breach would
-be a third cause, but the control plane never sends eve's session `mode` on
-any dispatch path, so every session runs in eve's default conversation mode
-and parks on a `session-limit` input request rather than failing. That is
-deliberate: chat, webhook, form, Slack and schedule runs are all observable
-and answerable in chat, so a budget prompt always has a human who can reach
-it. Sending `mode: "task"` would turn those into hard failures.)
+into a stream nobody is tailing, a `reset` retires the id, and a fresh
+`agent`-step child's task-mode token-budget breach fails the session — in
+all of these the platform row can stay `active`/`waiting`. The mode split is
+deliberate: chat sessions and `session:"thread"` continuations are
+observable and answerable in chat, so they run conversational and park on a
+`session-limit` prompt a human can reach; a task-mode child nobody watches
+fails fast instead of hanging on a prompt forever.
 The status-driven Slack thread-key eviction alone can
 never fire for those rows, so the eve-driven eviction (a 409
 `session_not_active` on a continue) is the second release trigger and is what
-keeps a Slack thread from bricking forever.
+keeps a Slack thread from bricking forever. The `agent` step executor is the
+workflow-side consumer of both 409s: `session_busy` is its one transient
+retry; `session_not_active` evicts the dead thread claim so the retry mints
+a fresh session; a failed child turn is never retried.
 
 **Turn cancellation.** `POST /runs/:id/cancel` remains the single platform
 contract (there is deliberately no second session-scoped cancel route); it now
@@ -341,22 +741,29 @@ version's baked artifact, never from `model_presets` (see "Compiler seam").
 
 Slack replies are posted by the control plane, never by the agent
 (`runs/delivery.ts` — the compiled Slack channel + `SLACK_BOT_TOKEN` agent-env
-injection are gone):
+injection are gone), and since the pipeline redesign they are **explicit
+only** — a pipeline has no well-defined "final assistant message", so nothing
+is delivered unless the workflow's config says what:
 
-- dispatch marks slack-origin runs `delivery_status = pending` (born owing a
-  reply);
-- the run tailer's finished-hook posts the run's final assistant reply
-  (`message.completed` with `finishReason: "stop"`) as a threaded
-  `chat.postMessage` with the team's decrypted bot token, then settles the
-  marker (`delivered` / `failed` with a reason);
-- paths that mark a run terminal OUTSIDE the tailer hook (`failDispatch`, the
-  dispatch-time allowlist failure, cancel of an untailed run, the sweeper's
-  no-eve-session fail) call `deliver()` themselves, so the marker settles at
-  the moment of failure instead of lingering `pending`;
+- the ONE writer of `delivery_status = 'pending'` is the pipeline run
+  creator, for slack-origin PARENT runs whose config declares
+  `onComplete.slackReply` (agent-step CHILD runs never owe a reply; the old
+  implicit last-assistant-message delivery is removed with the v1 dispatch);
+- the pipeline runner's terminal path renders the `onComplete.slackReply`
+  template against the FINAL run scope and posts it as a threaded
+  `chat.postMessage` with the team's decrypted bot token (the thread target
+  comes off the envelope's `slackThreadKey`), then settles the marker
+  (`delivered` / `failed` with a reason);
+- paths that mark a pipeline run terminal OUTSIDE the runner (the cancel
+  route's orphan fallback, recovery's `failOutright`) call `deliver()`
+  themselves, so the marker settles at the moment of failure instead of
+  lingering `pending` (`deliver()` no-ops for runs owing nothing);
 - boot recovery (`reconcileInterruptedRuns` → `recoverPending`) finds
-  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal event
-  and post) recover the reply from persisted `run_events` and deliver late;
-  failed/canceled ones settle the ledger.
+  TERMINAL runs stuck `pending`: succeeded ones (crash between terminal
+  status and post) RE-RENDER the reply from the workflow's published
+  template + the scope rebuilt from the `run_steps` ledger
+  (`rebuildScopeSteps`) and deliver late; failed/canceled ones settle the
+  ledger.
 
 Semantics are **at-least-once** (documented residual): the Slack post happens
 before the marker flips, so a crash in between re-delivers on recovery. The
@@ -381,10 +788,13 @@ which workers never run (spike finding 6). Scheduling is a platform concern
   from NOW (**no backfill** — a control plane down over three windows fires
   ONCE, then resumes cadence) BEFORE dispatching. The advisory lock makes
   claims safe under concurrent tickers;
-- the dispatch is the ordinary workflow dispatch (origin/trigger type
-  `schedule`, `data.scheduledFor` = the window that fired, empty message —
-  the instructions carry the task). Scheduled runs are ordinary sessions and
-  can park on HITL approvals;
+- the dispatch is the ordinary pipeline start (`startPipelineRun`;
+  origin/trigger type `schedule`, `data.scheduledFor` = the window that
+  fired, empty message — the steps carry the task). Scheduled runs are
+  ordinary pipeline runs; an agent step's parked child can still park them on
+  HITL approvals. A workflow-level `overlap: "skip"` drop logs
+  `schedule.overlap_skipped` and, like a failure, never un-advances the
+  cursor;
 - a dispatch failure never un-advances the cursor (one failed run per window,
   never a hot loop); an unparseable cron clears `next_fire_at`, disarming the
   trigger until the next publish rewrites it.
@@ -419,9 +829,10 @@ database-per-version isolation below remains required (REPORT finding 26).
 
 **Hard constraint: at most one live agent process per version hash,
 fleet-wide.** Note the agents-first pivot CONCENTRATES load on this
-constraint: all of an agent's chat sessions AND all workflows delegating to
-it ride its one published version hash — one world DB, one writer. The
-platform enforces it operationally:
+constraint: all of an agent's chat sessions AND every workflow `agent` step
+delegating to it ride its one published version hash — one world DB, one
+writer (also why the pipeline runner executes `for_each` at concurrency 1).
+The platform enforces it operationally:
 
 - the scheduler prefers the warm worker for a hash (affinity → warm → cold),
   and in-flight placement RESERVATIONS (runtime/scheduler.ts) keep a burst of
@@ -513,8 +924,20 @@ Settings → Models says so on the panel. Design:
 `worker-token`), `LOG_LEVEL` (debug|info|warn|error, default info),
 `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
 `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
-(default 30000 — the schedule ticker's scan cadence), and the Slack app
-(`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
+(default 30000 — the schedule ticker's scan cadence), `REMOTE_CANCEL_SWEEP_MS`
+(default 60000 — the periodic pending-remote-cancel sweep's cadence),
+`REMOTE_CANCEL_OBSERVE_MS` (default 600000 — how long a Stop's obligation
+may await eve's own confirmation before it is declared unresolved),
+`PIPELINE_RECOVERY_SWEEP_MS` (default 60000 — the periodic interrupted-
+pipeline adoption sweep's cadence), the product-DB pools `DB_POOL_SIZE` (default 10), `DB_LOCK_POOL_SIZE` (default 8
+— the session-dispatch lock pool) and `DB_PIPELINE_LOCK_POOL_SIZE` (default
+32 — the per-run pipeline driver lock pool, which bounds concurrent pipeline
+runs per control plane), the pipeline runner's
+tuning knobs `PIPELINE_MAX_WALL_CLOCK_MS` (default 1800000 = 30 min per
+run), `PIPELINE_MAX_STEPS_PER_RUN` (default 200 executed step instances),
+`PIPELINE_MAX_STEP_OUTPUT_BYTES` (default 262144) and `PIPELINE_CHILD_POLL_MS`
+(default 5000 — the parked agent-step child-run poll cadence), and the Slack
+app (`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`,
 `SLACK_APP_REDIRECT_URL`, optional `SLACK_API_BASE_URL`).
 
 ## Phase-3 additions — scheduler pool, failover, per-worker identity
@@ -658,9 +1081,12 @@ in-flight proxied requests, stops its agents, then deregisters.
   Slack event dedup, and OAuth nonce single-use are all in-process. A second
   replica would double-tail runs (the (run_id, seq) PK then crash-loops one
   tail), double-sweep failovers, and split SSE subscribers from their run's
-  tail. (The schedule ticker alone IS multi-instance-safe — its claims ride
-  per-trigger advisory locks — but nothing else is.) HA needs leader
-  election / shared state first — do not scale this process horizontally.
+  tail. (The schedule ticker, the pipeline runner's run adoption — boot
+  and the periodic pipeline-recovery sweeper alike — and the remote-cancel
+  sweeper ARE multi-instance-safe in isolation — per-trigger, per-run and
+  per-session advisory locks — but nothing else is.) HA needs
+  leader election / shared state first — do not scale this process
+  horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface
   (register/heartbeat/deregister, `/internal/metrics`) and the agent-facing
   token broker (`/internal/connections/token`, platform-JWT-authed — see its

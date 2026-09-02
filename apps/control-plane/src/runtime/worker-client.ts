@@ -17,7 +17,8 @@
  * package; this module is the transport for them):
  *
  * ```
- * POST /eve/v1/session          {message}            → 202 {ok,sessionId,status:"accepted"}
+ * POST /eve/v1/session          {message, mode?, outputSchema?}
+ *                                                    → 202 {ok,sessionId,status:"accepted"}
  * POST /eve/v1/session/:id      {message} XOR {inputResponses}
  *                                                    → 202 {ok,sessionId,status:"accepted"}
  *                                                    → 409 {ok:false,code:"session_not_active"}
@@ -72,6 +73,7 @@ import {
   type EveCancelTurnResponse,
   type EveClearSessionResponse,
   type EveCompactSessionResponse,
+  type EveCreateSessionRequest,
   type EveResetSessionResponse,
   type EveSessionFollowUpRequest,
 } from "@invisible-string/shared";
@@ -158,11 +160,18 @@ export interface WorkerClient {
     contentHash: string,
     request: EnsureAgentRequest,
   ): Promise<void>;
+  /**
+   * Create an ID-addressed session with its first message. The request is the
+   * SHARED create contract ({@link EveCreateSessionRequest}): chat and thread
+   * continuations send `{message}` alone; a pipeline agent step's
+   * `session: "fresh"` child adds `mode: "task"` (+ `outputSchema` when the
+   * step declares one — spike finding 36).
+   */
   createEveSession(
     workerAddress: string,
     contentHash: string,
     jwt: string,
-    message: string,
+    request: EveCreateSessionRequest,
   ): Promise<EveSessionCreated>;
   /**
    * Follow up on an existing session (send XOR respond). Throws
@@ -379,7 +388,7 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
       }
     },
 
-    async createEveSession(workerAddress, contentHash, jwt, message) {
+    async createEveSession(workerAddress, contentHash, jwt, request) {
       const res = await doFetch(
         `${agentProxyBase(workerAddress, contentHash)}${EVE_SESSION_ROUTE_PATH}`,
         {
@@ -388,9 +397,10 @@ export function createWorkerClient(options: CreateWorkerClientOptions): WorkerCl
             authorization: `Bearer ${jwt}`,
             "content-type": "application/json",
           },
-          // Exactly `{message}` — create has no 409 path, and adding keys eve
-          // does not expect (notably `continuationToken`) is a hard 400.
-          body: JSON.stringify({ message }),
+          // The shared create contract, serialized as-is — create has no 409
+          // path, and keys eve does not expect (notably `continuationToken`)
+          // are a hard 400, so bodies are built ONLY from that strict shape.
+          body: JSON.stringify(request),
           signal: AbortSignal.timeout(timeoutMs),
         },
       );

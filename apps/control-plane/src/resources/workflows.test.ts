@@ -4,16 +4,19 @@
  *
  * - CRUD returns validator diagnostics next to the row (create/GET/PATCH),
  *   and workspace scoping 404s foreign rows.
+ * - list summaries surface the pipeline shape: `stepKinds` in document
+ *   order, and `agentName` only for SOLE-agent-step pipelines.
  * - publish gates on error diagnostics (422 workflow_validation_failed),
- *   then snapshots draft → published (+ publishedAgentId/publishedAt) and
- *   syncs the trigger row per type: schedule (cron + nextFireAt strictly
- *   after now), slack (binding RULES refreshed, integration pointer
- *   preserved), form (formSchema snapshot), webhook (minted token survives
- *   republish; a type switch clears it).
+ *   then snapshots draft → published WITHOUT writing `published_agent_id`
+ *   (amendment A1) and syncs the trigger row per type: schedule (cron +
+ *   nextFireAt strictly after now), slack (binding RULES refreshed,
+ *   integration pointer preserved), form (formSchema snapshot), webhook
+ *   (minted token survives republish; a type switch clears it).
  * - the enabled toggle mirrors onto the trigger row and sets/clears the
  *   schedule cursor.
- * - agent-staleness warnings on GET after the agent republishes without a
- *   referenced context resource.
+ * - staleness warnings on GET after a referenced agent unpublishes or a
+ *   referenced connection is disabled — the published snapshot stays
+ *   dispatchable throughout.
  * - loadPublishedWorkflow (the dispatch loader) guards published state.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -23,6 +26,7 @@ import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   newId,
+  newStepId,
   type GetWorkflowResponse,
   type SlackTriggerBinding,
 } from "@invisible-string/shared";
@@ -80,7 +84,8 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
 
   afterAll(async () => {
     if (handle) {
-      // workflows first: published_agent_id → agents is ON DELETE RESTRICT.
+      // workflows first: legacy rows' published_agent_id → agents is ON
+      // DELETE RESTRICT (the column survives unwritten, amendment A1).
       for (const org of [orgId, otherOrgId]) {
         await handle.db.delete(schema.workflows).where(eq(schema.workflows.organizationId, org));
         await handle.db.delete(schema.organization).where(eq(schema.organization.id, org));
@@ -95,42 +100,11 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
   async function createAgent(options: {
     name: string;
     published?: boolean;
-    connectionNames?: string[];
-    skillNames?: string[];
   }): Promise<{ agentId: string; versionId: string | null }> {
-    const mcpConnectionIds: string[] = [];
-    for (const name of options.connectionNames ?? []) {
-      const rows = await handle.db
-        .insert(schema.connections)
-        .values({
-          id: newId("cn"),
-          scope: "workspace",
-          organizationId: orgId,
-          name,
-          source: "custom",
-          url: "https://mcp.example.test/mcp",
-        })
-        .returning({ id: schema.connections.id });
-      mcpConnectionIds.push(rows[0]!.id);
-    }
-    const skillIds: string[] = [];
-    for (const name of options.skillNames ?? []) {
-      const rows = await handle.db
-        .insert(schema.skills)
-        .values({
-          scope: "workspace",
-          organizationId: orgId,
-          name,
-          content: `# ${name}`,
-        })
-        .returning({ id: schema.skills.id });
-      skillIds.push(rows[0]!.id);
-    }
-
     const definition = {
       persona: "You are a test agent.",
       model: { preset: "balanced", reasoning: "medium" },
-      context: { mcpConnectionIds, skillIds },
+      context: { mcpConnectionIds: [], skillIds: [] },
     };
     const agentRows = await handle.db
       .insert(schema.agents)
@@ -176,6 +150,31 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     return versionId;
   }
 
+  /** A workspace connection with a cached tool list (tool-step target). */
+  async function createConnection(options: {
+    name: string;
+    tools?: string[];
+  }): Promise<string> {
+    const rows = await handle.db
+      .insert(schema.connections)
+      .values({
+        id: newId("cn"),
+        scope: "workspace",
+        organizationId: orgId,
+        name: options.name,
+        source: "custom",
+        url: "https://mcp.example.test/mcp",
+        toolsCache: (options.tools ?? ["create_issue"]).map((name) => ({
+          name,
+          description: "",
+          params: [],
+        })),
+        toolsCachedAt: new Date(),
+      })
+      .returning({ id: schema.connections.id });
+    return rows[0]!.id;
+  }
+
   async function triggerRowOf(workflowId: string) {
     const rows = await handle.db
       .select()
@@ -185,12 +184,25 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     return rows[0] ?? null;
   }
 
+  /** v2 pipeline draft: one agent step delegating to `agentId`. */
   function draftFor(
     agentId: string | null,
     trigger: Record<string, unknown>,
     markdown = "Do the delegated thing.",
   ) {
-    return { trigger, agentId, instructions: { markdown } };
+    return {
+      version: 2,
+      trigger,
+      steps: [
+        {
+          id: newStepId(),
+          slug: "delegate",
+          kind: "agent",
+          agentId,
+          instructions: { markdown },
+        },
+      ],
+    };
   }
 
   // ── CRUD + diagnostics ─────────────────────────────────────────────────────
@@ -205,7 +217,7 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     expect(created.diagnostics!.every((d) => d.severity === "error")).toBeTrue();
   });
 
-  test("a valid draft against a published agent has zero diagnostics; list resolves agentName", async () => {
+  test("a valid draft against a published agent has zero diagnostics; list resolves agentName + stepKinds", async () => {
     const { agentId } = await createAgent({ name: "List Agent" });
     const created = await createWorkflow(deps, actor, {
       name: "Valid Draft",
@@ -217,7 +229,43 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     const summary = list.workflows.find((w) => w.id === created.workflow.id);
     expect(summary?.agentName).toBe("List Agent");
     expect(summary?.triggerType).toBe("webhook");
+    expect(summary?.stepKinds).toEqual(["agent"]);
     expect(summary?.publishedAt).toBeNull();
+  });
+
+  test("multi-step pipelines list their kind capsule and no agentName", async () => {
+    const { agentId } = await createAgent({ name: "Multi Agent" });
+    const connectionId = await createConnection({ name: "Linear Multi" });
+    const created = await createWorkflow(deps, actor, {
+      name: "Multi Step",
+      draft: {
+        version: 2,
+        trigger: { type: "webhook" },
+        steps: [
+          {
+            id: newStepId(),
+            slug: "create",
+            kind: "tool",
+            connectionId,
+            tool: "create_issue",
+            args: { title: { $ref: "trigger.title" } },
+          },
+          {
+            id: newStepId(),
+            slug: "delegate",
+            kind: "agent",
+            agentId,
+            instructions: { markdown: "Follow up." },
+          },
+        ],
+      },
+    });
+    expect(created.diagnostics).toEqual([]);
+
+    const list = await listWorkflows(deps, orgId);
+    const summary = list.workflows.find((w) => w.id === created.workflow.id);
+    expect(summary?.stepKinds).toEqual(["tool", "agent"]);
+    expect(summary?.agentName).toBeNull();
   });
 
   test("PATCH returns diagnostics for an unpublished agent; foreign org 404s", async () => {
@@ -228,7 +276,8 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     });
     expect(
       updated.diagnostics!.some(
-        (d) => d.path === "agentId" && d.message.includes("no published version"),
+        (d) =>
+          d.path === "steps.0.agentId" && d.message.includes("no published version"),
       ),
     ).toBeTrue();
 
@@ -256,13 +305,13 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
       const details = error.toBody().error.details as {
         diagnostics: { path: string; severity: string }[];
       };
-      expect(details.diagnostics.some((d) => d.path === "agentId")).toBeTrue();
+      expect(details.diagnostics.some((d) => d.path === "steps.0.agentId")).toBeTrue();
     }
     const after = await getWorkflow(deps, orgId, created.workflow.id);
     expect(after.workflow.published).toBeNull();
   });
 
-  test("publish snapshots draft → published and the dispatch loader reads it", async () => {
+  test("publish snapshots draft → published (no published_agent_id write) and the dispatch loader reads it", async () => {
     const { agentId } = await createAgent({ name: "Webhook Agent" });
     const draft = draftFor(agentId, { type: "webhook" }, "Handle @trigger.email fast.");
     const created = await createWorkflow(deps, actor, { name: "Webhook WF", draft });
@@ -272,21 +321,33 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
     ).rejects.toMatchObject({ code: "workflow_not_published" });
 
     const published = await publishWorkflow(deps, orgId, created.workflow.id);
-    expect(published.workflow.published).toMatchObject({ agentId });
+    expect(published.workflow.published).toMatchObject({
+      version: 2,
+      steps: [{ kind: "agent", agentId }],
+    });
     expect(published.workflow.publishedAt).not.toBeNull();
 
+    // Amendment A1: agents bind per STEP — the legacy denormalized column
+    // stays unwritten (its delete-protection role moved to the agent DELETE
+    // path's published-config scan).
     const row = (
       await handle.db
         .select()
         .from(schema.workflows)
         .where(eq(schema.workflows.id, created.workflow.id))
     )[0]!;
-    expect(row.publishedAgentId).toBe(agentId);
+    expect(row.publishedAgentId).toBeNull();
 
     const loaded = await loadPublishedWorkflow(handle.db, orgId, created.workflow.id);
-    expect(loaded.agentId).toBe(agentId);
     expect(loaded.config.trigger.type).toBe("webhook");
-    expect(loaded.config.instructions.markdown).toContain("@trigger.email");
+    const step = loaded.config.steps[0]!;
+    expect(step.kind).toBe("agent");
+    if (step.kind === "agent") {
+      expect(step.agentId).toBe(agentId);
+      expect(step.instructions.markdown).toContain("@trigger.email");
+      // Schema defaults are baked into the snapshot.
+      expect(step.session).toBe("fresh");
+    }
 
     const trigger = await triggerRowOf(created.workflow.id);
     expect(trigger).toMatchObject({ type: "webhook", enabled: true, cron: null });
@@ -420,40 +481,70 @@ describe.skipIf(!TEST_DATABASE_URL)("workflows — CRUD, publish, trigger sync",
 
   // ── staleness warnings ─────────────────────────────────────────────────────
 
-  test("agent republish stranding a @ref surfaces a warning on GET, never unpublishes", async () => {
-    const { agentId } = await createAgent({
-      name: "Context Agent",
-      connectionNames: ["Linear"],
-    });
+  test("an agent unpublishing after workflow publish surfaces warnings, never unpublishes", async () => {
+    const { agentId } = await createAgent({ name: "Staleness Agent" });
     const created = await createWorkflow(deps, actor, {
       name: "Staleness WF",
-      draft: draftFor(agentId, { type: "webhook" }, "File it via @linear."),
+      draft: draftFor(agentId, { type: "webhook" }),
     });
     await publishWorkflow(deps, orgId, created.workflow.id);
 
     const clean: GetWorkflowResponse = await getWorkflow(deps, orgId, created.workflow.id);
     expect(clean.diagnostics).toEqual([]);
 
-    // The agent republishes WITHOUT the connection in its context.
-    await publishAgentVersion(agentId, {
-      persona: "You are a test agent.",
-      model: { preset: "balanced", reasoning: "medium" },
-      context: { mcpConnectionIds: [], skillIds: [] },
-    });
+    // The agent unpublishes (its published version pointer is cleared).
+    await handle.db
+      .update(schema.agents)
+      .set({ publishedVersionId: null })
+      .where(eq(schema.agents.id, agentId));
 
     const stale = await getWorkflow(deps, orgId, created.workflow.id);
     const warnings = stale.diagnostics!.filter((d) => d.severity === "warning");
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]!).toMatchObject({ path: "published.instructions.markdown" });
-    expect(warnings[0]!.message).toContain('"@linear"');
-    // The draft (still referencing @linear) now fails validation as an error…
+    expect(warnings[0]!).toMatchObject({ path: "published.steps.0.agentId" });
+    expect(warnings[0]!.message).toContain("no longer published");
+    // The draft (still binding the agent) now fails validation as an error…
     expect(
       stale.diagnostics!.some(
-        (d) => d.severity === "error" && d.path === "instructions.markdown",
+        (d) => d.severity === "error" && d.path === "steps.0.agentId",
       ),
     ).toBeTrue();
     // …but the published snapshot stays dispatchable.
     const loaded = await loadPublishedWorkflow(handle.db, orgId, created.workflow.id);
-    expect(loaded.agentId).toBe(agentId);
+    expect(loaded.config.steps).toHaveLength(1);
+  });
+
+  test("a disabled connection behind a published tool step warns on GET", async () => {
+    const connectionId = await createConnection({ name: "Stale Linear" });
+    const created = await createWorkflow(deps, actor, {
+      name: "Tool Staleness WF",
+      draft: {
+        version: 2,
+        trigger: { type: "webhook" },
+        steps: [
+          {
+            id: newStepId(),
+            slug: "create",
+            kind: "tool",
+            connectionId,
+            tool: "create_issue",
+            args: {},
+          },
+        ],
+      },
+    });
+    await publishWorkflow(deps, orgId, created.workflow.id);
+
+    await handle.db
+      .update(schema.connections)
+      .set({ enabled: false })
+      .where(eq(schema.connections.id, connectionId));
+
+    const stale = await getWorkflow(deps, orgId, created.workflow.id);
+    const warnings = stale.diagnostics!.filter(
+      (d) => d.path === "published.steps.0.connectionId",
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.message).toContain("disabled");
   });
 });

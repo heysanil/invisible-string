@@ -47,6 +47,12 @@ const formTrigger: TriggerConfig = {
 
 const sources: ReferenceSources = {
   trigger: formTrigger,
+  steps: [
+    { slug: "search", name: "Search Slack", kind: "tool", outputHints: ["result", "text"] },
+    { slug: "summarize", name: null, kind: "infer", outputHints: ["text"] },
+  ],
+  stateKeys: ["cursor"],
+  item: true,
   connections: [
     { name: "Linear", description: "Issue tracker" },
     { name: "Google Drive" },
@@ -227,6 +233,9 @@ const PROSE: Record<string, string> = {
   hyphenated: "Attach @skill.release-notes to the run.",
   parenthesised: "See (@linear) for context.",
   adjacentPunctuation: "Ping @linear, then @google-drive; finally @trigger.topic!",
+  stepRef: "Read @steps.search.result.messages before writing.",
+  stateAndItem: "Compare @item.ts against @state.cursor.",
+  nowTruncates: "Stamp @now.date on it.",
 };
 
 for (const [name, markdown] of Object.entries(PROSE)) {
@@ -301,9 +310,55 @@ test("referenceNodeProblem flags what the sources cannot resolve", () => {
   expect(referenceNodeProblem("@linear", sources)).toBeNull();
   expect(referenceNodeProblem("@trigger.email", sources)).toBeNull();
   expect(referenceNodeProblem("@skill.release-notes", sources)).toBeNull();
+  expect(referenceNodeProblem("@steps.search.text", sources)).toBeNull();
+  expect(referenceNodeProblem("@state.cursor", sources)).toBeNull();
+  expect(referenceNodeProblem("@item", sources)).toBeNull();
+  expect(referenceNodeProblem("@now", sources)).toBeNull();
   expect(referenceNodeProblem("@notion", sources)).toContain("notion");
   expect(referenceNodeProblem("@trigger.nope", sources)).toContain("nope");
   expect(referenceNodeProblem("@skill.missing", sources)).toContain("missing");
+  expect(referenceNodeProblem("@steps.missing", sources)).toContain("missing");
+  expect(referenceNodeProblem("@state.gone", sources)).toContain("gone");
+  expect(referenceNodeProblem("@item", { ...sources, item: false })).toContain(
+    "for_each",
+  );
+});
+
+test("unresolved STEP refs get the same amber treatment as connections", () => {
+  const editor = referenceEditor();
+  load(editor, "Use @steps.search.text and @steps.missing here.");
+  setReferenceSources(editor, sources);
+
+  const classOf = (raw: string): string | undefined =>
+    editor.view.dom
+      .querySelector(`[data-reference="${raw}"]`)
+      ?.getAttribute("class") ?? undefined;
+
+  expect(classOf("@steps.search.text")).toContain("tt-ref-resolved");
+  expect(classOf("@steps.missing")).toContain("tt-ref-unresolved");
+  expect(
+    editor.view.dom
+      .querySelector('[data-reference="@steps.missing"]')
+      ?.getAttribute("title"),
+  ).toBe(referenceNodeProblem("@steps.missing", sources));
+});
+
+test("step/state/item/now chips carry their parsed kind", () => {
+  const editor = referenceEditor();
+  load(editor, "Take @steps.search.result, @state.cursor, @item and @now.");
+  const kinds: Record<string, string> = {};
+  editor.state.doc.descendants((node) => {
+    if (node.type.name === REFERENCE_NODE_NAME) {
+      kinds[String(node.attrs.raw)] = String(node.attrs.kind);
+    }
+    return true;
+  });
+  expect(kinds).toEqual({
+    "@steps.search.result": "step",
+    "@state.cursor": "state",
+    "@item": "item",
+    "@now": "now",
+  });
 });
 
 test("the status plugin classifies every chip in the rendered document", () => {

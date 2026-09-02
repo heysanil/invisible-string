@@ -13,10 +13,10 @@
  *   fires ONCE, then resumes cadence) BEFORE dispatching. Multiple control
  *   planes are safe: the lock serializes claimers and the loser's re-check
  *   sees the advanced cursor.
- * - The dispatch itself is the ordinary workflow dispatch (origin/triggerType
- *   "schedule", `data.scheduledFor` = the window that fired, empty message —
- *   instructions carry the content). Scheduled runs are ordinary sessions:
- *   they can park on HITL approvals like any other run.
+ * - The dispatch itself is the ordinary workflow dispatch — a PIPELINE run
+ *   (startPipelineRun; origin/triggerType "schedule", `data.scheduledFor` =
+ *   the window that fired). Scheduled runs are ordinary pipeline runs: an
+ *   `agent` step's child can park on HITL approvals like any other run.
  *
  * A dispatch failure NEVER un-advances the cursor (the claim already
  * committed) — a broken schedule fires-and-fails once per window instead of
@@ -28,16 +28,21 @@
  */
 import { and, eq, isNotNull, lte, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
-import type { Logger } from "@invisible-string/shared";
+import type { Logger, TriggerEvent } from "@invisible-string/shared";
 
 import type { Db } from "../db";
+import { startPipelineRun } from "../pipeline/runner";
 import { CronParseError, nextFire } from "./cron";
 import {
-  dispatchTriggerRun,
-  resolveWorkflowDispatchTarget,
+  PIPELINE_TRIGGER_AGENT_ID,
+  resolveEnabledPipeline,
 } from "./dispatch";
 import { isRuntimeApiError } from "./errors";
-import type { RuntimeDeps } from "./routes";
+import {
+  pipelineLockPoolExhausted,
+  requirePipelines,
+  type RuntimeDeps,
+} from "./routes";
 
 /** Default tick cadence; overridden by SCHEDULE_TICK_MS (see .env.example). */
 export const DEFAULT_SCHEDULE_TICK_MS = 30_000;
@@ -150,7 +155,7 @@ export function createScheduleTicker(
   const tickMs = options.tickMs ?? DEFAULT_SCHEDULE_TICK_MS;
   const clock = options.now ?? (() => new Date());
 
-  /** The real dispatch: resolve the workflow's agent, render, run. */
+  /** The real dispatch: a schedule fire starts a PIPELINE run. */
   const dispatchDue: ScheduleDispatchFn =
     options.dispatch ??
     (async (due) => {
@@ -161,24 +166,41 @@ export function createScheduleTicker(
         .limit(1);
       const workflow = workflows[0];
       if (!workflow) return;
-      const target = await resolveWorkflowDispatchTarget(deps, workflow);
-      await dispatchTriggerRun(deps, {
-        organizationId: workflow.organizationId,
-        workflow: { id: workflow.id, snapshot: target.snapshot },
-        agent: target.agent,
-        origin: "schedule",
+      const config = resolveEnabledPipeline(workflow);
+      const triggerEvent: TriggerEvent = {
+        // Pipelines bind no single agent — agents bind per step.
+        agentId: PIPELINE_TRIGGER_AGENT_ID,
+        workflowId: workflow.id,
         triggerType: "schedule",
+        message: "",
+        // The fired window rides as trigger data purely as PROVENANCE on the
+        // run row. It is NOT addressable from steps — the workflow validator
+        // rejects every `@trigger.*` reference for schedule triggers (they
+        // carry no dispatch data; workflow-validator.ts triggerCarriesData).
+        data: { scheduledFor: due.scheduledFor.toISOString() },
         principal: { workspaceId: workflow.organizationId, source: "schedule" },
-        ingress: {
-          // Instructions carry the task; the fired window rides as trigger
-          // data purely as PROVENANCE on the run row. It is NOT addressable
-          // from instructions — the workflow validator rejects every
-          // `@trigger.*` reference for schedule triggers (they carry no
-          // dispatch data; workflow-validator.ts triggerCarriesData).
-          message: "",
-          data: { scheduledFor: due.scheduledFor.toISOString() },
-        },
+      };
+      const result = await startPipelineRun(requirePipelines(deps), {
+        organizationId: workflow.organizationId,
+        workflow: { id: workflow.id, config },
+        triggerEvent,
+        origin: "schedule",
       });
+      if (!result.started) {
+        // The pipeline lock pool is pinned by live runs (transient capacity,
+        // nothing created): the claim already advanced the cursor, so the
+        // window is lost like any other dispatch failure — surface it as one
+        // (the tick counts it `failed` at warn level), not as policy.
+        if (result.reason === "lock_pool_exhausted") throw pipelineLockPoolExhausted();
+        // `overlap: "skip"` refused the window (a slow run is still live) —
+        // the claim already advanced the cursor, so this window is simply
+        // dropped, which is exactly the policy's cursor-protecting intent.
+        logger.info("schedule.overlap_skipped", {
+          workspaceId: workflow.organizationId,
+          workflowId: workflow.id,
+          fields: { triggerId: due.triggerId },
+        });
+      }
     });
 
   async function tick(): Promise<ScheduleTickOutcome> {

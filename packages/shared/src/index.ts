@@ -1,9 +1,13 @@
 /**
  * Shared contracts package — single source of truth for:
  * - `AgentDefinition` (the agent draft — the compile unit)
- * - `WorkflowConfig` (trigger → agent → instructions) + `@reference` parsing
+ * - `WorkflowConfig` (trigger → pipeline steps) + `@reference` parsing
+ * - the pipeline step union + tree helpers (pipeline-config), pure template/
+ *   condition resolution (pipeline-template), the restricted structured-
+ *   output schema subset (pipeline-output-schema), and the `pipeline.*`
+ *   run-stream event vocabulary (pipeline-events)
  * - `TriggerEvent` (the normalized trigger envelope, storage/provenance only)
- * - task-message rendering (`renderTaskMessage` — what agents receive)
+ * - task-message rendering (`renderTaskMessage` — trigger-only helpers)
  * - API DTOs (agents, publish, sessions, messages + context controls, run SSE
  *   frames, Phase-3 trigger ingress / integrations / trigger bindings / run
  *   cancel)
@@ -25,6 +29,10 @@ export * from "./eve-events";
 export * from "./eve-session-api";
 export * from "./id";
 export * from "./observability";
+export * from "./pipeline-config";
+export * from "./pipeline-events";
+export * from "./pipeline-output-schema";
+export * from "./pipeline-template";
 export * from "./render";
 export * from "./tool-display";
 export * from "./trigger-adapters";

@@ -2,99 +2,114 @@
 title: Workflows
 section: Concepts
 order: 21
-description: "A Workflow is a standing delegation in three parts — Trigger, Agent, Instructions — the way you'd tell an assistant to watch for something and act on it."
+description: "A Workflow is a standing pipeline — a Trigger and a sequence of Steps the platform interprets, where an Agent is one kind of step rather than the whole job."
 ---
 
 # Workflows
 
 A Workflow is a **standing delegation** — the way you'd tell an assistant
-"watch these Slack messages and prepare a report." It reads like a delegation
-memo in three parts: *when it happens* (**Trigger**), *who handles it*
-(**Agent**), and *what they should do* (**Instructions**).
+"watch these Slack messages and prepare a report." It has two parts: *when it
+happens* (**Trigger**) and *what happens, step by step* (**Steps**) — a
+pipeline the platform interprets directly when the trigger fires. An Agent
+isn't the whole job anymore; it's one kind of step you reach for when a step
+actually needs judgment.
 
 ## Trigger
 
-When the Workflow fires: manually from the workflow editor's **Run** popover, a
-webhook, a form submission, a Slack event, or a schedule. (Manual runs land in
-Chat where you can follow them live — Chat itself starts conversations with
-Agents, not Workflows.) Each kind is covered in
+When the Workflow fires: manually from the workflow editor's **Run** popover,
+a webhook, a form submission, a Slack event, or a schedule. Each kind is
+covered in [Triggers](/docs/building/triggers).
+
+## Steps
+
+Seven step kinds, in two families. Three do work:
+
+- **Tool** — one deterministic call to a tool on a workspace MCP
+  [connection](/docs/building/context-mcp): search Slack, create a Linear
+  issue, fetch a page. No model involved, so it's fast, cheap, and does the
+  same thing every time.
+- **Infer** — a single direct model call on one of the workspace's
+  [model presets](/docs/building/models): a prompt in, text or a declared
+  structured shape out. For cheap transforms like summarizing or classifying.
+- **Agent** — a real session against a published
+  [Agent](/docs/concepts/agents), run as a **child run** with its own full
+  timeline. For open-ended work that needs the Agent's tools and judgment.
+
+And four control the flow, interpreted by the platform itself: **For each**
+(repeat a body of steps per item of a list), **Branch** (run different steps
+by condition), **Filter** (continue only when a condition holds — false at
+the top level skips the rest of the run, false inside a loop drops that
+item), and **State** (write durable keys that persist across runs).
+
+The doctrine is *the cheapest kind that suffices*: if the arguments are
+knowable up front, use a tool step; if it's a bounded transform, infer; only
+reach for an agent step when the work is genuinely open-ended.
+
+## References and the run scope
+
+Steps talk to each other with `@` references, resolved at run time against
+the run's scope: `@trigger.<field>` reads the trigger event's data,
+`@steps.<slug>.<path>` reads an earlier step's output (every step has a slug
+— its handle), `@state.<key>` reads the Workflow's durable state, `@item` is
+the current item inside a For each body, and `@now` is the run's start
+timestamp. In a prompt or template, a reference that resolves to nothing
+renders as "(not provided)" rather than failing the run.
+
+Two scoping rules matter. A step can only reference steps *before* it. And a
+For each body is **iteration-scoped**: a body step's output is addressable
+only from later steps of the same iteration — after the loop, only the loop
+step's own aggregate output survives.
+
+## Workflow state
+
+Each Workflow carries a small durable key-value store that outlives any
+single run — written by State steps, read with `@state.<key>`. Its canonical
+use is a cursor: "search since `@state.cursor`, process what's new, advance
+the cursor" is how a polling Workflow avoids re-processing the same items.
+See [Build a scheduled Workflow](/docs/guides/scheduled-workflow) for that
+pattern end to end.
+
+## Agent steps and versions
+
+An agent step binds one published Agent and hands it instructions rendered
+against the run scope. The child run uses the Agent's **current published
+version** at dispatch — the Agent's own equipment (connections, skills,
+model) is what it runs with, exactly as in chat. On a Slack-triggered
+Workflow, an agent step can opt into thread continuity, so replies in one
+Slack thread continue one ongoing session; see
 [Triggers](/docs/building/triggers).
-
-## Agent
-
-Which published Agent handles the work. A Workflow binds one Agent and attaches
-no extra context — the Agent's own equipment (connections, skills) is the
-context, and the instructions may reference it but never extend it.
-
-## Instructions
-
-What to do when the trigger fires, with `@trigger` references into the event's
-data. Instructions aren't compiled into anything: when the Workflow fires, the
-platform renders them — `@trigger` references resolved against the live event —
-and delivers them to the Agent as its task message.
 
 ## No builds
 
-Publishing a Workflow builds nothing. Publish validates the delegation — the
-trigger's shape is valid, the Agent exists and is published, the instructions
-are non-empty — and snapshots it, so edits go live instantly. When the
-trigger fires, the platform starts a session against the Agent's current
-published version, and that session pins the exact agent version it started
-with, just like chat.
-
-## What a Workflow is not
-
-A Workflow has no model of its own, no persona of its own, and no context of
-its own — every one of those belongs to the Agent it's bound to. Instructions
-can *reference* the Agent's connections and skills with `@`, but a Workflow
-can never extend or override what the Agent is equipped with. And a Workflow
-is not something you converse with: there's no chat surface for a Workflow the
-way there is for an [Agent](/docs/concepts/agents) — its only interface is its
-trigger.
-
-## What happens when it fires
-
-A trigger firing doesn't hand the Agent two separate things. The platform
-renders the Workflow's instructions and the trigger event into **one task
-message** and dispatches it to the Agent's current published version — from
-the Agent's side, it's a single message like any other. The trigger event
-itself is stored on the resulting run as provenance, so you can see what
-caused it later, but it isn't a side channel the Agent reads independently of
-that rendered message.
-
-## `@` references
-
-Instructions can reference two things with `@`: fields from the trigger event's
-data, and items from the bound Agent's context — its connections and skills.
-Both resolve at dispatch time, against the live event and the Agent's current
-context. A reference that no longer resolves — a trigger field that isn't in
-this event, a connection the Agent no longer has — surfaces as a staleness
-warning rather than a save-blocking error; see
-[Agents: renaming, deleting, and dependents](/docs/concepts/agents) for how
-that degrades at dispatch.
+Publishing a Workflow builds nothing. Publish validates the pipeline — the
+trigger's shape, at least one runnable step, agent steps bound to published
+Agents, tool steps on real enabled workspace connections, every `@` reference
+legal for its position — then snapshots it, so edits go live instantly. Runs
+always execute the published snapshot, never the draft.
 
 ## Where the result goes
 
-A Workflow's outcome always lands in the run itself, readable in its
-[run history](/docs/concepts/sessions-and-runs) regardless of trigger kind.
-Beyond that, where else it shows up depends on how it fired:
+Every run lands in the Workflow's **Runs** tab as a per-step timeline — each
+step's status, timing, and rendered input and output, with agent steps
+carrying their child run's full transcript. Beyond that, output goes exactly
+where the steps put it: a tool step that files an issue has filed it. Two
+trigger-specific notes: a webhook's HTTP response is only an acknowledgement
+that a run started, never the result; and a Slack-triggered Workflow posts a
+reply to the thread only when its configuration declares one
+(`onComplete.slackReply`, a template rendered when the run completes) —
+**nothing is posted when it doesn't**.
 
-- **Slack triggers** — the control plane posts the Agent's final reply back
-  into the originating Slack thread, at least once. A rare duplicate reply
-  after a crash is expected behavior, not a bug.
-- **Webhook triggers** — the HTTP response returned to the caller is only an
-  acknowledgement that the trigger was accepted. It is never the Agent's
-  answer; that only ever lands in the run. See
-  [Build a webhook Workflow](/docs/guides/webhook-workflow) for a worked
-  example.
-- **Everything else** — wherever the Agent's own tool calls put it. If the
-  Agent's job is to write a row to a spreadsheet or send an email, that
-  happens through its own equipped tools, not through the Workflow.
+## One run at a time
 
-## Repeated triggers and busy sessions
+By default a trigger firing while another run of the same Workflow is still
+live is **skipped**, not queued — deliberately, so a slow run can't overlap
+the next window and corrupt cursor state. A skipped webhook dispatch still
+answers 2xx (the caller did nothing wrong); the run simply doesn't start.
 
-A Workflow's dispatch still obeys the platform's one-run-per-session rule. If
-a trigger fires while the Agent's session for that Workflow is already busy —
-mid-run, or parked waiting on a human — the new run request is refused rather
-than interleaved with the one in progress. See
-[sessions & runs](/docs/concepts/sessions-and-runs) for what "busy" covers.
+## What a Workflow is not
+
+A Workflow has no persona and no model of its own — infer steps borrow
+workspace presets, and agent steps borrow published Agents whole. And it's
+not something you converse with: there's no chat surface for a Workflow the
+way there is for an [Agent](/docs/concepts/agents) — its only interface is
+its trigger, and its only record is its runs.

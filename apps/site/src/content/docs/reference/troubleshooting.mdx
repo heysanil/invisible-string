@@ -18,9 +18,13 @@ diagnostics point at exactly which section is at fault. For an Agent, the
 confirmed blocking cases are an empty persona (required to publish — the
 editor flags it as a warning while you're still typing, but Publish stays
 disabled until you write one) and a model override that isn't on the
-workspace allowlist. For a Workflow, publish is blocked when no Agent is
-chosen, the chosen Agent has no published version, or the instructions are
-empty. Resolve the flagged section — the diagnostics tell you which one.
+workspace allowlist. For a Workflow, publish is blocked while the pipeline
+isn't runnable: no steps at all, an agent step with no Agent chosen or one
+that has no published version, a tool step on a connection that's missing,
+disabled, or personal rather than workspace-scoped, an empty prompt, an `@`
+reference that's illegal for its position, or an invalid cron expression.
+Every finding is attached to the step or trigger it concerns — resolve the
+flagged card.
 
 **A connection referenced by an Agent's context was deleted or disabled.**
 The Agent won't compile until you re-equip a replacement connection or remove
@@ -101,21 +105,51 @@ it.
 **A webhook returns 429.** You're over the rate limit — back off per the
 `Retry-After` header the response carries.
 
+**A trigger fired but no run started.** Check the Runs tab first: by
+default a Workflow runs one pipeline at a time, and a trigger firing while
+the previous run is still live is **skipped**, not queued — a webhook or
+form dispatch still answers 2xx, with a body saying
+`"reason": "overlap_skipped"`. If nothing was running, confirm the Workflow
+is actually published: drafts never dispatch.
+
 **A scheduled Workflow fired once instead of catching up on several missed
 windows after downtime.** This is the intended no-backfill design, not a
 bug: the schedule ticker always advances the next fire time from now, so a
 control plane that was down across several windows fires once on recovery
 and resumes its normal cadence.
 
-**A Workflow's `@` references look broken after the bound Agent changed.**
-This is the staleness diagnostic: the Agent was republished missing
-something the instructions reference. It degrades gracefully rather than
-breaking dispatch — a dangling reference just doesn't resolve to anything —
-but you should update the reference in the workflow editor.
+**A step failed with a tool or argument error and never retried.** By
+design: only transient failures — the server unreachable, a timeout, a 429,
+a 5xx — are retried. A tool error or invalid-arguments answer means the
+server is up and said no; retrying the same call would just fail the same
+way. Re-check the tool name and argument shapes against the connection's
+tool picker, and use **Test step** to see the real response.
 
-**A Slack reply arrives twice after a crash or restart.** Expected — reply
-delivery is at-least-once, not exactly-once. A crash between posting the
-reply and recording that it was delivered can cause a rare duplicate.
+**A run failed `fan_out_exceeded` or `output_too_large`.** The pipeline hit
+a hard cap: a For each was handed more items than its limit allows, or a
+step produced more output than the per-step cap. Both fail loudly instead of
+silently truncating — truncation would corrupt whatever depends on the data.
+Narrow the search a tool step runs, or lower how much a step returns; the
+caps themselves are listed in
+[Limits and defaults](/docs/reference/limits-and-defaults).
+
+**A published Workflow shows a staleness warning.** Its published snapshot
+references something the workspace no longer has in dispatchable shape — an
+Agent that was unpublished or deleted, a connection that was removed or
+disabled. The Workflow still fires, but the affected step fails at run time.
+Fix the resource (or the step) and republish.
+
+**A Slack-triggered run succeeded but nothing was posted to Slack.** A
+reply posts only when the Workflow's configuration declares one
+(`onComplete.slackReply`) — no declared reply, no post, by design. The run's
+record is its step timeline in the Runs tab.
+
+**A Slack reply — or a tool step's side effect — landed twice after a crash
+or restart.** Expected: reply delivery and default tool steps are both
+at-least-once, not exactly-once. A crash inside the narrow window between
+doing the thing and recording that it was done repeats it on recovery. A
+tool step whose side effect must not repeat can opt into at-most-once, which
+fails as interrupted instead of re-firing.
 
 ## Self-hosting
 
@@ -136,6 +170,7 @@ the short version of the three most common issues:
 | Situation | Where to read more |
 |---|---|
 | Understanding how an Agent is built and published | [The agent editor](/docs/building/agent-editor) |
+| Building a pipeline and reading its run timelines | [The workflow editor](/docs/building/workflow-editor) |
 | How a session, a run, and waiting states relate | [Sessions & runs](/docs/concepts/sessions-and-runs) |
 | How chat, cancellation, and the message queue work | [Chat](/docs/building/chat) |
 | Connections, health states, and the tool filter | [Context & MCP](/docs/building/context-mcp) |

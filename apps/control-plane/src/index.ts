@@ -18,7 +18,14 @@ import type { ConnectorCatalogEntry, Logger } from "@invisible-string/shared";
 
 import { createAuth, type Auth } from "./auth";
 import { loadConfig, type Config } from "./config";
-import { createDb, type DbHandle } from "./db";
+import {
+  createDb,
+  lockPoolSizeFromEnv,
+  pipelineLockPoolSizeFromEnv,
+  poolSizeFromEnv,
+  statementTimeoutFromEnv,
+  type DbHandle,
+} from "./db";
 import { healthPlugin, type DeepHealthDeps } from "./health";
 import { createLogger } from "./log";
 import { requestLoggerPlugin } from "./request-log";
@@ -49,6 +56,21 @@ import { createDrizzleRunStore } from "./runs/store";
 import { RunTailerManager } from "./runs/tailer";
 import { createGuardedFetch } from "./net/guarded-fetch";
 import type { OauthBrokerDeps } from "./oauth/broker";
+import {
+  createPipelineRunner,
+  loadPipelineRunnerConfig,
+  type PipelineRunner,
+  type StepExecutorRegistry,
+} from "./pipeline/runner";
+import { pipelinePlugin, type PipelineRouteDeps } from "./pipeline/routes";
+import {
+  createDrizzleRunStepStore,
+  createDrizzleWorkflowStateStore,
+} from "./pipeline/step-store";
+import type { PipelineExecutorDeps } from "./pipeline/types";
+import { executeAgentStep } from "./pipeline/steps/agent";
+import { executeInferStep } from "./pipeline/steps/infer";
+import { executeToolStep } from "./pipeline/steps/tool";
 import { probeAndPersist } from "./probe/service";
 import { resourcesPlugin } from "./resources/plugin";
 import {
@@ -68,12 +90,20 @@ import {
 } from "./search/meili";
 import { createRegistrySync, type RegistrySync } from "./search/registry-sync";
 import {
+  createPipelineRecoverySweeper,
+  type PipelineRecoverySweeper,
+} from "./pipeline/recovery";
+import {
   loadOauthClientRegistrations,
   publicWebUrlFromEnv,
   tryLoadRuntimeConfig,
   type RuntimeConfig,
 } from "./runtime/config";
-import { reconcileInterruptedRuns } from "./runtime/reconcile";
+import {
+  createRemoteCancelSweeper,
+  reconcileInterruptedRuns,
+  type RemoteCancelSweeper,
+} from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
 import { createScheduleTicker, type ScheduleTicker } from "./runtime/schedule-ticker";
 import { createWorkerSweeper } from "./runtime/worker-sweeper";
@@ -114,6 +144,12 @@ export interface AppStack {
   logger: Logger;
   /** Present when the runtime API is configured (see runtime/config.ts). */
   runtime: RuntimeDeps | null;
+  /**
+   * Pipeline interpreter (workflow-pipelines redesign) — present with the
+   * runtime. Also carried on `runtime` as `pipelines` (the RuntimeDeps
+   * intersection below) so dispatch/routes reach it through the deps graph.
+   */
+  pipelines: PipelineRunner | null;
   /** Present when the runtime API is configured (triggers/integrations). */
   integrations: IntegrationDeps | null;
   /**
@@ -157,6 +193,8 @@ export function buildApp(opts: {
   workspaceDeps: WorkspaceDeps;
   resourceDeps: ResourceDeps;
   runtimeDeps?: RuntimeDeps | null;
+  /** Pipeline run/step/state/test routes — mounted beside the runtime API. */
+  pipelineDeps?: PipelineRouteDeps | null;
   integrationDeps?: IntegrationDeps | null;
   /** Copilot WS deps — the `/copilot` socket mounts when present. */
   copilotDeps?: CopilotDeps | null;
@@ -204,6 +242,9 @@ export function buildApp(opts: {
     .use(resourcesPlugin(resourceDeps));
   if (opts.runtimeDeps) {
     app.use(runtimePlugin(opts.runtimeDeps));
+  }
+  if (opts.pipelineDeps) {
+    app.use(pipelinePlugin(opts.pipelineDeps));
   }
   if (opts.integrationDeps) {
     app.use(integrationsPlugin(opts.integrationDeps));
@@ -337,6 +378,8 @@ export function createRuntimeDeps(opts: {
     store: runStore,
     bus,
     maxWallClockMs: runtime.maxRunWallClockMs,
+    remoteCancelObserveMs: runtime.remoteCancelObserveMs,
+    statementTimeoutMs: runtime.dbStatementTimeoutMs,
     logger,
     // Feed the run-duration histogram from every completed run (parked
     // `waiting` runs are not finished, so they are excluded), then settle any
@@ -398,7 +441,22 @@ export function createAppStack(
 ): AppStack {
   const config = loadConfig(env);
   const logger = createLogger({ env });
-  const dbHandle = createDb(config.databaseUrl);
+  // Three pools (db.ts): the root pool for every query, plus one dedicated
+  // lock pool per long-held advisory-lock family — the per-session dispatch
+  // critical section and the per-run pipeline driver lock. A holder pins
+  // one lock connection for its whole lifetime (an eve round-trip; a whole
+  // pipeline run), and on a shared pool `max` such holders deadlock the
+  // control plane waiting for a `max+1`th. The two lock families are kept
+  // apart from each other too, so a pipeline burst never starves a Stop.
+  // Every statement on every pool is bounded (DB_STATEMENT_TIMEOUT_MS) —
+  // the run tailer's takeover bound derives from the same parser through
+  // `RuntimeConfig.dbStatementTimeoutMs`.
+  const dbHandle = createDb(config.databaseUrl, {
+    max: poolSizeFromEnv(env),
+    lockMax: lockPoolSizeFromEnv(env),
+    pipelineLockMax: pipelineLockPoolSizeFromEnv(env),
+    statementTimeoutMs: statementTimeoutFromEnv(env),
+  });
   // The seeded-workspace publish kick needs the runtime graph, which is built
   // AFTER auth (workspace deps wrap the auth instance) — late-bind via a slot.
   const runtimeSlot: { current: RuntimeDeps | null } = { current: null };
@@ -437,14 +495,18 @@ export function createAppStack(
     },
   });
   const workspaceDeps = createWorkspaceDeps(auth, dbHandle.db);
-  const runtimeDeps = createRuntimeDeps({
-    env,
-    config,
-    db: dbHandle.db,
-    workspaceDeps,
-    logger,
-    overrides: runtimeOverrides,
-  });
+  // Intersection type so the pipeline runner can be late-bound below the
+  // same way `oauthTokens` is (RuntimeDeps is assignable to it; consumers of
+  // the field read it off the runtime graph).
+  const runtimeDeps: (RuntimeDeps & { pipelines?: PipelineRunner }) | null =
+    createRuntimeDeps({
+      env,
+      config,
+      db: dbHandle.db,
+      workspaceDeps,
+      logger,
+      overrides: runtimeOverrides,
+    });
   runtimeSlot.current = runtimeDeps;
   // Meilisearch registry-search mirror: constructed only when BOTH vars are
   // configured, and NEVER fatal — an unreachable Meilisearch degrades registry
@@ -505,6 +567,69 @@ export function createAppStack(
   // egress policy, one master key. Late-bound onto the runtime deps because
   // the broker assembles after createRuntimeDeps has returned.
   if (runtimeDeps) runtimeDeps.oauthTokens = oauthBroker;
+  // Pipeline interpreter (workflow-pipelines redesign): constructed beside
+  // the broker because tool steps ride the SAME guarded egress fetch and
+  // token lifecycle. Late-bound onto the runtime deps like `oauthTokens` so
+  // dispatch, the schedule ticker and the pipeline routes all reach it
+  // through the one deps graph.
+  let pipelineRunner: PipelineRunner | null = null;
+  let pipelineRouteDeps: PipelineRouteDeps | null = null;
+  if (runtimeDeps) {
+    // Executor registry for tool/infer/agent steps (pipeline/steps/*). The
+    // object is shared BY REFERENCE with the runner, so kinds registered
+    // after construction are picked up; a kind with no registered executor
+    // fails its step `executor_unavailable` rather than crashing the run.
+    // The `agent` executor reaches the dispatch machinery through the
+    // `runtimeDeps` handed to executorDeps below.
+    const stepExecutors: StepExecutorRegistry = {
+      tool: executeToolStep,
+      infer: executeInferStep,
+      agent: executeAgentStep,
+    };
+    // One executor dependency graph, shared between the runner and the
+    // pipeline routes' per-step test (both execute the same executors, so
+    // they must see the same egress fetch / oauth broker / provider keys).
+    const pipelineExecutorDeps: PipelineExecutorDeps = {
+      db: dbHandle.db,
+      logger,
+      masterKey: config.encryptionMasterKey,
+      fetchImpl: mcpEgressFetch,
+      oauthTokens: oauthBroker,
+      providerKeys: {
+        ...(runtimeDeps.runtime.openrouterApiKey
+          ? { openrouterApiKey: runtimeDeps.runtime.openrouterApiKey }
+          : {}),
+        ...(runtimeDeps.runtime.anthropicApiKey
+          ? { anthropicApiKey: runtimeDeps.runtime.anthropicApiKey }
+          : {}),
+        ...(runtimeDeps.runtime.openrouterBaseUrl
+          ? { openrouterBaseUrl: runtimeDeps.runtime.openrouterBaseUrl }
+          : {}),
+      },
+      runtimeDeps,
+    };
+    pipelineRunner = createPipelineRunner({
+      db: dbHandle.db,
+      runStore: runtimeDeps.runStore,
+      stepStore: createDrizzleRunStepStore(dbHandle.db),
+      stateStore: createDrizzleWorkflowStateStore(dbHandle.db),
+      bus: runtimeDeps.bus,
+      logger,
+      executors: stepExecutors,
+      executorDeps: pipelineExecutorDeps,
+      config: loadPipelineRunnerConfig(env),
+      workspaceRunCap: runtimeDeps.runtime.maxConcurrentRunsPerWorkspace,
+      metrics: runtimeDeps.metrics,
+      ...(runtimeDeps.delivery ? { delivery: runtimeDeps.delivery } : {}),
+    });
+    runtimeDeps.pipelines = pipelineRunner;
+    pipelineRouteDeps = {
+      db: dbHandle.db,
+      workspaceDeps,
+      logger,
+      executorDeps: pipelineExecutorDeps,
+    };
+  }
   const integrationDeps = createIntegrationDeps({
     env,
     runtimeDeps,
@@ -595,6 +720,7 @@ export function createAppStack(
     workspaceDeps,
     resourceDeps,
     runtimeDeps,
+    pipelineDeps: pipelineRouteDeps,
     integrationDeps,
     copilotDeps,
     health,
@@ -607,9 +733,13 @@ export function createAppStack(
     dbHandle,
     logger,
     runtime: runtimeDeps,
+    pipelines: pipelineRunner,
     integrations: integrationDeps,
     meili,
     close: async () => {
+      // Interrupt pipeline drivers WITHOUT terminal writes (their runs are
+      // re-adopted by the next boot's recovery), then drain the tailers.
+      await pipelineRunner?.stopAll();
       await runtimeDeps?.tailers.stopAll();
       await dbHandle.close();
     },
@@ -656,26 +786,38 @@ if (import.meta.main) {
   });
 
   let scheduleTicker: ScheduleTicker | null = null;
+  let remoteCancelSweeper: RemoteCancelSweeper | null = null;
+  let pipelineRecoverySweeper: PipelineRecoverySweeper | null = null;
   let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
-    // they hold cap slots and hang SSE streams forever otherwise. The
+    // they hold cap slots and hang SSE streams forever otherwise. Pipeline
+    // runs are re-driven from their step ledgers (pipeline/recovery.ts). The
     // delivery sweep settles TERMINAL runs stranded with a pending Slack
     // reply: succeeded ones deliver late (at-least-once), failed/canceled
     // ones settle the ledger (see runs/delivery.ts).
     void reconcileInterruptedRuns(stack.runtime, {
       delivery: stack.runtime.delivery,
+      ...(stack.pipelines ? { pipelines: stack.pipelines } : {}),
     })
-      .then(({ resumed, failed, deliveries }) => {
+      .then(({ resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries }) => {
         if (
           resumed > 0 ||
           failed > 0 ||
+          sessionsClosed > 0 ||
+          remoteCancels.settled > 0 ||
+          remoteCancels.deferred > 0 ||
+          remoteCancels.retained > 0 ||
+          remoteCancels.observing > 0 ||
+          remoteCancels.unresolved > 0 ||
+          pipelines.resumed > 0 ||
+          pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
-            fields: { resumed, failed, deliveries },
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.observing} observing, ${remoteCancels.deferred} deferred, ${remoteCancels.retained} retained, ${remoteCancels.unresolved} unresolved), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            fields: { resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries },
           });
         }
       })
@@ -699,6 +841,35 @@ if (import.meta.main) {
       tickMs: stack.runtime.runtime.scheduleTickMs,
     });
     scheduleTicker.start();
+    // Remote-cancel sweeper: re-runs boot reconciliation's pending-remote-
+    // cancel sweep every REMOTE_CANCEL_SWEEP_MS so a Stop whose confirmation
+    // is still owed (a crashed observation tail, an unreachable worker, a
+    // held lock) is re-observed by a HEALTHY process, not the next restart —
+    // and so an obligation past REMOTE_CANCEL_OBSERVE_MS is declared
+    // unresolved. Replica-safe: advisory-try-locked scan, per-session
+    // dispatch lock per candidate, one observation tail per session.
+    remoteCancelSweeper = createRemoteCancelSweeper(stack.runtime, {
+      intervalMs: stack.runtime.runtime.remoteCancelSweepMs,
+    });
+    remoteCancelSweeper.start();
+    // Pipeline-recovery sweeper: re-runs boot reconciliation's interrupted-
+    // pipeline adoption every PIPELINE_RECOVERY_SWEEP_MS so an orphan left
+    // `locked` at boot (pipeline lock pool exhausted, or a driver that died
+    // in another replica) is re-driven by a HEALTHY process instead of
+    // holding its cap slot until the next restart. Replica-safe: advisory-
+    // try-locked scan, and adoption itself is gated on the per-run driver
+    // lock (an acquirable lock proves no live driver owns the run).
+    if (stack.pipelines) {
+      pipelineRecoverySweeper = createPipelineRecoverySweeper(
+        {
+          db: stack.dbHandle.db,
+          runner: stack.pipelines,
+          logger: logger.child({ fields: { component: "pipeline-recovery" } }),
+        },
+        { intervalMs: stack.runtime.runtime.pipelineRecoverySweepMs },
+      );
+      pipelineRecoverySweeper.start();
+    }
     // Registry→Meilisearch sync ETL: mirrors the official MCP registry into
     // the disposable search index (immediate full/incremental run, then
     // REGISTRY_SYNC_INTERVAL_MS cadence). Only when the meili client exists —
@@ -729,7 +900,12 @@ if (import.meta.main) {
       fields: { signal },
     });
     stack.app.server?.stop();
-    void Promise.all([scheduleTicker?.stop(), registrySync?.stop()])
+    void Promise.all([
+      scheduleTicker?.stop(),
+      remoteCancelSweeper?.stop(),
+      pipelineRecoverySweeper?.stop(),
+      registrySync?.stop(),
+    ])
       .then(() => stack.close())
       .catch((error) => {
         logger.error("control-plane.shutdown_failed", { err: error });

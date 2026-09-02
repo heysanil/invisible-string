@@ -2,12 +2,16 @@
  * Trigger ingress + integrations + trigger-binding HTTP surface. Mounted only
  * when the runtime is configured (dispatch needs workers + artifacts).
  *
- * Agents-first (2026-07-10 redesign): ingress resolves the workflow's
- * published snapshot + its agent's CURRENT published version and hands both
- * to `dispatchTriggerRun`, which renders the instructions into the task
- * message — nothing trigger-specific reaches the agent, and no per-trigger
- * env (the old SLACK_BOT_TOKEN injection) exists; Slack replies are delivered
- * by the control-plane DeliveryService (runs/delivery.ts).
+ * Pipelines redesign: a trigger event on a workflow ALWAYS starts a PIPELINE
+ * run (`startPipelineRun`) of the published snapshot — the control plane
+ * interprets the steps itself; eve sessions exist only as `agent`-step CHILD
+ * runs. A Slack event therefore always starts a NEW run: thread continuity is
+ * the `agent` step's `session: "thread"`, keyed by the thread key this
+ * ingress stamps into `TriggerEvent.data.slackThreadKey`. Nothing
+ * trigger-specific reaches an agent, and no per-trigger env (the old
+ * SLACK_BOT_TOKEN injection) exists; Slack replies are delivered by the
+ * control-plane DeliveryService off the parent run's explicit
+ * `onComplete.slackReply` (runs/delivery.ts).
  *
  * PUBLIC (token/signature authenticated, no session):
  * - POST /t/:token                    webhook + form ingress → dispatcher
@@ -51,24 +55,22 @@ import {
   type SlackInnerEvent,
   type SlackIntegrationMetadata,
   type SlackTriggerBinding,
-  type TriggerIngressResponse,
-  type TriggerPrincipal,
+  type TriggerEvent,
   type WorkflowConfig,
 } from "@invisible-string/shared";
 
 import { resolveWorkspace, workspacePlugin } from "../workspace";
-import { publishedWorkflowOf } from "../resources/workflows";
 import { errors, isRuntimeApiError } from "../runtime/errors";
+import { startPipelineRun } from "../pipeline/runner";
 import {
-  dispatchTriggerRun,
-  findSlackThreadSession,
-  resolveWorkflowDispatchTarget,
+  isKnownSlackThread,
+  PIPELINE_TRIGGER_AGENT_ID,
+  resolveEnabledPipeline,
   slackThreadKey,
-  type DispatchTriggerInput,
 } from "../runtime/dispatch";
 import {
-  requireReadyAgentVersion,
-  type ReadyAgentVersion,
+  pipelineLockPoolExhausted,
+  requirePipelines,
   type RuntimeDeps,
 } from "../runtime/routes";
 import {
@@ -221,9 +223,10 @@ export function integrationsPlugin(deps: IntegrationDeps) {
   // Webhook idempotency: a source-provided key (Idempotency-Key /
   // X-Idempotency-Key header) makes redelivery return the SAME run instead of
   // starting a duplicate. Bounded in-process cache (single control-plane node).
-  const idempotency = new Map<string, { runId: string; sessionId: string }>();
+  // Pipeline runs have no session — the run id alone is the handle.
+  const idempotency = new Map<string, { runId: string }>();
   const IDEMPOTENCY_MAX = 10_000;
-  const rememberIdempotent = (key: string, value: { runId: string; sessionId: string }) => {
+  const rememberIdempotent = (key: string, value: { runId: string }) => {
     idempotency.set(key, value);
     if (idempotency.size > IDEMPOTENCY_MAX) {
       const first = idempotency.keys().next().value;
@@ -300,9 +303,15 @@ export function integrationsPlugin(deps: IntegrationDeps) {
       )
 
       // ── PUBLIC: webhook + form ingress ────────────────────────────────────
+      //
+      // 202 body is `{accepted: true, runId}` — pipeline runs have no session
+      // — or `{accepted: false, reason: "overlap_skipped"}` when the
+      // workflow's overlap policy dropped the event (a 2xx on purpose: the
+      // event was consumed by policy, and a 4xx would make well-behaved
+      // webhook sources retry a delivery the platform chose to skip).
       .post(
         "/t/:token",
-        async ({ params, request, set, server }): Promise<TriggerIngressResponse> => {
+        async ({ params, request, set, server }) => {
           const raw = await request.text();
           if (Buffer.byteLength(raw, "utf8") > TRIGGER_INGRESS_MAX_BODY_BYTES) {
             throw errors.triggerPayloadTooLarge(TRIGGER_INGRESS_MAX_BODY_BYTES);
@@ -353,13 +362,12 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             const prior = idempotency.get(`${trigger.id}:${idemKey}`);
             if (prior) {
               set.status = 202;
-              return { accepted: true, runId: prior.runId, sessionId: prior.sessionId };
+              return { accepted: true, runId: prior.runId };
             }
           }
 
-          // Kill switch + published snapshot + the agent's CURRENT published
-          // version with a ready build (floating binding).
-          const target = await resolveWorkflowDispatchTarget(runtime, workflow);
+          // Kill switch + published pipeline snapshot.
+          const config = resolveEnabledPipeline(workflow);
 
           // Form submissions validate against the trigger row's formSchema —
           // synced at workflow publish (and token rotation), so the persisted
@@ -370,45 +378,69 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             trigger.formSchema,
           );
 
-          const principal: TriggerPrincipal = {
-            workspaceId: workflow.organizationId,
-            source: trigger.type,
-          };
           logger.info("trigger.received", {
             workspaceId: workflow.organizationId,
             workflowId: workflow.id,
             fields: { triggerType: trigger.type },
           });
 
-          const result = await dispatchTriggerRun(runtime, {
-            organizationId: workflow.organizationId,
-            workflow: { id: workflow.id, snapshot: target.snapshot },
-            agent: target.agent,
-            origin: trigger.type,
+          const triggerEvent: TriggerEvent = {
+            // Pipelines bind no single agent — agents bind per step.
+            agentId: PIPELINE_TRIGGER_AGENT_ID,
+            workflowId: workflow.id,
             triggerType: trigger.type,
-            principal,
-            ingress: { message, data },
-          });
+            message,
+            data,
+            principal: {
+              workspaceId: workflow.organizationId,
+              source: trigger.type,
+            },
+          };
+          runtime.metrics.recordTrigger(trigger.type, "received");
+          let result;
+          try {
+            result = await startPipelineRun(requirePipelines(runtime), {
+              organizationId: workflow.organizationId,
+              workflow: { id: workflow.id, config },
+              triggerEvent,
+              origin: trigger.type,
+            });
+          } catch (error) {
+            runtime.metrics.recordTrigger(trigger.type, "failed");
+            throw error;
+          }
+          if (!result.started) {
+            if (result.reason === "lock_pool_exhausted") {
+              // Transient capacity (the pipeline lock pool is pinned by live
+              // runs; nothing was created): a typed 503 so the sender's
+              // retry policy applies — never a 202 that reads as "dropped by
+              // policy".
+              runtime.metrics.recordTrigger(trigger.type, "failed");
+              throw pipelineLockPoolExhausted();
+            }
+            logger.info("pipeline.overlap_skipped", {
+              workspaceId: workflow.organizationId,
+              workflowId: workflow.id,
+              fields: { triggerType: trigger.type },
+            });
+            set.status = 202;
+            return { accepted: false, reason: "overlap_skipped" };
+          }
+          runtime.metrics.recordTrigger(trigger.type, "dispatched");
 
           if (idemKey) {
             rememberIdempotent(`${trigger.id}:${idemKey}`, {
               runId: result.run.id,
-              sessionId: result.session.id,
             });
           }
-          logger.emit(
-            result.dispatched ? "info" : "warn",
-            result.dispatched ? "dispatch.delivered" : "dispatch.failed",
-            {
-              workspaceId: workflow.organizationId,
-              workflowId: workflow.id,
-              runId: result.run.id,
-              sessionId: result.session.id,
-            },
-          );
+          logger.info("dispatch.delivered", {
+            workspaceId: workflow.organizationId,
+            workflowId: workflow.id,
+            runId: result.run.id,
+          });
 
           set.status = 202;
-          return { accepted: true, runId: result.run.id, sessionId: result.session.id };
+          return { accepted: true, runId: result.run.id };
         },
         { parse: "none" },
       )
@@ -742,9 +774,10 @@ export function integrationsPlugin(deps: IntegrationDeps) {
     if (!mapped.ok) return; // bot echo / edit / empty — ignore
 
     // NOTE (agents-first): no SLACK_BOT_TOKEN ever enters agent env — the
-    // control-plane DeliveryService posts the reply off the run's terminal
-    // event (runs/delivery.ts), so agent env is identical across dispatch
-    // paths and warm processes can't hold a stale token.
+    // control-plane DeliveryService posts the reply off the parent pipeline
+    // run's explicit `onComplete.slackReply` (runs/delivery.ts), so agent env
+    // is identical across dispatch paths and warm processes can't hold a
+    // stale token.
     const triggers = await listSlackTriggersForIntegration(db, integration.id);
     for (const { trigger, workflow } of triggers) {
       const bindingResult = trigger.binding
@@ -759,107 +792,102 @@ export function integrationsPlugin(deps: IntegrationDeps) {
         mapped.value.replyTarget.channel,
         mapped.value.threadKey,
       );
-      const existingSession = await findSlackThreadSession(
+      // A Slack event ALWAYS starts a NEW pipeline run — but whether it
+      // starts one at all keeps the old thread semantics: a reply in a
+      // thread that already has a claimed session (an `agent` step's
+      // `session: "thread"` child) dispatches REGARDLESS of the binding
+      // (thread replies continue conversations); a fresh thread must pass
+      // the binding gate. "Known" means ANY continuable session under the
+      // bare key OR an agent-qualified derivative (`<bareKey>:agent:<id>`)
+      // — once a bare holder terminates and releases its claim, a qualified
+      // session may still carry the conversation, and a bare-key-only check
+      // would silently drop every unmentioned reply in that thread. The
+      // agent step, not this router, resolves the exact session and
+      // continues the eve thread.
+      const threadKnown = await isKnownSlackThread(
         db,
         workflow.organizationId,
         workflow.id,
         threadKey,
       );
-
-      if (!existingSession && !shouldStartNewSlackSession(event, binding)) {
+      if (!threadKnown && !shouldStartNewSlackSession(event, binding)) {
         continue; // new thread that this binding does not start on
       }
 
-      // Continuation runs the SESSION's pinned agent version (immutable —
-      // republishing never migrates a live thread); a new session runs the
-      // workflow's agent's CURRENT published version. Instructions always
-      // come from the workflow's published snapshot.
-      let snapshot: WorkflowConfig;
-      let agent: ReadyAgentVersion;
+      let config: WorkflowConfig;
       try {
-        if (existingSession) {
-          if (!workflow.enabled) continue;
-          snapshot = publishedWorkflowOf(workflow).config;
-          agent = await requireReadyAgentVersion(
-            runtime,
-            existingSession.agentVersionId,
-          );
-        } else {
-          const target = await resolveWorkflowDispatchTarget(runtime, workflow);
-          snapshot = target.snapshot;
-          agent = target.agent;
-        }
+        config = resolveEnabledPipeline(workflow);
       } catch {
-        continue; // disabled / unpublished / build not ready — skip this workflow
+        continue; // disabled / unpublished — skip this workflow
       }
 
-      const principal: TriggerPrincipal = {
-        workspaceId: workflow.organizationId,
-        source: `slack:${event.user ?? "unknown"}`,
-      };
-      const dispatchInput: DispatchTriggerInput = {
-        organizationId: workflow.organizationId,
-        workflow: { id: workflow.id, snapshot },
-        agent,
-        origin: "slack",
+      const triggerEvent: TriggerEvent = {
+        // Pipelines bind no single agent — agents bind per step.
+        agentId: PIPELINE_TRIGGER_AGENT_ID,
+        workflowId: workflow.id,
         triggerType: "slack",
-        principal,
-        ingress: { message: mapped.value.message, data: mapped.value.data },
-        ...(existingSession
-          ? { existingSession }
-          : {
-              sessionPrincipalExtra: { slackThreadKey: threadKey },
-              newSessionSlackThreadKey: threadKey,
-            }),
+        message: mapped.value.message,
+        // The thread key rides the envelope so the `agent` step
+        // (`session: "thread"` continuity) and the DeliveryService
+        // (`onComplete.slackReply` routing) can both resolve the thread
+        // without re-deriving Slack routing from raw event fields.
+        data: { ...mapped.value.data, slackThreadKey: threadKey },
+        principal: {
+          workspaceId: workflow.organizationId,
+          source: `slack:${event.user ?? "unknown"}`,
+        },
       };
       logger.info("trigger.received", {
         workspaceId: workflow.organizationId,
         workflowId: workflow.id,
-        ...(existingSession ? { sessionId: existingSession.id } : {}),
-        fields: { source: "slack", continued: existingSession != null },
+        fields: { source: "slack", threadContinuation: threadKnown },
       });
+      runtime.metrics.recordTrigger("slack", "received");
       try {
-        const result = await dispatchTriggerRun(runtime, dispatchInput);
-        logger.info("dispatch.delivered", {
-          workspaceId: workflow.organizationId,
-          workflowId: workflow.id,
-          runId: result.run.id,
-          sessionId: result.session.id,
-          fields: { source: "slack" },
+        const result = await startPipelineRun(requirePipelines(runtime), {
+          organizationId: workflow.organizationId,
+          workflow: { id: workflow.id, config },
+          triggerEvent,
+          origin: "slack",
         });
-      } catch (error) {
-        if (isRuntimeApiError(error) && error.code === "session_busy") {
-          // Expected under fan-out (a racing twin/duplicate already owns the
-          // thread's turn) — but never drop a Slack message with no trace.
-          // TRANSIENT by construction: the holder finishes and the next
-          // message in the thread goes through.
-          logger.warn("dispatch.session_busy", {
+        if (!result.started) {
+          if (result.reason === "lock_pool_exhausted") {
+            // Transient capacity, not policy: the pipeline lock pool is
+            // pinned by live runs and nothing was created. Slack has no
+            // retry channel here, so the message is dropped LOUDLY and
+            // counted as a failed dispatch (the runner already logged the
+            // exhaustion).
+            runtime.metrics.recordTrigger("slack", "failed");
+            logger.warn("pipeline.lock_pool_exhausted_dropped", {
+              workspaceId: workflow.organizationId,
+              workflowId: workflow.id,
+              fields: { source: "slack", dropped: true },
+            });
+            continue;
+          }
+          // `overlap: "skip"`: a run of this workflow is still live. The
+          // message is dropped BY POLICY (never silently — the thread's next
+          // message dispatches once the run settles).
+          logger.warn("pipeline.overlap_skipped", {
             workspaceId: workflow.organizationId,
             workflowId: workflow.id,
             fields: { source: "slack", dropped: true },
           });
           continue;
         }
-        if (isRuntimeApiError(error) && error.code === "session_not_active") {
-          // eve's PERMANENT 409: this thread's eve session is terminal, timed
-          // out, or reset. Deliberately NOT routed through the drop-and-log
-          // branch above — that recovery ("a twin owns the turn; the next
-          // message works") is exactly wrong here and would swallow an
-          // unrecoverable failure forever.
-          //
-          // The dispatch already evicted the claim (the session row is closed,
-          // which releases its slack_thread_key), so THIS message is lost but
-          // the thread is not: the next message finds no holder and mints a
-          // fresh session. Logged at error level because a user-visible
-          // message was dropped.
-          logger.error("dispatch.session_not_active", {
-            workspaceId: workflow.organizationId,
-            workflowId: workflow.id,
-            err: error,
-            fields: { source: "slack", dropped: true, threadClaimReleased: true },
-          });
-          continue;
-        }
+        runtime.metrics.recordTrigger("slack", "dispatched");
+        logger.info("dispatch.delivered", {
+          workspaceId: workflow.organizationId,
+          workflowId: workflow.id,
+          runId: result.run.id,
+          fields: { source: "slack" },
+        });
+      } catch (error) {
+        runtime.metrics.recordTrigger("slack", "failed");
+        // Session-plane conditions (session_busy, session_not_active) no
+        // longer surface here: the eve dispatch happens inside the `agent`
+        // step, which classifies and retries them (a dead thread session is
+        // evicted there and the NEXT message mints a fresh one).
         logger.error("dispatch.failed", {
           workspaceId: workflow.organizationId,
           workflowId: workflow.id,

@@ -26,6 +26,7 @@ function workflowSummary(id: string, name: string) {
     name,
     triggerType: "manual",
     agentName: null,
+    stepKinds: [],
     enabled: true,
     publishedAt: null,
     createdAt: NOW,

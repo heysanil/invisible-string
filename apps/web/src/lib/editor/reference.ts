@@ -1,6 +1,8 @@
 /**
- * The `@reference` node — atomic chips for `@trigger.*`, `@skill.*` and
- * `@<connection>` in the workflow-instructions editor.
+ * The `@reference` node — atomic chips for `@trigger.*`, `@steps.*`,
+ * `@state.*`, `@item`, `@now`, `@skill.*` and `@<connection>` in the
+ * pipeline's markdown surfaces (infer prompts, agent-step instructions,
+ * onComplete templates).
  *
  * THE CHIP IS A VIEW OF PLAIN TEXT, NEVER A NEW SYNTAX
  * ----------------------------------------------------

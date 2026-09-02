@@ -15,6 +15,16 @@ import { schema } from "@invisible-string/db";
 import { createDb, type DbHandle } from "../db";
 import { createLogger } from "../log";
 import { runMigrations } from "../migrate";
+import {
+  createPipelineRunner,
+  loadPipelineRunnerConfig,
+} from "../pipeline/runner";
+import {
+  createDrizzleRunStepStore,
+  createDrizzleWorkflowStateStore,
+} from "../pipeline/step-store";
+import { RunEventBus } from "../runs/bus";
+import { createDrizzleRunStore } from "../runs/store";
 import { MetricsRegistry } from "./metrics";
 import type { RuntimeDeps } from "./routes";
 import {
@@ -40,8 +50,9 @@ describe.skipIf(!TEST_DATABASE_URL)("schedule ticker", () => {
 
   /**
    * Only db/logger/metrics are consumed when `dispatch` is injected (the
-   * built-in dispatch path — resolve + dispatchTriggerRun — is proven by the
-   * phase-3 SCHEDULE acceptance); the cast keeps this suite worker-free.
+   * built-in dispatch path — resolveEnabledPipeline + startPipelineRun — is
+   * proven by the phase-3 SCHEDULE acceptance); the cast keeps this suite
+   * worker-free.
    */
   function deps(): RuntimeDeps {
     return { db: handle.db, logger, metrics } as unknown as RuntimeDeps;
@@ -75,10 +86,13 @@ describe.skipIf(!TEST_DATABASE_URL)("schedule ticker", () => {
     published?: boolean;
   }): Promise<{ workflowId: string; triggerId: string }> {
     const published = options.published ?? true;
+    // A v2 PIPELINE snapshot. Steps stay empty on purpose: the claim/scan
+    // tests never interpret it, and the real-dispatch test below wants the
+    // cheapest possible run (an empty pipeline completes immediately).
     const config = {
+      version: 2,
       trigger: { type: "schedule", cron: options.cron },
-      agentId: null,
-      instructions: { markdown: "Do the scheduled thing (@trigger.scheduledFor)" },
+      steps: [],
     };
     const workflows = await handle.db
       .insert(schema.workflows)
@@ -265,6 +279,70 @@ describe.skipIf(!TEST_DATABASE_URL)("schedule ticker", () => {
       "2026-07-10T12:05:00.000Z",
     );
     expect(metrics.scheduleCounts().failed).toBeGreaterThanOrEqual(1);
+  });
+
+  test("REAL dispatch: a due fire starts a PIPELINE run of the published snapshot", async () => {
+    // `now` is EARLIER than every other test's cursor so this scan claims
+    // only this trigger.
+    const now = new Date("2026-07-09T00:00:30.000Z");
+    const due = new Date("2026-07-09T00:00:00.000Z");
+    const { workflowId } = await createScheduledWorkflow({
+      cron: "*/5 * * * *",
+      nextFireAt: due,
+    });
+
+    const runner = createPipelineRunner({
+      db: handle.db,
+      runStore: createDrizzleRunStore(handle.db),
+      stepStore: createDrizzleRunStepStore(handle.db),
+      stateStore: createDrizzleWorkflowStateStore(handle.db),
+      bus: new RunEventBus(),
+      logger,
+      executors: {},
+      executorDeps: { db: handle.db, logger, masterKey: undefined, fetchImpl: fetch },
+      config: loadPipelineRunnerConfig({}),
+      workspaceRunCap: 10,
+    });
+    const tickerDeps = {
+      db: handle.db,
+      logger,
+      metrics,
+      pipelines: runner,
+    } as unknown as RuntimeDeps;
+
+    const outcome = await createScheduleTicker(tickerDeps, { now: () => now }).tick();
+    expect(outcome.dispatched).toBe(1);
+
+    // The pipeline run row landed with schedule provenance and (being an
+    // empty pipeline) settles succeeded.
+    const runs = await handle.db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.workflowId, workflowId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.mode).toBe("pipeline");
+    expect(runs[0]!.agentSessionId).toBeNull();
+    expect(runs[0]!.organizationId).toBe(orgId);
+    const envelope = runs[0]!.triggerEvent as {
+      triggerType?: string;
+      data?: { scheduledFor?: string };
+    };
+    expect(envelope.triggerType).toBe("schedule");
+    expect(envelope.data?.scheduledFor).toBe(due.toISOString());
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const rows = await handle.db
+        .select({ status: schema.runs.status })
+        .from(schema.runs)
+        .where(eq(schema.runs.id, runs[0]!.id));
+      if (rows[0]?.status === "succeeded") break;
+      await Bun.sleep(10);
+    }
+    const final = await handle.db
+      .select({ status: schema.runs.status })
+      .from(schema.runs)
+      .where(eq(schema.runs.id, runs[0]!.id));
+    expect(final[0]!.status).toBe("succeeded");
   });
 
   test("start/stop: the loop ticks on its cadence and stops cleanly", async () => {

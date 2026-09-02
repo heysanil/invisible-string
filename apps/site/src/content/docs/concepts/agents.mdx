@@ -50,12 +50,12 @@ draft, no matter how far the draft has since drifted.
 
 ## Who the Agent runs as
 
-Every dispatch — chat, a webhook, a schedule, a Slack event — runs the Agent
-with one workspace member's connected credentials. This "Run as" control lives
-on the Agent itself, not per-workflow, because a Workflow attaches no context
-of its own; the Agent's own equipment, including whose credentials it acts
-with, is the only context there is. See [sessions & runs](/docs/concepts/sessions-and-runs)
-for how a run uses that identity once it's underway.
+Every dispatch — a chat message, or a Workflow's `agent` step — runs the
+Agent with one workspace member's connected credentials. This "Run as"
+control lives on the Agent itself, not per-workflow: an agent step delegates
+to the Agent as-is, equipment and identity included, and can't override
+either. See [sessions & runs](/docs/concepts/sessions-and-runs) for how a
+run uses that identity once it's underway.
 
 ## Publishing and versions
 
@@ -82,20 +82,21 @@ apply to new sessions. See [sessions & runs](/docs/concepts/sessions-and-runs).
 
 ## Renaming, deleting, and dependents
 
-Renaming is the safe case. Because Workflows delegate to an Agent by reference
-rather than by name, editing the name in the agent editor's header renames it
-everywhere at once and breaks no binding.
+Renaming is the safe case. Because a Workflow's `agent` steps delegate to an
+Agent by reference rather than by name, editing the name in the agent
+editor's header renames it everywhere at once and breaks no binding.
 
-Context is where dependents get interesting. A Workflow's instructions may
-name the Agent's connections and skills with `@` references. If an Agent is
-republished missing something a bound Workflow referenced, that reference
-stops resolving — the [workflow editor](/docs/building/workflow-editor) surfaces
-a staleness warning rather than blocking the save. This is a warning, not a
-hard failure: it doesn't block publishing the Workflow, and it doesn't block
-dispatch either — a Workflow whose instructions carry a dangling reference
-still fires, it just runs without that reference resolving to anything.
+Publishing state is where dependents get interesting. An agent step needs
+its Agent to have a published version — that's checked when the Workflow
+publishes. If the Agent is later unpublished or otherwise stranded, the
+[workflow editor](/docs/building/workflow-editor) surfaces a **staleness
+warning** on the published Workflow rather than silently letting runs break:
+the Workflow still fires, but that agent step fails at run time until the
+Agent is published again.
 
 Deleting an Agent is the stricter case: it removes the Agent and every
-published version, so it's blocked outright while any Workflow or chat
-session still references it — there's no dangling-reference state to degrade
-into, because the delete itself doesn't go through.
+published version, so it's blocked outright while any *published* Workflow
+still binds it in an agent step, or any chat session still exists against it
+— the error names the Workflows in the way. A draft Workflow referencing it
+doesn't block the delete; the draft just gains a diagnostic naming the
+missing Agent the next time it's validated.

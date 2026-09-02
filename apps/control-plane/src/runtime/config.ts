@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError } from "../config";
+import { statementTimeoutFromEnv } from "../db";
 import { publicAppUrlFromEnv } from "../integrations/config";
 import {
   loadSessionTitleConfig,
@@ -92,6 +93,48 @@ export interface RuntimeConfig {
    * control plane scans for due cron triggers. Tests shrink it.
    */
   scheduleTickMs: number;
+  /**
+   * Remote-cancel sweep cadence (REMOTE_CANCEL_SWEEP_MS, default 60 s — keep
+   * in sync with runtime/reconcile.ts DEFAULT_REMOTE_CANCEL_SWEEP_MS): how
+   * often a HEALTHY process re-runs boot reconciliation's sweep 2b over
+   * canceled runs still carrying `remote_cancel_pending_at`, so a Stop whose
+   * remote leg was refused (lock pool saturated, transport failure) is
+   * finished without a restart. Tests shrink it or call the tick directly.
+   */
+  remoteCancelSweepMs: number;
+  /**
+   * Remote-cancel OBSERVATION window (REMOTE_CANCEL_OBSERVE_MS, default 10
+   * min — keep in sync with runs/tailer.ts DEFAULT_REMOTE_CANCEL_OBSERVE_MS):
+   * how long, from `runs.remote_cancel_pending_at`, a Stop's obligation may
+   * wait for eve's OWN confirmation on the session stream (the run's turn
+   * boundary after its own `turn.started`) before it is declared unresolved
+   * (`runs.remote_cancel_unresolved_at`, logged at warn, marker retained).
+   * Bounds both the live tail's observation and the sweeper's re-opened one.
+   */
+  remoteCancelObserveMs: number;
+  /**
+   * The product DB's per-statement bound (DB_STATEMENT_TIMEOUT_MS, default
+   * 30 s — ONE parser, `db.ts` `statementTimeoutFromEnv`, shared with the
+   * pool construction in index.ts so the two can never diverge). The run
+   * tailer DERIVES its takeover bound from it (`seizedWriteBoundMs`): a
+   * seized tail's in-flight write is landed or dead once this plus a margin
+   * has elapsed, so a successor waits exactly that long before taking a
+   * session's cursor over, and the manager evicts a seized drain from the
+   * stream-holder list on the same clock.
+   */
+  dbStatementTimeoutMs: number;
+  /**
+   * Pipeline-recovery sweep cadence (PIPELINE_RECOVERY_SWEEP_MS, default 60 s
+   * — keep in sync with pipeline/recovery.ts
+   * DEFAULT_PIPELINE_RECOVERY_SWEEP_MS): how often a HEALTHY process re-runs
+   * boot reconciliation's interrupted-pipeline adoption over queued/running/
+   * waiting pipeline runs with no live driver (an acquirable per-run lock),
+   * so an orphan left `locked` at boot — the pipeline lock pool was
+   * exhausted, or its driver died in another replica — is re-driven without
+   * a restart instead of holding its workspace-cap slot forever. Tests shrink
+   * it or call the tick directly.
+   */
+  pipelineRecoverySweepMs: number;
   /** Shared npm cache dir for agent-project installs (NPM_CACHE_DIR). */
   npmCacheDir: string;
   /**
@@ -241,6 +284,25 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     30_000,
     problems,
   );
+  const remoteCancelSweepMs = parsePositiveInt(
+    env.REMOTE_CANCEL_SWEEP_MS,
+    "REMOTE_CANCEL_SWEEP_MS",
+    60_000,
+    problems,
+  );
+  const remoteCancelObserveMs = parsePositiveInt(
+    env.REMOTE_CANCEL_OBSERVE_MS,
+    "REMOTE_CANCEL_OBSERVE_MS",
+    600_000,
+    problems,
+  );
+  const dbStatementTimeoutMs = statementTimeoutFromEnv(env);
+  const pipelineRecoverySweepMs = parsePositiveInt(
+    env.PIPELINE_RECOVERY_SWEEP_MS,
+    "PIPELINE_RECOVERY_SWEEP_MS",
+    60_000,
+    problems,
+  );
   const sseHeartbeatMs = parsePositiveInt(
     env.SSE_HEARTBEAT_MS,
     "SSE_HEARTBEAT_MS",
@@ -297,6 +359,10 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     maxAgentsPerWorker,
     workerSweepIntervalMs,
     scheduleTickMs,
+    remoteCancelSweepMs,
+    remoteCancelObserveMs,
+    dbStatementTimeoutMs,
+    pipelineRecoverySweepMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",

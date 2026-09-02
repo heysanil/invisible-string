@@ -12,10 +12,14 @@ import { ensureDomForThisFile } from "../test/setup";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act } from "react";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
-import type { CopilotProposal, WorkflowConfig } from "@invisible-string/shared";
+import type {
+  CopilotProposal,
+  PipelineStep,
+  WorkflowConfig,
+} from "@invisible-string/shared";
 
 import { CopilotDock } from "../components/copilot/CopilotDock";
-import { workflowCopilotAdapter } from "../lib/copilot/mutations";
+import { CONVERT_PROMPT, workflowCopilotAdapter } from "../lib/copilot/mutations";
 import type { WebSocketLike } from "../lib/copilot/socket";
 import { FIXTURE_AGENTS, FIXTURE_AGENT_IDS } from "../lib/agents/fixtures";
 import { pasteInto, pressEnter } from "../test/editor";
@@ -85,11 +89,46 @@ const q = () => within(document.body);
 
 const AGENTS = FIXTURE_AGENTS.map((entry) => entry.summary);
 const EXEC_ID = FIXTURE_AGENT_IDS.execAssistant;
+const CONNECTION_ID = "cn_slack12345678";
+
+/** Minted-shaped step id from a mnemonic (charset [0-9a-z], length 16). */
+function sid(mnemonic: string): string {
+  return `st_${mnemonic.padEnd(16, "0").slice(0, 16)}`;
+}
+
+const searchStep: PipelineStep = {
+  id: sid("search"),
+  slug: "search",
+  name: "Search Slack",
+  kind: "tool",
+  connectionId: CONNECTION_ID,
+  tool: "search_messages",
+  args: { query: { $tpl: "@trigger.text" } },
+  sideEffect: "at_least_once",
+};
+
+const summarizeStep: PipelineStep = {
+  id: sid("summarize"),
+  slug: "summarize",
+  kind: "infer",
+  preset: "quick",
+  prompt: { markdown: "Old line\nShared line" },
+};
+
+const agentStep: PipelineStep = {
+  id: sid("delegate"),
+  slug: "delegate",
+  kind: "agent",
+  agentId: EXEC_ID,
+  instructions: { markdown: "Do the thing." },
+  session: "fresh",
+};
 
 const definition: WorkflowConfig = {
+  version: 2,
   trigger: { type: "manual" },
-  agentId: EXEC_ID,
-  instructions: { markdown: "Old line\nShared line" },
+  steps: [searchStep, summarizeStep],
+  overlap: "skip",
 };
 
 function proposal(overrides: Partial<CopilotProposal> = {}): CopilotProposal {
@@ -127,6 +166,7 @@ function renderDock(
     getDraft: () => draft.current,
     dispatch,
     agents: AGENTS,
+    connections: [{ id: CONNECTION_ID, name: "Slack" }],
     onApplied,
   });
   const view = render(
@@ -277,27 +317,30 @@ test("user_message names the workflow surface + entity and carries the live draf
 });
 
 test("empty-state chips are draft-aware and send a user_message", () => {
-  // The fixture draft has instructions → refinement chips, not the scaffold
-  // ones (which would be destructive on a configured draft).
+  // The fixture draft has steps → refinement chips, not the scaffold ones
+  // (which would be destructive on a configured draft).
   renderDock();
   const socket = lastSocket();
   act(() => socket.open());
   expect(
     q().queryByRole("button", { name: "Set this up to triage Slack mentions" }),
   ).toBeNull();
-  fireEvent.click(q().getByRole("button", { name: "Tighten the instructions" }));
+  fireEvent.click(
+    q().getByRole("button", { name: "Explain this pipeline's issues" }),
+  );
   const frame = JSON.parse(socket.sent.at(-1)!);
   expect(frame.type).toBe("user_message");
-  expect(frame.message).toBe("Tighten the instructions");
+  expect(frame.message).toBe("Explain this pipeline's issues");
   expect(frame.draft).toEqual(definition);
 });
 
 test("a blank draft shows scaffold chips", () => {
   renderDock({
     draft: {
+      version: 2,
       trigger: { type: "manual" },
-      agentId: null,
-      instructions: { markdown: "" },
+      steps: [],
+      overlap: "skip",
     } satisfies WorkflowConfig,
   });
   const socket = lastSocket();
@@ -305,6 +348,14 @@ test("a blank draft shows scaffold chips", () => {
   expect(
     q().getByRole("button", { name: "Set this up to triage Slack mentions" }),
   ).toBeTruthy();
+});
+
+test("a single-agent-step pipeline offers the conversion chip", () => {
+  renderDock({ draft: { ...definition, steps: [agentStep] } });
+  const socket = lastSocket();
+  act(() => socket.open());
+  fireEvent.click(q().getByRole("button", { name: CONVERT_PROMPT }));
+  expect(JSON.parse(socket.sent.at(-1)!).message).toBe(CONVERT_PROMPT);
 });
 
 test("proposal frame renders a structured card; Apply routes through dispatch and reports accepted", () => {
@@ -331,7 +382,7 @@ test("proposal frame renders a structured card; Apply routes through dispatch an
       },
     },
   });
-  expect(applied).toHaveBeenCalledWith("trigger");
+  expect(applied).toHaveBeenCalledWith({ kind: "trigger" });
   expect(JSON.parse(socket.sent.at(-1)!)).toEqual({
     type: "mutation_result",
     proposalId: "prop-1",
@@ -342,26 +393,40 @@ test("proposal frame renders a structured card; Apply routes through dispatch an
   expect(q().getByTestId("suggestion-receipt").textContent).toContain("Applied");
 });
 
-test("setAgent proposal resolves the agent name; Dismiss reports rejected without applying", () => {
-  const { dispatch } = renderDock({
-    draft: { ...definition, agentId: null },
-  });
+test("addStep proposal renders a ghost step card; Dismiss reports rejected without applying", () => {
+  const { dispatch } = renderDock();
   const socket = lastSocket();
   act(() => socket.open());
+  const newStep: PipelineStep = {
+    id: sid("newtool"),
+    slug: "file-issue",
+    kind: "tool",
+    connectionId: CONNECTION_ID,
+    tool: "create_issue",
+    args: { title: { $tpl: "@steps.summarize.result" } },
+    sideEffect: "at_least_once",
+  };
   act(() =>
     socket.message({
       type: "proposal",
       proposal: proposal({
         id: "prop-2",
-        tool: "setAgent",
-        params: { agentId: EXEC_ID },
+        tool: "addStep",
+        params: { step: newStep, position: { after: sid("summarize") } },
       }),
     }),
   );
   const card = q().getByTestId("suggestion-card");
-  expect(card.textContent).toContain("Set agent: Executive assistant");
-  // Compact preview: no agent → the named agent.
-  expect(q().getByTestId("before-after").textContent).toContain("No agent");
+  expect(card.textContent).toContain("Add step: file-issue");
+  // The rich preview: ghost mini-card + position phrase + args table.
+  const preview = within(card).getByTestId("step-preview");
+  expect(within(preview).getByTestId("step-mini-card").textContent).toContain(
+    "create_issue",
+  );
+  expect(preview.textContent).toContain("after “summarize”");
+  expect(within(preview).getByTestId("args-diff").textContent).toContain(
+    "@steps.summarize.result",
+  );
 
   fireEvent.click(q().getByRole("button", { name: "Dismiss" }));
   expect(dispatch).not.toHaveBeenCalled();
@@ -375,17 +440,21 @@ test("setAgent proposal resolves the agent name; Dismiss reports rejected withou
   );
 });
 
-test("setInstructions proposal renders an inline diff", () => {
-  renderDock();
+test("updateStep proposal renders the prompt as an inline diff; Apply dispatches the action", () => {
+  const { dispatch } = renderDock();
   const socket = lastSocket();
   act(() => socket.open());
+  const updated: PipelineStep = {
+    ...summarizeStep,
+    prompt: { markdown: "New line\nShared line" },
+  };
   act(() =>
     socket.message({
       type: "proposal",
       proposal: proposal({
         id: "prop-3",
-        tool: "setInstructions",
-        params: { markdown: "New line\nShared line" },
+        tool: "updateStep",
+        params: { stepId: sid("summarize"), step: updated },
       }),
     }),
   );
@@ -396,9 +465,42 @@ test("setInstructions proposal renders an inline diff", () => {
   expect([...dels].map((n) => n.textContent)).toEqual(["−Old line"]);
   expect([...adds].map((n) => n.textContent)).toEqual(["+New line"]);
   expect(diff.textContent).toContain("Shared line");
+
+  fireEvent.click(q().getByRole("button", { name: /Apply/ }));
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "updateStep",
+    stepId: sid("summarize"),
+    step: updated,
+  });
 });
 
-test("suggestion card is keyboard-operable (Enter applies) and flashes the section", () => {
+test("read-tool step frames render in the work rail with humanized names", () => {
+  renderDock();
+  const socket = lastSocket();
+  act(() => socket.open());
+  act(() => {
+    socket.message({
+      type: "step",
+      key: "call-read-1",
+      toolName: "searchConnectionTools",
+      state: "ok",
+      resultPreview: "3 tools matched",
+    });
+    socket.message({
+      type: "step",
+      key: "call-read-2",
+      toolName: "getConnectionTool",
+      state: "pending",
+      resultPreview: null,
+    });
+  });
+  const box = q().getByTestId("copilot-work");
+  expect(box.textContent).toContain("Search connection tools");
+  expect(box.textContent).toContain("3 tools matched");
+  expect(box.textContent).toContain("Get connection tool");
+});
+
+test("suggestion card is keyboard-operable (Enter applies) and flashes the step", () => {
   const applied = mock(() => {});
   const { dispatch } = renderDock({ onApplied: applied });
   const socket = lastSocket();
@@ -408,16 +510,19 @@ test("suggestion card is keyboard-operable (Enter applies) and flashes the secti
       type: "proposal",
       proposal: proposal({
         id: "prop-4",
-        tool: "setAgent",
-        params: { agentId: EXEC_ID },
+        tool: "removeStep",
+        params: { stepId: sid("search") },
       }),
     }),
   );
-  const card = q().getByRole("group", { name: /Suggestion: Set agent/ });
+  const card = q().getByRole("group", { name: /Suggestion: Remove step/ });
   expect(card.getAttribute("tabindex")).toBe("0");
   fireEvent.keyDown(card, { key: "Enter" });
-  expect(dispatch).toHaveBeenCalledWith({ type: "setAgentId", id: EXEC_ID });
-  expect(applied).toHaveBeenCalledWith("agent");
+  expect(dispatch).toHaveBeenCalledWith({
+    type: "removeStep",
+    stepId: sid("search"),
+  });
+  expect(applied).toHaveBeenCalledWith({ kind: "step", stepId: sid("search") });
 });
 
 test("an off-surface proposal renders as unsupported and applies as a no-op", () => {
@@ -549,12 +654,7 @@ test("thinking indicator shows between send and first token; pending proposal sh
 });
 
 test("receipt description is frozen at decision time (no drift as the draft changes)", () => {
-  const blank: WorkflowConfig = {
-    trigger: { type: "manual" },
-    agentId: EXEC_ID,
-    instructions: { markdown: "" },
-  };
-  const { view, draft } = renderDock({ draft: blank });
+  const { view, draft } = renderDock();
   const socket = lastSocket();
   act(() => socket.open());
   act(() =>
@@ -562,21 +662,18 @@ test("receipt description is frozen at decision time (no drift as the draft chan
       type: "proposal",
       proposal: proposal({
         id: "prop-freeze",
-        tool: "setInstructions",
-        params: { markdown: "Fresh instructions" },
+        tool: "removeStep",
+        params: { stepId: sid("search") },
       }),
     }),
   );
   expect(q().getByTestId("suggestion-card").textContent).toContain(
-    "Write instructions",
+    "Remove step: Search Slack",
   );
   fireEvent.click(q().getByRole("button", { name: /Apply/ }));
-  // Simulate the applied draft flowing back down: the adapter now reads a
-  // non-empty instructions doc, which would retitle a live card "Rewrite".
-  draft.current = {
-    ...blank,
-    instructions: { markdown: "Fresh instructions" },
-  };
+  // Simulate the applied draft flowing back down: the step is gone, so a live
+  // card could no longer resolve the id and would degrade to the raw st_ id.
+  draft.current = { ...definition, steps: [summarizeStep] };
   view.rerender(
     <CopilotDock
       workspaceId="ws-1"
@@ -590,9 +687,9 @@ test("receipt description is frozen at decision time (no drift as the draft chan
       backoffBaseMs={1}
     />,
   );
-  // The receipt keeps the pending-time title instead of drifting to "Rewrite".
+  // The receipt keeps the pending-time title instead of drifting to the id.
   expect(q().getByTestId("suggestion-receipt").textContent).toContain(
-    "Applied — Write instructions",
+    "Applied — Remove step: Search Slack",
   );
 });
 

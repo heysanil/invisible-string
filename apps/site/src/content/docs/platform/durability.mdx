@@ -40,6 +40,29 @@ than the guarantee:
   [Chat](/docs/building/chat) for how the composer queues a follow-up while a
   run is busy.
 
+## Pipeline runs replay from their ledger
+
+A [Workflow](/docs/concepts/workflows)'s pipeline runs are durable by the
+same philosophy, on the control plane's own ledger: every step instance is
+claimed as a row before it executes and its output persisted when it
+finishes. If the control plane crashes mid-run, recovery on the next boot
+walks the pipeline again from the top — every step the ledger already shows
+finished is adopted as-is, its output rebuilt into the run's scope without
+re-executing, and only the step that was actually interrupted runs again.
+
+That replay is where the honest boundary shows: an interrupted tool step is
+retried by default, so its side effect can land twice across a crash — the
+same at-least-once stance as Slack reply delivery. A tool step configured
+as at-most-once fails as *interrupted* instead of risking the double fire —
+the honest option for a side effect that must not repeat. An interrupted
+agent step re-attaches rather than re-dispatching: its child run was linked
+before anything was sent, so recovery finds the child and keeps waiting on
+it. When the crash provably landed *before* the dispatch ever left the
+platform, recovery replaces the stillborn child with a fresh dispatch; in
+the one narrow window where that can't be proven, the step fails honestly
+instead of risking a duplicate agent turn — at-most-once, the same stance
+as an at-most-once tool step.
+
 ## A failover, narrated
 
 A worker stops heartbeating. The control plane's dead-worker sweep notices,
@@ -54,8 +77,9 @@ from where you sat, the run picks back up rather than restarting.
 
 Because a single agent version can only be written by one worker at a time, an
 Agent's entire live traffic — every chat session against it, and every
-Workflow delegating to it — concentrates onto its one current published
-version. That's a known, accepted trade-off in the platform's current
+Workflow `agent` step delegating to it — concentrates onto its one current
+published version. (It's also why a pipeline's loops run their agent steps
+one item at a time rather than fanning out.) That's a known, accepted trade-off in the platform's current
 single-worker-friendly deployment shape, not a hidden limitation: publishing a
 new version moves traffic to a new version's world database rather than
 spreading load across workers within one version.

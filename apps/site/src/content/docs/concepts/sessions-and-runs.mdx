@@ -2,28 +2,38 @@
 title: Sessions & runs
 section: Concepts
 order: 22
-description: "A session is a conversation with a published Agent; a run is one execution inside it. How sessions pin an agent version and stream progress back live."
+description: "A session is a conversation with a published Agent; a run is one execution. How agent runs and pipeline runs differ, stream live, and pin their versions."
 ---
 
 # Sessions & runs
 
 A session is a conversation with a published Agent; a run is a single
-execution within it. Whether it starts from chat or from a Workflow's trigger,
-a session pins the agent version it began with, and each run streams its
-progress back to the browser live — an ordered timeline of what the Agent said
-and what it did, with any human-in-the-loop pauses inline.
+execution. Runs come in two shapes. An **agent run** is one turn inside a
+session — what chat produces, and what a Workflow's `agent` step produces as
+a child. A **pipeline run** is one firing of a
+[Workflow](/docs/concepts/workflows): it has no session of its own — its
+record is a per-step timeline instead of a transcript.
 
-Runs stream over resumable SSE — reconnecting with a Last-Event-ID replays
-missed events rather than restarting — so a dropped connection never loses run
-history.
+Both stream their progress to the browser live over resumable SSE —
+reconnecting with a Last-Event-ID replays missed events rather than
+restarting — so a dropped connection never loses run history.
 
 ## What a run contains
 
-A run is the ordered stream itself: everything the Agent said, everything it
-thought through, every tool it called, and every point where it stopped and
-waited. Every run belongs to exactly one session and runs against exactly one
-agent version — the version its session pinned when it began, never a later
-one. How that stream renders is covered in [Chat](/docs/building/chat).
+An agent run is the ordered stream itself: everything the Agent said,
+everything it thought through, every tool it called, and every point where it
+stopped and waited. It belongs to exactly one session and runs against
+exactly one agent version — the version its session pinned when it began,
+never a later one. How that stream renders is covered in
+[Chat](/docs/building/chat).
+
+A pipeline run is the ledger of its steps: one entry per step instance — a
+loop body yields one per iteration — with each step's status, attempts,
+timing, and rendered input and output. When a pipeline reaches an `agent`
+step, it dispatches a **child run**: a real agent run with a session of its
+own — fresh by default, or a continued Slack-thread session — linked from
+the parent step; in the run's
+timeline view, the child's whole transcript is embedded in place.
 
 ## One run per session
 
@@ -33,9 +43,13 @@ run requests against a busy session are refused rather than interleaved. In
 chat that rule is invisible: messages you send during a run are queued and
 delivered when the session frees.
 
+Pipeline runs have no session, so a different rule bounds them: by default a
+Workflow runs one pipeline at a time, and a trigger firing mid-run is skipped
+rather than overlapped — see [Workflows](/docs/concepts/workflows).
+
 ## Waiting
 
-Three things park a run on a person before it can continue:
+Three things park an agent run on a person before it can continue:
 
 - **Tool approval** — a gated tool call needs a yes before it runs.
 - **A direct question** — the Agent is asking you something and needs an
@@ -44,23 +58,26 @@ Three things park a run on a person before it can continue:
   continuing needs your say-so.
 
 A waiting run still holds the session exactly like an actively streaming one
-does — see [One run per session](#one-run-per-session) above. Nothing about
-"waiting" is a lesser state than "running": it's still the one execution the
-session is allowed to have in flight.
+does. And waiting propagates: a child run that parks on an approval parks its
+parent pipeline step — and the whole pipeline run — until the child's prompt
+is answered, right there in the run timeline where the transcript is
+embedded.
 
 ## How a run ends
 
 A run finishes in one of three states: succeeds, fails, or is canceled — the
 state a run lands in when you stop it. Cancellation is a decision rather than
-an error: a stopped run is never reported as a failure, and a Workflow's
-outbound reply is never delivered from a run someone cut short — deliberately,
-not as an incidental side effect of how cancellation happens to be
-implemented, because a reply from a run nobody let finish isn't one the
+an error: a stopped run is never reported as a failure, and canceling a
+pipeline run also cancels any child run it has in flight. A Workflow's
+declared Slack reply is only ever sent from a run that *succeeded* —
+deliberately, because a reply from a run nobody let finish isn't one the
 platform should send on your behalf.
 
-A `failed` run doesn't take the session down with it. The session is still
+A `failed` run doesn't take a session down with it. The session is still
 there and still usable afterward — sending another message starts a new run
-against the same session, same pinned agent version.
+against the same session, same pinned agent version. A failed pipeline run
+likewise leaves its Workflow ready for the next trigger; its timeline shows
+exactly which step failed and why.
 
 ## Sessions end, too
 
@@ -71,11 +88,11 @@ published version.
 
 ## Where runs are visible
 
-A run is visible wherever its session is visible: in the chat thread for a
-conversational session, and in a Workflow's run history for one a trigger
-started. Both views show the same underlying timeline — chat just keeps it
-open live, while run history is where you go back and check what a triggered
-Workflow actually did. See [Durability](/docs/platform/durability) for what
-keeps that history intact across a worker failure, and
+Chat keeps a conversational session's runs open live in the thread. A
+Workflow's runs live in its **Runs** tab, each replayed as a step timeline —
+and the agent-step child runs are visible right there, embedded in their
+step's drawer, transcript and approvals included. See
+[Durability](/docs/platform/durability) for what keeps that history intact
+across a worker failure, and
 [Troubleshooting](/docs/reference/troubleshooting) if a run's state doesn't
 match what you expected.

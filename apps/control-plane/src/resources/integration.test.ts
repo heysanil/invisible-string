@@ -24,6 +24,7 @@ import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
+  newStepId,
   SESSION_MESSAGE_PREVIEW_MAX_CHARS,
   type AgentDefinitionInput,
   type CreateConnectionResponse,
@@ -565,23 +566,34 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     expect(wf.published).toBeNull();
     expect(wf.enabled).toBeTrue();
 
-    // Draft update returns validator diagnostics inline.
+    // Draft update returns validator diagnostics inline (v2 pipeline shape:
+    // one agent step delegating to the seeded agent).
     const draft = {
+      version: 2,
       trigger: { type: "manual" },
-      agentId: seededAgentId,
-      instructions: { markdown: "Be helpful." },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "delegate",
+          kind: "agent",
+          agentId: seededAgentId,
+          instructions: { markdown: "Be helpful." },
+        },
+      ],
     };
     const patch = await api("PATCH", `/workspaces/${orgId}/workflows/${wf.id}`, { cookie: ownerCookie, body: { draft } });
     expect(patch.status).toBe(200);
     const patchBody = (await patch.json()) as GetWorkflowResponse;
     expect(Array.isArray(patchBody.diagnostics)).toBeTrue();
 
-    // List summaries surface the draft trigger type + agent name.
+    // List summaries surface the draft trigger type + the SOLE agent step's
+    // agent name + the kind capsule.
     const list = await api("GET", `/workspaces/${orgId}/workflows`, { cookie: ownerCookie });
     const workflows = ((await list.json()) as ListWorkflowsResponse).workflows;
     const summary = workflows.find((w) => w.id === wf.id);
     expect(summary?.triggerType).toBe("manual");
     expect(summary?.agentName).toBe("General Purpose");
+    expect(summary?.stepKinds).toEqual(["agent"]);
 
     // A member (non-admin) cannot delete; an owner/admin can.
     await db.update(schema.member).set({ role: "member" }).where(and(eq(schema.member.userId, ownerUserId), eq(schema.member.organizationId, orgId)));
@@ -1614,24 +1626,45 @@ describe.skipIf(!TEST_DATABASE_URL)("resource CRUD integration", () => {
     const goodBody = (await goodPatch.json()) as UpdateAgentResponse;
     expect(goodBody.diagnostics).toMatchObject({ ok: true });
 
-    // DELETE is guarded while a workflow references the agent.
+    // DELETE is guarded while a PUBLISHED workflow's agent step references
+    // the agent — a draft-only reference never blocks (pipeline amendment A1:
+    // the scan reads published configs, replacing the retired
+    // published_agent_id RESTRICT role).
+    await publishedVersion(agent.id, agentDraft(), {});
     const wf = await api("POST", `/workspaces/${orgId}/workflows`, {
       cookie: ownerCookie,
       body: {
         name: "Uses Agent",
         draft: {
+          version: 2,
           trigger: { type: "manual" },
-          agentId: agent.id,
-          instructions: { markdown: "Delegate." },
+          steps: [
+            {
+              id: newStepId(),
+              slug: "delegate",
+              kind: "agent",
+              agentId: agent.id,
+              instructions: { markdown: "Delegate." },
+            },
+          ],
         },
       },
     });
     expect(wf.status).toBe(201);
     const wfId = ((await wf.json()) as GetWorkflowResponse).workflow.id;
 
+    // Draft-only: the delete would be allowed (proven by the 409 flipping on
+    // publish below, without any draft change in between).
+    const publishWf = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/publish`, { cookie: ownerCookie });
+    expect(publishWf.status).toBe(200);
+
     const blocked = await api("DELETE", `/workspaces/${orgId}/agents/${agent.id}`, { cookie: ownerCookie });
     expect(blocked.status).toBe(409);
-    expect(((await blocked.json()) as { error: { code: string } }).error.code).toBe("agent_in_use");
+    const blockedBody = (await blocked.json()) as {
+      error: { code: string; details?: { workflows?: string[] } };
+    };
+    expect(blockedBody.error.code).toBe("agent_in_use");
+    expect(blockedBody.error.details?.workflows).toEqual(["Uses Agent"]);
 
     await api("DELETE", `/workspaces/${orgId}/workflows/${wfId}`, { cookie: ownerCookie });
 

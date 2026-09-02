@@ -2,51 +2,58 @@
 title: Triggers
 section: Building
 order: 34
-description: "The five ways a Workflow fires — chat, webhook, form, Slack, and schedule — and how every one authenticates, normalizes, and dispatches the same way."
+description: "The five ways a Workflow fires — manual, webhook, form, Slack, and schedule — and how every one authenticates the event and starts the same pipeline run."
 ---
 
 # Triggers
 
 A trigger decides when a [Workflow](/docs/concepts/workflows) fires.
 invisible-string supports five kinds, and every kind lands the same way: the
-platform authenticates the event, normalizes it, and dispatches the run —
-delivering the event's data and the Workflow's instructions to the bound agent
-version as its task. Compiled agents carry no per-trigger channels; the
-trigger surface lives entirely in the platform.
+platform authenticates the event, normalizes it, and starts a **pipeline
+run** — the Workflow's published steps interpreted in order, with the
+event's data addressable as `@trigger.<key>` from any step. Compiled agents
+carry no per-trigger channels; the trigger surface lives entirely in the
+platform.
 
-| Kind | What fires it | What lands in the event | Where the reply goes | How it authenticates |
+| Kind | What fires it | What lands in the event | Where the result goes | How it authenticates |
 |---|---|---|---|---|
-| Manual | The [workflow editor](/docs/building/workflow-editor)'s **Run** popover | No structured data — the instructions carry the whole task | Streams live in Chat | Your authenticated session in the app |
-| Webhook | An HTTP `POST` to the ingress URL | The raw JSON body, verbatim, as `data` | Nowhere automatic — read the run's history | The `whk_` ingress token in the URL |
-| Form | A submission of the rendered form | Each declared field, type-coerced and validated | Nowhere automatic — read the run's history | The same per-workflow ingress token, embedded in the form's submit URL |
-| Slack | An `@mention` or DM the connected app receives | `{eventType, channel, ts, thread_ts, text, user, team, channelType}` | Posted back into the originating thread | Slack's request signature, verified within a replay window |
-| Schedule | The platform's cron ticker, on tick | `data.scheduledFor`; message is empty | Nowhere automatic — read the run's history | N/A — the platform fires it, nothing external calls in |
+| Manual | The [workflow editor](/docs/building/workflow-editor)'s **Run** popover | No structured data — your message is kept as run provenance | The run's step timeline in the Runs tab | Your authenticated session in the app |
+| Webhook | An HTTP `POST` to the ingress URL | The raw JSON body, verbatim, as `data` | The run's step timeline — the HTTP response is only an acknowledgement | The `whk_` ingress token in the URL |
+| Form | A submission of the rendered form | Each declared field, type-coerced and validated | The run's step timeline | The same per-workflow ingress token, embedded in the form's submit URL |
+| Slack | An `@mention` or DM the connected app receives | `{eventType, channel, ts, thread_ts, text, user, team, channelType}` | The run's step timeline — plus a thread reply, only when the Workflow declares one | Slack's request signature, verified within a replay window |
+| Schedule | The platform's cron ticker, on tick | `data.scheduledFor` | The run's step timeline | N/A — the platform fires it, nothing external calls in |
+
+One rule applies to all five: by default, a trigger firing while another run
+of the same Workflow is still live is **skipped**, not queued — protecting
+cursor state from a slow run overlapping the next window. A skipped webhook
+or form dispatch still answers 2xx, with a body saying the run was skipped.
 
 ## Manual
 
 Manual is the default trigger: fire the Workflow by hand from the
-[workflow editor](/docs/building/workflow-editor)'s **Run** popover and follow the run live
-in Chat. It carries no structured trigger data — the instructions alone
-describe the whole task, the same as any other manually started run.
+[workflow editor](/docs/building/workflow-editor)'s **Run** popover and
+follow the run's step timeline in the Runs tab. It carries no structured
+trigger data — the steps themselves describe the whole job, and the message
+you type in the popover is stored on the run as provenance.
 
 ## Webhook
 
 A per-Workflow ingress token accepts an HTTP `POST`, and the entire JSON body
-becomes the trigger event's `data` — no schema, no coercion. Tokens are
-minted as `whk_` plus 43 URL-safe base64 characters (256 bits of entropy),
-shown once at mint time, and never retrievable again: the platform stores
-only their SHA-256 hash, and `POST /t/:token` hashes the presented token to
-look it up.
+becomes the trigger event's `data` — no schema, no coercion; every top-level
+key is addressable as `@trigger.<key>`. Tokens are minted as `whk_` plus 43
+URL-safe base64 characters (256 bits of entropy), shown once at mint time,
+and never retrievable again: the platform stores only their SHA-256 hash,
+and `POST /t/:token` hashes the presented token to look it up.
 
 Before any JSON parsing happens, the ingress caps a request body at 256 KiB
 and rejects anything larger with `payload_too_large`, then checks per-token
 and per-IP rate limits, both returning `Retry-After` when exceeded — see
 [Limits and defaults](/docs/reference/limits-and-defaults) for the exact
-numbers. The HTTP response to that `POST` is only an acknowledgement that the
-trigger was accepted — it is never the Agent's answer. Read the actual result
-in the Workflow's run history; see
-[Build a webhook Workflow](/docs/guides/webhook-workflow) for a worked
-example.
+numbers. The HTTP response to that `POST` only acknowledges that a run
+started (it carries the run's id) or that the dispatch was skipped for
+overlap — it is never the result. Read the actual outcome in the Workflow's
+Runs tab; see [Build a webhook Workflow](/docs/guides/webhook-workflow) for
+a worked example.
 
 ## Form
 
@@ -75,20 +82,28 @@ team id and the trigger's binding — see
 up.
 
 The bot only receives events from channels it has been invited to —
-inviting it to each channel that should fire the trigger isn't optional. Two
-toggles on the binding decide what counts as a new run: `mentionOnly`
-(default true) means only `@mentions` start one, while thread replies always
-continue that run's existing session regardless of the mention setting;
-`includeDirectMessages` (default false) lets DMs start runs too, and a DM's
-session key is the channel itself rather than a thread, so a 1:1 conversation
-stays one ongoing session.
+inviting it to each channel that should fire the trigger isn't optional.
+**Every Slack event that passes the binding starts a new pipeline run.** Two
+toggles on the binding decide what passes: `mentionOnly` (default true)
+means only `@mentions` start a run in a fresh thread — but a reply in a
+thread where an agent step already holds a session dispatches regardless,
+since a reply is part of a conversation already underway; and
+`includeDirectMessages` (default false) lets DMs start runs too, with the DM
+channel itself as the conversation key.
 
-Replies post back into the originating thread via `chat.postMessage`, using
-the connected team's encrypted bot token. Delivery is at-least-once — a crash
-between posting the reply and recording that delivery can cause a rare
-duplicate post, which is expected behavior, not a bug. Slack's own event
-retries are separately deduplicated by `event_id`, so a flaky delivery on
-Slack's side doesn't compound the problem.
+Conversational continuity across those runs belongs to the pipeline's
+**agent step**: with `session: "thread"`, each run's agent step continues
+the session keyed to that Slack thread, so the Agent remembers the
+conversation even though every message was its own run.
+
+A reply posts back into the originating thread only when the Workflow's
+configuration declares one — an `onComplete.slackReply` template, rendered
+against the run's final scope when the run succeeds. **A Workflow that
+declares none posts nothing**, and failed or canceled runs never post.
+Declared replies are delivered at-least-once — a crash between posting and
+recording the delivery can cause a rare duplicate, which is expected
+behavior. Slack's own event retries are separately deduplicated by
+`event_id`.
 
 ## Schedule
 
@@ -105,5 +120,7 @@ The schedule ticker checks every 30 seconds by default and always advances
 the next fire time from now, never backfilling. Ticks missed while the
 platform is down are skipped, not queued — a control plane that's been down
 across several windows fires once on recovery and resumes its normal
-cadence, rather than bursting out every missed run at once. That's the safer
-default for anything that isn't idempotent.
+cadence, rather than bursting out every missed run at once. And a tick that
+finds the previous run still going is skipped for overlap without
+un-advancing the schedule. Both are the safer default for anything that
+isn't idempotent.

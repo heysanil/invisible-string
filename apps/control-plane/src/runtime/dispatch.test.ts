@@ -1,9 +1,23 @@
 import { describe, expect, test } from "bun:test";
 
-import { isModelAllowlisted, slackThreadKey } from "./dispatch";
+import {
+  agentQualifiedThreadKeyPrefix,
+  armDispatchAttempt,
+  isModelAllowlisted,
+  isProvablyUndispatched,
+  publishedPipelineConfigOf,
+  resolveEnabledPipeline,
+  slackThreadKey,
+} from "./dispatch";
 import { mapIngressBody, shouldStartNewSlackSession } from "../integrations/routes";
 import { isRuntimeApiError } from "./errors";
-import type { SlackInnerEvent, SlackTriggerBinding } from "@invisible-string/shared";
+import { createMemoryRunStore } from "../pipeline/test-support";
+import { hashTurnMessage } from "../runs/message-hash";
+import {
+  newStepId,
+  type SlackInnerEvent,
+  type SlackTriggerBinding,
+} from "@invisible-string/shared";
 
 describe("isModelAllowlisted (dispatch-time re-validation core)", () => {
   const allowlist = [
@@ -34,6 +48,141 @@ describe("slackThreadKey", () => {
   test("namespaces thread_ts by integration + channel", () => {
     expect(slackThreadKey("int-1", "C1", "1.0")).toBe("int-1:C1:1.0");
     expect(slackThreadKey("int-1", "C2", "1.0")).not.toBe(slackThreadKey("int-1", "C1", "1.0"));
+  });
+
+  test("agentQualifiedThreadKeyPrefix derives the per-agent claim namespace (never a bare-key collision)", () => {
+    const bare = slackThreadKey("int-1", "C1", "1.0");
+    expect(agentQualifiedThreadKeyPrefix(bare)).toBe("int-1:C1:1.0:agent:");
+    // A qualified derivative can never equal any bare key: bare keys have
+    // exactly two colons, derivatives at least four.
+    expect(agentQualifiedThreadKeyPrefix(bare).split(":").length).toBeGreaterThan(3);
+  });
+});
+
+// ── F1: dispatch-attempt marker + stillborn classification ──────────────────
+
+describe("armDispatchAttempt (marker + pre-eve cancel fence)", () => {
+  test("arms a queued run: startedAt is CAS-written while the status stays queued", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "queued");
+    const at = new Date("2026-09-01T00:00:00Z");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" }, at)).toBe("armed");
+    expect(store.statusLog).toHaveLength(1);
+    expect(store.statusLog[0]).toMatchObject({
+      runId: "run-1",
+      // Marker, acceptance-proof reset and the send's correlator (the digest
+      // of the exact message — never the text) land in ONE statement.
+      patch: { status: "queued", startedAt: at, turnId: null, messageHash: hashTurnMessage("hello") },
+    });
+    expect(store.statusLog[0]!.patch.messageHash).not.toContain("hello");
+  });
+
+  test("an input-response send is CONTENT-LESS: the correlator is recorded null (eve echoes no message.received for that turn)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "queued");
+    expect(
+      await armDispatchAttempt(store, "run-1", {
+        inputResponses: [{ requestId: "req-1", optionId: "approve" }],
+      }),
+    ).toBe("armed");
+    expect(store.statusLog[0]!.patch).toMatchObject({ turnId: null, messageHash: null });
+  });
+
+  test("a run the cancel route already settled refuses the marker → 'canceled' (the dispatch abandons)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "canceled", "canceled by user");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" })).toBe("canceled");
+    expect(store.statusLog).toHaveLength(0); // the CAS never wrote
+  });
+
+  test("any other terminal status reads 'terminal' (equally not dispatchable)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "failed", "swept");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" })).toBe("terminal");
+  });
+});
+
+describe("isProvablyUndispatched (stillborn-child classification)", () => {
+  const base = { status: "failed" as const, startedAt: null, eveSessionId: null };
+
+  test("failed + no marker → provably undispatched (safe to re-dispatch)", () => {
+    expect(isProvablyUndispatched(base)).toBe(true);
+  });
+
+  test("the marker alone flips it — the create MAY have been issued (fail honest)", () => {
+    expect(isProvablyUndispatched({ ...base, startedAt: new Date() })).toBe(false);
+  });
+
+  test("a PRE-EXISTING eve session id does NOT flip it — a thread continuation's session carries one from earlier turns; the MARKER is the authority on this run's send", () => {
+    expect(isProvablyUndispatched({ ...base, eveSessionId: "eve-1" })).toBe(true);
+    // Marker set + eve id: undecidable-or-later — never re-dispatch.
+    expect(
+      isProvablyUndispatched({
+        ...base,
+        startedAt: new Date(),
+        eveSessionId: "eve-1",
+      }),
+    ).toBe(false);
+  });
+
+  test("non-failed statuses are never stillborn (canceled stays canceled; live runs are watched)", () => {
+    for (const status of ["queued", "running", "waiting", "succeeded", "canceled"] as const) {
+      expect(isProvablyUndispatched({ ...base, status })).toBe(false);
+    }
+  });
+});
+
+describe("publishedPipelineConfigOf / resolveEnabledPipeline", () => {
+  const validPublished = {
+    version: 2,
+    trigger: { type: "webhook" },
+    steps: [
+      {
+        id: newStepId(),
+        slug: "reply",
+        kind: "agent",
+        agentId: null,
+        instructions: { markdown: "do it" },
+      },
+    ],
+  };
+  const workflowRow = (overrides: Record<string, unknown>) =>
+    ({
+      id: "wf-1",
+      organizationId: "org-1",
+      enabled: true,
+      published: validPublished,
+      ...overrides,
+    }) as never;
+
+  test("parses a published v2 snapshot (defaults applied)", () => {
+    const config = publishedPipelineConfigOf(workflowRow({}));
+    expect(config.version).toBe(2);
+    expect(config.overlap).toBe("skip"); // schema default
+    expect(config.steps).toHaveLength(1);
+  });
+
+  test("never-published and unparseable snapshots are BOTH workflow_not_published", () => {
+    for (const published of [null, { some: "pre-pipelines shape" }]) {
+      try {
+        publishedPipelineConfigOf(workflowRow({ published }));
+        throw new Error("expected a throw");
+      } catch (error) {
+        expect(isRuntimeApiError(error)).toBe(true);
+        if (isRuntimeApiError(error)) expect(error.code).toBe("workflow_not_published");
+      }
+    }
+  });
+
+  test("resolveEnabledPipeline checks the kill switch FIRST", () => {
+    try {
+      resolveEnabledPipeline(workflowRow({ enabled: false, published: null }));
+      throw new Error("expected a throw");
+    } catch (error) {
+      expect(isRuntimeApiError(error)).toBe(true);
+      if (isRuntimeApiError(error)) expect(error.code).toBe("trigger_disabled");
+    }
+    expect(resolveEnabledPipeline(workflowRow({})).version).toBe(2);
   });
 });
 

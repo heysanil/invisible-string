@@ -8,10 +8,15 @@
  * AGENT editor, lib/agents). Save → validate chain: the PATCH response
  * carries the shared validator's findings for the SAVED draft; a publish
  * flushes any pending save first so it snapshots what the user sees.
+ *
+ * Reference sources are POSITIONAL in a pipeline (a step sees only the steps
+ * before it), so the controller exposes `referenceSourcesFor(stepId)` rather
+ * than one static source set. An agent step's inspector overlays the bound
+ * agent's published context via the optional second argument — the
+ * controller never fetches per-step agent contexts itself.
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type {
-  AgentContext,
   AgentSummaryDto,
   PublishWorkflowResponse,
   WorkflowDiagnostics,
@@ -20,6 +25,7 @@ import type {
 
 import {
   emptyDiagnostics,
+  hasBlockingIssue,
   localDiagnostics,
   mergeDiagnostics,
   serverDiagnostics,
@@ -32,7 +38,11 @@ import {
   initBuilderState,
   type BuilderState,
 } from "./model";
-import type { ReferenceSources } from "./references";
+import {
+  referenceSourcesForStep,
+  type NamedResource,
+  type ReferenceSources,
+} from "./references";
 import type { ContextResources } from "./resources";
 import { usePublishWorkflow, useUpdateWorkflow } from "../queries/workflows";
 import { ApiError } from "../api-client";
@@ -53,20 +63,22 @@ export interface WorkflowPublishState {
 
 const INITIAL_PUBLISH_STATE: WorkflowPublishState = { phase: "idle", error: null };
 
+/** The connection/skill context an agent-step surface resolves against. */
+export interface StepReferenceContext {
+  connections: readonly NamedResource[];
+  skills: readonly NamedResource[];
+}
+
+const EMPTY_STEP_CONTEXT: StepReferenceContext = { connections: [], skills: [] };
+
 export interface BuilderControllerOptions {
   workspaceId: string;
   workflow: WorkflowDto;
   initialState: BuilderState;
-  /** Merged workspace+user connections/skills (resolves context ids to names). */
+  /** Merged workspace+user connections/skills (tool-step checks + pickers). */
   resources: ContextResources;
   /** Workspace agent inventory; null while loading (agent checks skip). */
   agents: readonly AgentSummaryDto[] | null;
-  /**
-   * The SELECTED agent's attached context (what `@connection`/`@skill`
-   * autocomplete + validation resolve against). Null while no agent is
-   * selected or its detail is still loading.
-   */
-  agentContext: AgentContext | null;
   /** Validator findings that rode the workflow GET (seed until first save). */
   initialDiagnostics?: WorkflowDiagnostics;
 }
@@ -77,7 +89,16 @@ export interface BuilderController {
   saveStatus: SaveStatus;
   isDirty: boolean;
   diagnostics: BuilderDiagnostics;
-  referenceSources: ReferenceSources;
+  /**
+   * The `@reference` sources for a surface belonging to `stepId` — prior
+   * steps only, state keys, `@item` inside loops. Agent-step inspectors pass
+   * their bound agent's resolved context as `context`; every other surface
+   * omits it (connection/skill refs are prose there).
+   */
+  referenceSourcesFor: (
+    stepId: string,
+    context?: StepReferenceContext,
+  ) => ReferenceSources;
   publishState: WorkflowPublishState;
   publish: () => Promise<PublishWorkflowResponse | null>;
   resetPublish: () => void;
@@ -95,7 +116,6 @@ export function useBuilderController(
     initialState,
     resources,
     agents,
-    agentContext,
     initialDiagnostics,
   } = options;
 
@@ -104,7 +124,9 @@ export function useBuilderController(
 
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [serverFindings, setServerFindings] = useState<BuilderDiagnostics>(() =>
-    initialDiagnostics ? serverDiagnostics(initialDiagnostics) : emptyDiagnostics(),
+    initialDiagnostics
+      ? serverDiagnostics(initialDiagnostics, initialState.definition.steps)
+      : emptyDiagnostics(),
   );
   const [publishState, setPublishState] =
     useState<WorkflowPublishState>(INITIAL_PUBLISH_STATE);
@@ -136,8 +158,9 @@ export function useBuilderController(
           // The PATCH validated the saved draft — consume its findings
           // instead of a follow-up call (omitted = validation didn't run;
           // keep whatever we had rather than pretending the draft is clean).
+          // Paths route against the draft that was SAVED.
           if (result.diagnostics) {
-            setServerFindings(serverDiagnostics(result.diagnostics));
+            setServerFindings(serverDiagnostics(result.diagnostics, next.steps));
           }
         } catch {
           setSaveStatus("error");
@@ -175,38 +198,30 @@ export function useBuilderController(
     }
   }, [definition, save]);
 
-  // ── diagnostics (local mirror ⊕ server findings) ──────────────────────────
+  // ── reference sources (positional) ────────────────────────────────────────
 
-  // `@connection`/`@skill` sources come from the SELECTED AGENT's context —
-  // the workflow attaches nothing itself; it delegates to an equipped agent.
-  const referenceSources = useMemo<ReferenceSources>(() => {
-    const connections = (agentContext?.mcpConnectionIds ?? [])
-      .map((id) => resources.connectionById.get(id))
-      .filter((c): c is NonNullable<typeof c> => c !== undefined)
-      .map((c) => ({ name: c.name, description: c.description }));
-    const skills = (agentContext?.skillIds ?? [])
-      .map((id) => resources.skillById.get(id))
-      .filter((s): s is NonNullable<typeof s> => s !== undefined)
-      .map((s) => ({ name: s.name, description: s.description }));
-    return { trigger: definition.trigger, connections, skills };
-  }, [
-    definition.trigger,
-    agentContext,
-    resources.connectionById,
-    resources.skillById,
-  ]);
+  const referenceSourcesFor = useCallback(
+    (stepId: string, context?: StepReferenceContext): ReferenceSources => {
+      const overlay = context ?? EMPTY_STEP_CONTEXT;
+      return referenceSourcesForStep(definition.steps, stepId, {
+        trigger: definition.trigger,
+        connections: overlay.connections,
+        skills: overlay.skills,
+      });
+    },
+    [definition.steps, definition.trigger],
+  );
+
+  // ── diagnostics (local mirror ⊕ server findings) ──────────────────────────
 
   const local = useMemo(
     () =>
       localDiagnostics({
         definition,
-        sources: referenceSources,
+        connections: resources.isPending ? null : resources.connections,
         agents,
-        // No agent selected ⇒ nothing to wait for (refs are then judged
-        // against empty sources, which is the truth).
-        contextResolved: definition.agentId === null || agentContext !== null,
       }),
-    [definition, referenceSources, agents, agentContext],
+    [definition, resources.isPending, resources.connections, agents],
   );
 
   // Only trust server findings while they reflect the SAVED draft (drop them
@@ -239,15 +254,11 @@ export function useBuilderController(
     setPublishState(INITIAL_PUBLISH_STATE);
   }, []);
 
-  // Publish is offered whenever there are no blocking errors (warnings ok).
+  // Publish is offered whenever there are no blocking errors (warnings ok)
+  // and the pipeline has at least one step.
   const canPublish = useMemo(
-    () =>
-      diagnostics.general.every((d) => d.severity !== "error") &&
-      Object.values(diagnostics.sections).every((list) =>
-        list.every((d) => d.severity !== "error"),
-      ) &&
-      definition.instructions.markdown.trim().length > 0,
-    [diagnostics, definition.instructions.markdown],
+    () => !hasBlockingIssue(diagnostics) && definition.steps.length > 0,
+    [diagnostics, definition.steps.length],
   );
 
   return {
@@ -256,7 +267,7 @@ export function useBuilderController(
     saveStatus,
     isDirty,
     diagnostics,
-    referenceSources,
+    referenceSourcesFor,
     publishState,
     publish,
     resetPublish,

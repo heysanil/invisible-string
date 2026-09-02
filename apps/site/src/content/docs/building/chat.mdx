@@ -146,12 +146,14 @@ Quick) rather than a raw provider slug.
 
 ## Origin and editing
 
-A session started by something other than chat — a webhook, a Slack event, a
-schedule, a form — shows a chip naming that origin, plus a second chip naming
-the Workflow that started it, in both the session list and the open thread.
-Runs in that kind of thread show a `Triggered · {message}` line in place of an
-outbound chat bubble. An **Edit agent ↗** link in the thread header jumps
-straight to the agent editor for the Agent behind the session.
+A session started by something other than chat — a
+[Workflow](/docs/concepts/workflows)'s agent step, dispatched by a webhook, a
+Slack event, a schedule, or a form — shows a chip naming that origin, plus a
+second chip naming the Workflow, in both the session list and the open
+thread. Runs in that kind of thread show a `Triggered · {message}` line in
+place of an outbound chat bubble, and the same transcript is embedded in the
+Workflow's own run timeline. An **Edit agent ↗** link in the thread header
+jumps straight to the agent editor for the Agent behind the session.
 
 ## Context controls
 

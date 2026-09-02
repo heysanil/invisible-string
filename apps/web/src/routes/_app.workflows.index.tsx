@@ -1,36 +1,30 @@
 /**
- * Workflows list — two-panel shape: the row list (trigger icon, agent chip,
- * Published/Draft + last-run state) and a right-pane explainer. A workflow is
- * a standing delegation: when a trigger fires, the chosen agent follows the
- * instructions. New workflows seed their draft with the workspace's first
- * PUBLISHED agent when one exists — no agent yet is a legal draft (the editor
- * surfaces the gap).
+ * Workflows list — two-panel shape: the row list (trigger icon, what the
+ * pipeline is made of, Published/Draft) and a right-pane explainer. A
+ * workflow is a standing pipeline: when a trigger fires, the control plane
+ * runs its steps in order — agents do the open-ended steps.
+ *
+ * Row middle chip (pipelines redesign): a workflow whose SOLE step delegates
+ * to an agent keeps the familiar agent chip; a multi-step pipeline renders a
+ * kind-glyph capsule + "N steps" (`WorkflowSummaryDto.stepKinds`, pre-order,
+ * server-truncated). Run history lives on the workflow's Runs tab now, not on
+ * the list rows.
  */
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import {
-  Bot,
-  Hand,
-  Hash,
-  KeyRound,
-  Plus,
-  Timer,
-  Webhook,
-  Zap,
-} from "lucide-react";
+import { Hand, Hash, KeyRound, Plus, Timer, Webhook, Zap } from "lucide-react";
 import type { ComponentType } from "react";
-import type { RunStatus, WorkflowSummaryDto } from "@invisible-string/shared";
+import type { WorkflowSummaryDto } from "@invisible-string/shared";
 
 import { monogramInitials } from "../components/agents/AgentMonogram";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
 import { Spinner } from "../components/ui/Spinner";
-import { StatusChip, type StatusTone } from "../components/ui/StatusChip";
+import { StatusChip } from "../components/ui/StatusChip";
 import { useToast } from "../components/ui/Toast";
 import { emptyDefinition } from "../lib/builder/model";
+import { STEP_KIND_ICONS } from "../lib/copilot/mutations";
 import { cn } from "../lib/cn";
-import { useAgents } from "../lib/queries/agents";
-import { useSessions } from "../lib/queries/sessions";
 import { useCreateWorkflow, useWorkflows } from "../lib/queries/workflows";
 import { errorMessage } from "../lib/forms";
 import { useActiveWorkspaceId } from "../lib/workspace";
@@ -47,17 +41,8 @@ const TRIGGER_ICON: Record<string, ComponentType<{ size?: number }>> = {
   schedule: Timer,
 };
 
-const RUN_STATUS_TONE: Record<RunStatus, StatusTone> = {
-  queued: "neutral",
-  running: "neutral",
-  waiting: "warning",
-  succeeded: "success",
-  failed: "error",
-  canceled: "neutral",
-};
-
 const DELEGATION_COPY =
-  "A workflow delegates work to an agent: when a trigger fires, your chosen agent follows the instructions.";
+  "A workflow is a pipeline: when a trigger fires, its steps run in order — tools and transforms deterministically, agents for the open-ended parts.";
 
 function WorkflowsIndex() {
   const { workspaceId, isPending: workspacePending } = useActiveWorkspaceId();
@@ -89,32 +74,15 @@ function WorkflowsList({ workspaceId }: { workspaceId: string }) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const workflows = useWorkflows(workspaceId);
-  const sessions = useSessions(workspaceId);
-  const agents = useAgents(workspaceId);
   const createWorkflow = useCreateWorkflow(workspaceId);
 
-  // Latest run status per workflow (sessions are ordered by activity desc);
-  // chat sessions carry no workflow provenance and are skipped.
-  const lastRunByWorkflow = new Map<string, RunStatus>();
-  for (const session of sessions.data ?? []) {
-    if (
-      session.workflowId !== null &&
-      session.lastRunStatus &&
-      !lastRunByWorkflow.has(session.workflowId)
-    ) {
-      lastRunByWorkflow.set(session.workflowId, session.lastRunStatus);
-    }
-  }
-
   async function createNew() {
-    // Seed the delegation with the first PUBLISHED agent; none yet is fine —
-    // the editor's Agent section surfaces the gap and links to /agents.
-    const firstPublished =
-      agents.data?.find((agent) => agent.publishedVersionId !== null) ?? null;
+    // An empty pipeline is a legal draft (publish requires ≥1 step); the
+    // editor's composer + strip guide the first step.
     try {
       const result = await createWorkflow.mutateAsync({
         name: "Untitled workflow",
-        draft: emptyDefinition(firstPublished?.id ?? null),
+        draft: emptyDefinition(),
       });
       navigate({
         to: "/workflows/$workflowId",
@@ -180,7 +148,6 @@ function WorkflowsList({ workspaceId }: { workspaceId: string }) {
               <WorkflowRow
                 key={workflow.id}
                 workflow={workflow}
-                lastRunStatus={lastRunByWorkflow.get(workflow.id) ?? null}
                 onOpen={() =>
                   navigate({
                     to: "/workflows/$workflowId",
@@ -211,11 +178,9 @@ function WorkflowsList({ workspaceId }: { workspaceId: string }) {
 
 function WorkflowRow({
   workflow,
-  lastRunStatus,
   onOpen,
 }: {
   workflow: WorkflowSummaryDto;
-  lastRunStatus: RunStatus | null;
   onOpen: () => void;
 }) {
   const Icon = workflow.triggerType
@@ -240,7 +205,11 @@ function WorkflowRow({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 pl-9">
-          <AgentChip agentName={workflow.agentName} />
+          {workflow.agentName !== null ? (
+            <AgentChip agentName={workflow.agentName} />
+          ) : (
+            <StepKindsCapsule stepKinds={workflow.stepKinds} />
+          )}
           {workflow.publishedAt !== null ? (
             <StatusChip tone="success" dot>
               Published
@@ -250,26 +219,47 @@ function WorkflowRow({
               Draft
             </StatusChip>
           )}
-          {lastRunStatus ? (
-            <StatusChip tone={RUN_STATUS_TONE[lastRunStatus]}>
-              {lastRunStatus}
-            </StatusChip>
-          ) : null}
         </div>
       </button>
     </li>
   );
 }
 
-/** Who the workflow delegates to — tiny monogram + name (or the gap). */
-function AgentChip({ agentName }: { agentName: string | null }) {
-  if (agentName === null) {
+/**
+ * What a multi-step pipeline is made of: one glyph per step kind in document
+ * order (server-truncated to 5) + a step count. Open strings by contract — an
+ * unknown future kind renders the fallback glyph, never breaks the row.
+ */
+function StepKindsCapsule({ stepKinds }: { stepKinds: readonly string[] }) {
+  if (stepKinds.length === 0) {
     return (
       <span className="inline-flex items-center gap-1 rounded-capsule border border-dashed border-black/15 px-2 py-[2px] text-[11px] font-medium text-ink-4">
-        <Bot size={10} aria-hidden="true" /> No agent
+        No steps yet
       </span>
     );
   }
+  return (
+    <span
+      data-testid="workflow-step-kinds"
+      className="inline-flex max-w-full items-center gap-1 rounded-capsule border border-black/[0.08] bg-white/50 px-2 py-[2px] text-[11px] font-medium text-ink-2"
+    >
+      <span className="flex items-center gap-0.5 text-ink-3">
+        {stepKinds.map((kind, index) => {
+          const icons: Partial<Record<string, ComponentType<{ size?: number }>>> =
+            STEP_KIND_ICONS;
+          const Glyph = icons[kind] ?? Zap;
+          return <Glyph key={`${kind}-${index}`} size={10} aria-hidden="true" />;
+        })}
+      </span>
+      <span>
+        {stepKinds.length} step{stepKinds.length === 1 ? "" : "s"}
+      </span>
+    </span>
+  );
+}
+
+/** A sole-agent-step pipeline keeps the familiar delegation chip. */
+function AgentChip({ agentName }: { agentName: string }) {
   return (
     <span
       data-testid="workflow-agent-chip"

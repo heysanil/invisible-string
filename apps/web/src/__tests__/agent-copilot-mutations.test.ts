@@ -136,10 +136,10 @@ describe("agentProposalToActions", () => {
 
   test("isAgentProposal rejects workflow-surface tools", () => {
     expect(
-      isAgentProposal(proposal("setInstructions", { markdown: "x" })),
+      isAgentProposal(proposal("setTrigger", { trigger: { type: "manual" } })),
     ).toBe(false);
     expect(
-      isAgentProposal(proposal("setAgent", { agentId: AGENT_ID })),
+      isAgentProposal(proposal("removeStep", { stepId: "st_aaaaaaaaaaaaaaaa" })),
     ).toBe(false);
   });
 });
@@ -268,7 +268,7 @@ describe("agentCopilotAdapter", () => {
 
   test("applyProposal ignores off-surface proposals (server bug)", () => {
     const { adapter, dispatched, applied } = makeAdapter();
-    adapter.applyProposal(proposal("setInstructions", { markdown: "x" }));
+    adapter.applyProposal(proposal("setTrigger", { trigger: { type: "manual" } }));
     expect(dispatched).toEqual([]);
     expect(applied).toEqual([]);
   });

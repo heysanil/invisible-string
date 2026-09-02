@@ -29,12 +29,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { jwtVerify } from "jose";
 import { schema, seedWorkspace } from "@invisible-string/db";
 import {
   generateMasterKeyBase64,
   newId,
+  newStepId,
   parseMasterKey,
   type AgentDefinitionInput,
   type ApiErrorBody,
@@ -44,6 +45,7 @@ import {
   type PostMessageResponse,
   type PublishAgentResponse,
   type ResetSessionResponse,
+  type RunDto,
   type RunEventFrame,
   type RunStatusFrame,
   type SessionContextControlResponse,
@@ -64,6 +66,7 @@ import {
 } from "./jwt";
 import { reconcileInterruptedRuns } from "./reconcile";
 import { createAppStack, type AppStack } from "../index";
+import type { PipelineRunner } from "../pipeline/runner";
 import {
   eveAccepted,
   eveSessionNotActive,
@@ -73,6 +76,7 @@ import {
   rejectContinuationToken,
   stampEveEvent,
 } from "../testing/fake-eve";
+import { hashTurnMessage } from "../runs/message-hash";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
@@ -111,6 +115,18 @@ const TERMINAL_TYPES = new Set([
   "session.failed",
 ]);
 
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 class FakeWorker {
   readonly sessions = new Map<string, FakeEveSession>();
   readonly ensureCalls: EnsureCall[] = [];
@@ -119,6 +135,9 @@ class FakeWorker {
   readonly continueBodies: unknown[] = [];
   /** Control-route calls: "cancel" | "clear" | "compact" | "reset". */
   readonly controlCalls: Array<{ sessionId: string; action: string }> = [];
+  /** Set to hold the NEXT session create in flight; `createEntered` resolves on entry. */
+  holdNextCreate: Deferred | null = null;
+  createEntered: Deferred | null = null;
   jwtFailures = 0;
   private server: ReturnType<typeof Bun.serve> | null = null;
   private counter = 0;
@@ -270,6 +289,13 @@ class FakeWorker {
     if (sub === "session" && req.method === "POST") {
       const parsed = parseCreateBody(await req.json().catch(() => ({})));
       if (parsed instanceof Response) return parsed;
+      // Crash-window tests: hold the accepted create in flight so a Stop can
+      // race the control plane's id persist.
+      this.createEntered?.resolve();
+      this.createEntered = null;
+      const gate = this.holdNextCreate;
+      this.holdNextCreate = null;
+      if (gate) await gate.promise;
       const id = `eve-sess-${++this.counter}`;
       const session: FakeEveSession = {
         id,
@@ -957,22 +983,102 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
 
   // ── workflow manual "Run now" ────────────────────────────────────────────
 
-  test("workflow /run dispatches the published snapshot with a rendered taskMessage", async () => {
-    await freshWorkerHeartbeat();
-    // A webhook-shaped workflow delegating to the published agent.
-    const created = await api("POST", `/workspaces/${orgId}/workflows`, {
-      cookie: ownerCookie,
-      body: {
-        name: "Runtime Run-now Workflow",
-        draft: {
-          trigger: { type: "webhook" },
+  test("workflow /run maps the runner's two `started:false` refusals to their own codes: 409 run_overlap_skipped (policy) vs the transient 503 pipeline_lock_pool_exhausted (capacity) — G4", async () => {
+    const config = {
+      version: 2,
+      trigger: { type: "manual" },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
           agentId,
-          instructions: { markdown: "Reply politely to @trigger.customer.email about their request." },
+          instructions: { markdown: "Say hello." },
+          session: "fresh",
         },
-      },
-    });
-    expect(created.status).toBe(201);
-    const wfId = ((await created.json()) as { workflow: { id: string } }).workflow.id;
+      ],
+    };
+    const inserted = await db
+      .insert(schema.workflows)
+      .values({
+        organizationId: orgId,
+        name: "Runtime Run-now Refusals",
+        draft: config as unknown as Record<string, unknown>,
+        published: config as unknown as Record<string, unknown>,
+        publishedAt: new Date(),
+        enabled: true,
+      })
+      .returning({ id: schema.workflows.id });
+    const wfId = inserted[0]!.id;
+    const runtime = stack.runtime!;
+    const real = runtime.pipelines;
+    const refusing = (reason: "overlap_skipped" | "lock_pool_exhausted"): PipelineRunner =>
+      ({ start: async () => ({ started: false, reason }) }) as unknown as PipelineRunner;
+    try {
+      runtime.pipelines = refusing("overlap_skipped");
+      const overlap = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
+        cookie: ownerCookie,
+        body: { message: "again" },
+      });
+      expect(overlap.status).toBe(409);
+      expect(((await overlap.json()) as { error: { code: string } }).error.code).toBe(
+        "run_overlap_skipped",
+      );
+
+      // Pre-fix: this branch ALSO answered 409 run_overlap_skipped — a
+      // capacity refusal (nothing created, retry shortly) rendered as
+      // "already running".
+      runtime.pipelines = refusing("lock_pool_exhausted");
+      const exhausted = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
+        cookie: ownerCookie,
+        body: { message: "again" },
+      });
+      expect(exhausted.status).toBe(503);
+      expect(((await exhausted.json()) as { error: { code: string } }).error.code).toBe(
+        "pipeline_lock_pool_exhausted",
+      );
+    } finally {
+      runtime.pipelines = real;
+    }
+    // Neither refusal created a run.
+    const rows = await db
+      .select({ id: schema.runs.id })
+      .from(schema.runs)
+      .where(eq(schema.runs.workflowId, wfId));
+    expect(rows).toHaveLength(0);
+  });
+
+  test("workflow /run starts a PIPELINE run; the agent step dispatches the rendered child; overlap-free reruns work", async () => {
+    await freshWorkerHeartbeat();
+    // A webhook-shaped one-agent-step pipeline bound to the published agent.
+    // The snapshot is written directly (workflow publish routes are proven in
+    // resources/workflows.test.ts; this suite targets the runtime /run route).
+    const config = {
+      version: 2,
+      trigger: { type: "webhook" },
+      steps: [
+        {
+          id: newStepId(),
+          slug: "reply",
+          kind: "agent",
+          agentId,
+          instructions: {
+            markdown: "Reply politely to @trigger.customer.email about their request.",
+          },
+          session: "fresh",
+        },
+      ],
+    };
+    const inserted = await db
+      .insert(schema.workflows)
+      .values({
+        organizationId: orgId,
+        name: "Runtime Run-now Workflow",
+        draft: config as unknown as Record<string, unknown>,
+        enabled: true,
+      })
+      .returning({ id: schema.workflows.id });
+    const wfId = inserted[0]!.id;
 
     // Run-now before publish → typed 409.
     const early = await api(
@@ -985,12 +1091,13 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       "workflow_not_published",
     );
 
-    const published = await api(
-      "POST",
-      `/workspaces/${orgId}/workflows/${wfId}/publish`,
-      { cookie: ownerCookie },
-    );
-    expect(published.status).toBe(200);
+    await db
+      .update(schema.workflows)
+      .set({
+        published: config as unknown as Record<string, unknown>,
+        publishedAt: new Date(),
+      })
+      .where(eq(schema.workflows.id, wfId));
 
     const res = await api("POST", `/workspaces/${orgId}/workflows/${wfId}/run`, {
       cookie: ownerCookie,
@@ -1000,25 +1107,18 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
       },
     });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as CreateSessionResponse;
+    const body = (await res.json()) as { run: RunDto };
 
-    // Workflow provenance on the session; the exact agent version pinned.
-    expect(body.session.workflowId).toBe(wfId);
-    expect(body.session.agentId).toBe(agentId);
-    expect(body.session.agentVersionId).toBe(versionId);
-
-    // The agent received the RENDERED task message, not the raw envelope —
-    // and the run row carries it as provenance.
-    expect(body.run.taskMessage).not.toBeNull();
-    expect(body.run.taskMessage!).toContain("<workflow-task>");
-    expect(body.run.taskMessage!).toContain("kim@example.com");
+    // Pipeline parent: no session, workflow provenance ON the run.
+    expect(body.run.mode).toBe("pipeline");
+    expect(body.run.agentSessionId).toBeNull();
+    expect(body.run.workflowId).toBe(wfId);
+    expect(body.run.taskMessage).toBeNull();
     expect(body.run.triggerEvent).toMatchObject({
-      agentId,
       workflowId: wfId,
       triggerType: "manual",
+      message: "manual test run",
     });
-    const eveSession = fixture.sessions.get(body.session.eveSessionId!)!;
-    expect(eveSession.receivedMessages[0]).toBe(body.run.taskMessage!);
 
     await until(async () => {
       const rows = await db
@@ -1026,7 +1126,32 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .from(schema.runs)
         .where(eq(schema.runs.id, body.run.id));
       return rows[0]?.status === "succeeded" || undefined;
-    }, "run-now run to succeed");
+    }, "run-now parent run to succeed");
+
+    // The agent step's CHILD run pinned the published version and received
+    // the RENDERED instructions as its eve task message.
+    const steps = await db
+      .select()
+      .from(schema.runSteps)
+      .where(eq(schema.runSteps.runId, body.run.id));
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.status).toBe("succeeded");
+    const childRun = (
+      await db.select().from(schema.runs).where(eq(schema.runs.id, steps[0]!.childRunId!))
+    )[0]!;
+    expect(childRun.taskMessage).toContain("kim@example.com");
+    expect(childRun.taskMessage).not.toContain("@trigger.customer.email");
+    const childSession = (
+      await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, childRun.agentSessionId!))
+    )[0]!;
+    expect(childSession.agentId).toBe(agentId);
+    expect(childSession.agentVersionId).toBe(versionId);
+    expect(childSession.workflowId).toBe(wfId);
+    const eveSession = fixture.sessions.get(childSession.eveSessionId!)!;
+    expect(eveSession.receivedMessages[0]).toBe(childRun.taskMessage!);
   });
 
   // ── SSE ─────────────────────────────────────────────────────────────────
@@ -1424,6 +1549,235 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(body.error.code).toBe("agent_not_published");
   });
 
+  // ── cancel racing an in-flight eve create (persist-then-recheck) ──────────
+
+  describe("cancel during an in-flight eve create", () => {
+    let raceCookie: string;
+    let raceOrgId: string;
+    let raceAgentId: string;
+
+    beforeAll(async () => {
+      // A FRESH workspace: the shared org's run cap is saturated by the caps
+      // test's held runs, and these tests need real dispatch admission.
+      const fresh = await signUpWithOrg("Create Race");
+      raceCookie = fresh.cookie;
+      raceOrgId = fresh.orgId;
+      await seedWorkspace(db, raceOrgId, fresh.userId);
+      raceAgentId = await createAgent(raceCookie, raceOrgId, "Race agent", {
+        persona: "Hi.",
+        model: { preset: "balanced", reasoning: "medium" },
+        context: { mcpConnectionIds: [], skillIds: [] },
+      });
+      const publish = await api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/publish`,
+        { cookie: raceCookie },
+      );
+      expect(publish.status).toBe(200);
+      const publishBody = (await publish.json()) as PublishAgentResponse;
+      await stack.runtime!.buildService.waitFor(publishBody.contentHash);
+      await until(async () => {
+        const record = await stack.runtime!.buildStore.get(publishBody.contentHash);
+        return record?.status === "succeeded" || undefined;
+      }, "race agent build");
+    }, 60_000);
+
+    /** The newest queued run of this workspace (inserted before the eve call). */
+    async function queuedRun(): Promise<{ runId: string; sessionId: string }> {
+      return until(async () => {
+        const rows = await db
+          .select({ runId: schema.runs.id, sessionId: schema.runs.agentSessionId })
+          .from(schema.runs)
+          .where(
+            and(
+              eq(schema.runs.organizationId, raceOrgId),
+              eq(schema.runs.status, "queued"),
+            ),
+          );
+        const row = rows[0];
+        return row?.sessionId
+          ? { runId: row.runId, sessionId: row.sessionId }
+          : undefined;
+      }, "the dispatch's queued run row");
+    }
+
+    test("fresh chat create: a Stop while the create is in flight hands the accepted turn to observation — turn-qualified cancel once eve starts it, obligation cleared on the boundary — and starts no normal tail", async () => {
+      await freshWorkerHeartbeat();
+      const gate = deferred();
+      const entered = deferred();
+      fixture.holdNextCreate = gate;
+      fixture.createEntered = entered;
+
+      const creating = api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/sessions`,
+        { cookie: raceCookie, body: { message: "doomed first message" } },
+      );
+      await entered.promise; // eve has ACCEPTED the create; the 202 is held
+      const { runId, sessionId } = await queuedRun();
+
+      // The Stop: no tail exists yet and the session row has no eve id, so
+      // the route's own best-effort remote chase has nothing to target — the
+      // window the post-eve recheck exists for.
+      const cancel = await api("POST", `/runs/${runId}/cancel`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(cancel.status).toBe(200);
+
+      gate.resolve();
+      const res = await creating;
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as CreateSessionResponse;
+      expect(body.run.status).toBe("canceled");
+      expect(body.session.status).toBe("closed");
+
+      // The accepted turn is OBSERVED, never guessed at: with the id
+      // persisted first, the post-eve recheck records the obligation and
+      // opens an observation tail (no unqualified cancel — eve consumes a
+      // pre-turn cancel as a no-op behind a 202). The fake eve starts the
+      // turn at once, so the observation attributes it, issues the
+      // turn-QUALIFIED cancel, and clears the obligation on the boundary.
+      const row = await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, sessionId));
+      const eveId = row[0]!.eveSessionId;
+      expect(eveId).toBeTruthy();
+      expect(row[0]!.status).toBe("closed");
+      await until(async () => {
+        const runs = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+        return runs[0]?.remoteCancelPendingAt === null && runs[0]?.turnId !== null
+          ? true
+          : undefined;
+      }, "the observation to confirm the accepted turn's boundary");
+      expect(fixture.controlCalls).toContainEqual({
+        sessionId: eveId!,
+        action: "cancel",
+      });
+      // The observation read the stream; no NORMAL tail ever adopted the
+      // canceled run (its status never left canceled).
+      expect(fixture.streamCalls.map((c) => c.sessionId)).toContain(eveId!);
+      const finalRun = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+      expect(finalRun[0]!.status).toBe("canceled");
+      await until(
+        async () => (stack.runtime!.tailers.get(runId) ? undefined : true),
+        "the observation to close",
+      );
+    }, 20_000);
+
+    test("post-reset create: the same Stop race is caught, a racing message gets session_busy, and the thread recovers", async () => {
+      await freshWorkerHeartbeat();
+      // Seed a session, let its run settle, then reset — leaving the
+      // replacement row EVELESS (its next message opens a fresh eve session).
+      const seeded = await api(
+        "POST",
+        `/workspaces/${raceOrgId}/agents/${raceAgentId}/sessions`,
+        { cookie: raceCookie, body: { message: "seed" } },
+      );
+      expect(seeded.status).toBe(201);
+      const seededBody = (await seeded.json()) as CreateSessionResponse;
+      await until(async () => {
+        const rows = await db
+          .select({ status: schema.runs.status })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, seededBody.run.id));
+        const status = rows[0]?.status;
+        return (status === "succeeded" || status === "failed") || undefined;
+      }, "the seed run to settle");
+      const reset = await api("POST", `/sessions/${seededBody.session.id}/reset`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(reset.status).toBe(200);
+      const resetBody = (await reset.json()) as ResetSessionResponse;
+      if (resetBody.status !== "reset") throw new Error("expected a reset");
+      const replacementId = resetBody.session.id;
+
+      const gate = deferred();
+      const entered = deferred();
+      fixture.holdNextCreate = gate;
+      fixture.createEntered = entered;
+      const sending = api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "doomed follow-up" },
+      });
+      await entered.promise;
+      const { runId } = await queuedRun();
+      const cancel = await api("POST", `/runs/${runId}/cancel`, {
+        cookie: raceCookie,
+        body: {},
+      });
+      expect(cancel.status).toBe(200);
+
+      // Admission fence: the canceled run's dispatch may still be in flight
+      // (marker set, session still eveless) — a racing message must be
+      // refused with the TRANSIENT session_busy, not open a second eve
+      // session on the row.
+      const racing = await api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "impatient retry" },
+      });
+      expect(racing.status).toBe(409);
+      const racingBody = (await racing.json()) as { error: { code: string } };
+      expect(racingBody.error.code).toBe("session_busy");
+
+      gate.resolve();
+      const res = await sending;
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as PostMessageResponse;
+      expect(body.run.status).toBe("canceled");
+
+      // The accepted turn was handed to observation and confirmed from eve's
+      // own stream (qualified cancel, boundary); the id persisted; the
+      // session belongs to the user's thread and stays OPEN.
+      const row = await db
+        .select()
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, replacementId));
+      const eveId = row[0]!.eveSessionId;
+      expect(eveId).toBeTruthy();
+      expect(row[0]!.status).toBe("active");
+      await until(async () => {
+        const runs = await db.select().from(schema.runs).where(eq(schema.runs.id, runId));
+        return runs[0]?.remoteCancelPendingAt === null && runs[0]?.turnId !== null
+          ? true
+          : undefined;
+      }, "the observation to confirm the accepted turn's boundary");
+      expect(fixture.controlCalls).toContainEqual({
+        sessionId: eveId!,
+        action: "cancel",
+      });
+      expect((await db.select().from(schema.runs).where(eq(schema.runs.id, runId)))[0]!.status).toBe(
+        "canceled",
+      );
+      await until(
+        async () => (stack.runtime!.tailers.get(runId) ? undefined : true),
+        "the observation to close",
+      );
+
+      // session_busy was transient: with the abandon settled the retry is
+      // admitted and continues the persisted eve session.
+      const retry = await api("POST", `/sessions/${replacementId}/messages`, {
+        cookie: raceCookie,
+        body: { message: "clean retry" },
+      });
+      expect(retry.status).toBe(201);
+      const retryBody = (await retry.json()) as PostMessageResponse;
+      await until(async () => {
+        const rows = await db
+          .select({ status: schema.runs.status })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, retryBody.run.id));
+        const status = rows[0]?.status;
+        return (
+          (status === "succeeded" || status === "failed" || status === "canceled") ||
+          undefined
+        );
+      }, "the retried run to settle");
+    }, 30_000);
+  });
+
   // ── boot reconciliation ───────────────────────────────────────────────────
 
   test("boot reconciliation resumes orphaned runs on live workers and fails the rest", async () => {
@@ -1451,7 +1805,10 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .returning();
       return rows[0]!;
     }
-    async function orphanRun(agentSessionId: string) {
+    async function orphanRun(
+      agentSessionId: string,
+      opts: { markerArmed?: boolean; sentMessage?: string } = {},
+    ) {
       const rows = await db
         .insert(schema.runs)
         .values({
@@ -1465,6 +1822,22 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
             principal: { workspaceId: orgId, source: "chat" },
           },
           status: "running",
+          // The dispatch-attempt marker: every dispatch path arms it
+          // strictly before the eve call, so a run that actually reached
+          // eve always carries it — reconciliation treats it as the
+          // authority on whether there is a turn to tail at all. The same
+          // CAS records the send's correlator (`message_hash`): a resumed
+          // tail attributes its turn by matching it against the turn's
+          // `message.received`, so an orphan that reached eve carries the
+          // hash of the message eve actually received.
+          ...(opts.markerArmed === false
+            ? {}
+            : {
+                startedAt: new Date(),
+                ...(opts.sentMessage !== undefined
+                  ? { messageHash: hashTurnMessage(opts.sentMessage) }
+                  : {}),
+              }),
         })
         .returning();
       return rows[0]!;
@@ -1478,14 +1851,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // clears the global `workers` table in beforeAll, so the counters below
     // describe only what this test seeds. Runs this process is still tailing
     // (the caps test's HOLD tails) are deliberately LEFT interrupted — the
-    // sweep must still skip them on its own.
+    // sweep must still skip them on its own. No `agent_sessions` join: a
+    // pipeline parent run has no session (`runs.agent_session_id` is
+    // nullable) and would slip past an inner join.
     const strays = await db
       .select({ id: schema.runs.id })
       .from(schema.runs)
-      .innerJoin(
-        schema.agentSessions,
-        eq(schema.runs.agentSessionId, schema.agentSessions.id),
-      )
       .where(inArray(schema.runs.status, ["queued", "running"]));
     const orphanedStrays = strays
       .map((row) => row.id)
@@ -1501,19 +1872,39 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
         .where(inArray(schema.runs.id, orphanedStrays));
     }
 
-    // Orphan A: live worker + real eve session → its tail is re-attached and
-    // drains eve's durable stream to a terminal (crash-safe resume).
+    // Orphan A: marker armed + live worker + real eve session → its tail is
+    // re-attached and drains eve's durable stream to a terminal (crash-safe
+    // resume).
     const liveSession = await orphanSession("eve-sess-1", liveWorkerId);
-    const liveRun = await orphanRun(liveSession.id);
+    // The orphan's tail resumes eve-sess-1 from its own (empty) cursor, so
+    // the first turn on that stream — opened by the message the chat tests
+    // sent — is the one it must recognize as its own, by content.
+    const liveRun = await orphanRun(liveSession.id, {
+      sentMessage: fixture.sessions.get("eve-sess-1")!.receivedMessages[0]!,
+    });
     // Orphan B: nothing to resume from → failed with completedAt so the cap
     // slot frees and SSE terminates.
     const deadSession = await orphanSession("eve-gone", null);
     const deadRun = await orphanRun(deadSession.id);
+    // Orphan C: a CONTINUATION that crashed BEFORE its send — the session
+    // carries an eve id from earlier turns and its worker is live, but the
+    // run's dispatch-attempt marker is NULL: nothing was ever sent, so
+    // re-tailing would follow a turn that does not exist. It must be failed,
+    // never resumed.
+    const undispatchedSession = await orphanSession("eve-sess-1", liveWorkerId);
+    const undispatchedRun = await orphanRun(undispatchedSession.id, {
+      markerArmed: false,
+    });
 
     // The two live HOLD tails from the caps test are skipped (still owned by
-    // this process's tailer manager) — only true orphans are touched.
+    // this process's tailer manager) — only true orphans are touched. The
+    // counts are lower bounds, not exact: the reconcile sweep is DB-global
+    // and other gated suites sharing this database leave their own
+    // interrupted agent runs behind (bun runs every file in one process);
+    // the per-run assertions below carry the real semantics.
     const outcome = await reconcileInterruptedRuns(stack.runtime!);
-    expect(outcome).toMatchObject({ resumed: 1, failed: 1 });
+    expect(outcome.resumed).toBeGreaterThanOrEqual(1);
+    expect(outcome.failed).toBeGreaterThanOrEqual(1);
 
     const dead = await db
       .select({ status: schema.runs.status, completedAt: schema.runs.completedAt, error: schema.runs.error })
@@ -1522,6 +1913,16 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     expect(dead[0]!.status).toBe("failed");
     expect(dead[0]!.completedAt).not.toBeNull();
     expect(dead[0]!.error).toContain("control plane restarted");
+
+    // Orphan C failed honest — the marker is the authority, and the
+    // session's pre-existing eve id + live worker did not tempt a tail onto
+    // a turn that was never sent.
+    const undispatched = await db
+      .select({ status: schema.runs.status, error: schema.runs.error })
+      .from(schema.runs)
+      .where(eq(schema.runs.id, undispatchedRun.id));
+    expect(undispatched[0]!.status).toBe("failed");
+    expect(undispatched[0]!.error).toContain("never reached the agent");
 
     await until(async () => {
       const rows = await db

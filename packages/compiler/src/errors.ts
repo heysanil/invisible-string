@@ -41,7 +41,9 @@ export type CompileErrorCode =
   /** A persona @reference names an unknown connection/skill, or is bare. */
   | "UNRESOLVED_REFERENCE"
   /** @trigger.* in a persona — agents are trigger-agnostic. */
-  | "TRIGGER_REF_NOT_ALLOWED";
+  | "TRIGGER_REF_NOT_ALLOWED"
+  /** @steps/@state/@item/@now in a persona — pipeline scope is workflow-only. */
+  | "PIPELINE_REF_NOT_ALLOWED";
 
 export class CompileError extends Error {
   readonly code: CompileErrorCode;

@@ -41,9 +41,10 @@
  */
 import { eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
+import type { MasterKey } from "@invisible-string/shared";
 
-import { getAccessToken } from "../oauth/tokens";
-import type { ResourceDeps } from "../resources/common";
+import type { Db } from "../db";
+import { getAccessToken, type TokenLifecycleDeps } from "../oauth/tokens";
 import { decryptConnectionAuthHeaders } from "../resources/mcp-crypto";
 import { errors, isRuntimeApiError } from "../runtime/errors";
 import { probeMcpServer, type ProbeOutcome } from "./mcp-probe";
@@ -52,15 +53,26 @@ import { probeMcpServer, type ProbeOutcome } from "./mcp-probe";
 export type ConnectionRow = typeof schema.connections.$inferSelect;
 
 /**
- * What a probe runs on: the resource graph plus the guarded egress fetch.
+ * The narrow structural slice {@link probeAndPersist} actually uses —
+ * `ResourceDeps` satisfies it as-is (the connection routes pass their whole
+ * deps object), and the pipeline tool step's re-probe passes just these four
+ * fields off its executor deps.
  *
- * The OAuth token lifecycle rides `ResourceDeps.oauthBroker` — `OauthBrokerDeps`
- * already satisfies `TokenLifecycleDeps` structurally (db + masterKey +
- * publicAppUrl + fetchImpl + logger), which is precisely why that type was
- * written as a subset — so teaching the probe about tokens needs no new wiring
- * at the composition root.
+ * The OAuth token lifecycle rides `oauthBroker` — `ResourceDeps.oauthBroker`
+ * (`OauthBrokerDeps`) already satisfies `TokenLifecycleDeps` structurally
+ * (db + masterKey + publicAppUrl + fetchImpl + logger), which is precisely
+ * why that type was written as a subset — so teaching the probe about tokens
+ * needed no new wiring at the composition root; the pipeline tool step hands
+ * over its `oauthTokens`, the same broker object.
  */
-export type ProbeDeps = ResourceDeps & { probeFetch: typeof fetch };
+export interface ProbePersistDeps {
+  db: Db;
+  masterKey: MasterKey | undefined;
+  /** Guarded egress fetch (net/guarded-fetch.ts) — never bare fetch. */
+  probeFetch: typeof fetch;
+  /** The ONE reader of an oauth grant's tokens (oauth/tokens.ts). */
+  oauthBroker: TokenLifecycleDeps;
+}
 
 /**
  * Probe `row`'s MCP server and persist the classified outcome, returning the
@@ -74,7 +86,7 @@ export type ProbeDeps = ResourceDeps & { probeFetch: typeof fetch };
  * create hook logs.
  */
 export async function probeAndPersist(
-  deps: ProbeDeps,
+  deps: ProbePersistDeps,
   row: ConnectionRow,
 ): Promise<ConnectionRow> {
   const outcome = await classifyConnection(deps, row);
@@ -108,7 +120,7 @@ export async function probeAndPersist(
  * an OAuth grant can also be un-consented, mid-refresh, or retired.
  */
 async function classifyConnection(
-  deps: ProbeDeps,
+  deps: ProbePersistDeps,
   row: ConnectionRow,
 ): Promise<ProbeOutcome> {
   if (row.authType !== "oauth") {

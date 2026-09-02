@@ -12,8 +12,8 @@ rendered before capturing it.
 | `invite.png` | The invite **confirm panel** at `/accept-invitation/:id`: the workspace name in the "Join <workspace>" heading, the inviter's email as the subtitle, the invited role as a chip ("member"), and the Decline/Accept invitation controls — captured for a pending invite that is never accepted. |
 | `agents.png` | `/agents/:id` — the **agent editor** (the flagship): left rail with the agent's monogram, lifecycle chips and four live section cards (Persona · Model · Context · Access), and the center column with the persona document in its markdown editor, the Balanced model preset, and two connections + a skill attached in Context. |
 | `chat.png` | A chat session with a **completed run**: the agent picked via "New chat", the user's question and the streamed prose reply, and the session list on the left with the agent-named session row and its status dot. |
-| `workflow.png` | `/workflows/:id` — the **delegation editor**: one focused column with all three sections expanded — Trigger ("When this runs": Form, 2 fields), Agent ("Who does the work": the published agent's card selected in the radio group), Instructions ("What they should do": resolved `@notes` / `@trigger.email` reference chips in the editor) — header showing the green **Published** chip (workflow publish is instant; builds belong to agents). |
-| `copilot.png` | The workflow editor with the **copilot dock open** mid-conversation: two applied suggestion receipts (Set trigger · Set agent) and one **un-applied** "Write instructions" card showing the inline instructions **diff preview** with its Apply/Dismiss controls, while the live sections reflect the already-applied trigger and agent. |
+| `workflow.png` | `/workflows/:id` — the **pipeline editor**: a trigger card (Form, 2 fields) and a vertical step strip with one **agent** step bound to the published agent — its inline instructions inspector showing resolved `@notes` / `@trigger.email` reference chips — and the header's green **Published** chip (workflow publish is instant; builds belong to agents). |
+| `copilot.png` | The workflow editor's **copilot composer pane** mid-conversation: two applied suggestion receipts (Set trigger · Add step: Remember sender) and one **un-applied** "Add step: Save note" tool-step card showing the args-table **diff preview** with its Apply control, while its dashed ghost card sits on the strip beside the already-applied trigger and state step. |
 | `context.png` | `/context` with two MCP connection cards (one custom-URL, one registry-installed) and one authored skill (with an attachment count). |
 | `settings.png` | `/settings` → **Models**: the three model-preset rows (Powerful / Balanced / Quick), each with its provider · model chip and repoint selects. The model **allowlist table** lives on the adjacent `/settings/allowlist` sub-route, visible in the settings nav. |
 
@@ -31,7 +31,7 @@ That one command brings the full stack up (compose project `p2e2e`), signs up
 a fresh workspace through first-run onboarding, sends and views a pending
 invite from a second browser context, authors the skill/connections, builds +
 publishes an agent (real `eve build`), chats with it, builds a workflow
-delegated to it (instant publish), drives the scripted copilot, walks the
+with an agent step bound to it (instant publish), drives the scripted copilot, walks the
 eight routes, and tears everything down. Add `E2E_REUSE=1` to keep the stack
 alive between iterations.
 

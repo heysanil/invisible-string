@@ -77,6 +77,19 @@ describe("MetricsRegistry", () => {
     expect(m.deliveryCounts()).toEqual({ delivered: 2, failed: 1 });
   });
 
+  test("pipeline dispatch counters tally starts and the two typed skips", () => {
+    const m = new MetricsRegistry();
+    m.recordPipelineDispatch("started");
+    m.recordPipelineDispatch("started");
+    m.recordPipelineDispatch("overlap_skipped");
+    m.recordPipelineDispatch("lock_pool_exhausted");
+    expect(m.pipelineDispatchCounts()).toEqual({
+      started: 2,
+      overlapSkipped: 1,
+      lockPoolExhausted: 1,
+    });
+  });
+
   test("schedule counters tally ticker mechanics", () => {
     const m = new MetricsRegistry();
     m.recordSchedule("due");
@@ -130,6 +143,11 @@ describe("collectMetrics", () => {
     expect(internalMetricsResponseSchema.safeParse(snapshot).success).toBe(true);
     expect(snapshot.deliveries).toEqual({ delivered: 1, failed: 0 });
     expect(snapshot.schedule).toEqual({ due: 0, dispatched: 1, failed: 0 });
+    expect(snapshot.pipelineDispatch).toEqual({
+      started: 0,
+      overlapSkipped: 0,
+      lockPoolExhausted: 0,
+    });
     expect(snapshot.queueDepth).toBe(3);
     expect(snapshot.activeRuns).toBe(2);
     expect(snapshot.activeSessions).toBe(5);
@@ -164,6 +182,7 @@ describe("renderMetricsText", () => {
     expect(text).toContain('is_run_duration_ms_bucket{le="+Inf"}');
     expect(text).toContain('is_deliveries_total{outcome="failed"} 1');
     expect(text).toContain('is_schedule_fires_total{outcome="due"} 1');
+    expect(text).toContain('is_pipeline_dispatches_total{outcome="lock_pool_exhausted"} 0');
   });
 });
 

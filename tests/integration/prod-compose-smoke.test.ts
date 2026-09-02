@@ -8,10 +8,13 @@
  *   sign-up → workspace (seeds AGENTS, and the onboarding kick background-
  *   publishes "General Purpose") → explicit agent publish → the REAL
  *   in-container `eve build` succeeds → workflow publish validation rejects
- *   an agent-less draft (422 workflow_validation_failed + diagnostics) →
- *   a valid webhook workflow publishes INSTANTLY ({workflow}, no build) →
- *   mint an ingress token → POST /t/:token dispatches a run (202): the agent
- *   artifact is pulled from Garage and BOOTED inside the worker container.
+ *   a step-less pipeline draft (422 workflow_validation_failed + diagnostics)
+ *   → a valid webhook pipeline (one agent step) publishes INSTANTLY
+ *   ({workflow}, no build) → mint an ingress token → POST /t/:token starts a
+ *   pipeline run (202 {accepted, runId}) → the run_steps ledger links a CHILD
+ *   run, which proves the agent artifact was pulled from Garage and BOOTED
+ *   inside the worker container (the child link is written only after the eve
+ *   session exists).
  *
  * WHY THIS LANE EXISTS: every other lane runs the control plane on the HOST
  * (Bun + mise-installed node), so code that accidentally depends on host-only
@@ -23,10 +26,11 @@
  * also exercises the nginx route-prefix enumeration (AGENTS.md) since all
  * calls (including /t/:token) ride the gateway.
  *
- * The dispatched run itself is NOT awaited: OPENROUTER_API_KEY is a throwaway
- * value (dispatch only requires a key to be configured; no mock model ships
- * in the prod images), so the model turn would fail — the smoke asserts the
- * dispatch/boot path, which completes before the 202.
+ * The dispatched run is NOT awaited to a terminal status: OPENROUTER_API_KEY
+ * is a throwaway value (dispatch only requires a key to be configured; no
+ * mock model ships in the prod images), so the model turn would fail — the
+ * smoke asserts the dispatch/boot path (the child link on the step ledger),
+ * never the turn's outcome.
  *
  * Deliberately standalone: no app/workspace imports — the stack under test is
  * the images, not host code. Gated on PROD_SMOKE=1 (+ docker). Slow (3 image
@@ -306,9 +310,9 @@ describe.skipIf(!GATE)("prod-compose smoke (agent publish + dispatch inside the 
         await api("POST", `/workspaces/${orgId}/workflows`, {
           name: "Prod Smoke Workflow",
           draft: {
+            version: 2,
             trigger: { type: "webhook" },
-            agentId: null,
-            instructions: { markdown: "" },
+            steps: [],
           },
         }),
         "create workflow",
@@ -316,8 +320,8 @@ describe.skipIf(!GATE)("prod-compose smoke (agent publish + dispatch inside the 
       );
       const workflowId = createdWorkflow.workflow.id;
 
-      // The validator BLOCKS an agent-less, instruction-less draft with typed
-      // diagnostics (agents-first publish gate — no compiler involved).
+      // The validator BLOCKS a step-less pipeline draft with typed
+      // diagnostics (publish gate — no compiler involved).
       const rejected = await api(
         "POST",
         `/workspaces/${orgId}/workflows/${workflowId}/publish`,
@@ -329,16 +333,30 @@ describe.skipIf(!GATE)("prod-compose smoke (agent publish + dispatch inside the 
       expect(Array.isArray(rejection.error.details?.diagnostics)).toBeTrue();
       expect(rejection.error.details!.diagnostics!.length).toBeGreaterThan(0);
 
-      // Fix the draft → publish is INSTANT: the response is the row (no
-      // contentHash/build fields — workflows compile nothing).
+      // Fix the draft (one agent step delegating to the built agent) →
+      // publish is INSTANT: the response is the row (no contentHash/build
+      // fields — workflows compile nothing). Step ids are minted `st_` +
+      // 16 lowercase alnum; this file is deliberately standalone, so mint
+      // one inline instead of importing shared's newStepId.
+      const stepId = `st_${randomBytes(8).toString("hex")}`;
       await expectJson(
         await api("PATCH", `/workspaces/${orgId}/workflows/${workflowId}`, {
           draft: {
+            version: 2,
             trigger: { type: "webhook" },
-            agentId,
-            instructions: {
-              markdown: "Summarize the incoming event described by @trigger.kind in one line.",
-            },
+            steps: [
+              {
+                id: stepId,
+                slug: "summarize",
+                kind: "agent",
+                agentId,
+                session: "fresh",
+                instructions: {
+                  markdown:
+                    "Summarize the incoming event described by @trigger.kind in one line.",
+                },
+              },
+            ],
           },
         }),
         "update workflow draft",
@@ -366,23 +384,45 @@ describe.skipIf(!GATE)("prod-compose smoke (agent publish + dispatch inside the 
         201,
       );
 
-      // 202 means the whole dispatch path ran inside the containers: snapshot
-      // + agent resolution, task-message render, artifact pulled from Garage,
-      // agent BOOTED in the worker image, eve session created. (The model
-      // turn after this fails on the throwaway key — deliberately unasserted.)
+      // 202 means the pipeline run row landed and the in-container
+      // interpreter took it (no session exists — the ack is {accepted,
+      // runId}). The agent step then dispatches its CHILD run
+      // asynchronously; the ledger's child link is written only AFTER
+      // snapshot + agent resolution, instruction render, the artifact pull
+      // from Garage, the agent BOOT in the worker image, and eve session
+      // creation — so polling for it proves the whole in-container boot
+      // path. (The model turn after that fails on the throwaway key —
+      // deliberately unasserted.)
       const ingress = await fetch(`${BASE}/t/${minted.token}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ message: "Prod smoke ingress event.", kind: "smoke" }),
       });
-      const accepted = await expectJson<{ accepted: boolean; runId: string; sessionId: string }>(
+      const accepted = await expectJson<{ accepted: boolean; runId: string }>(
         ingress,
         "trigger ingress",
         202,
       );
       expect(accepted.accepted).toBeTrue();
       expect(accepted.runId).toBeTruthy();
-      expect(accepted.sessionId).toBeTruthy();
+
+      const childLinked = await until(
+        async () => {
+          const body = await expectJson<{
+            steps: { stepId: string; childRunId: string | null }[];
+          }>(
+            await api("GET", `/runs/${accepted.runId}/steps`),
+            "run steps",
+            200,
+          );
+          const step = body.steps.find((s) => s.stepId === stepId);
+          return step?.childRunId ?? undefined;
+        },
+        "agent step to dispatch its child run (in-container artifact boot)",
+        5 * 60_000,
+        3_000,
+      );
+      expect(childLinked).toBeTruthy();
     },
     30 * 60_000,
   );

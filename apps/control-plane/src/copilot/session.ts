@@ -14,6 +14,12 @@
  * continues immediately: the client still applies (single writer, unchanged)
  * and still renders the card, so the turn stays an audit trail.
  *
+ * The workflow surface's READ tools (searchConnectionTools/getConnectionTool)
+ * take a THIRD path (pipelines redesign): executed inline server-side — pure
+ * lookups over the turn's inventory — with the ordinary step frames
+ * (pending → ok with a short resultPreview) and the full text pushed back as
+ * a normal tool result. No proposal, no park, no client round-trip.
+ *
  * What the client SEES of all this (spec D7.1) is three frame kinds beyond
  * `delta`: a `thought` per round-trip that carries the model's reasoning
  * cumulatively, a `step` per tool call carrying only lifecycle
@@ -34,6 +40,7 @@ import {
   summarizeToolResult,
   type CopilotAgentIdentity,
   type CopilotMutationOutcome,
+  type CopilotMutationParams,
   type CopilotServerFrame,
   type CopilotStepState,
   type CopilotSurface,
@@ -42,6 +49,7 @@ import {
 import type { CopilotConfig } from "./config";
 import type { WorkspaceInventory } from "./inventory";
 import { buildSystemPrompt, buildToolSpecs } from "./prompt";
+import { executeReadTool, isWorkflowReadTool } from "./read-tools";
 import type { CopilotTransport } from "./transport";
 import {
   applyAcceptedMutation,
@@ -193,9 +201,12 @@ export class CopilotSession {
     );
     this.messages.push({ role: "user", content: opts.message });
 
+    // Per-surface round-trip cap (config.ts): pipeline building legitimately
+    // spends extra round-trips on read tools before any proposal.
+    const maxSteps = this.deps.config.maxStepsPerTurn[opts.surface];
     let outputTokens = 0;
     try {
-      for (let step = 0; step < this.deps.config.maxStepsPerTurn; step++) {
+      for (let step = 0; step < maxSteps; step++) {
         abortController.signal.throwIfAborted();
 
         type ToolCall = { toolCallId: string; toolName: string; input: unknown };
@@ -316,6 +327,39 @@ export class CopilotSession {
             // wire and the client renders it canceled; the server has nothing
             // further to say about it.
             this.sendStep(call.toolCallId, call.toolName, "pending", null);
+            // READ tools (workflow surface): executed inline over the turn's
+            // inventory — the result goes straight back to the model, nothing
+            // is proposed and nothing parks. On the agent surface they fall
+            // through to validateMutation, which bounces them with a
+            // surface-naming error.
+            if (
+              opts.surface === "workflow" &&
+              isWorkflowReadTool(call.toolName)
+            ) {
+              const outcome = executeReadTool(
+                call.toolName,
+                call.input,
+                opts.inventory,
+              );
+              let readResult: string;
+              if (outcome.ok) {
+                readResult = outcome.result;
+                this.sendStep(call.toolCallId, call.toolName, "ok", outcome.preview);
+              } else {
+                readResult = `INVALID TOOL CALL (not shown to the user): ${outcome.message}. Fix the call and try again.`;
+                this.sendStep(
+                  call.toolCallId,
+                  call.toolName,
+                  "error",
+                  outcome.message,
+                );
+              }
+              (toolResults.content as unknown[]).push(
+                resultFor(call, readResult),
+              );
+              resolved.add(call.toolCallId);
+              continue;
+            }
             const validation = validateMutation(
               call.toolName,
               call.input,
@@ -335,6 +379,22 @@ export class CopilotSession {
                 validation.message,
               );
             } else {
+              // Warning-grade advisories (collateral outside the proposed
+              // subtree, cache-unverifiable tool names) ride the tool result
+              // once the change is applied, so the model can clean up in
+              // follow-up proposals without the card being blocked.
+              const warningSuffix =
+                validation.warnings.length > 0
+                  ? ` WARNINGS: ${validation.warnings.join("; ")}`
+                  : "";
+              // addStep ids are MINTED server-side, so the model cannot know
+              // the id it just created — and it NEEDS it to chain the next
+              // step's position (or a later updateStep). The applied result
+              // is the one place to hand it back.
+              const mintedNote =
+                validation.tool === "addStep"
+                  ? ` The new step's id is "${(validation.params as CopilotMutationParams["addStep"]).step.id}" — use it for position.after/stepId in later calls.`
+                  : "";
               const rationale = extractRationale(call.input);
               this.deps.send({
                 type: "proposal",
@@ -356,8 +416,7 @@ export class CopilotSession {
                   validation.tool,
                   validation.params,
                 );
-                resultText =
-                  "accepted — allow-edits is on, so this change was applied to the draft immediately";
+                resultText = `accepted — allow-edits is on, so this change was applied to the draft immediately.${mintedNote}${warningSuffix}`;
                 this.sendStep(
                   call.toolCallId,
                   call.toolName,
@@ -375,8 +434,7 @@ export class CopilotSession {
                     validation.tool,
                     validation.params,
                   );
-                  resultText =
-                    "accepted — the user applied this change to the draft";
+                  resultText = `accepted — the user applied this change to the draft.${mintedNote}${warningSuffix}`;
                   this.sendStep(
                     call.toolCallId,
                     call.toolName,
@@ -416,7 +474,7 @@ export class CopilotSession {
       }
       // Step cap reached without a natural stop.
       throw new CopilotOverBudgetError(
-        `turn exceeded ${this.deps.config.maxStepsPerTurn} model round-trips`,
+        `turn exceeded ${maxSteps} model round-trips`,
       );
     } catch (error) {
       if (abortController.signal.aborted || isAbortError(error)) {

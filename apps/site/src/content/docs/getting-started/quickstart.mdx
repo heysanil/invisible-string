@@ -73,30 +73,36 @@ pauses, and context controls.
 ## Step 4: Delegate standing work
 
 Open the [workflow editor](/docs/building/workflow-editor) and create a
-Workflow. Pick a **Schedule** trigger and set a cron expression — `0 9 * * 1-5`
-runs every weekday at 9am, evaluated on the platform clock in UTC — then bind
-the Agent from step 1 and write instructions for what it should do when the
-trigger fires.
+Workflow. The editor is two panes: a copilot composer on the left, and the
+pipeline — a trigger card and a strip of step cards — on the right. Describe
+the job in the composer: *"Every weekday at 9am UTC, have the release-notes
+agent summarize yesterday's merged PRs."* On a brand-new draft the copilot
+applies its edits as it goes, so you'll watch a **Schedule** trigger
+(`0 9 * * 1-5`, evaluated in UTC) and an **agent** step bound to your Agent
+appear on the strip — every card expandable into an inspector if you'd
+rather tune it by hand.
 
-Instructions can pull from the trigger's own data with `@trigger.<path>` — a
-Slack-triggered Workflow, for instance, can reference the incoming message
-with `@trigger.text`. A schedule trigger carries no event data of its own, so
-its instructions typically don't need one; the Agent just does the same thing
-on the same cadence. See [Triggers](/docs/building/triggers) for what each
-trigger kind actually delivers.
+That one-step pipeline is the simplest Workflow there is. The model's real
+range shows when a job is mostly deterministic: `tool` steps call MCP tools
+on the workspace's connections directly, `infer` steps make cheap one-shot
+model calls, and steps pass data to each other with `@` references — see
+[Workflows](/docs/concepts/workflows) for the step kinds and
+[Triggers](/docs/building/triggers) for what each trigger delivers.
 
 Press **Publish** — a Workflow builds nothing, so it's instant. Then press
-**Run** in the header and submit with **Fire now** to fire it immediately and
-watch it run, instead of waiting for the next scheduled tick. Runs always
-dispatch the published Workflow, which is why publishing comes first.
+**Run** in the header and submit with **Fire now** to fire it immediately,
+instead of waiting for the next scheduled tick. Runs always dispatch the
+published Workflow, which is why publishing comes first; the pipeline pane
+shows each step light up live, and **View run** opens the full step timeline
+in the Runs tab.
 
 ## You now have
 
 - A published Agent with a persona, a model preset, and a version-pinned,
   content-hashed build behind it.
 - A chat thread that streamed a run live and can queue more work at any time.
-- A Workflow that delegates the same Agent to a schedule, testable on demand
-  from the header's **Run** popover.
+- A Workflow whose pipeline delegates to the same Agent on a schedule,
+  testable on demand from the header's **Run** popover.
 
 Go deeper on any piece: [the agent editor](/docs/building/agent-editor),
 [models](/docs/building/models), [context & MCP](/docs/building/context-mcp),

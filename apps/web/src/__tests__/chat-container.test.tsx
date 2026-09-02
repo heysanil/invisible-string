@@ -11,6 +11,7 @@
  * controls — is real.
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { useEffect, useReducer } from "react";
@@ -155,7 +156,9 @@ function sessionResponse(status: RunStatus, title: string | null = null) {
     runs: [
       {
         id: RUN_ID,
+        mode: "agent",
         agentSessionId: SESSION_ID,
+        workflowId: null,
         status,
         triggerEvent: {
           agentId: AGENT_ID,
@@ -593,7 +596,7 @@ test("removing a queued row drops it before it is ever sent", async () => {
   await waitFor(() => expect(view.getByText(/scrap this one/)).toBeTruthy());
 
   fireEvent.click(view.getByRole("button", { name: /Remove queued message/ }));
-  await waitFor(() => expect(view.queryByText(/scrap this one/)).toBeNull());
+  await waitFor(() => expectAbsent(() => view.queryByText(/scrap this one/), "the queued message"));
 });
 
 // ── the header's derived facts and the tool directory (spec D5/D6) ──────────

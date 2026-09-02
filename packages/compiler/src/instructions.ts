@@ -7,8 +7,10 @@
  *   generated appendix lists each connection/skill WITH its description so
  *   eve's `connection_search` / `load_skill` routing can find them.
  * - `@trigger.*` is a compile error: agents are trigger-agnostic — trigger
- *   data belongs to WORKFLOW instructions, rendered at dispatch by
- *   `renderTaskMessage`.
+ *   data belongs to WORKFLOW pipelines, rendered at dispatch.
+ * - `@steps.*` / `@state.*` / `@item` / `@now` are compile errors too:
+ *   pipeline run scope exists only in workflow pipelines, never in a persona
+ *   (mirrored client-side by the copilot validator).
  *
  * Unresolved references are compile errors: drafts may be lenient, published
  * versions may not (see agent-definition.ts docs).
@@ -50,6 +52,17 @@ export function renderInstructions(
         `"${ref.raw}" cannot be used in a persona — agents are trigger-agnostic; @trigger references belong in workflow instructions`,
         { raw: ref.raw, path: ref.path },
       );
+    } else if (
+      ref.kind === "step" ||
+      ref.kind === "state" ||
+      ref.kind === "item" ||
+      ref.kind === "now"
+    ) {
+      throw new CompileError(
+        "PIPELINE_REF_NOT_ALLOWED",
+        `"${ref.raw}" cannot be used in a persona — pipeline scope (@steps/@state/@item/@now) exists only in workflow pipelines`,
+        { raw: ref.raw },
+      );
     } else if (ref.kind === "skill") {
       if (ref.slug === "" || !skillsBySlug.has(ref.slug)) {
         throw new CompileError(
@@ -74,7 +87,7 @@ export function renderInstructions(
   // Rewrite from the end so earlier spans stay valid.
   let resolved = source;
   for (const ref of [...refs].reverse()) {
-    if (ref.kind === "trigger") continue; // unreachable — thrown above
+    if (ref.kind !== "skill" && ref.kind !== "connection") continue; // unreachable — thrown above
     const replacement =
       ref.kind === "skill"
         ? `the "${ref.slug}" skill`

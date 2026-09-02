@@ -33,11 +33,40 @@ const MAX_TOOL_DESCRIPTION_CHARS = 500;
 const MAX_ERROR_CHARS = 500;
 const MAX_CAUSE_DEPTH = 8;
 
-/** One `tools_cache` entry: bare tool name + trimmed description + param names. */
+/** Depth cap on the trimmed per-tool `inputSchema` kept in the cache (root = 1). */
+export const MAX_INPUT_SCHEMA_DEPTH = 5;
+/** Property/enum caps so one pathological server cannot bloat `tools_cache`. */
+const MAX_SCHEMA_PROPERTIES = 100;
+const MAX_SCHEMA_ENUM_VALUES = 100;
+
+/**
+ * A TRIMMED JSON-Schema node cached per tool: only the keywords the pipeline
+ * tool-step pre-flight and the schema-aware arg forms read
+ * (`type`/`properties`/`required`/`enum`/`items`/`description`), depth-capped
+ * at {@link MAX_INPUT_SCHEMA_DEPTH}. Everything else a server advertises
+ * (pattern, format, $ref, …) is dropped — the SERVER stays authoritative;
+ * this is a hint, never an enforcement contract.
+ */
+export interface ProbeToolSchema {
+  type?: string;
+  description?: string;
+  enum?: (string | number | boolean)[];
+  properties?: Record<string, ProbeToolSchema>;
+  required?: string[];
+  items?: ProbeToolSchema;
+}
+
+/**
+ * One `tools_cache` entry: bare tool name + trimmed description + param names.
+ * `inputSchema` arrived with the pipeline redesign and is OPTIONAL — cache
+ * rows written by earlier probes lack it, and every reader must keep working
+ * off name-presence alone when it is absent (it fills in on the next probe).
+ */
 export interface ProbeTool {
   name: string;
   description: string;
   params: string[];
+  inputSchema?: ProbeToolSchema;
 }
 
 export interface ProbeOutcome {
@@ -59,12 +88,43 @@ export interface ProbeMcpServerInput {
   timeoutMs?: number;
 }
 
-/** Internal marker so the overall deadline reads as a timeout, not a protocol error. */
-class ProbeTimeoutError extends Error {
+/**
+ * Marker so the overall deadline reads as a timeout, not a protocol error.
+ * Exported for the pipeline MCP caller (pipeline/mcp-call.ts), which shares
+ * {@link withDeadline} and classifies this as its retryable `timeout` class.
+ */
+export class ProbeTimeoutError extends Error {
   constructor(ms: number) {
-    super(`probe timed out after ${ms}ms`);
+    super(`mcp request timed out after ${ms}ms`);
     this.name = "ProbeTimeoutError";
   }
+}
+
+/** The connection fields both MCP dialers (probe + tool call) build a transport from. */
+export interface McpTransportInput {
+  url: string;
+  transport: "streamable-http" | "sse";
+  /** Decrypted static auth headers, possibly empty. Function scope only. */
+  headers: Record<string, string>;
+  /** The guarded egress fetch — neither dialer ever uses bare fetch. */
+  fetchImpl: typeof fetch;
+}
+
+/**
+ * Construct the SDK transport exactly the way the probe dials: guarded fetch
+ * injected, auth headers on every request. Shared with pipeline/mcp-call.ts so
+ * the two callers cannot drift on transport construction. Throws on an
+ * unparseable URL (callers classify that as unreachable).
+ */
+export function createMcpClientTransport(input: McpTransportInput): Transport {
+  const url = new URL(input.url);
+  const options = {
+    fetch: input.fetchImpl,
+    requestInit: { headers: input.headers },
+  };
+  return input.transport === "sse"
+    ? new SSEClientTransport(url, options)
+    : new StreamableHTTPClientTransport(url, options);
 }
 
 /**
@@ -79,29 +139,25 @@ export async function probeMcpServer(
   const client = new Client({ name: "invisible-string-probe", version: "1.0.0" });
   let transport: Transport | undefined;
   try {
-    const url = new URL(input.url);
-    const options = {
-      fetch: input.fetchImpl,
-      requestInit: { headers: input.headers },
-    };
-    transport =
-      input.transport === "sse"
-        ? new SSEClientTransport(url, options)
-        : new StreamableHTTPClientTransport(url, options);
+    transport = createMcpClientTransport(input);
     const listed = await withDeadline(timeoutMs, async () => {
       await client.connect(transport!, { timeout: timeoutMs });
       return await client.listTools(undefined, { timeout: timeoutMs });
     });
     return {
       health: "ok",
-      tools: listed.tools.slice(0, MAX_TOOLS).map((tool) => ({
-        name: tool.name,
-        description: (tool.description ?? "").slice(
-          0,
-          MAX_TOOL_DESCRIPTION_CHARS,
-        ),
-        params: Object.keys(tool.inputSchema?.properties ?? {}),
-      })),
+      tools: listed.tools.slice(0, MAX_TOOLS).map((tool) => {
+        const inputSchema = trimToolInputSchema(tool.inputSchema);
+        return {
+          name: tool.name,
+          description: (tool.description ?? "").slice(
+            0,
+            MAX_TOOL_DESCRIPTION_CHARS,
+          ),
+          params: Object.keys(tool.inputSchema?.properties ?? {}),
+          ...(inputSchema ? { inputSchema } : {}),
+        };
+      }),
       error: null,
     };
   } catch (error) {
@@ -115,11 +171,74 @@ export async function probeMcpServer(
 }
 
 /**
+ * Trim a server-advertised tool `inputSchema` into the cacheable subset (see
+ * {@link ProbeToolSchema}). Pure and defensive: a non-object node, or a node
+ * whose kept keywords all trim away, yields undefined — the cache entry then
+ * simply carries no schema, exactly like a pre-pipeline row.
+ */
+export function trimToolInputSchema(
+  raw: unknown,
+  depth = 1,
+): ProbeToolSchema | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const node = raw as Record<string, unknown>;
+  const out: ProbeToolSchema = {};
+  if (typeof node.type === "string") out.type = node.type;
+  if (typeof node.description === "string") {
+    out.description = node.description.slice(0, MAX_TOOL_DESCRIPTION_CHARS);
+  }
+  if (Array.isArray(node.enum)) {
+    const values = node.enum
+      .filter(
+        (value): value is string | number | boolean =>
+          typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean",
+      )
+      .slice(0, MAX_SCHEMA_ENUM_VALUES);
+    if (values.length > 0) out.enum = values;
+  }
+  if (Array.isArray(node.required)) {
+    const names = node.required.filter(
+      (name): name is string => typeof name === "string",
+    );
+    if (names.length > 0) out.required = names;
+  }
+  // The depth cap prunes CHILDREN, not the node itself: a node at the cap
+  // keeps its scalar keywords and drops the nesting below it.
+  if (depth < MAX_INPUT_SCHEMA_DEPTH) {
+    if (
+      node.properties !== null &&
+      typeof node.properties === "object" &&
+      !Array.isArray(node.properties)
+    ) {
+      const properties: Record<string, ProbeToolSchema> = {};
+      for (const [key, child] of Object.entries(
+        node.properties as Record<string, unknown>,
+      ).slice(0, MAX_SCHEMA_PROPERTIES)) {
+        const trimmed = trimToolInputSchema(child, depth + 1);
+        if (trimmed) properties[key] = trimmed;
+      }
+      if (Object.keys(properties).length > 0) out.properties = properties;
+    }
+    const items = trimToolInputSchema(node.items, depth + 1);
+    if (items) out.items = items;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
  * Race an operation against a wall-clock deadline. The SDK's per-request
  * timeout covers requests once they are issued; this outer deadline also
  * covers transport start-up (the SSE endpoint wait has no request timeout).
+ * Shared with pipeline/mcp-call.ts, whose deadline covers connect + call.
  */
-async function withDeadline<T>(ms: number, op: () => Promise<T>): Promise<T> {
+export async function withDeadline<T>(
+  ms: number,
+  op: () => Promise<T>,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new ProbeTimeoutError(ms)), ms);
@@ -150,8 +269,12 @@ function classifyFailure(
   };
 }
 
-/** Walk the error (and its `cause` chain) for an HTTP 401/403 from the transport. */
-function findAuthStatus(error: unknown): number | null {
+/**
+ * Walk the error (and its `cause` chain) for an HTTP 401/403 from the
+ * transport. Exported for pipeline/mcp-call.ts, which classifies auth
+ * failures the same way.
+ */
+export function findAuthStatus(error: unknown): number | null {
   let current: unknown = error;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && current != null; depth++) {
     if (current instanceof UnauthorizedError) return 401;
@@ -166,7 +289,8 @@ function findAuthStatus(error: unknown): number | null {
   return null;
 }
 
-function describeError(error: unknown): string {
+/** Bounded human-readable message for an unknown thrown value (shared). */
+export function describeError(error: unknown): string {
   const message =
     error instanceof Error ? error.message || error.name : String(error);
   return message.slice(0, MAX_ERROR_CHARS);
@@ -174,9 +298,10 @@ function describeError(error: unknown): string {
 
 /**
  * Redact every credential header value (and, for `Bearer x`-style values,
- * the trailing token alone) from a message before it can reach `last_error`.
+ * the trailing token alone) from a message before it can reach `last_error`
+ * (or, via pipeline/mcp-call.ts, a `run_steps.error` string).
  */
-function scrubSecrets(
+export function scrubSecrets(
   message: string,
   headers: Record<string, string>,
 ): string {

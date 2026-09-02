@@ -342,7 +342,7 @@ Run against the deployed domain after every deploy:
    upload to Garage → worker presigned pull), and chat with it — the working
    block should stream and complete.
 5. Fire a webhook trigger to confirm ingress (needs a published workflow
-   delegating to the agent, with a minted webhook token):
+   with a webhook trigger and a minted webhook token):
    `curl -sS -X POST https://<domain>/t/<token> -H 'content-type: application/json' -d '{}'`.
 
 ---

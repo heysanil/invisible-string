@@ -11,6 +11,17 @@
  * `decryptConnectionAuthHeaders`, or a live OAuth access token through the
  * broker's central refresh — with plaintext confined to this function's scope.
  *
+ * CREDENTIALS LIVE IN TWO DIFFERENT HOMES, and the classification follows the
+ * probe's (`probe/service.ts` `classifyConnection`, the 2026-08-31 OAuth fix
+ * plan): a static secret is an envelope on `connections.auth_config_encrypted`
+ * and is either configured or not; an OAuth grant's token is an envelope on
+ * `connection_oauth.access_token_encrypted`, readable ONLY through
+ * `getAccessToken`, and the grant can also be un-consented, mid-refresh, or
+ * retired. "Credentialed" is therefore a fact about what this call actually
+ * presented, never about the auth TYPE — an oauth row whose grant was never
+ * consented has nothing to present, so it is `auth_required` with NO dial,
+ * while a 401 against a token we did send is the only real `auth_error`.
+ *
  * Failure classes (→ `run_steps.error_class`):
  *  - `config_error`      connection missing/disabled, tool filtered out, or
  *                        the server says the tool does not exist (which also
@@ -21,9 +32,21 @@
  *                        invalid-params answer
  *  - `tool_error`        the server executed the tool and flagged `isError`
  *  - `output_too_large`  structured result over {@link MAX_TOOL_RESULT_BYTES}
- *  - `auth_*` / `oauth_not_connected` / crypto codes — never retryable
+ *  - `auth_required`     nothing to present: an oauth grant nobody consented
+ *                        to (never dialled), or a 401 from a server we sent
+ *                        no credential to
+ *  - `auth_error`        a credential existed and was rejected: the server
+ *                        401'd what we presented, or the authorization server
+ *                        retired the grant (refresh `invalid_grant`) —
+ *                        re-consent is the only recovery, so never retried
+ *  - `oauth_not_connected` (broker unwired) / crypto codes — never retryable
  *  - `unreachable` / `timeout` / `rate_limited` / `server_error` — the ONLY
- *    retryable classes (the runner owns backoff + attempt budgets)
+ *    retryable classes (the runner owns backoff + attempt budgets). An
+ *    authorization server that cannot be reached for a refresh is
+ *    `unreachable` too: the refresh token was not spent, the grant stays
+ *    `connected` (oauth/tokens.ts persists nothing on a blip), so the retry
+ *    simply asks again — a 30-second AS outage must never brick a step or a
+ *    connection.
  */
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
@@ -120,6 +143,24 @@ export const executeToolStep: StepExecutor = async (ctx) => {
   // never persisted, never in an outcome.
   let headers: Record<string, string>;
   if (row.authType === "oauth") {
+    // The grant's own status FIRST, because `getAccessToken` cannot tell the
+    // two unusable states apart — it answers `oauth_not_connected` both for a
+    // grant nobody ever consented to and for one the authorization server has
+    // since disowned. Those are opposite facts ("connect this" vs "your
+    // authorization was rejected"), and a never-consented grant has nothing
+    // to present: a dial could only report the absence we already know.
+    const grant = await deps.db
+      .select({ status: schema.connectionOauth.status })
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, row.id))
+      .limit(1);
+    const grantStatus = grant[0]?.status ?? null;
+    if (grantStatus === null || grantStatus === "pending") {
+      return failed(
+        "auth_required",
+        `connection "${row.name}" has not been connected — complete its OAuth consent first`,
+      );
+    }
     if (!deps.oauthTokens) {
       return failed(
         "oauth_not_connected",
@@ -127,12 +168,13 @@ export const executeToolStep: StepExecutor = async (ctx) => {
       );
     }
     try {
+      // The ONE reader of a grant's tokens: it refreshes centrally when the
+      // stored token is (about to be) stale, and fails before any MCP dial
+      // when the grant cannot produce one at all.
       const grant = await getAccessToken(deps.oauthTokens, row.id);
       headers = { Authorization: `Bearer ${grant.token}` };
     } catch (error) {
-      // `oauth_not_connected` (dead grant — re-consent is the only recovery)
-      // and the crypto/exchange codes are all non-retryable by construction.
-      if (isRuntimeApiError(error)) return failed(error.code, error.message);
+      if (isRuntimeApiError(error)) return classifyTokenFailure(row, error);
       throw error;
     }
   } else {
@@ -163,8 +205,12 @@ export const executeToolStep: StepExecutor = async (ctx) => {
     url: row.url,
     transport: row.transport,
     headers,
-    // Mirrors probeAndPersist: an `oauth` row counts as credentialed.
-    hasCredentials: row.authConfigEncrypted != null || row.authType === "oauth",
+    // What this call actually PRESENTS, never the auth type: an oauth row
+    // only reaches here holding a broker token (so a 401 is the server
+    // rejecting it — the one real `auth_error`), a static row is credentialed
+    // iff its envelope exists. Mirrors the probe's `classifyConnection`.
+    hasCredentials:
+      row.authType === "oauth" ? true : row.authConfigEncrypted != null,
     fetchImpl: deps.fetchImpl,
     toolName: step.tool,
     args,
@@ -279,6 +325,51 @@ function describeJson(value: unknown): string {
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/**
+ * A grant that cannot produce a token is not an unhealthy MCP server. Same
+ * table as the probe's `classifyTokenFailure` (probe/service.ts):
+ *
+ *  - `oauth_not_connected` — reached ONLY from a grant past `pending` (the
+ *    caller answers `auth_required` before this for one that never
+ *    consented), so the authorization server disowned a grant the user
+ *    really did complete: revoked, or a refresh answered `invalid_grant`. A
+ *    credential existed and was rejected — `auth_error`, and re-consent is
+ *    the only recovery, so retrying spends nothing but attempts.
+ *  - `oauth_exchange_failed` — the AS's token endpoint timed out, 5xx'd, or
+ *    was refused by the egress guard. A third party we could not reach —
+ *    `unreachable`, RETRYABLE: oauth/tokens.ts persists nothing on such a
+ *    blip (only `invalid_grant` is terminal there), the refresh token is
+ *    unspent and the grant stays `connected`, so the next attempt asks again.
+ *    Its detail is HTTP status + RFC error code only — never an OAuth value —
+ *    so it is safe in `run_steps.error`.
+ *
+ * Anything else (missing master key, an undecryptable envelope) is genuine
+ * infrastructure failure under its own code: never retryable.
+ */
+function classifyTokenFailure(
+  row: ConnectionRow,
+  error: { code: string; message: string },
+): StepOutcome {
+  if (error.code === "oauth_not_connected") {
+    return failed(
+      "auth_error",
+      `connection "${row.name}"'s authorization has expired or been revoked — reconnect it`,
+    );
+  }
+  if (error.code === "oauth_exchange_failed") {
+    return {
+      status: "failed",
+      errorClass: "unreachable",
+      error: `authorization server unreachable while refreshing connection "${row.name}"'s token: ${error.message}`.slice(
+        0,
+        MAX_STEP_ERROR_CHARS,
+      ),
+      retryable: true,
+    };
+  }
+  return failed(error.code, error.message);
+}
 
 function failed(errorClass: string, error: string): StepOutcome {
   return {

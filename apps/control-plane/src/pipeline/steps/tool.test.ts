@@ -22,18 +22,29 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { schema } from "@invisible-string/db";
-import { newStepId, type PipelineStep, type ToolStep } from "@invisible-string/shared";
+import {
+  encryptSecret,
+  generateMasterKeyBase64,
+  newStepId,
+  parseMasterKey,
+  type MasterKey,
+  type PipelineStep,
+  type ToolStep,
+} from "@invisible-string/shared";
 
 import { createDb, type Db, type DbHandle } from "../../db";
 import { createLogger } from "../../log";
 import { runMigrations } from "../../migrate";
 import { createGuardedFetch } from "../../net/guarded-fetch";
+import { connectionOauthAad } from "../../oauth/client-identity";
 import type { StepExecuteContext } from "../types";
 import { executeToolStep, preflightToolArgs } from "./tool";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const guardedFetch = createGuardedFetch({ allowPrivate: true });
 const logger = createLogger({ sink: () => {}, minLevel: "error" });
+/** Seals the oauth fixtures' tokens the way the broker does (AAD-bound). */
+const MASTER_KEY = parseMasterKey(generateMasterKeyBase64());
 
 // ── pure: pre-flight (ungated) ───────────────────────────────────────────────
 
@@ -144,11 +155,39 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 interface Fixture {
   url: string;
   close(): Promise<void>;
+  /**
+   * When set, EVERY request — the handshake included — must carry
+   * `Bearer <requiredBearer>` or gets a 401, the way a real OAuth MCP server
+   * behaves (the e2e stub's gate, fix plan P1.3).
+   */
+  requiredBearer: string | null;
+  /** The `Authorization` header of the most recent request (null = none). */
+  lastAuthorization: string | null;
+  /** Request count — the "do not dial" branches are proven by it not moving. */
+  dials: number;
 }
 
 async function serveFixture(): Promise<Fixture> {
+  const fixture: Fixture = {
+    url: "",
+    close: async () => {},
+    requiredBearer: null,
+    lastAuthorization: null,
+    dials: 0,
+  };
   const server = createServer((req, res) => {
     void (async () => {
+      fixture.dials += 1;
+      fixture.lastAuthorization = req.headers.authorization ?? null;
+      if (
+        fixture.requiredBearer !== null &&
+        fixture.lastAuthorization !== `Bearer ${fixture.requiredBearer}`
+      ) {
+        res.statusCode = 401;
+        res.setHeader("www-authenticate", 'Bearer realm="mcp"');
+        res.end("unauthorized");
+        return;
+      }
       const mcp = buildFixtureMcpServer();
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined, // stateless
@@ -176,14 +215,24 @@ async function serveFixture(): Promise<Fixture> {
     server.listen(0, "127.0.0.1", () => resolve()),
   );
   const { port } = server.address() as AddressInfo;
-  return {
-    url: `http://127.0.0.1:${port}/mcp`,
-    close: () =>
-      new Promise<void>((resolve) => {
-        for (const socket of sockets) socket.destroy();
-        server.close(() => resolve());
-      }),
-  };
+  fixture.url = `http://127.0.0.1:${port}/mcp`;
+  fixture.close = () =>
+    new Promise<void>((resolve) => {
+      for (const socket of sockets) socket.destroy();
+      server.close(() => resolve());
+    });
+  return fixture;
+}
+
+/** A loopback URL nothing is listening on — a third party that is simply down. */
+async function closedLoopbackUrl(path: string): Promise<string> {
+  const idle = createServer();
+  await new Promise<void>((resolve) =>
+    idle.listen(0, "127.0.0.1", () => resolve()),
+  );
+  const { port } = idle.address() as AddressInfo;
+  await new Promise<void>((resolve) => idle.close(() => resolve()));
+  return `http://127.0.0.1:${port}${path}`;
 }
 
 function toolStep(overrides: Partial<ToolStep> = {}): ToolStep {
@@ -204,23 +253,29 @@ function contextFor(
   orgId: string,
   step: PipelineStep,
   input: unknown,
+  options: { masterKey?: MasterKey; broker?: boolean } = {},
 ): StepExecuteContext {
+  const masterKey = options.masterKey;
   return {
     deps: {
       db,
       logger,
-      masterKey: undefined,
+      masterKey,
       fetchImpl: guardedFetch,
-      // The re-probe resolves credentials through the broker (an oauth row's
-      // token lives behind `getAccessToken`), so the fixture wires one even
-      // though every row here carries static auth.
-      oauthTokens: {
-        db,
-        masterKey: undefined,
-        publicAppUrl: "http://localhost:3000",
-        fetchImpl: guardedFetch,
-        logger,
-      },
+      // The broker is the ONE reader of an oauth grant's tokens, and the
+      // re-probe resolves credentials through it too — so the fixture wires
+      // one by default (`broker: false` models an unwired deployment).
+      ...(options.broker === false
+        ? {}
+        : {
+            oauthTokens: {
+              db,
+              masterKey,
+              publicAppUrl: "http://localhost:3000",
+              fetchImpl: guardedFetch,
+              logger,
+            },
+          }),
     },
     orgId,
     run: { id: `run-${randomUUID()}`, workflowId: `wf-${randomUUID()}` },
@@ -512,13 +567,192 @@ describe.skipIf(!TEST_DATABASE_URL)("executeToolStep", () => {
     }
   });
 
-  test("an oauth connection without a wired broker fails oauth_not_connected", async () => {
-    const id = await insertConnection({ authType: "oauth" });
-    const outcome = await executeToolStep(
-      contextFor(handle.db, orgId, toolStep({ connectionId: id }), {
-        args: { note: "x" },
-      }),
+  // ── oauth rows: the probe's credential doctrine (2026-08-31 fix plan) ────
+  //
+  // An oauth row's token lives in `connection_oauth.access_token_encrypted`,
+  // behind `getAccessToken`; `hasCredentials` is a fact about what the call
+  // PRESENTS, never about the auth type. These mirror probe/service.test.ts's
+  // oauth cases so the step and the probe can never drift apart on what a
+  // grant state means.
+
+  /** Seal a secret exactly as the broker does: envelope AAD-bound to the row. */
+  function seal(
+    value: string,
+    column: "access_token" | "refresh_token",
+    grantId: string,
+  ): string {
+    return JSON.stringify(
+      encryptSecret(value, MASTER_KEY, connectionOauthAad(column, grantId)),
     );
+  }
+
+  async function insertOauthConnection(
+    grant: Partial<typeof schema.connectionOauth.$inferInsert> = {},
+  ): Promise<{ id: string; grantId: string }> {
+    const id = await insertConnection({ authType: "oauth" });
+    const grantId = `co_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await handle.db.insert(schema.connectionOauth).values({
+      id: grantId,
+      connectionId: id,
+      status: "pending",
+      ...grant,
+    });
+    return { id, grantId };
+  }
+
+  async function grantStatus(grantId: string) {
+    const rows = await handle.db
+      .select({ status: schema.connectionOauth.status })
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.id, grantId));
+    return rows[0]?.status ?? null;
+  }
+
+  const oauthCall = (id: string, options?: { masterKey?: MasterKey; broker?: boolean }) =>
+    executeToolStep(
+      contextFor(
+        handle.db,
+        orgId,
+        toolStep({ connectionId: id }),
+        { args: { note: "x" } },
+        { masterKey: MASTER_KEY, ...options },
+      ),
+    );
+
+  test("oauth row with a pending grant → auth_required, and the server is never dialled", async () => {
+    const { id } = await insertOauthConnection();
+    const dialsBefore = fixture.dials;
+    const outcome = await oauthCall(id);
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "auth_required",
+      retryable: false,
+    });
+    if (outcome.status !== "failed") throw new Error("unreachable");
+    expect(outcome.error).toContain("has not been connected");
+    // No consent means no token means nothing worth asking the server.
+    expect(fixture.dials).toBe(dialsBefore);
+  });
+
+  test("oauth row with no grant row at all reads auth_required too", async () => {
+    const id = await insertConnection({ authType: "oauth" });
+    const dialsBefore = fixture.dials;
+    const outcome = await oauthCall(id);
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "auth_required",
+      retryable: false,
+    });
+    expect(fixture.dials).toBe(dialsBefore);
+  });
+
+  test("a connected grant dials WITH the broker token — the only credential an oauth row has", async () => {
+    const token = "broker-issued-access-token-for-a-tool-step";
+    const { id } = await insertOauthConnection({ status: "connected" });
+    // Seal after insert: the envelope's AAD binds the grant id.
+    const grantRows = await handle.db
+      .select({ id: schema.connectionOauth.id })
+      .from(schema.connectionOauth)
+      .where(eq(schema.connectionOauth.connectionId, id));
+    await handle.db
+      .update(schema.connectionOauth)
+      .set({
+        accessTokenEncrypted: seal(token, "access_token", grantRows[0]!.id),
+        accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      })
+      .where(eq(schema.connectionOauth.id, grantRows[0]!.id));
+    // Like every real OAuth MCP server, the fixture 401s an unauthenticated
+    // handshake — the call can only succeed if the token really rode along.
+    fixture.requiredBearer = token;
+    try {
+      const outcome = await oauthCall(id);
+      expect(outcome).toMatchObject({ status: "succeeded" });
+      expect(fixture.lastAuthorization).toBe(`Bearer ${token}`);
+      expect(JSON.stringify(outcome)).not.toContain(token);
+    } finally {
+      fixture.requiredBearer = null;
+    }
+  });
+
+  test("a rejected broker token reads auth_error, never retryable, and never leaks", async () => {
+    const token = "broker-token-the-server-does-not-know";
+    const { id, grantId } = await insertOauthConnection({ status: "connected" });
+    await handle.db
+      .update(schema.connectionOauth)
+      .set({
+        accessTokenEncrypted: seal(token, "access_token", grantId),
+        accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      })
+      .where(eq(schema.connectionOauth.id, grantId));
+    fixture.requiredBearer = "some-other-token";
+    try {
+      const outcome = await oauthCall(id);
+      expect(outcome).toMatchObject({
+        status: "failed",
+        errorClass: "auth_error",
+        retryable: false,
+      });
+      expect(fixture.lastAuthorization).toBe(`Bearer ${token}`);
+      expect(JSON.stringify(outcome)).not.toContain(token);
+    } finally {
+      fixture.requiredBearer = null;
+    }
+  });
+
+  test("a RETIRED grant reads auth_error — a credential existed and stopped working — with no dial", async () => {
+    // `connected` with nothing left to spend: no access token and no refresh
+    // token, so `getAccessToken` retires the grant and answers
+    // `oauth_not_connected`. This grant WAS consented, so the honest class is
+    // `auth_error` (re-consent is the only recovery), not the never-connected
+    // `auth_required` — the step reads the grant's status precisely so the
+    // two do not collapse.
+    const { id, grantId } = await insertOauthConnection({ status: "connected" });
+    const dialsBefore = fixture.dials;
+    const outcome = await oauthCall(id);
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "auth_error",
+      retryable: false,
+    });
+    expect(fixture.dials).toBe(dialsBefore);
+    expect(await grantStatus(grantId)).toBe("expired");
+  });
+
+  test("an unreachable authorization server is a RETRYABLE unreachable, and leaves the grant alive", async () => {
+    const refreshToken = "refresh-token-for-a-down-authorization-server";
+    const { id, grantId } = await insertOauthConnection({ status: "connected" });
+    // A stale access token plus a token endpoint nothing answers: the central
+    // refresh fails the way a real AS outage does. Only `invalid_grant` is
+    // terminal there (fix plan P3.1): nothing is persisted, the refresh token
+    // is unspent, so the runner may simply try again.
+    await handle.db
+      .update(schema.connectionOauth)
+      .set({
+        tokenEndpoint: await closedLoopbackUrl("/token"),
+        accessTokenEncrypted: seal("stale-access-token", "access_token", grantId),
+        accessTokenExpiresAt: new Date(Date.now() - 1_000),
+        refreshTokenEncrypted: seal(refreshToken, "refresh_token", grantId),
+      })
+      .where(eq(schema.connectionOauth.id, grantId));
+    const dialsBefore = fixture.dials;
+    const outcome = await oauthCall(id);
+    expect(outcome).toMatchObject({
+      status: "failed",
+      errorClass: "unreachable",
+      retryable: true,
+    });
+    if (outcome.status !== "failed") throw new Error("unreachable");
+    expect(outcome.error).toContain("authorization server unreachable");
+    expect(outcome.error).not.toContain(refreshToken);
+    // No token, so the MCP server was never asked anything.
+    expect(fixture.dials).toBe(dialsBefore);
+    // The blip did not brick the grant.
+    expect(await grantStatus(grantId)).toBe("connected");
+  }, 20_000);
+
+  test("a consented oauth row without a wired broker fails oauth_not_connected", async () => {
+    const { id } = await insertOauthConnection({ status: "connected" });
+    const outcome = await oauthCall(id, { broker: false });
     expect(outcome).toMatchObject({
       status: "failed",
       errorClass: "oauth_not_connected",

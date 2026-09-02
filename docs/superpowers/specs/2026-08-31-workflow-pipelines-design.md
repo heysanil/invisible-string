@@ -234,7 +234,20 @@ output without failing the loop). Delivery is §7's — explicit only.
 **`tool`** (`steps/tool.ts` over `mcp-call.ts`): connection loaded
 workspace-scoped + enabled; auth per type — none, static headers via
 `decryptConnectionAuthHeaders`, or a live OAuth access token through the
-broker's central refresh — plaintext confined to function scope. `mcp-call.ts`
+broker's central refresh — plaintext confined to function scope. The OAuth
+branch follows the probe's credential doctrine (the 2026-08-31 OAuth fix
+plan) exactly: the grant's status is read FIRST, and a `pending`/absent grant
+fails `auth_required` with NO dial (nothing to present; a round trip could
+only report the absence already known); `getAccessToken` is the ONE reader
+of the grant's token, and its failures classify like the probe's —
+`oauth_not_connected` past `pending` means the authorization server retired
+a grant the user completed, so it is a non-retryable `auth_error`
+(re-consent is the only recovery), while `oauth_exchange_failed` (AS
+timeout/5xx/guard refusal — the refresh token unspent, the grant still
+`connected`, since only `invalid_grant` is terminal in `oauth/tokens.ts`) is
+a RETRYABLE `unreachable`. `hasCredentials` on the call is what the step
+actually presented — a broker token, or a static envelope — never the auth
+type. `mcp-call.ts`
 extends the probe's dial machinery (same transport construction, outer
 deadline, close-in-finally, `scrubSecrets` over every failure message) with
 one `tools/call`; fresh client per attempt (pooling can arrive later behind

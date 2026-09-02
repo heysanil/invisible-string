@@ -740,8 +740,20 @@ describe.skipIf(!TEST_DATABASE_URL)("oauth consent broker", () => {
     // The tool cache populates, which is what feeds the tool picker,
     // per-tool approvals, the agent-version tool directory and the copilot
     // inventory — none of which any OAuth connection could reach before.
-    expect(health.toolsCache).toEqual([
-      { name: "echo", description: "Echo a message back.", params: ["message"] },
+    // The pipeline probe also caches each tool's `inputSchema` (tool steps
+    // pre-flight rendered args against it) — the same shape every other
+    // connection's cache carries (wider than the column's declared type).
+    expect(health.toolsCache as unknown).toEqual([
+      {
+        name: "echo",
+        description: "Echo a message back.",
+        params: ["message"],
+        inputSchema: {
+          type: "object",
+          properties: { message: { type: "string" } },
+          required: ["message"],
+        },
+      },
     ]);
     expect(health.toolsCachedAt).not.toBeNull();
     // And it authenticated with the broker's own token — not merely with

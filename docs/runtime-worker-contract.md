@@ -574,22 +574,41 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   LIVE tail in this process, that tail is SIGNALED to re-read the session's
   obligations (`refreshSessionObligations`) and counted `observing` too.
   Liveness is checked AT the handoff, never assumed from the manager's map:
-  a tail leaves the session's reader slot the instant its abort lands
-  (`onAbort`, synchronous — observation closed or expired, a detach, a
-  terminal), not when its `done` resolves, which can trail the abort by
-  arbitrarily long (a hung reconnect); `refreshSessionObligations` resolves
-  false for a tail whose abort has landed (`RunTailHandle.refreshObligations`
-  re-reads nothing then), and every caller treats false as "no reader" and
+  a tail leaves the session's reader slot the instant it CLOSES — `close`
+  is the ONE exit transition, taken synchronously at the start of every
+  path out of a tail (`onClose`: observation closed or expired, a detach, a
+  settlement that aborts, the run's natural terminal, reconnect
+  exhaustion, a seizure), never when its `done` resolves, which can trail
+  the close by arbitrarily long (a hung reconnect);
+  `refreshSessionObligations` resolves false for a closed tail
+  (`RunTailHandle.refreshObligations` re-reads nothing then, and re-checks
+  after its re-read), and every caller treats false as "no reader" and
   opens its own observer — `observe()` awaits the signal and, refused, opens
   the observation itself. The one-reader invariant holds across that
-  handoff because an aborted tail keeps HOLDING the stream until `done`
-  (its cursor is not released before): the manager parks it in a draining
-  slot, chains the successor's tail (`waitFor`) behind it exactly as it
-  chains behind a detached observation, and the context controls' quiet
-  check (`isSessionStreamHeld`) counts a draining tail as a reader. Before
-  this, a settlement landing between an observation's abort and its
-  `done.finally` was "handed" to a tail that could no longer act, reported
-  `observing`, and the run had no reader until the next sweep;
+  handoff because a closed tail keeps HOLDING the stream until `done` (its
+  cursor is not released before): the manager parks it in the session's
+  draining list, chains the successor's tail (`chainBehind`) behind the
+  latest drainer exactly as it chains behind a detached observation, and
+  the context controls' quiet check (`isSessionStreamHeld`) counts a
+  draining tail as a reader. That chain wait is BOUNDED and the observer's
+  window is armed up front: a chained observation tail arms its
+  `REMOTE_CANCEL_OBSERVE_MS` deadline at CREATION (before the wait, before
+  its loads), so an expiry during the wait still declares the run
+  unresolved and releases the handle; and once the prior is closed the
+  successor waits at most `streamTakeoverMs` (`DEFAULT_STREAM_TAKEOVER_MS`,
+  5 s) for its `done`, then SEIZES it (`RunTailHandle.seize`: closed,
+  fenced so it consumes, attributes and writes nothing more even if its
+  hung connect or body yields later, its in-flight event handling awaited
+  — bounded again) and takes the cursor over from the persisted counts
+  (`run.tail_takeover`, warn). Behind a LIVE prior the wait stays
+  unbounded — seizing a live reader would fail its run, and two live tails
+  on one session is what admission forbids. Before this, a tail exiting
+  through its natural terminal stayed in the reader slot until
+  `done.finally` (a settlement signal in that window was adopted by a tail
+  about to return, and the run had no reader until the next sweep), and a
+  chained observer awaited a hung drain with no bound and armed its
+  deadline only afterwards — the session's live tail slot wedged until
+  restart;
   nothing to act on (an armed eveless
   session, no live worker) is `retained`; a held lock is `deferred`. The
   post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a

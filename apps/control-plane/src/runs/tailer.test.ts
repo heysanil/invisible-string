@@ -2519,6 +2519,302 @@ describe("tailer — ordering races (round 13: X1 one-read claimants + retroacti
   });
 });
 
+describe("tailer — liveness (round 14: Y1 close-on-every-exit, Y2 bounded chain wait + deadline armed at creation)", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  /** A promise the test resolves by hand. */
+  const gate = () => {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  };
+
+  test("Y1 — a tail exiting through its NATURAL terminal closes synchronously: B's settlement signal landing while A's terminal writes are still in flight is refused (never adopted by a tail about to return), B gets its own observer at once — chained behind A's cursor — and B's cancel goes out QUALIFIED on its turn", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-A", "a");
+    // A's terminal write (`markRun succeeded`) hangs until the test opens
+    // the gate: the window between A's terminal and its `done.finally`.
+    const terminalWrite = gate();
+    const markRun = store.markRun;
+    store.markRun = async (runId, patch) => {
+      if (patch.status === "succeeded") await terminalWrite.promise;
+      return markRun(runId, patch);
+    };
+    const manager = new RunTailerManager({ store, bus: new RunEventBus(), maxWallClockMs: 60_000 });
+    const cancelRemoteTurn = async (options?: { turnId?: string }) => {
+      seen.push(options);
+    };
+    const streamA = liveStream();
+    const a = manager.start({
+      runId: "run-A",
+      agentSessionId: "s",
+      openStream: streamA.open,
+      cancelRemoteTurn,
+    });
+    await until(() => store.runStatus === "running", "A to adopt its run");
+    streamA.push(turnStarted("turn_A"));
+    streamA.push(messageReceived("turn_A", "a"));
+    streamA.push(turnCompleted("turn_A"));
+    streamA.push(sessionWaiting());
+    // A has reached its terminal and is inside the gated write.
+    await until(() => a.closed, "A to close on its natural terminal");
+    expect(store.runStatus).toBe("running"); // the terminal write has not landed
+    expect(await settled(a.done)).toBeFalse();
+    // Pre-fix: A stayed in the reader slot until `done.finally` — a signal
+    // here found `abort.signal.aborted === false`, A adopted B's obligation,
+    // answered true, then returned: B had no reader until the next sweep.
+    expect(manager.hasSessionTail("s")).toBeFalse();
+    expect(manager.isSessionStreamHeld("s")).toBeTrue();
+    store.sent("run-B", "b");
+    store.obligations.set("run-B", { pendingAt: new Date(), unresolvedAt: null });
+    expect(await manager.refreshSessionObligations("s")).toBeFalse();
+    const streamB = liveStream();
+    let connectsB = 0;
+    const b = await manager.observe({
+      runId: "run-B",
+      agentSessionId: "s",
+      openStream: async (...args) => {
+        connectsB += 1;
+        return streamB.open(...args);
+      },
+      cancelRemoteTurn,
+      deadlineAt: Date.now() + 60_000,
+    });
+    expect(b).not.toBeNull();
+    expect(b!.observing).toBeTrue();
+    expect(manager.hasSessionTail("s")).toBeTrue();
+    // ONE reader: B is chained behind A's still-held cursor.
+    await sleep(20);
+    expect(connectsB).toBe(0);
+    terminalWrite.open();
+    await a.done;
+    expect(store.runStatus).toBe("succeeded");
+    await until(() => connectsB === 1, "B to open once A released the stream");
+    streamB.push(turnStarted("turn_B"));
+    streamB.push(messageReceived("turn_B", "b"));
+    await until(() => seen.length === 1, "B's qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_B" }]);
+    streamB.push(turnCancelled("turn_B"));
+    await until(() => !store.obligations.has("run-B"), "B cleared on its boundary");
+    await b!.done;
+    expect(manager.activeCount).toBe(0);
+    expect(manager.isSessionStreamHeld("s")).toBeFalse();
+  });
+
+  test("Y1 — reconnect exhaustion closes synchronously too: the handle leaves the reader slot before the `failed` write lands, and a signal in that window is refused", async () => {
+    const store = memoryStore();
+    store.sent("run-A", "a");
+    const failedWrite = gate();
+    const markRun = store.markRun;
+    store.markRun = async (runId, patch) => {
+      if (patch.status === "failed") await failedWrite.promise;
+      return markRun(runId, patch);
+    };
+    const manager = new RunTailerManager({
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+      maxReconnectAttempts: 1,
+      reconnectDelayMs: 1,
+    });
+    const a = manager.start({
+      runId: "run-A",
+      agentSessionId: "s",
+      openStream: async () => ndjsonResponse([]), // drops at once, every time
+      cancelRemoteTurn: async () => {},
+    });
+    await until(() => a.closed, "A to close on reconnect exhaustion");
+    expect(store.runStatus).toBe("running");
+    expect(await settled(a.done)).toBeFalse();
+    expect(manager.hasSessionTail("s")).toBeFalse();
+    expect(manager.isSessionStreamHeld("s")).toBeTrue();
+    store.sent("run-B", "b");
+    store.obligations.set("run-B", { pendingAt: new Date(), unresolvedAt: null });
+    expect(await manager.refreshSessionObligations("s")).toBeFalse();
+    failedWrite.open();
+    await a.done;
+    expect(store.runStatus).toBe("failed");
+    expect(manager.isSessionStreamHeld("s")).toBeFalse();
+  });
+
+  test("Y2 — a HUNG drain is seized: B chained behind A (closed, its reconnect never resolves) takes the stream over after the takeover bound — exactly one live reader, A fenced so its late-yielding connect writes NOTHING, no duplicate (run_id, seq)", async () => {
+    const warns: string[] = [];
+    const logger = createLogger({
+      sink: (event) => {
+        if (event.level === "warn") warns.push(event.event);
+      },
+      minLevel: "debug",
+    });
+    const store = memoryStore();
+    store.runStatus = "canceled";
+    store.sent("run-A", "a");
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const manager = new RunTailerManager({
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+      reconnectDelayMs: 1,
+      streamTakeoverMs: 50,
+      logger,
+    });
+    // A's reconnect HANGS and ignores the abort signal entirely (a proxy
+    // that never answers) — the test resolves it LATE, with a body that
+    // carries events, to prove the fence.
+    let connectsA = 0;
+    const hangA: { resolve: ((response: Response) => void) | null } = { resolve: null };
+    const a = await manager.observe({
+      runId: "run-A",
+      agentSessionId: "s",
+      openStream: async () => {
+        connectsA += 1;
+        if (connectsA === 1) return ndjsonResponse([]);
+        return new Promise<Response>((resolve) => {
+          hangA.resolve = resolve;
+        });
+      },
+      cancelRemoteTurn: async () => {},
+      deadlineAt: Date.now() + 60_000,
+    });
+    await until(() => hangA.resolve !== null, "A's reconnect to hang");
+    a!.detach(); // closed, cursor still held
+    expect(manager.isSessionStreamHeld("s")).toBeTrue();
+
+    store.sent("run-B", "b");
+    store.obligations.set("run-B", {
+      pendingAt: new Date(),
+      unresolvedAt: null,
+      createdAt: new Date(Date.now() + 1),
+    });
+    const streamB = liveStream();
+    let connectsB = 0;
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const b = await manager.observe({
+      runId: "run-B",
+      agentSessionId: "s",
+      openStream: async (...args) => {
+        connectsB += 1;
+        return streamB.open(...args);
+      },
+      cancelRemoteTurn: async (options?: { turnId?: string }) => {
+        seen.push(options);
+      },
+      deadlineAt: Date.now() + 60_000,
+    });
+    expect(b).not.toBeNull();
+    // Pre-fix: B awaited A's `done` with no bound — never opened, the
+    // session wedged behind a drain nothing could release.
+    await until(() => connectsB === 1, "B to take the stream over after the bound");
+    expect(warns).toContain("run.tail_takeover");
+    expect(await settled(a!.done)).toBeFalse(); // A's hung connect is abandoned, not resolved
+    expect(manager.hasSessionTail("s")).toBeTrue(); // exactly one live reader: B
+    expect(manager.get("run-B")).toBe(b!);
+    expect(a!.closed).toBeTrue();
+    // A's connect finally answers WITH events: fenced, A must write none.
+    hangA.resolve!(
+      ndjsonResponse([
+        turnStarted("turn_late"),
+        messageReceived("turn_late", "a"),
+        turnCancelled("turn_late"),
+        sessionWaiting(),
+      ]),
+    );
+    await a!.done;
+    expect(store.events.filter((e) => e.runId === "run-A")).toHaveLength(0);
+    expect(store.turnIds.has("run-A")).toBeFalse(); // attributed nothing either
+    // B reads its own turn; every persisted row is B's, each seq once.
+    streamB.push(turnStarted("turn_B"));
+    streamB.push(messageReceived("turn_B", "b"));
+    await until(() => seen.length === 1, "B's qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_B" }]);
+    streamB.push(turnCancelled("turn_B"));
+    await until(() => !store.obligations.has("run-B"), "B cleared on its boundary");
+    expect(store.events.every((e) => e.runId === "run-B")).toBeTrue();
+    expect(new Set(store.events.map((e) => e.seq)).size).toBe(store.events.length);
+    b!.detach();
+    await b!.done;
+    expect(manager.activeCount).toBe(0);
+    expect(manager.isSessionStreamHeld("s")).toBeFalse();
+  });
+
+  test("Y2 — the observation deadline is armed at CREATION: it fires DURING the chain wait, declares the obligation unresolved, and releases the handle — the chained observer never opens a stream and no longer blocks the session", async () => {
+    const warns: string[] = [];
+    const logger = createLogger({
+      sink: (event) => {
+        if (event.level === "warn") warns.push(event.event);
+      },
+      minLevel: "debug",
+    });
+    const store = memoryStore();
+    store.runStatus = "canceled";
+    store.sent("run-A", "a");
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const manager = new RunTailerManager({
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+      reconnectDelayMs: 1,
+      streamTakeoverMs: 60_000, // the bound is NOT what ends this wait
+      logger,
+    });
+    let connectsA = 0;
+    const hangA: { release: ((error: Error) => void) | null } = { release: null };
+    const a = await manager.observe({
+      runId: "run-A",
+      agentSessionId: "s",
+      openStream: async () => {
+        connectsA += 1;
+        if (connectsA === 1) return ndjsonResponse([]);
+        return new Promise<Response>((_resolve, reject) => {
+          hangA.release = reject;
+        });
+      },
+      cancelRemoteTurn: async () => {},
+      deadlineAt: Date.now() + 60_000,
+    });
+    await until(() => hangA.release !== null, "A's reconnect to hang");
+    a!.detach();
+    store.sent("run-B", "b");
+    store.obligations.set("run-B", {
+      pendingAt: new Date(),
+      unresolvedAt: null,
+      createdAt: new Date(Date.now() + 1),
+    });
+    let connectsB = 0;
+    const b = await manager.observe({
+      runId: "run-B",
+      agentSessionId: "s",
+      openStream: async () => {
+        connectsB += 1;
+        return ndjsonResponse([], { stayOpen: true });
+      },
+      cancelRemoteTurn: async () => {},
+      deadlineAt: Date.now() + 40,
+    });
+    expect(b).not.toBeNull();
+    expect(manager.hasSessionTail("s")).toBeTrue();
+    // Pre-fix: the deadline was armed only AFTER the chain wait, so it never
+    // fired — B stayed the session's live tail forever.
+    await until(
+      () => store.obligations.get("run-B")?.unresolvedAt != null,
+      "B declared unresolved on its deadline while chained",
+    );
+    expect(warns).toContain("run.remote_cancel_unresolved");
+    expect(b!.closed).toBeTrue();
+    await b!.done; // the chain wait ends on B's own close
+    expect(connectsB).toBe(0); // never a second reader
+    expect(manager.hasSessionTail("s")).toBeFalse();
+    expect(manager.get("run-B")).toBeUndefined();
+    expect(store.obligations.has("run-B")).toBeTrue(); // marker kept — the honest residual
+    expect(manager.isSessionStreamHeld("s")).toBeTrue(); // A still drains
+    hangA.release!(new Error("aborted"));
+    await a!.done;
+    expect(manager.activeCount).toBe(0);
+    expect(manager.isSessionStreamHeld("s")).toBeFalse();
+  });
+});
+
 describe("authorization latch (connectors plan-3 task 9)", () => {
   // NOTE: `authorization.required` is DORMANT on eve 0.31.3 for the
   // platform's getToken-only connections (spike REPORT finding 34 — a mid-run

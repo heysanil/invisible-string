@@ -152,10 +152,20 @@
  * leftover drain (the manager detaches an observation tail when a normal
  * tail starts on the same session: ONE reader per eve stream, always). A
  * handoff to a live tail checks LIVENESS at the handoff: a tail leaves the
- * manager's reader slot the instant its abort lands (`onAbort`), a signal
- * to an aborted tail answers false, and the caller then opens its own
- * observer — chained behind the aborted tail's still-held cursor until its
- * `done` resolves, never a second reader.
+ * manager's reader slot the instant it CLOSES — `close(reason)`, the ONE
+ * transition every exit path takes synchronously at its start (a Stop or
+ * shutdown settlement, an observation closing or expiring, a detach, the
+ * run's natural terminal, reconnect exhaustion, the wall-clock cap, a
+ * seizure) — never when its `done` resolves; a signal to a closed tail
+ * answers false, and the caller then opens its own observer — chained
+ * behind the closed tail's still-held cursor, never a second reader. That
+ * chain wait is BOUNDED (`streamTakeoverMs`): a drain that never releases
+ * its cursor (a reconnect or store call that never resolves) is SEIZED
+ * after the bound — closed and fenced so it consumes, attributes and writes
+ * nothing more, its in-flight event handling awaited — and the successor
+ * takes the cursor over from the persisted counts. An observer's deadline
+ * is armed at CREATION, so it fires during the chain wait too (unresolved
+ * declared, the handle released) — a hung drain can never wedge a session.
  *
  * WALL-CLOCK CAP AND SHUTDOWN owe the same confirmation. MAX_RUN_WALL_CLOCK_MS
  * starts when tailing starts; expiry settles the run `failed` — WITH the
@@ -463,11 +473,23 @@ export interface TailRunOptions {
    */
   observe?: { deadlineAt: number };
   /**
-   * Chained start: resolve before reading anything. The manager passes the
-   * `done` of a detached observation tail on the same session so the two
-   * never read eve's stream at once (one cursor owner per stream).
+   * Chained start: wait for the prior holder of the session's stream to
+   * release its cursor before reading anything. The manager passes the
+   * handle of a detached observation tail (or a tail still draining) on the
+   * same session so the two never read eve's stream at once (one cursor
+   * owner per stream). The wait is UNBOUNDED while the prior is a live
+   * reader (admission forbids that case; the manager warns) and BOUNDED by
+   * `streamTakeoverMs` once it is closed: a drain that never releases its
+   * cursor is seized (`RunTailHandle.seize`) and this tail takes over.
    */
-  waitFor?: Promise<void>;
+  chainBehind?: ChainedStream;
+  /**
+   * How long a chained start waits for a CLOSED prior tail to release the
+   * stream before seizing it (default {@link DEFAULT_STREAM_TAKEOVER_MS}).
+   * The prior is being torn down — a reconnect or store call that never
+   * resolves must not wedge the session behind it.
+   */
+  streamTakeoverMs?: number;
   /** Reconnect attempts after unexpected drops (default 5). */
   maxReconnectAttempts?: number;
   /** Base reconnect backoff in ms (default 500; ×2 per attempt). */
@@ -485,21 +507,29 @@ export interface TailRunOptions {
    */
   onAuthorizationRequired?: (info: { connectionName: string }) => void;
   /**
-   * Called SYNCHRONOUSLY the moment the tail's abort lands — observation
-   * closed (confirmed / unresolved), a detach, a settlement that aborts, a
-   * terminal — i.e. the instant this tail will read no further event. The
-   * manager unbinds the session's reader slot here (not in `done.finally`,
-   * which resolves only once the stream is released — possibly much later,
-   * behind a hung connect), so a settlement arriving in between finds no
-   * live reader and opens its own observer instead of signaling a tail that
-   * can no longer act.
+   * Called SYNCHRONOUSLY the moment the tail CLOSES (`close(reason)` — the
+   * one transition every exit path takes at its start: observation closed
+   * (confirmed / unresolved), a detach, a settlement that aborts, the run's
+   * natural terminal, reconnect exhaustion, a seizure), i.e. the instant
+   * this tail will read no further event and adopt nothing. The manager
+   * unbinds the session's reader slot here (not in `done.finally`, which
+   * resolves only once the stream is released — possibly much later, behind
+   * a hung connect), so a settlement arriving in between finds no live
+   * reader and opens its own observer instead of signaling a tail that can
+   * no longer act.
    */
-  onAbort?: () => void;
+  onClose?: () => void;
   /** Structured run-lifecycle logging (started/terminal). Optional. */
   logger?: Logger;
 }
 
 export const DEFAULT_REMOTE_CANCEL_OBSERVE_MS = 10 * 60 * 1000;
+
+/**
+ * Bound on a chained tail's wait for a CLOSED prior tail to release the
+ * session's stream before seizing it ({@link TailRunOptions.streamTakeoverMs}).
+ */
+export const DEFAULT_STREAM_TAKEOVER_MS = 5_000;
 
 /** Retries of a failed (transport) qualified cancel issued by observation. */
 const QUALIFIED_CANCEL_RETRY_ATTEMPTS = 3;
@@ -546,13 +576,28 @@ export interface RunTailHandle {
   /** True while the tail is in observation mode (its run is already settled). */
   readonly observing: boolean;
   /**
-   * True once the tail's abort has landed: it reads no further event and
-   * can adopt nothing — NOT a reader any more, even though `done` may still
-   * be pending (the stream is released only when `done` resolves).
+   * True once the tail has CLOSED — every exit path (an abort, the run's
+   * natural terminal, reconnect exhaustion, a seizure) takes the one
+   * `close` transition synchronously at its start: it reads no further
+   * event and can adopt nothing — NOT a reader any more, even though `done`
+   * may still be pending (the stream is released only when `done` resolves).
    */
   readonly closed: boolean;
+  /** Resolves the moment the tail closes (see `closed`) — before `done`. */
+  onceClosed: Promise<void>;
   /** Resolves when the tail has fully stopped (terminal, observation closed, or dead). */
   done: Promise<void>;
+  /**
+   * Force the stream's release: close the tail (idempotent), FENCE it so it
+   * consumes, attributes and writes nothing more even if the connection or
+   * body it is stuck on later yields, and resolve once any event handling
+   * already in flight has settled (the tail is between reads, or has
+   * exited) — so the old reader's last write lands before a new reader
+   * takes the cursor. The hung connect/read itself is abandoned (`done`
+   * still trails it). A successor chained behind a drain that outlived
+   * `streamTakeoverMs` calls this before taking over.
+   */
+  seize(): Promise<void>;
   /**
    * Stop the run. `status: "canceled"` (a user Stop) finalizes the row NOW —
    * with its obligation — and switches the tail to observation; the promise
@@ -586,6 +631,12 @@ export interface RunTailHandle {
    */
   refreshObligations(): Promise<boolean>;
 }
+
+/** The prior holder of a session's stream that a chained tail waits behind. */
+export type ChainedStream = Pick<
+  RunTailHandle,
+  "runId" | "closed" | "onceClosed" | "done" | "seize"
+>;
 
 /** One open remote-cancel obligation this tail is following. */
 interface Obligation {
@@ -628,6 +679,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     bus,
     maxWallClockMs,
     remoteCancelObserveMs = DEFAULT_REMOTE_CANCEL_OBSERVE_MS,
+    streamTakeoverMs = DEFAULT_STREAM_TAKEOVER_MS,
     maxReconnectAttempts = 5,
     reconnectDelayMs = 500,
     onFinish,
@@ -638,10 +690,55 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const log = logger?.child({ runId, sessionId: agentSessionId });
   const tailStartedAt = Date.now();
   const abort = new AbortController();
-  // The manager's reader-slot release rides the abort itself (synchronous),
-  // never `done` — see TailRunOptions.onAbort.
-  if (options.onAbort) abort.signal.addEventListener("abort", options.onAbort, { once: true });
   let cancelReason: string | null = null;
+  /**
+   * THE ONE EXIT TRANSITION. Every path out of the tail — a settlement's
+   * abort, an observation closing or expiring, a detach, a seizure, the
+   * run's natural terminal, reconnect exhaustion, and the `done` body's own
+   * exit as a backstop — goes through here SYNCHRONOUSLY at its start:
+   * `closed` flips, the manager frees the session's reader slot
+   * (`onClose`), the stream is aborted, and from this instant
+   * `refreshObligations` answers false and no event is consumed, attributed
+   * or written. Only an explicit abort used to move a handle out of the
+   * reader slot: a tail exiting through its natural terminal (or reconnect
+   * exhaustion) stayed live until `done.finally`, so a settlement signal in
+   * that window was adopted by a tail about to return — and its run had no
+   * reader until the next sweep.
+   */
+  let closed = false;
+  let resolveClosed!: () => void;
+  const onceClosed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const close = (reason: string) => {
+    if (closed) return;
+    closed = true;
+    try {
+      options.onClose?.();
+    } catch (error) {
+      log?.warn("run.tail_close_hook_failed", {
+        fields: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    abort.abort();
+    resolveClosed();
+    log?.debug("run.tail_closed", { fields: { reason } });
+  };
+  /**
+   * Event handling in flight — the preamble's writes, or one consumed
+   * event's attribution + persist. A seizure waits for it to settle so the
+   * old reader's last write lands before the new reader takes the cursor;
+   * between reads (and behind a hung connect) the tail is idle.
+   */
+  let busy = false;
+  let idleWaiters: Array<() => void> = [];
+  const setBusy = (value: boolean) => {
+    busy = value;
+    if (value) return;
+    const waiters = idleWaiters;
+    idleWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
   /** `follow` = a live run's tail; `observe` = owing eve a confirmation only. */
   let mode: "follow" | "observe" = options.observe ? "observe" : "follow";
   /**
@@ -661,6 +758,8 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   let obligations: Obligation[] = [];
   let finished = mode === "observe";
   let observationClosed = false;
+  /** The preamble has loaded the session's obligations (deadline callback). */
+  let obligationsLoaded = false;
   // Final assistant reply of THIS run (see RunFinishedHook). Only tracked
   // once the run's own turn boundary has been seen — a leftover stop-message
   // drained from a previous turn must never be delivered as this run's reply.
@@ -711,7 +810,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     // Compare-and-swap: markRun refuses to overwrite a terminal status. When
     // another actor (run-cancel API, sweeper) already finalized this run, the
     // tail steps aside — no session stomp, no duplicate status frame.
-    const now = new Date();
+    // ONE instant: a row settled WITH its obligation carries the same
+    // timestamp in both columns by construction (a second clock read here
+    // straddled a millisecond boundary now and then).
+    const now = extra.remoteCancelPendingAt ?? new Date();
     const marked = await store.markRun(runId, {
       status,
       error: error ?? null,
@@ -740,7 +842,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const closeObservation = () => {
     if (observationClosed) return;
     observationClosed = true;
-    abort.abort();
+    close("observation closed");
   };
 
   /** An obligation is MET: clear the durable marker, drop it from the list. */
@@ -769,7 +871,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * answer confirms the obligation on the spot.
    */
   const issueQualifiedCancel = (obligation: Obligation, attempt = 1): void => {
-    if (!cancelRemoteTurn || obligation.turnId === null) return;
+    // A closed tail is nobody's observer: the sweeper (or the caller's own
+    // observer) re-issues from the row.
+    if (closed || !cancelRemoteTurn || obligation.turnId === null) return;
     const turnId = obligation.turnId;
     void cancelRemoteTurn({ turnId })
       .then(async (reply) => {
@@ -790,10 +894,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             reason: error instanceof Error ? error.message : String(error),
           },
         });
-        if (attempt >= QUALIFIED_CANCEL_RETRY_ATTEMPTS || abort.signal.aborted) return;
+        if (attempt >= QUALIFIED_CANCEL_RETRY_ATTEMPTS || closed) return;
         const timer = setTimeout(() => {
           retryTimers.delete(timer);
-          if (!abort.signal.aborted && obligations.includes(obligation)) {
+          if (!closed && obligations.includes(obligation)) {
             issueQualifiedCancel(obligation, attempt + 1);
           }
         }, QUALIFIED_CANCEL_RETRY_DELAY_MS * attempt);
@@ -805,7 +909,13 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     if (observeTimer) clearTimeout(observeTimer);
     observeTimer = setTimeout(() => {
       void (async () => {
-        const mine = obligations.find((o) => o.self);
+        // Armed at CREATION — before a chained wait, before the preamble
+        // loads the list. Until it is loaded the obligation is owed by
+        // construction (`observe` is only opened for a run carrying its
+        // marker); the store's CAS answers false if it was met meanwhile.
+        const mine = obligationsLoaded
+          ? obligations.find((o) => o.self)
+          : { turnId: ownTurnId };
         if (mine) {
           // Explicit, visible residual — never a silent clear. Predecessor
           // obligations carried by this tail are bounded by the sweeper's
@@ -875,6 +985,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * Best-effort: a store failure here leaves the obligation as it was.
    */
   const recoverPersistedTurns = async (candidates: Obligation[], why: string): Promise<void> => {
+    if (closed) return;
     const open = candidates
       .filter((o) => obligations.includes(o) && o.turnId === null && o.messageHash !== null)
       .sort(byAttributionPriority);
@@ -948,6 +1059,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     why: string,
     snapshot?: SessionClaimants,
   ): Promise<void> => {
+    // A closed tail adopts nothing: whatever is on the row belongs to the
+    // caller's own observer (or the sweeper), which loads it from the store.
+    if (closed) return;
     const current = (snapshot ?? (await store.listSessionClaimants(agentSessionId))).obligations;
     const next: Obligation[] = [];
     const adopted: Obligation[] = [];
@@ -1180,7 +1294,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       // (its own obligation, if any, is on it), nothing is owed, or the
       // process is going down (the obligation is durable; the sweeper
       // re-opens observation at the next boot).
-      abort.abort();
+      close("settled without observation");
       return outcome;
     }
     // OBSERVATION: stay on the stream for eve's own confirmation.
@@ -1226,9 +1340,74 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
         }, maxWallClockMs)
       : null;
 
-  const done = (async () => {
-    if (options.waitFor) await options.waitFor;
-    if (detaching) return;
+  /**
+   * THE CHAIN WAIT, bounded. Behind a LIVE prior (a reader still following
+   * its run — admission forbids two, the manager warned) the wait is
+   * unbounded: seizing it would fail a live run. Once the prior is CLOSED
+   * it is being torn down and owes nothing but its cursor: after
+   * `streamTakeoverMs` without `done` its drain is hung (a reconnect or
+   * store call that never resolves), so it is seized — closed and fenced,
+   * its in-flight handling awaited (bounded again) — and this tail takes
+   * the cursor over from the persisted counts. Own closure (the observation
+   * deadline, a detach, shutdown) ends the wait at once.
+   */
+  const awaitStreamRelease = async (prior: ChainedStream): Promise<void> => {
+    const priorDone = prior.done.then(
+      () => "released" as const,
+      () => "released" as const,
+    );
+    const ownClose = onceClosed.then(() => "closed" as const);
+    const bounded = <T extends string>(
+      ms: number,
+      ...races: Array<Promise<T>>
+    ): Promise<T | "timeout"> => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const expiry = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), ms);
+      });
+      return Promise.race<T | "timeout">([...races, expiry]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    };
+    const first = await Promise.race([
+      priorDone,
+      prior.onceClosed.then(() => "prior closed" as const),
+      ownClose,
+    ]);
+    if (first !== "prior closed") return;
+    if ((await bounded(streamTakeoverMs, priorDone, ownClose)) !== "timeout") return;
+    if (closed) return;
+    log?.warn("run.tail_takeover", {
+      fields: {
+        drainingRunId: prior.runId,
+        waitedMs: streamTakeoverMs,
+        reason:
+          "the closed prior tail never released the session's stream — seizing it and taking its cursor over",
+      },
+    });
+    const seized = prior.seize().then(() => "seized" as const);
+    if ((await bounded(streamTakeoverMs, seized, ownClose)) === "timeout" && !closed) {
+      log?.warn("run.tail_takeover_forced", {
+        fields: {
+          drainingRunId: prior.runId,
+          waitedMs: streamTakeoverMs,
+          reason:
+            "the seized tail's in-flight event handling did not settle — proceeding; its stream is fenced, a write that lands later is the residual",
+        },
+      });
+    }
+  };
+
+  // OBSERVATION DEADLINE, armed at CREATION — before any chain wait, before
+  // the preamble's loads: it fires while waiting too (unresolved declared,
+  // the tail closed, its handle released), so a drain this observer is
+  // chained behind can never hold it past its window.
+  if (options.observe) armObserveDeadline(options.observe.deadlineAt);
+
+  const run = async (): Promise<void> => {
+    if (options.chainBehind) await awaitStreamRelease(options.chainBehind);
+    if (closed) return;
+    setBusy(true);
     // Resume points derived from what is already persisted (crash-safe).
     let seq = await store.countRunEvents(runId);
     let startIndex = await store.countSessionEvents(agentSessionId);
@@ -1254,9 +1433,12 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     ownMessageHash = turnState?.messageHash ?? null;
     const pending = (await store.listSessionClaimants(agentSessionId)).obligations;
     obligations = pending.map(toObligation);
+    obligationsLoaded = true;
+    if (closed) return;
     if (mode === "observe") {
       const mine = obligations.find((o) => o.self);
       if (!mine) {
+        close("nothing owed");
         log?.info("run.observation_skipped", {
           fields: { reason: "no open obligation on the row — met by another actor" },
         });
@@ -1273,8 +1455,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       // opened; if the boundary is down too, nothing is owed and the
       // observation ends before it starts).
       await recoverPersistedTurns(obligations, "observation started");
-      if (observationClosed) return;
-      armObserveDeadline(options.observe!.deadlineAt);
+      if (closed) return;
       log?.info("run.observing", {
         fields: {
           resumedSeq: seq,
@@ -1327,6 +1508,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           sawOwnTurn = true;
         }
       }
+      if (closed) return;
       // CAS: a run another actor already finalized (sweeper failed it while
       // the dispatch was still in flight, or the user canceled it) must NOT
       // be resurrected to `running` — the tail simply never starts.
@@ -1336,7 +1518,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       });
       if (!adopted) {
         finished = true;
-        if (wallClockTimer) clearTimeout(wallClockTimer);
+        close("run already terminal");
         log?.info("run.tail_refused", {
           fields: { reason: "run already terminal — not resurrecting" },
         });
@@ -1380,11 +1562,15 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           duplicate: boolean;
         } | null = null;
         try {
+          setBusy(false); // nothing in flight behind a connect
           const response = await openStream(
             startIndex,
             abort.signal,
             requestTailIndex ? { includeTailIndex: true } : undefined,
           );
+          // A close that landed during the connect (a seizure, an expiry):
+          // a connect that ignored the signal must not be consumed.
+          if (closed) throw new Error("tail closed during connect");
           if (!response.ok || response.body === null) {
             throw new Error(`stream returned ${response.status}`);
           }
@@ -1464,7 +1650,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             catchUpBound = null;
           };
 
-          for await (const event of ndjsonEvents(response.body)) {
+          for await (const event of busyMarked(ndjsonEvents(response.body))) {
+            // THE FENCE: a closed tail consumes nothing further — not even
+            // from a body that ignores the abort (a seized drain's stream
+            // yielding late must never write a (run_id, seq) again).
+            if (closed) throw new Error("tail closed — reading no further event");
             const eventId = event.meta?.id;
             // Reconnect-overlap guard. A re-read of an already-persisted
             // event advances the cursor and still drives the latches (the
@@ -1616,6 +1806,10 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
                   })
                 : null;
             if (terminal) {
+              // Close FIRST (synchronously): the reader slot is free before
+              // the row settles, so a settlement signal landing during the
+              // writes below finds no reader and opens its own observer.
+              close(`terminal: ${terminal.runStatus}`);
               await finishRun(
                 terminal.runStatus,
                 terminal.sessionStatus,
@@ -1635,6 +1829,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           }
           attempt = consumedThisConnect > 0 ? 1 : attempt + 1;
           if (attempt > maxReconnectAttempts) {
+            close("reconnect attempts exhausted");
             if (mode === "observe") {
               // The obligation stays on the row; the sweeper re-opens the
               // observation (a dead agent/worker cannot be observed here).
@@ -1673,11 +1868,45 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       for (const timer of retryTimers) clearTimeout(timer);
       retryTimers.clear();
     }
+  };
+
+  /** Marks the tail busy while the consumer handles each yielded event. */
+  async function* busyMarked(
+    events: AsyncIterable<EveStreamEvent>,
+  ): AsyncGenerator<EveStreamEvent> {
+    try {
+      for await (const event of events) {
+        setBusy(true);
+        yield event;
+        setBusy(false);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const done = (async () => {
+    try {
+      await run();
+    } finally {
+      // Backstop: any exit not closed at its start (a preamble store
+      // failure rejecting `done`) closes here, before `done` settles.
+      close("tail exited");
+      setBusy(false);
+    }
   })();
 
   const detach = () => {
     detaching = true;
-    abort.abort();
+    close("detached");
+  };
+
+  const seize = (): Promise<void> => {
+    close("seized by a successor tail");
+    if (!busy) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      idleWaiters.push(resolve);
+    });
   };
 
   return {
@@ -1687,8 +1916,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       return mode === "observe";
     },
     get closed() {
-      return abort.signal.aborted;
+      return closed;
     },
+    onceClosed,
     done,
     async cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
@@ -1714,13 +1944,16 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       });
     },
     detach,
+    seize,
     refreshObligations: () =>
       serialized(async () => {
-        // An aborted tail re-reads nothing and can act on nothing: say so,
-        // never "handed off" — the caller opens its own observer.
-        if (abort.signal.aborted) return false;
+        // A closed tail re-reads nothing and can act on nothing: say so,
+        // never "handed off" — the caller opens its own observer. Checked
+        // AGAIN after the re-read: a terminal or an expiry landing during
+        // it leaves the row for the caller's own observer to load.
+        if (closed) return false;
         await refreshObligationsUnlocked("signaled");
-        return true;
+        return !closed;
       }),
   };
 }
@@ -1755,19 +1988,25 @@ export class RunTailerManager {
   private readonly handles = new Map<string, RunTailHandle>();
   /**
    * ONE reader per eve stream: the LIVE tail (any mode) per session. A tail
-   * leaves this slot the instant its abort lands (`onAbort`, synchronous) —
-   * it reads nothing more and can adopt nothing, so a settlement arriving
-   * before its `done` resolves must not be handed to it.
+   * leaves this slot the instant it closes (`onClose`, synchronous — an
+   * abort, its natural terminal, reconnect exhaustion alike) — it reads
+   * nothing more and can adopt nothing, so a settlement arriving before its
+   * `done` resolves must not be handed to it.
    */
   private readonly sessionHandles = new Map<string, RunTailHandle>();
   /**
-   * Tails whose abort has landed but whose `done` is still pending: the
-   * stream is RELEASED only when `done` resolves (the body reader may still
-   * be inside a read, or a connect may still be hanging), so a successor on
-   * the session chains on it (`waitFor`) rather than opening a second
-   * cursor — and the context controls count it as a holder of the stream.
+   * Tails that have closed but whose `done` is still pending: the stream is
+   * RELEASED only when `done` resolves (the body reader may still be inside
+   * a read, or a connect may still be hanging), so a successor on the
+   * session chains on it (`chainBehind`) rather than opening a second
+   * cursor — bounded: a drain that outlives `streamTakeoverMs` is seized by
+   * the successor — and the context controls count it as a holder of the
+   * stream until then. A LIST per session, in close order: a successor that
+   * seized a hung drain and then closed itself is a second draining tail on
+   * the same session (one slot would overwrite the first and lose its
+   * still-held stream); chaining goes behind the latest.
    */
-  private readonly drainingHandles = new Map<string, RunTailHandle>();
+  private readonly drainingHandles = new Map<string, RunTailHandle[]>();
 
   constructor(
     private readonly defaults: {
@@ -1775,6 +2014,7 @@ export class RunTailerManager {
       bus: RunEventBus;
       maxWallClockMs: number;
       remoteCancelObserveMs?: number;
+      streamTakeoverMs?: number;
       maxReconnectAttempts?: number;
       reconnectDelayMs?: number;
       /** Metrics seam propagated to every tail (run-duration histogram). */
@@ -1784,27 +2024,44 @@ export class RunTailerManager {
     },
   ) {}
 
-  /** The tail currently holding the session's stream, live or draining. */
-  private streamHolder(agentSessionId: string): RunTailHandle | undefined {
-    return this.sessionHandles.get(agentSessionId) ?? this.drainingHandles.get(agentSessionId);
+  /** The latest tail still draining the session's stream, if any. */
+  private latestDraining(agentSessionId: string): RunTailHandle | undefined {
+    const draining = this.drainingHandles.get(agentSessionId);
+    return draining?.[draining.length - 1];
   }
 
-  /** Move a tail from the reader slot to the draining slot (its abort landed). */
+  /** The tail currently holding the session's stream, live or draining. */
+  private streamHolder(agentSessionId: string): RunTailHandle | undefined {
+    return this.sessionHandles.get(agentSessionId) ?? this.latestDraining(agentSessionId);
+  }
+
+  /** Move a tail from the reader slot to the draining list (it closed). */
   private releaseReader(handle: RunTailHandle): void {
     if (this.sessionHandles.get(handle.agentSessionId) === handle) {
       this.sessionHandles.delete(handle.agentSessionId);
-      this.drainingHandles.set(handle.agentSessionId, handle);
+      const draining = this.drainingHandles.get(handle.agentSessionId) ?? [];
+      draining.push(handle);
+      this.drainingHandles.set(handle.agentSessionId, draining);
     }
   }
 
+  /** The tail's `done` resolved: its stream is released. */
+  private releaseStream(handle: RunTailHandle): void {
+    const draining = this.drainingHandles.get(handle.agentSessionId);
+    if (!draining) return;
+    const remaining = draining.filter((h) => h !== handle);
+    if (remaining.length === 0) this.drainingHandles.delete(handle.agentSessionId);
+    else this.drainingHandles.set(handle.agentSessionId, remaining);
+  }
+
   private open(
-    options: StartTailOptions & Pick<TailRunOptions, "observe" | "waitFor">,
+    options: StartTailOptions & Pick<TailRunOptions, "observe" | "chainBehind">,
   ): RunTailHandle {
     let handle: RunTailHandle | undefined;
     const opened = tailRun({
       ...this.defaults,
       ...options,
-      onAbort: () => {
+      onClose: () => {
         if (handle) this.releaseReader(handle);
       },
     });
@@ -1814,9 +2071,7 @@ export class RunTailerManager {
     void handle.done.finally(() => {
       if (this.handles.get(opened.runId) === opened) this.handles.delete(opened.runId);
       this.releaseReader(opened);
-      if (this.drainingHandles.get(opened.agentSessionId) === opened) {
-        this.drainingHandles.delete(opened.agentSessionId);
-      }
+      this.releaseStream(opened);
     });
     return handle;
   }
@@ -1826,15 +2081,16 @@ export class RunTailerManager {
    * reader: an observation tail already on this session is detached and the
    * new tail waits for it to stop before reading — it inherits the session's
    * open obligations through its leftover drain (tailer module doc). A tail
-   * still draining (aborted, stream not yet released) is chained on the
-   * same way.
+   * still draining (closed, stream not yet released) is chained on the
+   * same way — bounded by `streamTakeoverMs`, after which the successor
+   * seizes the hung drain and takes its cursor over.
    */
   start(options: StartTailOptions): RunTailHandle {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;
     const prior = this.sessionHandles.get(options.agentSessionId);
-    const draining = this.drainingHandles.get(options.agentSessionId);
-    let waitFor: Promise<void> | undefined;
+    const draining = this.latestDraining(options.agentSessionId);
+    let chainBehind: ChainedStream | undefined;
     if (prior) {
       if (prior.observing) {
         this.defaults.logger?.info("run.observation_handover", {
@@ -1852,16 +2108,16 @@ export class RunTailerManager {
           fields: { priorRunId: prior.runId },
         });
       }
-      waitFor = prior.done;
+      chainBehind = prior;
     } else if (draining) {
       this.defaults.logger?.info("run.tail_drain_wait", {
         runId: options.runId,
         sessionId: options.agentSessionId,
         fields: { drainingRunId: draining.runId },
       });
-      waitFor = draining.done;
+      chainBehind = draining;
     }
-    return this.open({ ...options, waitFor });
+    return this.open({ ...options, chainBehind });
   }
 
   /**
@@ -1869,13 +2125,13 @@ export class RunTailerManager {
    * (the sweeper, boot reconciliation, the post-eve recheck). Null when the
    * session's LIVE tail took the obligation over — it is signaled to re-read
    * the session's obligations, and only a signal it actually acted on counts
-   * (`refreshObligations` resolves false once the tail's abort has landed:
-   * such a tail reads nothing more, and trusting the handoff would leave
-   * the run with no reader until the next sweep). Otherwise a new
-   * observation tail is opened — chained behind a tail still draining the
-   * stream, so there is never a second cursor — and returned. Async because
-   * the handoff is awaited; the caller counts the run `observing` either
-   * way.
+   * (`refreshObligations` resolves false once the tail has closed: such a
+   * tail reads nothing more, and trusting the handoff would leave the run
+   * with no reader until the next sweep). Otherwise a new observation tail
+   * is opened — chained behind a tail still draining the stream, so there
+   * is never a second cursor, with its observation deadline already armed
+   * and the chain wait bounded — and returned. Async because the handoff is
+   * awaited; the caller counts the run `observing` either way.
    */
   async observe(options: StartTailOptions & { deadlineAt: number }): Promise<RunTailHandle | null> {
     const existing = this.handles.get(options.runId);
@@ -1889,7 +2145,7 @@ export class RunTailerManager {
       if (await this.refreshSessionObligations(options.agentSessionId)) return null;
     }
     const { deadlineAt, ...rest } = options;
-    const draining = this.drainingHandles.get(options.agentSessionId);
+    const draining = this.latestDraining(options.agentSessionId);
     if (draining) {
       this.defaults.logger?.info("run.tail_drain_wait", {
         runId: options.runId,
@@ -1897,7 +2153,7 @@ export class RunTailerManager {
         fields: { drainingRunId: draining.runId },
       });
     }
-    return this.open({ ...rest, observe: { deadlineAt }, waitFor: draining?.done });
+    return this.open({ ...rest, observe: { deadlineAt }, chainBehind: draining });
   }
 
   get(runId: string): RunTailHandle | undefined {
@@ -1906,8 +2162,8 @@ export class RunTailerManager {
 
   /**
    * Is a LIVE tail (follow or observation — one that still reads) on this
-   * session in this process? A tail whose abort has landed is not: it can
-   * carry no obligation from here on.
+   * session in this process? A closed tail is not: it can carry no
+   * obligation from here on.
    */
   hasSessionTail(agentSessionId: string): boolean {
     return this.sessionHandles.has(agentSessionId);
@@ -1915,7 +2171,7 @@ export class RunTailerManager {
 
   /**
    * Is the session's eve stream HELD in this process — by a live tail, or
-   * by an aborted one whose `done` has not resolved (its cursor is not
+   * by a closed one whose `done` has not resolved (its cursor is not
    * released yet)? The context controls' quiet check: a second reader must
    * not attach until the stream is released.
    */
@@ -1930,8 +2186,8 @@ export class RunTailerManager {
    * tail re-reads the store and adopts the new obligation, issuing its
    * qualified cancel at once when the turn is already known. Resolves false
    * when no LIVE tail is on the session in this process — none at all, or
-   * one whose abort landed before (or while) the signal reached it: the
-   * caller must then open its own observer, never count the handoff.
+   * one that closed before (or while) the signal reached it: the caller
+   * must then open its own observer, never count the handoff.
    */
   async refreshSessionObligations(agentSessionId: string): Promise<boolean> {
     const handle = this.sessionHandles.get(agentSessionId);

@@ -35,13 +35,32 @@
  * 5. CANCELED-MID-DISPATCH ADMISSION + BELT-AND-BRACES: a canceled run whose
  *    dispatch may still be in flight (marker set, session eveless) keeps the
  *    session `session_busy` — transiently, resolving when the dispatch
- *    persists the id or the session closes — and a canceled continuation's
- *    late abandon SKIPS its unqualified session-level cancel once a newer
- *    run owns the session.
+ *    persists the id or the session closes.
  *
  * 6. GUARDED SWEEP-2 CLOSE: the boot sweep's eveless-session close re-reads
- *    the row inside the UPDATE's WHERE — a candidate that gained its eve id
- *    between snapshot and close is untouched.
+ *    the row AND its ledger inside the UPDATE's WHERE — a candidate that
+ *    gained its eve id (or a live run) between snapshot and close is
+ *    untouched — and the sweep skips a candidate whose dispatch lock is held
+ *    (a dispatch is mid-flight this instant).
+ *
+ * 7. PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts): the abandon's
+ *    successor-count → remote-cancel decision runs under the session's
+ *    dispatch lock, and ADMISSION needs the same lock — so while a canceled
+ *    continuation's dispatch (or its settlement, the remote cancel included)
+ *    is in flight, a successor is refused with the transient `session_busy`
+ *    instead of being admitted into the race. Consequences proven here:
+ *    the abandon can never find a successor (so the accepted turn is ALWAYS
+ *    remote-canceled — the leak closed), and its unqualified session-level
+ *    cancel can never land after a successor's turn started (the wrong-turn
+ *    kill closed).
+ *
+ * 8. EVELESS CREATE FAILED AFTER ARMING (failEveDispatch): an eve create
+ *    that fails — a client-side timeout racing eve's 202 included — on a
+ *    session with NO persisted eve id closes the session on ANY terminal
+ *    outcome, so it can never be re-admitted to mint a second live turn
+ *    beside the possibly accepted, unobservable one (the documented
+ *    at-most-once residual); the next message gets a FRESH session. A
+ *    session that already carries an eve id survives a failed follow-up.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -67,6 +86,7 @@ import {
   closeEvelessSessionIfStillAbandoned,
   reconcileInterruptedRuns,
 } from "./reconcile";
+import { createPgSessionDispatchLocks } from "./session-lock";
 import {
   cancelChildRun,
   countDispatchingRuns,
@@ -95,7 +115,7 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-/** Fake eve plane: records calls; the NEXT create/continue can be held in flight. */
+/** Fake eve plane: records calls; the NEXT create/continue/cancel can be held in flight. */
 class FakeWorkerClient {
   readonly createCalls: string[] = [];
   readonly continueCalls: Array<{ eveSessionId: string }> = [];
@@ -106,6 +126,11 @@ class FakeWorkerClient {
   /** Continuation twins of the create gates (held continueEveSession). */
   continueGate: Deferred | null = null;
   continueEntered: Deferred | null = null;
+  /** Cancel twins (a held cancelEveTurn — the settlement window). */
+  cancelGate: Deferred | null = null;
+  cancelEntered: Deferred | null = null;
+  /** Set to make the next createEveSession THROW (a client-side timeout). */
+  createError: Error | null = null;
   private counter = 0;
 
   async ensureAgent(): Promise<void> {}
@@ -120,6 +145,9 @@ class FakeWorkerClient {
     const gate = this.createGate;
     this.createGate = null;
     if (gate) await gate.promise;
+    const error = this.createError;
+    this.createError = null;
+    if (error) throw error;
     return { sessionId: `eve-fresh-${++this.counter}` };
   }
   async continueEveSession(
@@ -142,7 +170,26 @@ class FakeWorkerClient {
     eveSessionId: string,
   ): Promise<Record<string, never>> {
     this.cancelCalls.push({ eveSessionId });
+    this.cancelEntered?.resolve();
+    const gate = this.cancelGate;
+    this.cancelGate = null;
+    if (gate) await gate.promise;
     return {};
+  }
+}
+
+/** Poll until `probe` returns a value (deferred background legs). */
+async function until<T>(
+  probe: () => Promise<T | undefined> | T | undefined,
+  what: string,
+  timeoutMs = 10_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await probe();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
   }
 }
 
@@ -587,12 +634,15 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
 
       // Inject the Stop into the read→act window: the FIRST status re-read
       // after the create returns triggers the REAL cancel path
-      // (cancelChildRun's no-tail branch: row CAS + best-effort remote
-      // chase) and hands the dispatch back the PRE-cancel value — exactly a
-      // Stop racing past the recheck. With the id persisted FIRST, the
-      // Stop's own remote leg finds it on the row and cancels the accepted
-      // turn; with the old read-then-persist order the chase read an
-      // eveless session, no-oped, and the turn ran unobserved.
+      // (cancelChildRun's no-tail branch: row CAS + guarded remote chase)
+      // and hands the dispatch back the PRE-cancel value — exactly a Stop
+      // racing past the recheck. The dispatch holds the session's dispatch
+      // lock at that instant, so the Stop's chase is DEFERRED (never
+      // dropped): once the dispatch settles and releases, the deferred leg
+      // re-checks successors under the lock and cancels the accepted turn
+      // with the id the dispatch persisted FIRST. With the old
+      // read-then-persist order the chase read an eveless session, no-oped,
+      // and the turn ran unobserved.
       const realStore = deps.runStore;
       const cancelsBefore = fakeWorker.cancelCalls.length;
       let injected = false;
@@ -618,14 +668,16 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       expect(injected).toBeTrue();
       const eveId = result.session.eveSessionId;
       expect(eveId).toBeTruthy();
-      // THE invariant: the accepted turn was remote-canceled — by the Stop's
-      // own chase (it found the persisted id) — never left running
-      // unobserved.
-      expect(
-        fakeWorker.cancelCalls
-          .slice(cancelsBefore)
-          .map((c) => c.eveSessionId),
-      ).toContain(eveId!);
+      // THE invariant: the accepted turn is remote-canceled — by the Stop's
+      // own chase, deferred past the dispatch's lock hold, finding the
+      // persisted id — never left running unobserved.
+      await until(
+        () =>
+          fakeWorker.cancelCalls
+            .slice(cancelsBefore)
+            .some((c) => c.eveSessionId === eveId!) || undefined,
+        "the deferred remote cancel to reach eve",
+      );
       expect((await runStore.getRunStatus(childRunId!))?.status).toBe("canceled");
       // Hygiene: settle the session so later tests see no live claim.
       await runStore.markSession(result.session.id, "closed");
@@ -707,29 +759,32 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
     20_000,
   );
 
+  async function insertThreadSession(threadKey: string, eveId: string) {
+    const rows = await handle.db
+      .insert(schema.agentSessions)
+      .values({
+        organizationId: orgId,
+        agentId,
+        agentVersionId: versionId,
+        workflowId,
+        eveSessionId: eveId, // a live thread with earlier turns
+        origin: "slack",
+        principal: { workspaceId: orgId, source: "slack" },
+        slackThreadKey: threadKey,
+        affinityWorkerId: workerId,
+        status: "waiting",
+      })
+      .returning();
+    return rows[0]!;
+  }
+
   test(
-    "belt-and-braces (D4): a canceled continuation's late abandon never fires its unqualified cancel once a newer run owns the session",
+    "leak closed (D7): while a canceled continuation's dispatch is unresolved, a successor is REFUSED (session_busy) — so the abandon always remote-cancels the accepted turn instead of skipping it",
     async () => {
       const threadKey = `int-dcw:C6:${randomUUID().slice(0, 8)}`;
       const eveId = `eve-cont-${randomUUID().slice(0, 8)}`;
       await freshHeartbeat();
-      const db = handle.db;
-      const rows = await db
-        .insert(schema.agentSessions)
-        .values({
-          organizationId: orgId,
-          agentId,
-          agentVersionId: versionId,
-          workflowId,
-          eveSessionId: eveId, // a live thread with earlier turns
-          origin: "slack",
-          principal: { workspaceId: orgId, source: "slack" },
-          slackThreadKey: threadKey,
-          affinityWorkerId: workerId,
-          status: "waiting",
-        })
-        .returning();
-      const thread = rows[0]!;
+      const thread = await insertThreadSession(threadKey, eveId);
 
       const continueGate = deferred();
       const continueEntered = deferred();
@@ -746,9 +801,7 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
       await continueEntered.promise; // A's continue is now in flight
       expect(aRunId).toBeDefined();
 
-      // Stop settles A terminal mid-flight. The session carries its eve id,
-      // so the canceled-mid-dispatch busy arm deliberately does NOT block
-      // continuations — B is admitted and its turn starts.
+      // Stop settles A terminal mid-flight.
       expect(
         await runStore.markRun(aRunId!, {
           status: "canceled",
@@ -756,32 +809,228 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
           completedAt: new Date(),
         }),
       ).toBeTrue();
-      const b = await dispatchRenderedRun(
-        deps,
-        dispatchInput(threadKey, { existingSession: thread }),
-      );
-      expect(b.dispatched).toBeTrue();
 
-      // A's continue returns: the abandon sees B's live run on the session
-      // and SKIPS the unqualified session-level cancel — a late cancel would
-      // kill B's turn, not A's.
+      // THE FIX: B cannot be admitted while A's dispatch is unresolved — the
+      // per-session dispatch lock refuses it with the TRANSIENT session_busy.
+      // (Pre-fix, B was admitted here, which forced A's abandon to skip its
+      // remote cancel and LEAKED A's accepted turn: it got neither tail nor
+      // cancel.)
+      let busyError: unknown;
+      try {
+        await dispatchRenderedRun(
+          deps,
+          dispatchInput(threadKey, { existingSession: thread }),
+        );
+      } catch (error) {
+        busyError = error;
+      }
+      expect(isRuntimeApiError(busyError)).toBeTrue();
+      expect((busyError as { code: string }).code).toBe("session_busy");
+
+      // A's continue returns: with no successor possible, the abandon ALWAYS
+      // remote-cancels A's accepted turn — the leak is closed.
       continueGate.resolve();
       const a = await dispatchingA;
       expect(a.dispatched).toBeFalse();
       expect(a.canceledBeforeDispatch).toBeTrue();
-      expect(
-        fakeWorker.cancelCalls.map((c) => c.eveSessionId),
-      ).not.toContain(eveId);
-      // The thread's session stays open — it belongs to B now.
+      expect(fakeWorker.cancelCalls.map((c) => c.eveSessionId)).toContain(eveId);
+      // The thread's session stays open (a continuation's session belongs to
+      // its thread) and the busy was transient: B's retry lands cleanly.
       const after = await sessionRow(thread.id);
       expect(after.status).toBe("active");
       expect(after.slackThreadKey).toBe(threadKey);
+      const b = await dispatchRenderedRun(
+        deps,
+        dispatchInput(threadKey, { existingSession: after }),
+      );
+      expect(b.dispatched).toBeTrue();
 
       await runStore.markRun(b.run.id, {
         status: "canceled",
         error: "test cleanup",
         completedAt: new Date(),
       });
+      await runStore.markSession(thread.id, "closed");
+    },
+    20_000,
+  );
+
+  test(
+    "wrong-turn kill closed (D7): admission stays refused while the abandon's unqualified cancel is still in flight — the cancel can only ever reach the canceled run's own turn",
+    async () => {
+      const threadKey = `int-dcw:C7:${randomUUID().slice(0, 8)}`;
+      const eveId = `eve-cont-${randomUUID().slice(0, 8)}`;
+      await freshHeartbeat();
+      const thread = await insertThreadSession(threadKey, eveId);
+
+      const continueGate = deferred();
+      const continueEntered = deferred();
+      fakeWorker.continueGate = continueGate;
+      fakeWorker.continueEntered = continueEntered;
+
+      let aRunId: string | undefined;
+      const dispatchingA = dispatchRenderedRun(deps, {
+        ...dispatchInput(threadKey, { existingSession: thread }),
+        onRunCreated: async (_tx, run) => {
+          aRunId = run.id;
+        },
+      });
+      await continueEntered.promise;
+      expect(aRunId).toBeDefined();
+      expect(
+        await runStore.markRun(aRunId!, {
+          status: "canceled",
+          error: "stopped during the continuation dispatch",
+          completedAt: new Date(),
+        }),
+      ).toBeTrue();
+
+      // Hold A's SETTLEMENT open at the exact window: the abandon counted
+      // successors (none) and its unqualified session-level cancel is now in
+      // flight to eve.
+      const cancelGate = deferred();
+      const cancelEntered = deferred();
+      fakeWorker.cancelGate = cancelGate;
+      fakeWorker.cancelEntered = cancelEntered;
+      continueGate.resolve();
+      await cancelEntered.promise; // the unqualified cancel is airborne
+
+      // THE FIX: the lock is held through settlement, so B still cannot be
+      // admitted — its turn can never start under the airborne cancel.
+      // (Pre-fix, B was admitted in exactly this window and the late cancel
+      // killed B's turn instead of A's.)
+      let busyError: unknown;
+      try {
+        await dispatchRenderedRun(
+          deps,
+          dispatchInput(threadKey, { existingSession: thread }),
+        );
+      } catch (error) {
+        busyError = error;
+      }
+      expect(isRuntimeApiError(busyError)).toBeTrue();
+      expect((busyError as { code: string }).code).toBe("session_busy");
+
+      cancelGate.resolve();
+      const a = await dispatchingA;
+      expect(a.dispatched).toBeFalse();
+      expect(a.canceledBeforeDispatch).toBeTrue();
+      // The cancel that landed was A's own turn's — and B, admitted only
+      // after settlement, is untouched by it.
+      expect(fakeWorker.cancelCalls.map((c) => c.eveSessionId)).toContain(eveId);
+      const cancelsAfterA = fakeWorker.cancelCalls.length;
+      const b = await dispatchRenderedRun(
+        deps,
+        dispatchInput(threadKey, { existingSession: await sessionRow(thread.id) }),
+      );
+      expect(b.dispatched).toBeTrue();
+      expect(fakeWorker.cancelCalls.length).toBe(cancelsAfterA);
+
+      await runStore.markRun(b.run.id, {
+        status: "canceled",
+        error: "test cleanup",
+        completedAt: new Date(),
+      });
+      await runStore.markSession(thread.id, "closed");
+    },
+    20_000,
+  );
+
+  test(
+    "eveless create failed after arming (D8): the session is closed on a FAILED outcome too — the next message mints a fresh session, never a second turn on the poisoned row",
+    async () => {
+      const threadKey = `int-dcw:C8:${randomUUID().slice(0, 8)}`;
+      await freshHeartbeat();
+      // An EVELESS live holder (the post-reset / never-acked shape) that owns
+      // the thread claim; this dispatch is its CREATE.
+      const holderRows = await handle.db
+        .insert(schema.agentSessions)
+        .values({
+          organizationId: orgId,
+          agentId,
+          agentVersionId: versionId,
+          workflowId,
+          eveSessionId: null,
+          origin: "slack",
+          principal: { workspaceId: orgId, source: "slack" },
+          slackThreadKey: threadKey,
+          affinityWorkerId: workerId,
+          status: "active",
+        })
+        .returning();
+      const holder = holderRows[0]!;
+
+      // The create THROWS after the marker armed — a client-side timeout that
+      // may have raced eve's 202: the id, if any, is lost forever.
+      fakeWorker.createError = Object.assign(
+        new Error("eve session create failed: request timed out"),
+        { name: "TimeoutError" },
+      );
+      let thrown: unknown;
+      try {
+        await dispatchRenderedRun(
+          deps,
+          dispatchInput(threadKey, { existingSession: holder }),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(isRuntimeApiError(thrown)).toBeTrue();
+      expect((thrown as { code: string }).code).toBe("worker_dispatch_failed");
+
+      // THE FIX: failed (not just canceled) closes the still-eveless session
+      // and releases its claim — it can never be re-admitted to mint a second
+      // live turn beside the possibly accepted, unobservable one.
+      const closed = await sessionRow(holder.id);
+      expect(closed.status).toBe("closed");
+      expect(closed.slackThreadKey).toBeNull();
+
+      // The next message gets a FRESH session (pre-fix the row stayed active
+      // and held the claim — the thread answered session_busy until a boot).
+      const next = await dispatchRenderedRun(deps, dispatchInput(threadKey));
+      expect(next.dispatched).toBeTrue();
+      expect(next.session.id).not.toBe(holder.id);
+      await runStore.markRun(next.run.id, {
+        status: "canceled",
+        error: "test cleanup",
+        completedAt: new Date(),
+      });
+      await runStore.markSession(next.session.id, "closed");
+    },
+    20_000,
+  );
+
+  test(
+    "eveless close never costs an ID-BEARING session (D8): a failed follow-up leaves the user's thread open",
+    async () => {
+      const threadKey = `int-dcw:C9:${randomUUID().slice(0, 8)}`;
+      const eveId = `eve-cont-${randomUUID().slice(0, 8)}`;
+      await freshHeartbeat();
+      const thread = await insertThreadSession(threadKey, eveId);
+      const failingContinue = async () => {
+        throw Object.assign(new Error("continue timed out"), {
+          name: "TimeoutError",
+        });
+      };
+      const realContinue = fakeWorker.continueEveSession.bind(fakeWorker);
+      (fakeWorker as { continueEveSession: unknown }).continueEveSession =
+        failingContinue;
+      let thrown: unknown;
+      try {
+        await dispatchRenderedRun(
+          deps,
+          dispatchInput(threadKey, { existingSession: thread }),
+        );
+      } catch (error) {
+        thrown = error;
+      } finally {
+        (fakeWorker as { continueEveSession: unknown }).continueEveSession =
+          realContinue;
+      }
+      expect(isRuntimeApiError(thrown)).toBeTrue();
+      const after = await sessionRow(thread.id);
+      expect(after.status).not.toBe("closed"); // the thread survives
+      expect(after.slackThreadKey).toBe(threadKey);
       await runStore.markSession(thread.id, "closed");
     },
     20_000,
@@ -890,6 +1139,79 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
     expect((await sessionRow(abandoned.id)).status).toBe("closed");
     expect(await closeEvelessSessionIfStillAbandoned(db, abandoned.id)).toBeFalse();
 
+    // ATOMIC LEDGER GUARD (D6): a run admitted between nomination and close
+    // (its dispatch lock released — e.g. the sweep raced an admission whose
+    // lock it never observed) makes the close a no-op: the UPDATE's WHERE
+    // re-asserts NOT EXISTS a live run, so a session with a queued run can
+    // never be closed mid-dispatch (pre-fix this returned true and released
+    // the thread claim under the live run).
+    const raced = await insertCandidate();
+    const admitted = await db
+      .insert(schema.runs)
+      .values({
+        agentSessionId: raced.id,
+        organizationId: orgId,
+        mode: "agent",
+        triggerEvent: triggerEvent() as unknown as Record<string, unknown>,
+        status: "queued",
+      })
+      .returning();
+    expect(await closeEvelessSessionIfStillAbandoned(db, raced.id)).toBeFalse();
+    expect((await sessionRow(raced.id)).status).toBe("active");
+    // The live run settles → the same close now succeeds.
+    await runStore.markRun(admitted[0]!.id, {
+      status: "canceled",
+      error: "test cleanup",
+      completedAt: new Date(),
+    });
+    expect(await closeEvelessSessionIfStillAbandoned(db, raced.id)).toBeTrue();
+
     await runStore.markSession(healed.id, "closed");
+  }, 20_000);
+
+  test("sweep-2 vs a live dispatch (D6): a candidate whose dispatch lock is HELD is skipped by boot reconciliation, and closed once the lock is free", async () => {
+    const db = handle.db;
+    await freshHeartbeat();
+    // A valid nominee: eveless, active, newest run terminal + marker-set.
+    const rows = await db
+      .insert(schema.agentSessions)
+      .values({
+        organizationId: orgId,
+        agentId,
+        agentVersionId: versionId,
+        workflowId: null,
+        eveSessionId: null,
+        origin: "chat",
+        principal: { workspaceId: orgId, source: "chat" },
+        affinityWorkerId: workerId,
+        status: "active",
+      })
+      .returning();
+    const nominee = rows[0]!;
+    await db.insert(schema.runs).values({
+      agentSessionId: nominee.id,
+      organizationId: orgId,
+      mode: "agent",
+      triggerEvent: triggerEvent() as unknown as Record<string, unknown>,
+      status: "canceled",
+      startedAt: new Date(),
+      completedAt: new Date(),
+    });
+
+    // A live dispatch holds the session's critical section this instant —
+    // the sweep must skip the candidate entirely.
+    const locks = createPgSessionDispatchLocks(db.$client);
+    const held = await locks.acquire(nominee.id);
+    expect(held).not.toBeNull();
+    try {
+      await reconcileInterruptedRuns(deps);
+      expect((await sessionRow(nominee.id)).status).toBe("active");
+    } finally {
+      await held!.release();
+    }
+
+    // Lock free → the next sweep closes it.
+    await reconcileInterruptedRuns(deps);
+    expect((await sessionRow(nominee.id)).status).toBe("closed");
   }, 20_000);
 });

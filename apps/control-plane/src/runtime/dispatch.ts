@@ -78,6 +78,18 @@
  * session id instead of tailed. The remote leg is skipped when a NEWER run
  * already owns the session (an unqualified session-level cancel must never
  * stop a turn that is not this run's).
+ *
+ * PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts). The fences above
+ * are individually correct, but three decisions about one session used to
+ * race as separate read-then-acts: successor ADMISSION, the canceled-dispatch
+ * ABANDON, and the boot sweep CLOSE. Every dispatch that will call eve for a
+ * session therefore holds that session's advisory dispatch lock from before
+ * its admission/busy check through eve-return + persist + recheck/abandon
+ * settlement; admission of a new run, the guarded remote cancel
+ * (routes.ts `cancelEveTurnGuarded`), and the boot sweep's eveless close all
+ * take the same lock. Contention is the transient `session_busy`. A crash
+ * releases the lock with its connection, and the marker/busy-arm predicates
+ * remain as its crash-safe shadow.
  */
 import { and, desc, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
@@ -97,6 +109,7 @@ import { assertUnderRunCap, lockWorkspaceRunCap } from "./caps";
 import { errors, isRuntimeApiError } from "./errors";
 import { agentJwtParams, mintPlatformJwt } from "./jwt";
 import {
+  acquireFreshSessionDispatchLock,
   countDispatchingRuns,
   ensureAgentOnWorker,
   failEveDispatch,
@@ -105,6 +118,11 @@ import {
   type RuntimeDeps,
 } from "./routes";
 import { selectWorker } from "./scheduler";
+import {
+  SESSION_LOCK_ADMISSION_WAIT_MS,
+  sessionDispatchLocksOf,
+  type SessionDispatchLock,
+} from "./session-lock";
 
 type SessionRow = typeof schema.agentSessions.$inferSelect;
 type RunRow = typeof schema.runs.$inferSelect;
@@ -410,6 +428,29 @@ export async function dispatchRenderedRun(
   deps: RuntimeDeps,
   input: DispatchRenderedRunInput,
 ): Promise<DispatchRenderedRunResult> {
+  // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts): the lock is
+  // acquired inside dispatchSerialized (a continuation's before its admission
+  // transaction; a new session's immediately after its claim transaction —
+  // the id exists only then) and held through eve-return + persist +
+  // terminal-recheck/abandon settlement. Under it, no successor can be
+  // admitted while this dispatch's abandon decision is in flight — so the
+  // post-eve recheck's unqualified session-level cancel can only ever reach
+  // THIS run's accepted turn, and an accepted turn can never be leaked to a
+  // successor race. Released here so every return/throw path unwinds it; the
+  // tail itself always runs lock-free.
+  const lockBox: { lock: SessionDispatchLock | null } = { lock: null };
+  try {
+    return await dispatchSerialized(deps, input, lockBox);
+  } finally {
+    await lockBox.lock?.release();
+  }
+}
+
+async function dispatchSerialized(
+  deps: RuntimeDeps,
+  input: DispatchRenderedRunInput,
+  lockBox: { lock: SessionDispatchLock | null },
+): Promise<DispatchRenderedRunResult> {
   const { db, runtime } = deps;
   const version = input.agent.version;
   const hash = version.contentHash;
@@ -424,6 +465,19 @@ export async function dispatchRenderedRun(
     versionHash: hash,
     affinityWorkerId: input.existingSession?.affinityWorkerId,
   });
+
+  // A CONTINUATION targets a session other actors can reach (thread lookups,
+  // cancels, the boot sweep), so its dispatch lock is taken BEFORE the
+  // admission transaction — the busy check and the run insert happen under
+  // it. Contention answers the platform's own TRANSIENT `session_busy`
+  // (nothing has been created yet; the caller retries).
+  const locks = sessionDispatchLocksOf(deps);
+  if (input.existingSession) {
+    lockBox.lock = await locks.acquire(input.existingSession.id, {
+      waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
+    });
+    if (!lockBox.lock) throw errors.sessionBusy();
+  }
 
   // Session + run rows land BEFORE the eve dispatch (202-async window: a crash
   // mid-dispatch leaves a visible failed run, never an untracked, uncapped eve
@@ -564,6 +618,14 @@ export async function dispatchRenderedRun(
   });
 
   const isNewSession = input.existingSession === undefined;
+
+  // A NEW session's id exists only now — take its dispatch lock immediately
+  // after commit, strictly before any eve-ward step
+  // ({@link acquireFreshSessionDispatchLock}: a timeout settles the queued
+  // run + born-here session and reports the transient busy).
+  if (isNewSession) {
+    lockBox.lock = await acquireFreshSessionDispatchLock(deps, session.id, run.id);
+  }
 
   // EARLY CANCEL FENCE: a Stop that raced the claim transaction (the abort
   // fired after the link hook's own in-transaction check passed) must not pay
@@ -804,11 +866,15 @@ export type PostEveRecheck = "live" | "canceled" | "superseded";
  * BELT-AND-BRACES: this cancel is UNQUALIFIED (session-level — no turnId
  * exists, since the tail that would learn one never starts), so it must
  * never fire once a NEWER run owns the session: delivered late, it would
- * reach eve after that run's turn started and kill it. Admission normally
- * cannot happen while this run is unresolved (`countDispatchingRuns` counts
- * a canceled run whose dispatch may still be in flight as busy), but a
- * continuation's session carries an eve id from earlier turns and stays
- * admittable — so the newer-run check here is what protects that path.
+ * reach eve after that run's turn started and kill it. The per-session
+ * dispatch lock (session-lock.ts) makes that impossible for lock-holding
+ * dispatches — the recheck runs UNDER the lock, and admission needs the same
+ * lock, so no successor can appear mid-decision (and the leak's twin — a
+ * successor already present forcing the remote leg to be skipped while THIS
+ * run's accepted turn goes untold — cannot happen either). The newer-run
+ * check is deliberately KEPT: it is the crash-safe shadow of the lock (a
+ * session-level advisory lock dies with its connection) and the guard for
+ * any future caller that reaches here without holding it.
  */
 export async function recheckCanceledDuringEve(
   deps: RuntimeDeps,

@@ -319,13 +319,50 @@ session on the row. The state resolves fast — the in-flight dispatch persists
 the id (persist-then-recheck), a failed call closes the session, and the boot
 sweep handles a crash. Exactly one tail per eve NDJSON stream at any instant.
 
+**Per-session dispatch critical section**
+(`apps/control-plane/src/runtime/session-lock.ts`): the row predicates above
+are individually correct but used to race as separate read-then-acts —
+successor admission, a canceled dispatch's abandon (successor count → maybe
+an unqualified eve cancel), and the boot sweep's eveless close. Every
+dispatch that will call eve for a session (chat create, follow-up,
+post-reset create, `session:"thread"` continuation, HITL resume) now holds
+that session's SESSION-level Postgres advisory lock — on a reserved
+postgres-js connection, the pipeline runner's per-run-lock mechanics — from
+before its admission/busy check through eve-return + id persist +
+terminal-recheck/abandon settlement (never across the tail). Admission takes
+the same lock, so no successor can be admitted mid-decision: the abandon
+always remote-cancels its own accepted turn (nothing leaks), and its
+unqualified session-level cancel can never land after a successor's turn
+started. The cancel routes' remote leg (`cancelEveTurnGuarded`) try-acquires
+the lock and re-counts successors under it; when a dispatch holds the lock
+the chase is DEFERRED into the background (never dropped — the holder's
+recheck may have read the run before the Stop settled it) and re-runs the
+same under-lock successor check once the holder releases. The boot sweep
+skips a candidate whose lock is held and its guarded UPDATE re-asserts the
+ledger (`NOT EXISTS` a live run) atomically. Contention answers the
+transient `session_busy`; the lock dies with its connection on a crash, and
+the marker/busy-arm predicates remain as its crash-safe shadow.
+
+**Eveless create failed after arming (at-most-once residual):** when the eve
+call for a session with NO persisted eve id fails AFTER the dispatch-attempt
+marker was armed — a thrown transport error, and specifically a client-side
+timeout that can race eve's 202 — the create MAY have been accepted with the
+id lost forever. `failEveDispatch` therefore closes a still-eveless session
+on ANY terminal outcome (failed too, not just canceled), releasing its
+thread claim; the next message mints a FRESH session, never a second live
+turn on the poisoned row, and the possibly accepted turn runs to completion
+unobserved exactly once (the same documented at-most-once residual as the
+crash between marker write and id persist). Marker-null failures (the call
+provably never issued) and sessions that already carry an eve id are
+untouched — a failed follow-up never costs the user their thread.
+
 **Two 409s with OPPOSITE recoveries — never collapse them** (constants:
 `SESSION_BUSY_ERROR_CODE` / `SESSION_NOT_ACTIVE_ERROR_CODE` in
 `packages/shared/src/api.ts`):
 
 | Code | Origin | Meaning | Recovery |
 |---|---|---|---|
-| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, or a just-canceled run's dispatch may still be in flight on an eveless session | wait, retry; a racing Slack twin is logged and dropped |
+| `session_busy` | the PLATFORM's own one-tail-per-session guard (above) | transient — a run is already queued/running/waiting, a just-canceled run's dispatch may still be in flight on an eveless session, or another dispatch holds the session's dispatch critical section (its eve call or settlement is in flight this instant) | wait, retry; a racing Slack twin is logged and dropped |
 | `session_not_active` | eve, 409 on `POST /eve/v1/session/:id` | **permanent for that session id** — unknown, terminal, reset, or timed out | never retry: close the platform session row (releasing any `slack_thread_key`), fail the run with this code, and let the next message mint a fresh session |
 
 `session_not_active` is a semantic *widening* of the 0.19 busy 409, not a

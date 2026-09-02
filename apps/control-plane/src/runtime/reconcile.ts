@@ -29,10 +29,14 @@
  *    the residue of a dispatch whose eve create raced a Stop or crashed
  *    between the marker write and the id persist. No create from BEFORE the
  *    crash can still be in flight, but reconciliation runs BESIDE live
- *    traffic (index.ts fires it after listen), so the close is an atomic
- *    guarded UPDATE ({@link closeEvelessSessionIfStillAbandoned}) that
- *    re-asserts eveless + non-terminal in its WHERE — a candidate that
- *    gained its eve id between snapshot and close stays untouched. Closing
+ *    traffic (index.ts fires it after listen), so each candidate is taken
+ *    under its per-session DISPATCH LOCK (session-lock.ts — a held lock
+ *    means a dispatch is mid-flight this instant and the candidate is
+ *    skipped), the nomination is re-read under that lock, and the close is
+ *    an atomic guarded UPDATE ({@link closeEvelessSessionIfStillAbandoned})
+ *    that re-asserts eveless + non-terminal AND the ledger (NOT EXISTS a
+ *    live run) in its WHERE — a candidate that gained its eve id, or a run,
+ *    between snapshot and close stays untouched. Closing
  *    releases any Slack thread-key claim the thread-claim eviction now
  *    deliberately refuses to evict for marker-SET holders (see dispatch.ts).
  *    Marker-NULL eveless holders are left alone: the claim eviction handles
@@ -54,7 +58,7 @@
  *    owed). Runs only when a DeliveryService is wired (the integrations
  *    config may be absent).
  */
-import { and, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notExists, notInArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
 import type { Db } from "../db";
@@ -66,6 +70,7 @@ import type { PipelineRunner } from "../pipeline/runner";
 import type { DeliveryService } from "../runs/delivery";
 import { startTail, type RuntimeDeps } from "./routes";
 import { isWorkerLive, toSchedulableWorker } from "./scheduler";
+import { sessionDispatchLocksOf } from "./session-lock";
 
 /**
  * Sweep-2 close as an ATOMIC GUARDED UPDATE. The snapshot that nominated the
@@ -74,11 +79,15 @@ import { isWorkerLive, toSchedulableWorker } from "./scheduler";
  * give a snapshotted session its eve id (and finish a run on it) between
  * selection and close. Closing on the snapshot's say-so would kill a healthy
  * session; instead the eveless + non-terminal predicate is re-asserted
- * INSIDE the UPDATE's WHERE, so a now-healthy row is untouched by
- * construction (the row is re-read under its lock, never trusted from the
- * snapshot). The thread-key release rides the same statement, mirroring
- * markSession's terminal transition. Returns true iff THIS call closed the
- * row — callers count only rows actually updated.
+ * INSIDE the UPDATE's WHERE — AND so is the LEDGER: a `NOT EXISTS` on any
+ * non-terminal run of the session, because the condition that NOMINATED the
+ * candidate (newest run terminal + marker-set) can also go stale — a run
+ * admitted between nomination and close would otherwise let the close fire
+ * and release a thread claim mid-dispatch. So a now-healthy row is untouched
+ * by construction (the row and its ledger are re-read under the UPDATE's
+ * lock, never trusted from the snapshot). The thread-key release rides the
+ * same statement, mirroring markSession's terminal transition. Returns true
+ * iff THIS call closed the row — callers count only rows actually updated.
  */
 export async function closeEvelessSessionIfStillAbandoned(
   db: Db,
@@ -92,6 +101,19 @@ export async function closeEvelessSessionIfStillAbandoned(
         eq(schema.agentSessions.id, agentSessionId),
         isNull(schema.agentSessions.eveSessionId),
         notInArray(schema.agentSessions.status, ["closed", "error"]),
+        // The atomic ledger guard: no live run may exist on the session at
+        // the instant of the close (nomination staleness — see the doc).
+        notExists(
+          db
+            .select({ id: schema.runs.id })
+            .from(schema.runs)
+            .where(
+              and(
+                eq(schema.runs.agentSessionId, agentSessionId),
+                inArray(schema.runs.status, ["queued", "running", "waiting"]),
+              ),
+            ),
+        ),
       ),
     )
     .returning({ id: schema.agentSessions.id });
@@ -209,10 +231,13 @@ export async function reconcileInterruptedRuns(
   // dispatch that died (or was canceled) after arming but before the eve id
   // persisted — no create from BEFORE the crash is still in flight, so close
   // it and free its Slack thread-key claim. Live traffic runs beside this
-  // sweep (index.ts fires it after listen), so the close itself is a guarded
-  // UPDATE ({@link closeEvelessSessionIfStillAbandoned}) — a candidate that
-  // gained its eve id after this snapshot is untouched, and only rows
-  // actually updated are counted.
+  // sweep (index.ts fires it after listen), so each candidate is handled
+  // under its per-session dispatch lock (skip when held — a dispatch is
+  // mid-flight), the nomination is re-read under the lock, and the close
+  // itself is a guarded UPDATE ({@link closeEvelessSessionIfStillAbandoned})
+  // whose WHERE re-asserts eveless + non-terminal + no-live-run — a
+  // candidate that gained its eve id (or a run) after this snapshot is
+  // untouched, and only rows actually updated are counted.
   const evelessCandidates = await deps.db
     .select({ id: schema.agentSessions.id })
     .from(schema.agentSessions)
@@ -222,24 +247,44 @@ export async function reconcileInterruptedRuns(
         notInArray(schema.agentSessions.status, ["closed", "error"]),
       ),
     );
+  const sessionLocks = sessionDispatchLocksOf(deps);
   for (const candidate of evelessCandidates) {
-    const newest = await deps.db
-      .select({ status: schema.runs.status, startedAt: schema.runs.startedAt })
-      .from(schema.runs)
-      .where(eq(schema.runs.agentSessionId, candidate.id))
-      .orderBy(desc(schema.runs.createdAt))
-      .limit(1);
-    const run = newest[0];
-    if (
-      run &&
-      run.startedAt !== null &&
-      (run.status === "succeeded" ||
-        run.status === "failed" ||
-        run.status === "canceled")
-    ) {
-      if (await closeEvelessSessionIfStillAbandoned(deps.db, candidate.id)) {
-        outcome.sessionsClosed += 1;
+    // The candidate's DISPATCH LOCK first (session-lock.ts): a held lock
+    // means a live dispatch owns the session this instant — its eve create
+    // may be mid-flight — so the sweep skips it entirely (the next boot, or
+    // the dispatch's own settlement, handles the row). The nomination read
+    // then happens UNDER the lock, so no lock-honoring dispatch can change
+    // the ledger between nomination and close; the guarded UPDATE's ledger
+    // re-assertion remains as the atomic belt for anything else.
+    const lock = await sessionLocks.acquire(candidate.id);
+    if (!lock) {
+      deps.logger.debug("reconcile.eveless_candidate_skipped", {
+        sessionId: candidate.id,
+        fields: { reason: "a dispatch holds the session's critical section" },
+      });
+      continue;
+    }
+    try {
+      const newest = await deps.db
+        .select({ status: schema.runs.status, startedAt: schema.runs.startedAt })
+        .from(schema.runs)
+        .where(eq(schema.runs.agentSessionId, candidate.id))
+        .orderBy(desc(schema.runs.createdAt))
+        .limit(1);
+      const run = newest[0];
+      if (
+        run &&
+        run.startedAt !== null &&
+        (run.status === "succeeded" ||
+          run.status === "failed" ||
+          run.status === "canceled")
+      ) {
+        if (await closeEvelessSessionIfStillAbandoned(deps.db, candidate.id)) {
+          outcome.sessionsClosed += 1;
+        }
       }
+    } finally {
+      await lock.release();
     }
   }
 

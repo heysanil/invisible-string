@@ -317,6 +317,8 @@ describe.skipIf(!GATE)("dispatch crash windows (marker, recheck, eviction, boot 
           return null;
         },
         hasSessionTail: () => false,
+        isSessionStreamHeld: () => false,
+        refreshSessionObligations: async () => false,
         get: () => undefined,
         cancelRun: async () => false,
         cancelRunGuarded: async () => null,

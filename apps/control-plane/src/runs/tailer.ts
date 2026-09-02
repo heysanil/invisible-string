@@ -101,6 +101,18 @@
  *   4. otherwise the turn is FOREIGN: persisted normally, never attributed,
  *      never canceled, never classified as anyone's own.
  *
+ * The claimant set is ONE store read (`RunStore.listSessionClaimants`: the
+ * open obligations AND the live unattributed runs in a single statement —
+ * a no-tail Stop commits a run from live to settled in one CAS, and two
+ * reads around that commit saw it in neither). Adoption is RETROACTIVE:
+ * an obligation loaded or adopted with a null turn id is matched against
+ * the session's persisted unowned content turns
+ * (`RunStore.listUnownedContentTurns` — a `message.received` on disk whose
+ * id no run carries as `turn_id`, i.e. one classified foreign when it
+ * opened) so it never waits for an opening that already went by: a match
+ * writes the proof and issues the qualified cancel, or meets the
+ * obligation on the spot when the turn's own boundary is on disk too.
+ *
  * Send ORDER attributes nothing any more (content-less turns aside — among
  * content-less senders only): a never-sent obligation cannot steal a
  * successor's turn unless the two texts are identical — the residual. The
@@ -138,7 +150,12 @@
  * — the SAME primitive, with the same attribution rules — and a successor's
  * normal tail on that session takes the obligations over through its
  * leftover drain (the manager detaches an observation tail when a normal
- * tail starts on the same session: ONE reader per eve stream, always).
+ * tail starts on the same session: ONE reader per eve stream, always). A
+ * handoff to a live tail checks LIVENESS at the handoff: a tail leaves the
+ * manager's reader slot the instant its abort lands (`onAbort`), a signal
+ * to an aborted tail answers false, and the caller then opens its own
+ * observer — chained behind the aborted tail's still-held cursor until its
+ * `done` resolves, never a second reader.
  *
  * WALL-CLOCK CAP AND SHUTDOWN owe the same confirmation. MAX_RUN_WALL_CLOCK_MS
  * starts when tailing starts; expiry settles the run `failed` — WITH the
@@ -160,7 +177,7 @@ import {
 
 import type { RunEventBus } from "./bus";
 import { hashTurnMessage } from "./message-hash";
-import type { RunStore } from "./store";
+import type { PendingRemoteCancel, RunStore, SessionClaimants } from "./store";
 
 /**
  * Terminal-run notification (metrics + outbound-delivery seam): status,
@@ -467,6 +484,17 @@ export interface TailRunOptions {
    * Exceptions are swallowed (logged) — a health flip must never kill a tail.
    */
   onAuthorizationRequired?: (info: { connectionName: string }) => void;
+  /**
+   * Called SYNCHRONOUSLY the moment the tail's abort lands — observation
+   * closed (confirmed / unresolved), a detach, a settlement that aborts, a
+   * terminal — i.e. the instant this tail will read no further event. The
+   * manager unbinds the session's reader slot here (not in `done.finally`,
+   * which resolves only once the stream is released — possibly much later,
+   * behind a hung connect), so a settlement arriving in between finds no
+   * live reader and opens its own observer instead of signaling a tail that
+   * can no longer act.
+   */
+  onAbort?: () => void;
   /** Structured run-lifecycle logging (started/terminal). Optional. */
   logger?: Logger;
 }
@@ -517,6 +545,12 @@ export interface RunTailHandle {
   agentSessionId: string;
   /** True while the tail is in observation mode (its run is already settled). */
   readonly observing: boolean;
+  /**
+   * True once the tail's abort has landed: it reads no further event and
+   * can adopt nothing — NOT a reader any more, even though `done` may still
+   * be pending (the stream is released only when `done` resolves).
+   */
+  readonly closed: boolean;
   /** Resolves when the tail has fully stopped (terminal, observation closed, or dead). */
   done: Promise<void>;
   /**
@@ -546,9 +580,11 @@ export interface RunTailHandle {
    * and signals the live tail through the manager). An adopted obligation
    * whose turn is already known gets its qualified cancel at once. Runs
    * through the tail's serial queue, so it never interleaves with an
-   * attribution or a settlement.
+   * attribution or a settlement. Resolves FALSE when the tail's abort has
+   * landed (it re-read nothing and will act on nothing): the caller must
+   * not count the handoff as done and opens its own observer instead.
    */
-  refreshObligations(): Promise<void>;
+  refreshObligations(): Promise<boolean>;
 }
 
 /** One open remote-cancel obligation this tail is following. */
@@ -602,6 +638,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const log = logger?.child({ runId, sessionId: agentSessionId });
   const tailStartedAt = Date.now();
   const abort = new AbortController();
+  // The manager's reader-slot release rides the abort itself (synchronous),
+  // never `done` — see TailRunOptions.onAbort.
+  if (options.onAbort) abort.signal.addEventListener("abort", options.onAbort, { once: true });
   let cancelReason: string | null = null;
   /** `follow` = a live run's tail; `observe` = owing eve a confirmation only. */
   let mode: "follow" | "observe" = options.observe ? "observe" : "follow";
@@ -806,6 +845,81 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   const isKnownTurn = (turnId: string): boolean =>
     ownTurnId === turnId || obligations.some((o) => o.turnId === turnId);
 
+  const toObligation = (row: PendingRemoteCancel): Obligation => ({
+    runId: row.runId,
+    turnId: row.turnId,
+    messageHash: row.messageHash,
+    unresolved: row.unresolvedAt !== null,
+    createdAt: row.createdAt.getTime(),
+    self: row.runId === runId,
+  });
+
+  /**
+   * RETROACTIVE attribution, from disk. An obligation loaded or adopted with
+   * a null turn id may already have had its turn: the turn opened BEFORE
+   * the obligation existed for any reader (a continuation Stopped without
+   * a tail after its message was on the wire), matched nothing, and was
+   * persisted FOREIGN — by this tail, by a reader that has since crashed,
+   * or by an earlier build. Waiting for "its turn opening" would wait
+   * forever, the qualified cancel would never go out, and the obligation
+   * would age out unresolved with its turn possibly still running. So every
+   * null-turn CONTENT obligation is matched against the session's persisted
+   * unowned content turns (`listUnownedContentTurns` — `message.received`
+   * text hashed, no run's `turn_id` equal to the id) under the live rules:
+   * attribution priority among the candidates, oldest persisted turn first
+   * among identical texts, and ids this tail already knows are never
+   * re-claimed. A match writes the proof (`setRunTurnId`) and either issues
+   * the qualified cancel or — the turn's own boundary is on disk too —
+   * meets the obligation on the spot. Content-less obligations have no
+   * correlator to look back with and keep waiting for the live stream.
+   * Best-effort: a store failure here leaves the obligation as it was.
+   */
+  const recoverPersistedTurns = async (candidates: Obligation[], why: string): Promise<void> => {
+    const open = candidates
+      .filter((o) => obligations.includes(o) && o.turnId === null && o.messageHash !== null)
+      .sort(byAttributionPriority);
+    if (open.length === 0) return;
+    let persisted: Awaited<ReturnType<RunStore["listUnownedContentTurns"]>>;
+    try {
+      persisted = await store.listUnownedContentTurns(agentSessionId);
+    } catch (error) {
+      log?.warn("run.persisted_turn_lookback_failed", {
+        fields: { why, reason: error instanceof Error ? error.message : String(error) },
+      });
+      return;
+    }
+    const taken = new Set<string>();
+    for (const obligation of open) {
+      const match = persisted.find(
+        (turn) =>
+          !taken.has(turn.turnId) &&
+          !isKnownTurn(turn.turnId) &&
+          turn.messageHash === obligation.messageHash,
+      );
+      if (!match) continue;
+      taken.add(match.turnId);
+      obligation.turnId = match.turnId;
+      if (obligation.self) ownTurnId = match.turnId;
+      const written = await store.setRunTurnId(obligation.runId, match.turnId);
+      log?.info("run.remote_cancel_turn_attributed", {
+        fields: {
+          obligationRunId: obligation.runId,
+          turnId: match.turnId,
+          written,
+          by: "persisted",
+          ended: match.ended,
+          unresolved: obligation.unresolved,
+          why,
+        },
+      });
+      if (match.ended) {
+        await confirmObligation(obligation, "own turn boundary already persisted");
+      } else {
+        issueQualifiedCancel(obligation);
+      }
+    }
+  };
+
   /**
    * CURRENT obligations, not a start-of-tail snapshot. The list this tail
    * follows was loaded once when it started, but obligations are created
@@ -824,12 +938,19 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * at once), known rows keep this tail's more recent turn id, and rows
    * another actor has cleared (a session-terminal answer on a route, the
    * guarded settlement) are dropped. Cheap: a few rows by session id.
-   * Callers hold the serial queue.
+   * Callers hold the serial queue. A turn opening passes the snapshot it
+   * read (`listSessionClaimants` — ONE statement covering obligations AND
+   * live successors), so its claimant search and this merge see the same
+   * instant; every other caller reads here. Adopted rows with a null turn
+   * id are then looked back on disk (`recoverPersistedTurns`).
    */
-  const refreshObligationsUnlocked = async (why: string): Promise<void> => {
-    const current = await store.listPendingRemoteCancels(agentSessionId);
+  const refreshObligationsUnlocked = async (
+    why: string,
+    snapshot?: SessionClaimants,
+  ): Promise<void> => {
+    const current = (snapshot ?? (await store.listSessionClaimants(agentSessionId))).obligations;
     const next: Obligation[] = [];
-    const adopted: string[] = [];
+    const adopted: Obligation[] = [];
     for (const row of current) {
       // A follow tail's own live run owes nothing (its marker, if any, is
       // written only by the settlement that flips this tail to observe).
@@ -848,16 +969,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
         next.push(known);
         continue;
       }
-      const obligation: Obligation = {
-        runId: row.runId,
-        turnId: row.turnId,
-        messageHash: row.messageHash,
-        unresolved: row.unresolvedAt !== null,
-        createdAt: row.createdAt.getTime(),
-        self: row.runId === runId,
-      };
+      const obligation = toObligation(row);
       next.push(obligation);
-      adopted.push(obligation.runId);
+      adopted.push(obligation);
       if (obligation.turnId !== null) issueQualifiedCancel(obligation);
     }
     const dropped = obligations.filter((o) => !current.some((row) => row.runId === o.runId));
@@ -866,12 +980,16 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       log?.info("run.obligations_refreshed", {
         fields: {
           why,
-          adopted,
+          adopted: adopted.map((o) => o.runId),
           dropped: dropped.map((o) => o.runId),
           following: obligations.map((o) => o.runId),
         },
       });
     }
+    // An adopted obligation's turn may already have gone by on this stream
+    // (persisted foreign before the obligation existed): attribute it from
+    // disk now, never wait for an opening that already happened.
+    await recoverPersistedTurns(adopted, why);
     if (mode === "observe" && obligations.length === 0) closeObservation();
   };
 
@@ -884,7 +1002,13 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * live successor) proves every obligation on the session over.
    *
    * Runs on the tail's serial queue (never interleaves with a settlement),
-   * and consults the store's CURRENT obligations before the claimant search.
+   * and consults the store's CURRENT claimants — obligations AND live
+   * successors — from ONE read taken before the search. Two reads (the
+   * obligations first, the live runs later) had a window: a no-tail Stop
+   * committing a successor's marker between them flipped it from live to
+   * settled, so it was in NEITHER result — its already-open turn was
+   * classified foreign, and the obligation adopted afterwards with a null
+   * id could neither be cancelled qualified nor cleared on its boundary.
    */
   const attributeTurn = (turnId: string, content: TurnContent): Promise<TurnAttribution> =>
     serialized(() => attributeTurnUnlocked(turnId, content));
@@ -893,7 +1017,8 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     turnId: string,
     content: TurnContent,
   ): Promise<TurnAttribution> => {
-    await refreshObligationsUnlocked("turn opened");
+    const claimants = await store.listSessionClaimants(agentSessionId);
+    await refreshObligationsUnlocked("turn opened", claimants);
     const correlator = content?.hash ?? null;
     const kind = content ? "content" : "content-less";
     let result: TurnAttribution;
@@ -933,7 +1058,8 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       } else if (content) {
         // A live successor whose own tail has not taken the stream over
         // yet (its turn was drained here): hand it its acceptance proof.
-        const successor = (await store.listUnattributedLiveRuns(agentSessionId)).find(
+        // Same snapshot as the obligations above — never a second read.
+        const successor = claimants.live.find(
           (run) => run.runId !== runId && run.messageHash === content.hash,
         );
         if (successor) {
@@ -1126,15 +1252,8 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     const turnState = await store.getRunTurnState(runId);
     ownTurnId = turnState?.turnId ?? null;
     ownMessageHash = turnState?.messageHash ?? null;
-    const pending = await store.listPendingRemoteCancels(agentSessionId);
-    obligations = pending.map((p) => ({
-      runId: p.runId,
-      turnId: p.turnId,
-      messageHash: p.messageHash,
-      unresolved: p.unresolvedAt !== null,
-      createdAt: p.createdAt.getTime(),
-      self: p.runId === runId,
-    }));
+    const pending = (await store.listSessionClaimants(agentSessionId)).obligations;
+    obligations = pending.map(toObligation);
     if (mode === "observe") {
       const mine = obligations.find((o) => o.self);
       if (!mine) {
@@ -1148,6 +1267,13 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       // The turn is already known (a crashed observation, or a transport
       // failure the sweeper is retrying): (re)issue the qualified cancel.
       if (mine.turnId !== null) issueQualifiedCancel(mine);
+      // Any obligation whose turn is NOT known may have had it already —
+      // persisted foreign by a reader that is gone: attribute from disk
+      // (own included: a crashed observation re-opened after the turn
+      // opened; if the boundary is down too, nothing is owed and the
+      // observation ends before it starts).
+      await recoverPersistedTurns(obligations, "observation started");
+      if (observationClosed) return;
       armObserveDeadline(options.observe!.deadlineAt);
       log?.info("run.observing", {
         fields: {
@@ -1158,6 +1284,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       });
     } else {
       obligations = obligations.filter((o) => !o.self);
+      // Predecessor obligations whose turn already went by (persisted
+      // foreign under an earlier reader) are attributed from disk BEFORE
+      // this run's own recovery below, so the identical-text tie resolves
+      // as it does live: an obligation before the tail's own run.
+      await recoverPersistedTurns(obligations, "tail started");
       sawOwnTurn = ownTurnId !== null;
       if (!sawOwnTurn && seq > 0) {
         // A tail that persisted its own turn's opening before the proof
@@ -1555,6 +1686,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     get observing() {
       return mode === "observe";
     },
+    get closed() {
+      return abort.signal.aborted;
+    },
     done,
     async cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
@@ -1582,8 +1716,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     detach,
     refreshObligations: () =>
       serialized(async () => {
-        if (abort.signal.aborted) return;
+        // An aborted tail re-reads nothing and can act on nothing: say so,
+        // never "handed off" — the caller opens its own observer.
+        if (abort.signal.aborted) return false;
         await refreshObligationsUnlocked("signaled");
+        return true;
       }),
   };
 }
@@ -1616,8 +1753,21 @@ export interface StartTailOptions {
 
 export class RunTailerManager {
   private readonly handles = new Map<string, RunTailHandle>();
-  /** ONE reader per eve stream: the live tail (any mode) per session. */
+  /**
+   * ONE reader per eve stream: the LIVE tail (any mode) per session. A tail
+   * leaves this slot the instant its abort lands (`onAbort`, synchronous) —
+   * it reads nothing more and can adopt nothing, so a settlement arriving
+   * before its `done` resolves must not be handed to it.
+   */
   private readonly sessionHandles = new Map<string, RunTailHandle>();
+  /**
+   * Tails whose abort has landed but whose `done` is still pending: the
+   * stream is RELEASED only when `done` resolves (the body reader may still
+   * be inside a read, or a connect may still be hanging), so a successor on
+   * the session chains on it (`waitFor`) rather than opening a second
+   * cursor — and the context controls count it as a holder of the stream.
+   */
+  private readonly drainingHandles = new Map<string, RunTailHandle>();
 
   constructor(
     private readonly defaults: {
@@ -1634,27 +1784,56 @@ export class RunTailerManager {
     },
   ) {}
 
-  private register(handle: RunTailHandle): void {
+  /** The tail currently holding the session's stream, live or draining. */
+  private streamHolder(agentSessionId: string): RunTailHandle | undefined {
+    return this.sessionHandles.get(agentSessionId) ?? this.drainingHandles.get(agentSessionId);
+  }
+
+  /** Move a tail from the reader slot to the draining slot (its abort landed). */
+  private releaseReader(handle: RunTailHandle): void {
+    if (this.sessionHandles.get(handle.agentSessionId) === handle) {
+      this.sessionHandles.delete(handle.agentSessionId);
+      this.drainingHandles.set(handle.agentSessionId, handle);
+    }
+  }
+
+  private open(
+    options: StartTailOptions & Pick<TailRunOptions, "observe" | "waitFor">,
+  ): RunTailHandle {
+    let handle: RunTailHandle | undefined;
+    const opened = tailRun({
+      ...this.defaults,
+      ...options,
+      onAbort: () => {
+        if (handle) this.releaseReader(handle);
+      },
+    });
+    handle = opened;
     this.handles.set(handle.runId, handle);
     this.sessionHandles.set(handle.agentSessionId, handle);
     void handle.done.finally(() => {
-      if (this.handles.get(handle.runId) === handle) this.handles.delete(handle.runId);
-      if (this.sessionHandles.get(handle.agentSessionId) === handle) {
-        this.sessionHandles.delete(handle.agentSessionId);
+      if (this.handles.get(opened.runId) === opened) this.handles.delete(opened.runId);
+      this.releaseReader(opened);
+      if (this.drainingHandles.get(opened.agentSessionId) === opened) {
+        this.drainingHandles.delete(opened.agentSessionId);
       }
     });
+    return handle;
   }
 
   /**
    * Start (or return) the live tail for a run. A session may have ONE
    * reader: an observation tail already on this session is detached and the
    * new tail waits for it to stop before reading — it inherits the session's
-   * open obligations through its leftover drain (tailer module doc).
+   * open obligations through its leftover drain (tailer module doc). A tail
+   * still draining (aborted, stream not yet released) is chained on the
+   * same way.
    */
   start(options: StartTailOptions): RunTailHandle {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;
     const prior = this.sessionHandles.get(options.agentSessionId);
+    const draining = this.drainingHandles.get(options.agentSessionId);
     let waitFor: Promise<void> | undefined;
     if (prior) {
       if (prior.observing) {
@@ -1674,41 +1853,74 @@ export class RunTailerManager {
         });
       }
       waitFor = prior.done;
+    } else if (draining) {
+      this.defaults.logger?.info("run.tail_drain_wait", {
+        runId: options.runId,
+        sessionId: options.agentSessionId,
+        fields: { drainingRunId: draining.runId },
+      });
+      waitFor = draining.done;
     }
-    const handle = tailRun({ ...this.defaults, ...options, waitFor });
-    this.register(handle);
-    return handle;
+    return this.open({ ...options, waitFor });
   }
 
   /**
    * Re-open OBSERVATION for a settled run still owing eve a confirmation
    * (the sweeper, boot reconciliation, the post-eve recheck). Null when the
-   * session already has a live tail — that tail carries the session's
-   * obligations — so the caller counts it `observing`, never a second reader.
+   * session's LIVE tail took the obligation over — it is signaled to re-read
+   * the session's obligations, and only a signal it actually acted on counts
+   * (`refreshObligations` resolves false once the tail's abort has landed:
+   * such a tail reads nothing more, and trusting the handoff would leave
+   * the run with no reader until the next sweep). Otherwise a new
+   * observation tail is opened — chained behind a tail still draining the
+   * stream, so there is never a second cursor — and returned. Async because
+   * the handoff is awaited; the caller counts the run `observing` either
+   * way.
    */
-  observe(options: StartTailOptions & { deadlineAt: number }): RunTailHandle | null {
+  async observe(options: StartTailOptions & { deadlineAt: number }): Promise<RunTailHandle | null> {
     const existing = this.handles.get(options.runId);
-    if (existing) return existing;
-    if (this.sessionHandles.has(options.agentSessionId)) {
-      // The live tail carries this run's obligation from here on — tell it
-      // (fire-and-forget: the store re-read at its next turn opening or
-      // boundary is the guarantee; the signal is the fast path).
-      void this.refreshSessionObligations(options.agentSessionId);
-      return null;
+    if (existing && !existing.closed) return existing;
+    // Bounded: a live tail that aborts under the signal is released
+    // synchronously, so the next iteration finds none (or one another
+    // caller opened meanwhile — which is then a live reader to signal).
+    for (let round = 0; round < 3; round += 1) {
+      const live = this.sessionHandles.get(options.agentSessionId);
+      if (!live) break;
+      if (await this.refreshSessionObligations(options.agentSessionId)) return null;
     }
     const { deadlineAt, ...rest } = options;
-    const handle = tailRun({ ...this.defaults, ...rest, observe: { deadlineAt } });
-    this.register(handle);
-    return handle;
+    const draining = this.drainingHandles.get(options.agentSessionId);
+    if (draining) {
+      this.defaults.logger?.info("run.tail_drain_wait", {
+        runId: options.runId,
+        sessionId: options.agentSessionId,
+        fields: { drainingRunId: draining.runId },
+      });
+    }
+    return this.open({ ...rest, observe: { deadlineAt }, waitFor: draining?.done });
   }
 
   get(runId: string): RunTailHandle | undefined {
     return this.handles.get(runId);
   }
 
-  /** Is any tail (follow or observation) live on this session in this process? */
+  /**
+   * Is a LIVE tail (follow or observation — one that still reads) on this
+   * session in this process? A tail whose abort has landed is not: it can
+   * carry no obligation from here on.
+   */
   hasSessionTail(agentSessionId: string): boolean {
     return this.sessionHandles.has(agentSessionId);
+  }
+
+  /**
+   * Is the session's eve stream HELD in this process — by a live tail, or
+   * by an aborted one whose `done` has not resolved (its cursor is not
+   * released yet)? The context controls' quiet check: a second reader must
+   * not attach until the stream is released.
+   */
+  isSessionStreamHeld(agentSessionId: string): boolean {
+    return this.streamHolder(agentSessionId) !== undefined;
   }
 
   /**
@@ -1717,21 +1929,25 @@ export class RunTailerManager {
    * holds the stream (the guarded settlement's `observing` verdict). The
    * tail re-reads the store and adopts the new obligation, issuing its
    * qualified cancel at once when the turn is already known. Resolves false
-   * when no tail is live on the session in this process.
+   * when no LIVE tail is on the session in this process — none at all, or
+   * one whose abort landed before (or while) the signal reached it: the
+   * caller must then open its own observer, never count the handoff.
    */
   async refreshSessionObligations(agentSessionId: string): Promise<boolean> {
     const handle = this.sessionHandles.get(agentSessionId);
     if (!handle) return false;
     try {
-      await handle.refreshObligations();
+      return await handle.refreshObligations();
     } catch (error) {
+      // The tail is live and re-reads the store at its next turn opening
+      // and boundary regardless — still the session's reader.
       this.defaults.logger?.warn("run.obligations_refresh_failed", {
         runId: handle.runId,
         sessionId: agentSessionId,
         fields: { reason: error instanceof Error ? error.message : String(error) },
       });
+      return !handle.closed;
     }
-    return true;
   }
 
   /**

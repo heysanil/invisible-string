@@ -338,6 +338,8 @@ describe.skipIf(!GATE)("session dispatch lock defects (D1, D3, D4, D6)", () => {
         },
         observe: () => null,
         hasSessionTail: () => false,
+        isSessionStreamHeld: () => false,
+        refreshSessionObligations: async () => false,
         get: () => undefined,
         cancelRun: async () => false,
         cancelRunGuarded: async () => null,

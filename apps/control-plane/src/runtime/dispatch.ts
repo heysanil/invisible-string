@@ -1188,7 +1188,7 @@ export async function recheckCanceledDuringEve(
     return "superseded";
   }
   const pendingAt = await markRemoteCancelPending(deps.db, runId);
-  const opened = startObservation(
+  const opened = await startObservation(
     deps,
     target.workerAddress,
     target.hash,

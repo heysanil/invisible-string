@@ -583,12 +583,13 @@ export function startTail(
  * (the post-eve recheck, the periodic sweep, boot reconciliation): the same
  * tail primitive, started in observation mode from the run's persisted seq,
  * bounded by `deadlineAt` (obligation timestamp + REMOTE_CANCEL_OBSERVE_MS).
- * Returns whether a NEW observation tail was opened; false means the session
- * already has a live tail in this process — that tail carries the session's
- * obligations (one reader per eve stream), so the caller counts the run
- * `observing` either way.
+ * Returns whether a NEW observation tail was opened; false means the session's
+ * LIVE tail in this process took the obligation over (signaled, and the
+ * signal was acted on — an aborted tail never counts; the manager opens a
+ * new observer behind it instead), so the caller counts the run `observing`
+ * either way. One reader per eve stream.
  */
-export function startObservation(
+export async function startObservation(
   deps: RuntimeDeps,
   workerAddress: string,
   contentHash: string,
@@ -596,8 +597,8 @@ export function startObservation(
   runId: string,
   agentSessionId: string,
   deadlineAt: number,
-): boolean {
-  const handle = deps.tailers.observe({
+): Promise<boolean> {
+  const handle = await deps.tailers.observe({
     runId,
     agentSessionId,
     deadlineAt,
@@ -1055,14 +1056,18 @@ export async function settleRemoteCancelGuarded(
         });
         return "unresolved";
       }
-      // 7. Owed: observe eve's stream. A tail already on the session (any
-      // mode) carries the obligation from here — but it loaded the session's
-      // obligations when IT started, so it is told to re-read them now: the
-      // run's turn, when it opens on that stream, must be attributed to
-      // this run by content (and cancelled qualified), never persisted as
-      // foreign because the reader's list predates this Stop.
-      if (deps.tailers.hasSessionTail(agentSessionId)) {
-        await deps.tailers.refreshSessionObligations(agentSessionId);
+      // 7. Owed: observe eve's stream. A LIVE tail already on the session
+      // (any mode) carries the obligation from here — but it loaded the
+      // session's obligations when IT started, so it is told to re-read them
+      // now: the run's turn, when it opens on that stream, must be attributed
+      // to this run by content (and cancelled qualified), never persisted as
+      // foreign because the reader's list predates this Stop. Only a signal
+      // the tail ACTED on is a handoff: a tail whose abort landed (its
+      // observation closed a moment ago, its `done` still pending) re-reads
+      // nothing, and trusting it would leave this run with no reader until
+      // the next sweep — so `false` falls through to opening an observer of
+      // our own (chained behind the draining tail: one cursor per stream).
+      if (await deps.tailers.refreshSessionObligations(agentSessionId)) {
         return "observing";
       }
       let target: SessionControlTarget;
@@ -1078,7 +1083,7 @@ export async function settleRemoteCancelGuarded(
         });
         return "retained";
       }
-      startObservation(
+      await startObservation(
         deps,
         target.workerAddress,
         target.hash,
@@ -1311,8 +1316,9 @@ export async function requireQuietControllableSession(
     throw errors.sessionBusy();
   }
   // ONE reader per eve stream: an observation tail (a settled Stop still
-  // owing eve's confirmation) is a reader, and its turn may still be live.
-  if (deps.tailers.hasSessionTail(session.id)) {
+  // owing eve's confirmation) is a reader, and its turn may still be live —
+  // and an aborted tail still holds the cursor until its `done` resolves.
+  if (deps.tailers.isSessionStreamHeld(session.id)) {
     throw errors.sessionBusy();
   }
   return session.eveSessionId;

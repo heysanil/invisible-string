@@ -453,18 +453,35 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   makes it CONTENT-LESS — a HITL `inputResponses` resume opens with NO
   `message.received` (`turn.started` straight to `step.started`, spike
   fixture `mocked-resumed-events.ndjson`), and its sender's `message_hash`
-  is null. The obligations consulted are the session's CURRENT ones, never
-  a start-of-tail snapshot: the tail re-reads them from the store
-  (`RunStore.listPendingRemoteCancels`) at every turn opening (before the
-  claimant search), every turn/session boundary (before the owner match),
-  its own settlement, and on the manager's signal
-  (`RunTailerManager.refreshSessionObligations` — sent by the guarded
-  settlement and by an `observe()` refused for "the session already has a
-  reader") — adopting rows it did not follow (a continuation Stopped before
-  its own tail started, whose turn would otherwise have been persisted as
-  FOREIGN because the reader's list predated the Stop; an adopted row whose
-  turn is already known gets its qualified cancel at once) and dropping rows
-  another actor cleared. Attribution, settlement and that refresh run on ONE
+  is null. The claimants consulted are the session's CURRENT ones, never
+  a start-of-tail snapshot, and they come from ONE store read
+  (`RunStore.listSessionClaimants` — a single statement returning both the
+  open obligations and the live runs still awaiting their proof, so a run
+  is in exactly one list and never in neither): the tail reads it at every
+  turn opening (before the claimant search — the same snapshot serves the
+  obligation match and the live-successor lookup), every turn/session
+  boundary (before the owner match), its own settlement, and on the
+  manager's signal (`RunTailerManager.refreshSessionObligations` — sent by
+  the guarded settlement and by an `observe()` that found a live reader on
+  the session) — adopting rows it did not follow (a continuation Stopped
+  before its own tail started, whose turn would otherwise have been
+  persisted as FOREIGN because the reader's list predated the Stop; an
+  adopted row whose turn is already known gets its qualified cancel at once)
+  and dropping rows another actor cleared. Two reads (obligations first,
+  live runs later) had a window: a no-tail Stop committing between them
+  flipped the run from live to settled so it was in NEITHER result, its
+  already-open turn was classified foreign, and the obligation adopted
+  afterwards with a null id could neither be cancelled qualified nor cleared
+  on its boundary. Adoption is also RETROACTIVE: an obligation loaded or
+  adopted with a null turn id is matched against the session's persisted
+  unowned CONTENT turns (`RunStore.listUnownedContentTurns` — a
+  `message.received` on disk under any run of the session whose id no run
+  carries as `turn_id`, i.e. one classified foreign when it opened — by an
+  earlier reader, a crashed one, or this tail before the obligation
+  existed) under the same priority rules; a match writes `turn_id` and
+  issues the qualified cancel, or — the turn's own boundary is on disk too —
+  meets the obligation on the spot, so an obligation never waits for an
+  opening that has already gone by. Attribution, settlement and that refresh run on ONE
   per-tail serial queue: a Stop (or the wall-clock cap, or shutdown) never
   snapshots `ownTurnId` while an attribution's `setRunTurnId` is in flight —
   it settles after the attribution completes, re-reads the row's `turn_id`
@@ -472,7 +489,7 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   is known by then. The claimant, in order: **(1)** the session's open obligation
   whose `message_hash` equals the correlator (content-less turns match null
   hashes) and whose turn has not started — pending obligations before
-  UNRESOLVED ones, oldest first within each (`RunStore.listPendingRemoteCancels`);
+  UNRESOLVED ones, oldest first within each (`RunStore.listSessionClaimants`);
   **(2)** in follow mode, the tail's own run iff ITS `message_hash` equals
   the correlator; **(3)** for content turns, a LIVE run on the session with
   that hash and no `turn_id` yet (a successor admitted while an observation
@@ -554,8 +571,25 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   persisted seq on the session's affinity worker (`startObservation` — the
   same primitive, never a normal tail, which would re-drive/misclassify a
   canceled run), counted `observing` — and when the session already has a
-  live tail in this process, that tail is SIGNALED to re-read the session's
-  obligations (`refreshSessionObligations`) and counted `observing` too;
+  LIVE tail in this process, that tail is SIGNALED to re-read the session's
+  obligations (`refreshSessionObligations`) and counted `observing` too.
+  Liveness is checked AT the handoff, never assumed from the manager's map:
+  a tail leaves the session's reader slot the instant its abort lands
+  (`onAbort`, synchronous — observation closed or expired, a detach, a
+  terminal), not when its `done` resolves, which can trail the abort by
+  arbitrarily long (a hung reconnect); `refreshSessionObligations` resolves
+  false for a tail whose abort has landed (`RunTailHandle.refreshObligations`
+  re-reads nothing then), and every caller treats false as "no reader" and
+  opens its own observer — `observe()` awaits the signal and, refused, opens
+  the observation itself. The one-reader invariant holds across that
+  handoff because an aborted tail keeps HOLDING the stream until `done`
+  (its cursor is not released before): the manager parks it in a draining
+  slot, chains the successor's tail (`waitFor`) behind it exactly as it
+  chains behind a detached observation, and the context controls' quiet
+  check (`isSessionStreamHeld`) counts a draining tail as a reader. Before
+  this, a settlement landing between an observation's abort and its
+  `done.finally` was "handed" to a tail that could no longer act, reported
+  `observing`, and the run had no reader until the next sweep;
   nothing to act on (an armed eveless
   session, no live worker) is `retained`; a held lock is `deferred`. The
   post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a

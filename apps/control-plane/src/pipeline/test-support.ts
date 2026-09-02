@@ -92,14 +92,14 @@ export function createMemoryRunStore(): MemoryRunStore {
         ? { status: current.status, turnId: null, messageHash: null, remoteCancelPendingAt: null }
         : null;
     },
-    async listUnattributedLiveRuns() {
+    async listSessionClaimants() {
+      return { obligations: [], live: [] };
+    },
+    async listUnownedContentTurns() {
       return [];
     },
     async setRunTurnId() {
       return true;
-    },
-    async listPendingRemoteCancels() {
-      return [];
     },
     async clearRemoteCancelPending() {
       return false;

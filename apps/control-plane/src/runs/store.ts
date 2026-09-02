@@ -12,6 +12,7 @@ import type {
 } from "@invisible-string/shared";
 
 import type { Db } from "../db";
+import { hashTurnMessage } from "./message-hash";
 
 export interface StoredRunEvent {
   seq: number;
@@ -89,6 +90,34 @@ export interface UnattributedLiveRun {
   createdAt: Date;
 }
 
+/**
+ * Everything on a session that can CLAIM a turn, read in ONE statement (one
+ * Postgres snapshot — see {@link RunStore.listSessionClaimants}): the open
+ * obligations in attribution priority, and the live runs still awaiting
+ * their proof. A run is in exactly one list: the marker alone makes it an
+ * obligation (whatever its status); without one it is live iff its
+ * dispatch-attempt marker is set, its status is non-terminal and its
+ * `turn_id` is null.
+ */
+export interface SessionClaimants {
+  obligations: PendingRemoteCancel[];
+  live: UnattributedLiveRun[];
+}
+
+/**
+ * A CONTENT turn already persisted on the session's stream that no run owns
+ * — its `message.received` is on disk under some run of the session, and no
+ * run on the session carries its id as `turn_id` (it was classified FOREIGN
+ * when it opened). `ended` says whether its own boundary (`turn.cancelled` /
+ * `turn.completed` with that id) is persisted too.
+ */
+export interface UnownedContentTurn {
+  turnId: string;
+  /** sha256 of the turn's `message.received` text (runs/message-hash.ts). */
+  messageHash: string;
+  ended: boolean;
+}
+
 export interface RunStore {
   /** Append one normalized eve event; seq is caller-assigned (monotonic). */
   appendEvent(runId: string, seq: number, event: EveStreamEvent): Promise<StoredRunEvent>;
@@ -149,7 +178,10 @@ export interface RunStore {
    */
   setRunTurnId(runId: string, turnId: string): Promise<boolean>;
   /**
-   * The session's OPEN remote-cancel obligations — runs carrying
+   * The session's turn CLAIMANTS in ONE statement — one snapshot, so a run
+   * is in exactly one of the two lists and never in neither:
+   *
+   * `obligations`: the OPEN remote-cancel obligations — runs carrying
    * `remote_cancel_pending_at` (settled `canceled` by a Stop, or `failed` by
    * the tail's wall-clock cap / shutdown), UNRESOLVED ones INCLUDED — in
    * attribution priority: pending (not yet unresolved) before unresolved,
@@ -160,19 +192,37 @@ export interface RunStore {
    * none matches may the turn be the tail's own, a live successor's, or
    * foreign (runs/tailer.ts). A tail started in observation mode for one of
    * these runs handles the whole list the same way.
+   *
+   * `live`: live (queued/running/waiting) runs on the session whose
+   * dispatch-attempt marker is set and whose latest send has no `turn_id`
+   * yet — a successor admitted after an observation tail attached, whose
+   * own tail has not yet taken the stream over. A tail that sees a content
+   * turn no obligation claims looks here: a hash match writes that run's
+   * `turn_id` (eve's proof it moved on — every obligation on the session is
+   * over) and the successor's tail then reads its own turn from the column
+   * instead of waiting for a `turn.started` that was drained under the
+   * observed run.
+   *
+   * ONE read, not two, because a no-tail Stop flips a run from `live` to
+   * `obligations` in one CAS: read as two statements, a Stop committing
+   * between them left the run in NEITHER result (terminal, so not live; the
+   * marker landed after the obligations read), its already-open turn was
+   * classified FOREIGN, and the obligation adopted later with a null turn
+   * id could neither be cancelled qualified nor cleared on its boundary.
    */
-  listPendingRemoteCancels(agentSessionId: string): Promise<PendingRemoteCancel[]>;
+  listSessionClaimants(agentSessionId: string): Promise<SessionClaimants>;
   /**
-   * Live (queued/running/waiting) runs on the session whose dispatch-attempt
-   * marker is set and whose latest send has no `turn_id` yet — a successor
-   * admitted after an observation tail attached, whose own tail has not yet
-   * taken the stream over. An observation tail that sees a content turn no
-   * obligation claims looks here: a hash match writes that run's `turn_id`
-   * (eve's proof it moved on — every obligation on the session is over) and
-   * the successor's tail then reads its own turn from the column instead of
-   * waiting for a `turn.started` that was drained under the observed run.
+   * CONTENT turns already persisted on the session's stream (any run of the
+   * session) that NO run on the session owns — no `turn_id` equals their
+   * id — oldest first, each with whether its own boundary is persisted too.
+   * Read by a tail when it adopts (or loads) an obligation whose turn id is
+   * still null: the obligation's turn may have opened BEFORE the obligation
+   * existed for the reader (a Stop settled without a tail after the turn
+   * was on the wire), been classified foreign, and gone by — attribution is
+   * then retroactive, from disk, so the qualified cancel still goes out (or,
+   * if the boundary is already down, the obligation is met on the spot).
    */
-  listUnattributedLiveRuns(agentSessionId: string): Promise<UnattributedLiveRun[]>;
+  listUnownedContentTurns(agentSessionId: string): Promise<UnownedContentTurn[]>;
   /**
    * Meet a run's remote-cancel obligation: clears `remote_cancel_pending_at`
    * AND `remote_cancel_unresolved_at` (a late confirmation resolves an
@@ -383,7 +433,9 @@ export function createDrizzleRunStore(db: Db): RunStore {
       return updated.length > 0;
     },
 
-    async listPendingRemoteCancels(agentSessionId) {
+    async listSessionClaimants(agentSessionId) {
+      // ONE statement = one snapshot (see the interface doc): a run is in
+      // exactly one of the two lists, never in neither.
       const rows = await db
         .select({
           runId: schema.runs.id,
@@ -397,44 +449,82 @@ export function createDrizzleRunStore(db: Db): RunStore {
         .where(
           and(
             eq(schema.runs.agentSessionId, agentSessionId),
-            // The marker alone defines an obligation: a Stop settles the row
-            // `canceled`, the wall-clock cap / shutdown settle it `failed`
-            // — both owe eve the same confirmation. Unresolved rows stay in
-            // the list (still attributable), ranked last.
-            isNotNull(schema.runs.remoteCancelPendingAt),
+            or(
+              // The marker alone defines an obligation: a Stop settles the
+              // row `canceled`, the wall-clock cap / shutdown settle it
+              // `failed` — both owe eve the same confirmation. Unresolved
+              // rows stay in the list (still attributable), ranked last.
+              isNotNull(schema.runs.remoteCancelPendingAt),
+              and(
+                inArray(schema.runs.status, ["queued", "running", "waiting"]),
+                isNotNull(schema.runs.startedAt),
+                isNull(schema.runs.turnId),
+              ),
+            ),
           ),
         )
         .orderBy(
           sql`${schema.runs.remoteCancelUnresolvedAt} IS NOT NULL`,
           asc(schema.runs.createdAt),
         );
-      return rows.map((row) => ({
-        runId: row.runId,
-        turnId: row.turnId,
-        messageHash: row.messageHash,
-        pendingAt: row.pendingAt ?? new Date(0),
-        unresolvedAt: row.unresolvedAt,
-        createdAt: row.createdAt,
-      }));
+      const obligations: PendingRemoteCancel[] = [];
+      const live: UnattributedLiveRun[] = [];
+      for (const row of rows) {
+        if (row.pendingAt !== null) {
+          obligations.push({
+            runId: row.runId,
+            turnId: row.turnId,
+            messageHash: row.messageHash,
+            pendingAt: row.pendingAt,
+            unresolvedAt: row.unresolvedAt,
+            createdAt: row.createdAt,
+          });
+        } else {
+          live.push({ runId: row.runId, messageHash: row.messageHash, createdAt: row.createdAt });
+        }
+      }
+      return { obligations, live };
     },
 
-    async listUnattributedLiveRuns(agentSessionId) {
-      return db
+    async listUnownedContentTurns(agentSessionId) {
+      const turnId = sql<string | null>`${schema.runEvents.event} -> 'data' ->> 'turnId'`;
+      const rows = await db
         .select({
-          runId: schema.runs.id,
-          messageHash: schema.runs.messageHash,
-          createdAt: schema.runs.createdAt,
+          turnId,
+          // The text comes back only to be hashed here (never persisted or
+          // logged beyond the digest — runs/message-hash.ts).
+          message: sql<string | null>`${schema.runEvents.event} -> 'data' ->> 'message'`,
+          ended: sql<boolean>`EXISTS (
+            SELECT 1 FROM run_events b JOIN runs rb ON rb.id = b.run_id
+            WHERE rb.agent_session_id = ${agentSessionId}
+              AND b.event ->> 'type' IN ('turn.cancelled', 'turn.completed')
+              AND b.event -> 'data' ->> 'turnId' = ${turnId}
+          )`,
         })
-        .from(schema.runs)
+        .from(schema.runEvents)
+        .innerJoin(schema.runs, eq(schema.runEvents.runId, schema.runs.id))
         .where(
           and(
             eq(schema.runs.agentSessionId, agentSessionId),
-            inArray(schema.runs.status, ["queued", "running", "waiting"]),
-            isNotNull(schema.runs.startedAt),
-            isNull(schema.runs.turnId),
+            sql`${schema.runEvents.event} ->> 'type' = 'message.received'`,
+            sql`NOT EXISTS (
+              SELECT 1 FROM runs o
+              WHERE o.agent_session_id = ${agentSessionId}
+                AND o.turn_id = ${turnId}
+            )`,
           ),
         )
-        .orderBy(asc(schema.runs.createdAt));
+        .orderBy(asc(schema.runs.createdAt), asc(schema.runEvents.seq));
+      const turns: UnownedContentTurn[] = [];
+      for (const row of rows) {
+        if (typeof row.turnId !== "string" || typeof row.message !== "string") continue;
+        turns.push({
+          turnId: row.turnId,
+          messageHash: hashTurnMessage(row.message),
+          ended: row.ended === true,
+        });
+      }
+      return turns;
     },
 
     async clearRemoteCancelPending(runId) {

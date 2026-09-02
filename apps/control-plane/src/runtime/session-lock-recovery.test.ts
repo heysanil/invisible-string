@@ -284,6 +284,8 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
         },
         observe: () => null,
         hasSessionTail: () => false,
+        isSessionStreamHeld: () => false,
+        refreshSessionObligations: async () => false,
         get: () => undefined,
         cancelRun: async () => false,
         cancelRunGuarded: async () => null,

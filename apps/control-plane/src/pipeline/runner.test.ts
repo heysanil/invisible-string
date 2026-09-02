@@ -103,7 +103,8 @@ interface Harness {
   sleeps: number[];
   deliverCalls: DeliverInput[];
   start(input: Partial<StartPipelineRunInput> & { config: WorkflowConfig }): Promise<
-    { started: true; run: RunRow } | { started: false; reason: "overlap_skipped" }
+    | { started: true; run: RunRow }
+    | { started: false; reason: "overlap_skipped" | "lock_pool_exhausted" }
   >;
 }
 
@@ -160,6 +161,9 @@ function harness(opts: {
           if (live) return { skippedOverlap: true };
         }
         const run = makeRunRow({
+          // The runner already holds the lock on this PRE-MINTED id
+          // (lock-before-claim) — a creator must insert under it.
+          id: input.runId,
           organizationId: input.organizationId,
           workflowId: input.workflowId,
           triggerEvent: input.triggerEvent as unknown as Record<string, unknown>,

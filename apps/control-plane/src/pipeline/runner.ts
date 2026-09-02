@@ -22,6 +22,23 @@
  * boot recovery adopts only runs whose lock is free (schedule-ticker
  * pattern; no new single-instance dependency).
  *
+ * LOCK POOL DISCIPLINE (the N3 deadlock). A session-level lock pins one
+ * physical connection for the driver's whole lifetime (up to
+ * `PIPELINE_MAX_WALL_CLOCK_MS`), so it NEVER rides the root pool: ten long
+ * concurrent pipelines used to reserve all ten default root connections and
+ * every driver then blocked on its own ledger/status query — the whole
+ * control plane wedged. The lock reserves from the DEDICATED pipeline lock
+ * pool (`Db.$pipelineLockClient`, `DB_PIPELINE_LOCK_POOL_SIZE`, db.ts) —
+ * separate from the root pool AND from the session-dispatch lock pool, so a
+ * pipeline burst can never starve a chat Stop's lock chase. The reserve wait
+ * is BOUNDED (`PIPELINE_LOCK_RESERVE_TIMEOUT_MS`), and exhaustion is a
+ * typed, transient, FAST refusal: the lock is taken BEFORE the run row is
+ * created (lock-before-claim on a PRE-MINTED run id — the session-lock
+ * doctrine), so `start` answers `{started:false, reason:"lock_pool_exhausted"}`
+ * with nothing created (no row, no cap slot, no delivery obligation), and
+ * boot adoption of an orphan simply waits for the next recovery sweep. The
+ * runner refuses to fall back onto `$client`.
+ *
  * CRASH RECOVERY is replay: a rebooted driver walks the config from the top
  * and every claim that returns an existing row is ADOPTED — terminal outputs
  * rebuild the scope without re-execution, and only the frontier truly runs.
@@ -34,6 +51,8 @@
  * a flag + aborts the in-flight attempt's signal; remaining steps are left
  * unwritten and the run lands `canceled` — a user decision, never an error.
  */
+import { randomUUID } from "node:crypto";
+
 import { and, count, eq, inArray } from "drizzle-orm";
 import type postgres from "postgres";
 import { schema } from "@invisible-string/db";
@@ -57,6 +76,8 @@ import type { RunEventBus } from "../runs/bus";
 import type { DeliveryService } from "../runs/delivery";
 import type { RunStore } from "../runs/store";
 import { ACTIVE_RUN_STATUSES, assertUnderRunCap, lockWorkspaceRunCap } from "../runtime/caps";
+import type { MetricsRegistry } from "../runtime/metrics";
+import { reserveBounded } from "../runtime/session-lock";
 import {
   createPipelineEventAppender,
   publishRunStatus,
@@ -202,24 +223,73 @@ export interface PipelineRunLock {
   release(): Promise<void>;
 }
 
+/**
+ * The pipeline lock pool could not hand out a connection within the bound —
+ * every connection is pinned by a live driver. TRANSIENT (drivers release at
+ * settlement) and thrown rather than folded into `null`, because null means
+ * "another driver holds THIS run" (contention, permanent for the caller) and
+ * the two have opposite recoveries: a held lock is left alone, an exhausted
+ * pool is retried later (the next dispatch, the next recovery sweep).
+ */
+export class PipelineLockPoolExhaustedError extends Error {
+  override readonly name = "PipelineLockPoolExhaustedError";
+  readonly code = "lock_pool_exhausted";
+  constructor(readonly runId: string, readonly reserveTimeoutMs: number) {
+    super(
+      `pipeline lock pool exhausted: no connection within ${reserveTimeoutMs}ms for run ${runId}`,
+    );
+  }
+}
+
+export function isPipelineLockPoolExhaustedError(
+  value: unknown,
+): value is PipelineLockPoolExhaustedError {
+  return value instanceof PipelineLockPoolExhaustedError;
+}
+
 export interface PipelineLockFactory {
-  /** Null when another driver (this or another instance) holds the run. */
+  /**
+   * Null when another driver (this or another instance) holds the run.
+   * Throws {@link PipelineLockPoolExhaustedError} when the lock pool cannot
+   * hand out a connection within its bound (production factory only).
+   */
   tryAcquire(runId: string): Promise<PipelineRunLock | null>;
 }
+
+/**
+ * Bound on ONE `reserve()` against the pipeline lock pool. Exhaustion is
+ * transient — drivers release at settlement — so a caller refuses fast
+ * (`lock_pool_exhausted`) rather than queueing behind minutes-long holds.
+ */
+export const PIPELINE_LOCK_RESERVE_TIMEOUT_MS = 2_000;
 
 /**
  * `pg_try_advisory_lock(hashtext('pipeline:'||run_id))` on a RESERVED
  * postgres-js connection: session-level locks live on one physical
  * connection, and the pool rotates connections per query — so the lock (and
  * its unlock) must ride a connection reserved for the driver's lifetime.
+ * `sql` MUST be the dedicated pipeline lock pool (`Db.$pipelineLockClient`)
+ * — never the root pool (module doc, lock pool discipline) — and the
+ * reservation is bounded: an exhausted pool throws
+ * {@link PipelineLockPoolExhaustedError} instead of queueing.
  */
 export function createPgPipelineLockFactory(
   sql: postgres.Sql,
+  options: { reserveTimeoutMs?: number; logger?: Logger } = {},
 ): PipelineLockFactory {
+  const reserveTimeoutMs =
+    options.reserveTimeoutMs ?? PIPELINE_LOCK_RESERVE_TIMEOUT_MS;
   return {
     async tryAcquire(runId) {
       const key = `pipeline:${runId}`;
-      const reserved = await sql.reserve();
+      const reserved = await reserveBounded(sql, reserveTimeoutMs);
+      if (!reserved) {
+        options.logger?.warn("pipeline.lock_pool_exhausted", {
+          runId,
+          fields: { reserveTimeoutMs },
+        });
+        throw new PipelineLockPoolExhaustedError(runId, reserveTimeoutMs);
+      }
       let locked = false;
       try {
         const rows =
@@ -248,6 +318,13 @@ export function createPgPipelineLockFactory(
 // ── Run creation (overlap + cap, dispatchTriggerRun's ordering) ─────────────
 
 export interface CreatePipelineRunInput {
+  /**
+   * The PRE-MINTED run id the creator MUST insert under — the runner already
+   * holds the run's advisory lock on it (lock-before-claim), so a creator
+   * that minted its own id would leave the driver locking a key nobody
+   * else's lock names.
+   */
+  runId: string;
   organizationId: string;
   workflowId: string;
   overlap: WorkflowConfig["overlap"];
@@ -296,6 +373,7 @@ export function createDrizzlePipelineRunCreator(
         const inserted = await tx
           .insert(schema.runs)
           .values({
+            id: input.runId,
             agentSessionId: null,
             organizationId: input.organizationId,
             workflowId: input.workflowId,
@@ -337,9 +415,18 @@ export interface StartPipelineRunInput {
   origin: SessionOrigin;
 }
 
+/**
+ * Why `start` refused to create a run. Both are policy/capacity refusals
+ * with NOTHING created: `overlap_skipped` (a run of this workflow is still
+ * live — `overlap: "skip"`) and `lock_pool_exhausted` (every pipeline lock
+ * connection is pinned by a live driver — transient; retry later, or raise
+ * `DB_PIPELINE_LOCK_POOL_SIZE`).
+ */
+export type PipelineStartSkipReason = "overlap_skipped" | "lock_pool_exhausted";
+
 export type StartPipelineRunResult =
   | { started: true; run: RunRow }
-  | { started: false; reason: "overlap_skipped" };
+  | { started: false; reason: PipelineStartSkipReason };
 
 export interface PipelineRunnerDeps {
   /**
@@ -360,6 +447,8 @@ export interface PipelineRunnerDeps {
   workspaceRunCap: number;
   /** Settles `onComplete.slackReply` obligations; optional in fixtures. */
   delivery?: DeliveryService;
+  /** Fleet metrics — the dispatch-outcome counters; optional in fixtures. */
+  metrics?: MetricsRegistry;
   // Seams (production defaults derive from `db`):
   runCreator?: PipelineRunCreator;
   locks?: PipelineLockFactory;
@@ -498,9 +587,21 @@ export class PipelineRunner {
             workspaceRunCap: deps.workspaceRunCap,
           })
         : missing("runCreator"));
+    // The per-run lock rides the DEDICATED pipeline lock pool — deliberately
+    // NO fallback onto `db.$client` (module doc: locks on the root pool are
+    // the N3 deadlock). A `Db` built without one must inject `locks`.
+    const pipelineLockClient = db?.$pipelineLockClient;
     this.locks =
       deps.locks ??
-      (db ? createPgPipelineLockFactory(db.$client) : missing("locks"));
+      (pipelineLockClient
+        ? createPgPipelineLockFactory(pipelineLockClient, { logger: this.logger })
+        : db
+          ? (() => {
+              throw new Error(
+                "PipelineRunner needs a `db` with a pipeline lock pool (createDb attaches `$pipelineLockClient`) or an injected `locks` — it never locks on the root pool",
+              );
+            })()
+          : missing("locks"));
     this.loadConfig =
       deps.loadWorkflowConfig ??
       (db
@@ -532,33 +633,64 @@ export class PipelineRunner {
     const config = input.workflow.config;
     const deliveryPending =
       input.origin === "slack" && Boolean(config.onComplete?.slackReply);
-    const created = await this.runCreator.create({
-      organizationId: input.organizationId,
-      workflowId: input.workflow.id,
-      overlap: config.overlap,
-      triggerEvent: input.triggerEvent,
-      deliveryPending,
-    });
+    // LOCK-BEFORE-CLAIM (module doc): the run id is minted here, so nobody
+    // else can name its lock before the row commits — the acquire is
+    // uncontended by construction, and only lock-POOL pressure can refuse
+    // it. Taking it first means a refusal creates NOTHING: no row, no cap
+    // slot, no delivery obligation — the same "typed skip with nothing to
+    // undo" shape as `overlap_skipped`.
+    const runId = randomUUID();
+    let lock: PipelineRunLock | null;
+    try {
+      lock = await this.locks.tryAcquire(runId);
+    } catch (error) {
+      if (!isPipelineLockPoolExhaustedError(error)) throw error;
+      lock = null;
+    }
+    if (!lock) {
+      this.logger.warn("pipeline.lock_pool_exhausted_skipped", {
+        workspaceId: input.organizationId,
+        workflowId: input.workflow.id,
+        msg: "pipeline lock pool exhausted: every connection is pinned by a live run — the dispatch was refused (transient; nothing was created)",
+        fields: { origin: input.origin },
+      });
+      this.deps.metrics?.recordPipelineDispatch("lock_pool_exhausted");
+      return { started: false, reason: "lock_pool_exhausted" };
+    }
+    let created: CreatePipelineRunResult;
+    try {
+      created = await this.runCreator.create({
+        runId,
+        organizationId: input.organizationId,
+        workflowId: input.workflow.id,
+        overlap: config.overlap,
+        triggerEvent: input.triggerEvent,
+        deliveryPending,
+      });
+    } catch (error) {
+      await lock.release();
+      throw error;
+    }
     if ("skippedOverlap" in created) {
+      await lock.release();
       this.logger.info("pipeline.overlap_skipped", {
         workspaceId: input.organizationId,
         workflowId: input.workflow.id,
         msg: "overlap policy 'skip': a run of this workflow is still live",
       });
+      this.deps.metrics?.recordPipelineDispatch("overlap_skipped");
       return { started: false, reason: "overlap_skipped" };
     }
     const run = created.run;
-    const lock = await this.locks.tryAcquire(run.id);
-    if (!lock) {
-      // A fresh run id nobody else knows — an unacquirable lock is infra
-      // trouble, not contention. Fail visibly rather than execute unlocked.
-      const error = "pipeline advisory lock unavailable at start";
-      await this.failOutright(run.id, error, "lock_unavailable");
-      return {
-        started: true,
-        run: { ...run, status: "failed", error },
-      };
+    if (run.id !== runId) {
+      // A creator that ignored the pre-minted id would leave the driver
+      // locking a key nobody else's lock names — fail loudly, never drive.
+      await lock.release();
+      const error = "pipeline run creator ignored the pre-minted run id";
+      await this.failOutright(run.id, error, "invalid_run");
+      return { started: true, run: { ...run, status: "failed", error } };
     }
+    this.deps.metrics?.recordPipelineDispatch("started");
     this.launch(run, config, extractTriggerData(run.triggerEvent), lock);
     return { started: true, run };
   }
@@ -566,12 +698,25 @@ export class PipelineRunner {
   /**
    * Boot-recovery adoption of an orphaned pipeline run (queued/running/
    * waiting): acquire its advisory lock ("locked" when another driver holds
-   * it), reload the workflow's published config, and replay the ledger.
-   * A run whose workflow/config is gone fails outright ("failed").
+   * it — or when the pipeline lock pool is exhausted, which leaves the run
+   * un-adopted for the next recovery sweep rather than queueing on a pool
+   * pinned by live drivers), reload the workflow's published config, and
+   * replay the ledger. A run whose workflow/config is gone fails outright
+   * ("failed").
    */
   async resume(run: RunRow): Promise<"resumed" | "locked" | "failed"> {
     if (this.internalHandles.has(run.id)) return "locked";
-    const lock = await this.locks.tryAcquire(run.id);
+    let lock: PipelineRunLock | null;
+    try {
+      lock = await this.locks.tryAcquire(run.id);
+    } catch (error) {
+      if (!isPipelineLockPoolExhaustedError(error)) throw error;
+      this.logger.warn("pipeline.recovery_lock_pool_exhausted", {
+        runId: run.id,
+        msg: "pipeline lock pool exhausted: the orphaned run stays un-adopted until the next recovery sweep",
+      });
+      return "locked";
+    }
     if (!lock) return "locked";
     try {
       if (!run.workflowId || !run.organizationId) {

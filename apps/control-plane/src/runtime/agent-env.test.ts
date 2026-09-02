@@ -34,6 +34,7 @@ const RUNTIME: RuntimeConfig = {
   maxAgentsPerWorker: 20,
   workerSweepIntervalMs: 30_000,
   scheduleTickMs: 30_000,
+  remoteCancelSweepMs: 60_000,
   npmCacheDir: "/tmp/npm-cache",
   buildRoot: "/var/lib/agents",
   sseHeartbeatMs: 15_000,

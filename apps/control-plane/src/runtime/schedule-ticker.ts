@@ -38,7 +38,11 @@ import {
   resolveEnabledPipeline,
 } from "./dispatch";
 import { isRuntimeApiError } from "./errors";
-import { requirePipelines, type RuntimeDeps } from "./routes";
+import {
+  pipelineLockPoolExhausted,
+  requirePipelines,
+  type RuntimeDeps,
+} from "./routes";
 
 /** Default tick cadence; overridden by SCHEDULE_TICK_MS (see .env.example). */
 export const DEFAULT_SCHEDULE_TICK_MS = 30_000;
@@ -183,6 +187,11 @@ export function createScheduleTicker(
         origin: "schedule",
       });
       if (!result.started) {
+        // The pipeline lock pool is pinned by live runs (transient capacity,
+        // nothing created): the claim already advanced the cursor, so the
+        // window is lost like any other dispatch failure — surface it as one
+        // (the tick counts it `failed` at warn level), not as policy.
+        if (result.reason === "lock_pool_exhausted") throw pipelineLockPoolExhausted();
         // `overlap: "skip"` refused the window (a slow run is still live) —
         // the claim already advanced the cursor, so this window is simply
         // dropped, which is exactly the policy's cursor-protecting intent.

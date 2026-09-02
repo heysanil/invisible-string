@@ -21,6 +21,7 @@ import { loadConfig, type Config } from "./config";
 import {
   createDb,
   lockPoolSizeFromEnv,
+  pipelineLockPoolSizeFromEnv,
   poolSizeFromEnv,
   type DbHandle,
 } from "./db";
@@ -93,7 +94,11 @@ import {
   tryLoadRuntimeConfig,
   type RuntimeConfig,
 } from "./runtime/config";
-import { reconcileInterruptedRuns } from "./runtime/reconcile";
+import {
+  createRemoteCancelSweeper,
+  reconcileInterruptedRuns,
+  type RemoteCancelSweeper,
+} from "./runtime/reconcile";
 import { publishAgentByName, runtimePlugin, type RuntimeDeps } from "./runtime/routes";
 import { createScheduleTicker, type ScheduleTicker } from "./runtime/schedule-ticker";
 import { createWorkerSweeper } from "./runtime/worker-sweeper";
@@ -429,13 +434,17 @@ export function createAppStack(
 ): AppStack {
   const config = loadConfig(env);
   const logger = createLogger({ env });
-  // Two pools (db.ts): the root pool for every query, and a dedicated lock
-  // pool for the per-session dispatch critical section — a holder pins one
-  // lock connection for its whole eve round-trip, and on a shared pool
-  // `max` such holders deadlock the control plane waiting for a `max+1`th.
+  // Three pools (db.ts): the root pool for every query, plus one dedicated
+  // lock pool per long-held advisory-lock family — the per-session dispatch
+  // critical section and the per-run pipeline driver lock. A holder pins
+  // one lock connection for its whole lifetime (an eve round-trip; a whole
+  // pipeline run), and on a shared pool `max` such holders deadlock the
+  // control plane waiting for a `max+1`th. The two lock families are kept
+  // apart from each other too, so a pipeline burst never starves a Stop.
   const dbHandle = createDb(config.databaseUrl, {
     max: poolSizeFromEnv(env),
     lockMax: lockPoolSizeFromEnv(env),
+    pipelineLockMax: pipelineLockPoolSizeFromEnv(env),
   });
   // The seeded-workspace publish kick needs the runtime graph, which is built
   // AFTER auth (workspace deps wrap the auth instance) — late-bind via a slot.
@@ -599,6 +608,7 @@ export function createAppStack(
       executorDeps: pipelineExecutorDeps,
       config: loadPipelineRunnerConfig(env),
       workspaceRunCap: runtimeDeps.runtime.maxConcurrentRunsPerWorkspace,
+      metrics: runtimeDeps.metrics,
       ...(runtimeDeps.delivery ? { delivery: runtimeDeps.delivery } : {}),
     });
     runtimeDeps.pipelines = pipelineRunner;
@@ -765,6 +775,7 @@ if (import.meta.main) {
   });
 
   let scheduleTicker: ScheduleTicker | null = null;
+  let remoteCancelSweeper: RemoteCancelSweeper | null = null;
   let registrySync: RegistrySync | null = null;
   if (stack.runtime) {
     // Adopt or fail runs orphaned in queued/running by a previous crash —
@@ -784,13 +795,14 @@ if (import.meta.main) {
           sessionsClosed > 0 ||
           remoteCancels.settled > 0 ||
           remoteCancels.deferred > 0 ||
+          remoteCancels.retained > 0 ||
           pipelines.resumed > 0 ||
           pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.deferred} deferred), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.deferred} deferred, ${remoteCancels.retained} retained), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
             fields: { resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries },
           });
         }
@@ -815,6 +827,15 @@ if (import.meta.main) {
       tickMs: stack.runtime.runtime.scheduleTickMs,
     });
     scheduleTicker.start();
+    // Remote-cancel sweeper: re-runs boot reconciliation's pending-remote-
+    // cancel sweep every REMOTE_CANCEL_SWEEP_MS so a Stop whose eve leg was
+    // refused (saturated lock pool, unreachable worker, transport failure)
+    // is finished by a HEALTHY process, not the next restart. Replica-safe:
+    // advisory-try-locked scan, per-session dispatch lock per candidate.
+    remoteCancelSweeper = createRemoteCancelSweeper(stack.runtime, {
+      intervalMs: stack.runtime.runtime.remoteCancelSweepMs,
+    });
+    remoteCancelSweeper.start();
     // Registry→Meilisearch sync ETL: mirrors the official MCP registry into
     // the disposable search index (immediate full/incremental run, then
     // REGISTRY_SYNC_INTERVAL_MS cadence). Only when the meili client exists —
@@ -845,7 +866,11 @@ if (import.meta.main) {
       fields: { signal },
     });
     stack.app.server?.stop();
-    void Promise.all([scheduleTicker?.stop(), registrySync?.stop()])
+    void Promise.all([
+      scheduleTicker?.stop(),
+      remoteCancelSweeper?.stop(),
+      registrySync?.stop(),
+    ])
       .then(() => stack.close())
       .catch((error) => {
         logger.error("control-plane.shutdown_failed", { err: error });

@@ -9,7 +9,11 @@
  * (`pg_advisory_lock('pipeline:'||run_id)`): only runs whose lock is
  * acquirable are adopted, so a second control-plane instance (or this one's
  * own live drivers) are never double-driven — the schedule-ticker pattern,
- * no new single-instance dependency.
+ * no new single-instance dependency. The lock reserves from the DEDICATED
+ * pipeline lock pool (db.ts `$pipelineLockClient`, never the root pool) with
+ * a bounded wait: an exhausted pool leaves the orphan un-adopted (counted
+ * `locked`, logged `pipeline.recovery_lock_pool_exhausted`) for the next
+ * sweep rather than queueing behind live drivers.
  *
  * The actual resume semantics live in the driver's claim-adopt replay
  * (runner.ts): scope rebuilds from the `run_steps` ledger's terminal
@@ -30,7 +34,10 @@ import type { PipelineRunner, RunRow } from "./runner";
 export type PipelineRecoveryOutcome = {
   /** Adopted and re-driven from the ledger frontier. */
   resumed: number;
-  /** Advisory lock unavailable — a live driver already owns the run. */
+  /**
+   * Advisory lock unavailable — a live driver already owns the run, or the
+   * pipeline lock pool was exhausted (transient; re-swept next time).
+   */
   locked: number;
   /** Unresumable (workflow/config gone) — failed with the slot freed. */
   failed: number;

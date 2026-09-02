@@ -307,6 +307,30 @@ advisory lock is free and REPLAYS the config against the ledger — terminal
 interrupted agent step re-attaches to its child by `child_run_id` instead of
 double-dispatching.
 
+**The per-run driver lock rides its OWN pool.** A session-level advisory lock
+pins one physical connection for the driver's whole lifetime (up to
+`PIPELINE_MAX_WALL_CLOCK_MS`), so it never reserves from the root pool — ten
+long concurrent pipelines used to pin all ten default root connections and
+every driver then blocked on its own ledger/status query, wedging the whole
+control plane. The lock reserves from the dedicated PIPELINE LOCK pool
+(`Db.$pipelineLockClient`, `DB_PIPELINE_LOCK_POOL_SIZE`, default 32 —
+`apps/control-plane/src/db.ts`), separate from the root pool AND from the
+session-dispatch lock pool (a pipeline burst must never starve a chat Stop's
+lock chase), with a BOUNDED reserve (`PIPELINE_LOCK_RESERVE_TIMEOUT_MS`).
+The pool therefore bounds concurrent pipeline runs per control plane, and
+exhaustion is a typed, transient, FAST refusal: `startPipelineRun` takes the
+lock BEFORE the run row exists (lock-before-claim on a pre-minted run id —
+the session-lock doctrine) and answers `{started:false,
+reason:"lock_pool_exhausted"}` with NOTHING created (no row, no cap slot, no
+delivery obligation). Webhook/form ingress and the manual "Run now" surface
+it as 503 `pipeline_lock_pool_exhausted`; a Slack message is dropped with a
+warning and a `failed` trigger count; a schedule window counts as a failed
+dispatch (its cursor already advanced); every refusal lands in
+`is_pipeline_dispatches_total{outcome="lock_pool_exhausted"}`. Boot adoption
+of an orphan on an exhausted pool defers to the next recovery sweep
+(counted `locked`, logged `pipeline.recovery_lock_pool_exhausted`) — never a
+queue, never a failed run. The runner refuses to fall back onto `$client`.
+
 **One run per eve session at a time (hole closed):** `waiting` (parked HITL)
 counts as busy alongside queued/running — a new message into a parked session
 is 409 `session_busy` ("answer the pending approval first"), and
@@ -361,7 +385,13 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   that could never come. `acquire()` is always called OUTSIDE any root-pool
   transaction, the reserve wait is bounded
   (`SESSION_LOCK_RESERVE_TIMEOUT_MS`), and a saturated lock pool reads as
-  contention — the transient `session_busy` — never as a queue.
+  contention — the transient `session_busy` — never as a queue. A waiter
+  WITH a wait budget (the deferred remote-cancel chase, bounded at minutes)
+  does not give up on one reserve timeout: it backs off (up to 1 s) and
+  reserves again until its deadline, so a chase genuinely spans its bound.
+  The pipeline runner's per-run lock is the OTHER long-held family and has
+  its own, separate pool (`DB_PIPELINE_LOCK_POOL_SIZE`, above) — the two are
+  kept apart so neither burst can starve the other.
 - **Lock-before-claim, CAS everywhere.** A NEW session's id is pre-minted
   app-side so its lock is taken BEFORE the claim transaction: a lock timeout
   creates nothing (the old post-claim acquisition failed the run and closed
@@ -390,13 +420,31 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   cannot reopen under an airborne unqualified cancel that would kill the
   successor's turn. If the lock cannot be had, only a turn-qualified cancel
   is issued (scoped, so safe without the lock) and an unqualified one is SKIPPED and
-  recorded. Every no-tail Stop sets `runs.remote_cancel_pending_at` in the
-  SAME CAS that settles the row `canceled`; `cancelEveTurnGuarded` clears it
-  once its under-lock attempt completes (issued, superseded because a newer
-  run owns the session — eve serializes turns, so the settled turn is over
-  — or nothing to chase), and boot reconciliation (sweep 2b) finishes any
-  marker a crash left behind. The in-process deferral is the fast path, not
-  the guarantee.
+  recorded — and so is a cancel the tail AWAITED that FAILED in transport
+  (a refused connection, a dead or absent worker, an HTTP error): `failed`
+  sets the obligation exactly like `skipped`. Every no-tail Stop sets
+  `runs.remote_cancel_pending_at` in the SAME CAS that settles the row
+  `canceled`; `cancelEveTurnGuarded` clears it ONLY on a CONFIRMED outcome
+  under the lock — eve acknowledged the cancel (202, or 200
+  `no_active_turn`, eve's one dead-session rendering), eve answered 409
+  `session_not_active` (provably terminal for that id, so nothing can be
+  running), a newer run provably owns the session (superseded — eve
+  serializes turns, so the settled turn is over), or there is nothing to
+  chase (no eve session). A transport/HTTP failure before the cancel
+  reached eve RETAINS the marker (the pre-fix best-effort swallow cleared it
+  and recorded a cancel that never left the process as done, leaving the
+  accepted turn running with nobody owing it). Retained and deferred
+  obligations are finished by three actors, all idempotent under the
+  session lock (the marker is re-read under the lock before any cancel, so a
+  met obligation is never cancelled twice): the in-process deferred chase
+  (the fast path, bounded at `SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS` and
+  retried with backoff across a saturated lock pool), the PERIODIC
+  remote-cancel sweep (`createRemoteCancelSweeper`, `REMOTE_CANCEL_SWEEP_MS`,
+  default 60 s — reconciliation's sweep 2b re-run by a healthy process with
+  `defer: false`, so a held lock or exhausted pool is simply retried next
+  tick and no replica fans out background chases; its candidate scan is
+  advisory-try-locked), and boot reconciliation (sweep 2b with the deferral
+  on). A Stop is therefore never stranded until a restart.
 
 **Eveless create failed after arming (at-most-once residual):** when the eve
 call for a session with NO persisted eve id fails AFTER the dispatch-attempt
@@ -671,7 +719,12 @@ Settings → Models says so on the panel. Design:
 `worker-token`), `LOG_LEVEL` (debug|info|warn|error, default info),
 `TRIGGER_RATE_LIMIT_PER_TOKEN_PER_MIN` (default 60),
 `TRIGGER_RATE_LIMIT_PER_IP_PER_MIN` (default 120), `SCHEDULE_TICK_MS`
-(default 30000 — the schedule ticker's scan cadence), the pipeline runner's
+(default 30000 — the schedule ticker's scan cadence), `REMOTE_CANCEL_SWEEP_MS`
+(default 60000 — the periodic pending-remote-cancel sweep's cadence), the
+product-DB pools `DB_POOL_SIZE` (default 10), `DB_LOCK_POOL_SIZE` (default 8
+— the session-dispatch lock pool) and `DB_PIPELINE_LOCK_POOL_SIZE` (default
+32 — the per-run pipeline driver lock pool, which bounds concurrent pipeline
+runs per control plane), the pipeline runner's
 tuning knobs `PIPELINE_MAX_WALL_CLOCK_MS` (default 1800000 = 30 min per
 run), `PIPELINE_MAX_STEPS_PER_RUN` (default 200 executed step instances),
 `PIPELINE_MAX_STEP_OUTPUT_BYTES` (default 262144) and `PIPELINE_CHILD_POLL_MS`
@@ -820,10 +873,11 @@ in-flight proxied requests, stops its agents, then deregisters.
   Slack event dedup, and OAuth nonce single-use are all in-process. A second
   replica would double-tail runs (the (run_id, seq) PK then crash-loops one
   tail), double-sweep failovers, and split SSE subscribers from their run's
-  tail. (The schedule ticker and the pipeline runner's run adoption ARE
-  multi-instance-safe in isolation — per-trigger and per-run advisory locks —
-  but nothing else is.) HA needs leader election / shared state first — do
-  not scale this process horizontally.
+  tail. (The schedule ticker, the pipeline runner's run adoption and the
+  remote-cancel sweeper ARE multi-instance-safe in isolation — per-trigger,
+  per-run and per-session advisory locks — but nothing else is.) HA needs
+  leader election / shared state first — do not scale this process
+  horizontally.
 - **`/internal/*` must not be internet-reachable.** The worker-plane surface
   (register/heartbeat/deregister, `/internal/metrics`) and the agent-facing
   token broker (`/internal/connections/token`, platform-JWT-authed — see its

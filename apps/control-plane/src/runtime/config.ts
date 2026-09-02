@@ -92,6 +92,15 @@ export interface RuntimeConfig {
    * control plane scans for due cron triggers. Tests shrink it.
    */
   scheduleTickMs: number;
+  /**
+   * Remote-cancel sweep cadence (REMOTE_CANCEL_SWEEP_MS, default 60 s — keep
+   * in sync with runtime/reconcile.ts DEFAULT_REMOTE_CANCEL_SWEEP_MS): how
+   * often a HEALTHY process re-runs boot reconciliation's sweep 2b over
+   * canceled runs still carrying `remote_cancel_pending_at`, so a Stop whose
+   * remote leg was refused (lock pool saturated, transport failure) is
+   * finished without a restart. Tests shrink it or call the tick directly.
+   */
+  remoteCancelSweepMs: number;
   /** Shared npm cache dir for agent-project installs (NPM_CACHE_DIR). */
   npmCacheDir: string;
   /**
@@ -241,6 +250,12 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     30_000,
     problems,
   );
+  const remoteCancelSweepMs = parsePositiveInt(
+    env.REMOTE_CANCEL_SWEEP_MS,
+    "REMOTE_CANCEL_SWEEP_MS",
+    60_000,
+    problems,
+  );
   const sseHeartbeatMs = parsePositiveInt(
     env.SSE_HEARTBEAT_MS,
     "SSE_HEARTBEAT_MS",
@@ -297,6 +312,7 @@ export function loadRuntimeConfig(env: Env = process.env): RuntimeConfig {
     maxAgentsPerWorker,
     workerSweepIntervalMs,
     scheduleTickMs,
+    remoteCancelSweepMs,
     npmCacheDir:
       env.NPM_CACHE_DIR?.trim() || join(tmpdir(), "invisible-string-npm-cache"),
     buildRoot: env.AGENT_BUILD_ROOT?.trim() || "/var/lib/agents",

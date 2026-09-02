@@ -114,17 +114,25 @@ export const SESSION_LOCK_FRESH_SESSION_WAIT_MS = 2_000;
  * outlast the longest lock hold: ensure-agent (2 × 60 s cold boot) + the eve
  * call (60 s) + settlement. The obligation is ALSO durable
  * (`runs.remote_cancel_pending_at`), so a crash mid-deferral is finished by
- * boot reconciliation — the background chase is the fast path, not the
- * guarantee.
+ * boot reconciliation and the periodic remote-cancel sweep (reconcile.ts
+ * `createRemoteCancelSweeper`, `REMOTE_CANCEL_SWEEP_MS`) — the background
+ * chase is the fast path, not the guarantee. The wait GENUINELY spans this
+ * bound: a saturated lock pool (N2) is retried with backoff until the
+ * deadline, not abandoned after one reserve timeout.
  */
 export const SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS = 5 * 60 * 1000;
 
 /**
  * Bound on ONE `reserve()` against the lock pool. Exhaustion (every lock
  * connection pinned by a holder) is transient — holders release at
- * settlement — so a waiter answers `session_busy` rather than queueing.
+ * settlement — so a waiter with no wait budget answers `session_busy`
+ * rather than queueing; a waiter WITH a budget (the deferred chase) backs
+ * off and reserves again until its deadline.
  */
 export const SESSION_LOCK_RESERVE_TIMEOUT_MS = 2_000;
+
+/** Longest pause between two reserve attempts on an exhausted lock pool. */
+export const SESSION_LOCK_EXHAUSTED_BACKOFF_MAX_MS = 1_000;
 
 const DEFAULT_POLL_MS = 25;
 
@@ -137,9 +145,12 @@ type Reserved = Awaited<ReturnType<postgres.Sql["reserve"]>>;
 /**
  * `sql.reserve()` bounded by `timeoutMs`. postgres-js queues reservations
  * indefinitely when the pool is exhausted; here a late reservation is
- * released the moment it arrives and the caller sees null instead.
+ * released the moment it arrives and the caller sees null instead. Shared
+ * with the pipeline runner's per-run lock factory (pipeline/runner.ts) —
+ * every long-held advisory lock in the control plane reserves through this
+ * bound, so no pool wait is ever open-ended.
  */
-async function reserveBounded(
+export async function reserveBounded(
   sql: postgres.Sql,
   timeoutMs: number,
 ): Promise<Reserved | null> {
@@ -184,14 +195,33 @@ export function createPgSessionDispatchLocks(
       // connection for the minutes a lock hold can last — only the WINNING
       // attempt keeps its reservation, for the lock's lifetime.
       let reserved: Reserved | null = null;
+      let exhaustedBackoffMs = pollMs;
       for (;;) {
         const attempt = await reserveBounded(lockSql, reserveTimeoutMs);
         if (!attempt) {
-          logger?.warn("session.dispatch_lock_pool_exhausted", {
+          // POOL EXHAUSTED (N2): every lock connection is pinned by a holder.
+          // A waiter with no budget left reads it as contention; a waiter
+          // with budget — the deferred remote-cancel chase, bounded at
+          // minutes — backs off and reserves again, so the chase genuinely
+          // spans its bound instead of giving up after one reserve timeout
+          // and stranding the obligation until the sweep or a restart.
+          if (Date.now() >= deadline) {
+            logger?.warn("session.dispatch_lock_pool_exhausted", {
+              sessionId: agentSessionId,
+              fields: { reserveTimeoutMs, waitMs },
+            });
+            return null;
+          }
+          logger?.debug("session.dispatch_lock_pool_exhausted_retry", {
             sessionId: agentSessionId,
-            fields: { reserveTimeoutMs },
+            fields: { backoffMs: exhaustedBackoffMs },
           });
-          return null;
+          await Bun.sleep(exhaustedBackoffMs);
+          exhaustedBackoffMs = Math.min(
+            exhaustedBackoffMs * 2,
+            SESSION_LOCK_EXHAUSTED_BACKOFF_MAX_MS,
+          );
+          continue;
         }
         let locked = false;
         try {

@@ -64,8 +64,22 @@ export interface ScheduleCounts {
   failed: number;
 }
 
+/**
+ * Pipeline dispatch outcomes (pipeline/runner.ts `start`): runs `started`,
+ * and the two typed refusals that create nothing — `overlapSkipped`
+ * (`overlap: "skip"`, a run of the workflow is still live) and
+ * `lockPoolExhausted` (every `DB_PIPELINE_LOCK_POOL_SIZE` connection is
+ * pinned by a live driver — transient capacity, the N3 signal to watch).
+ */
+export interface PipelineDispatchCounts {
+  started: number;
+  overlapSkipped: number;
+  lockPoolExhausted: number;
+}
+
 export type DeliveryOutcomeBucket = keyof DeliveryCounts;
 export type ScheduleOutcomeBucket = keyof ScheduleCounts;
+export type PipelineDispatchOutcome = "started" | "overlap_skipped" | "lock_pool_exhausted";
 
 /**
  * Process-lifetime counters/gauges. All mutations are cheap and synchronous;
@@ -78,6 +92,11 @@ export class MetricsRegistry {
   private cacheMisses = 0;
   private deliveries: DeliveryCounts = { delivered: 0, failed: 0 };
   private schedule: ScheduleCounts = { due: 0, dispatched: 0, failed: 0 };
+  private pipelineDispatch: PipelineDispatchCounts = {
+    started: 0,
+    overlapSkipped: 0,
+    lockPoolExhausted: 0,
+  };
 
   /** One trigger observation, keyed by type (manual|form|webhook|slack|schedule|…). */
   recordTrigger(triggerType: string, outcome: TriggerOutcome): void {
@@ -93,6 +112,20 @@ export class MetricsRegistry {
   /** One schedule-ticker observation (due scan hit / dispatch / failure). */
   recordSchedule(outcome: ScheduleOutcomeBucket): void {
     this.schedule = { ...this.schedule, [outcome]: this.schedule[outcome] + 1 };
+  }
+
+  /** One pipeline `start` outcome (a run, or a typed skip that created nothing). */
+  recordPipelineDispatch(outcome: PipelineDispatchOutcome): void {
+    const key: keyof PipelineDispatchCounts =
+      outcome === "started"
+        ? "started"
+        : outcome === "overlap_skipped"
+          ? "overlapSkipped"
+          : "lockPoolExhausted";
+    this.pipelineDispatch = {
+      ...this.pipelineDispatch,
+      [key]: this.pipelineDispatch[key] + 1,
+    };
   }
 
   /** One completed-run wall-clock observation (ms). NaN is ignored (see shared). */
@@ -130,6 +163,10 @@ export class MetricsRegistry {
 
   scheduleCounts(): ScheduleCounts {
     return { ...this.schedule };
+  }
+
+  pipelineDispatchCounts(): PipelineDispatchCounts {
+    return { ...this.pipelineDispatch };
   }
 }
 
@@ -225,6 +262,8 @@ export interface ControlPlaneMetricsSnapshot extends InternalMetricsResponse {
   deliveries: DeliveryCounts;
   /** Schedule-ticker mechanics (runtime/schedule-ticker.ts). */
   schedule: ScheduleCounts;
+  /** Pipeline dispatch outcomes (pipeline/runner.ts `start`). */
+  pipelineDispatch: PipelineDispatchCounts;
 }
 
 /** Fold the registry + a DB read into the metrics snapshot. */
@@ -252,6 +291,7 @@ export async function collectMetrics(opts: {
     buildCache: registry.buildCache(),
     deliveries: registry.deliveryCounts(),
     schedule: registry.scheduleCounts(),
+    pipelineDispatch: registry.pipelineDispatchCounts(),
   };
 }
 
@@ -294,6 +334,9 @@ export function renderMetricsText(snapshot: ControlPlaneMetricsSnapshot): string
   lines.push(`is_schedule_fires_total{outcome="due"} ${snapshot.schedule.due}`);
   lines.push(`is_schedule_fires_total{outcome="dispatched"} ${snapshot.schedule.dispatched}`);
   lines.push(`is_schedule_fires_total{outcome="failed"} ${snapshot.schedule.failed}`);
+  lines.push(`is_pipeline_dispatches_total{outcome="started"} ${snapshot.pipelineDispatch.started}`);
+  lines.push(`is_pipeline_dispatches_total{outcome="overlap_skipped"} ${snapshot.pipelineDispatch.overlapSkipped}`);
+  lines.push(`is_pipeline_dispatches_total{outcome="lock_pool_exhausted"} ${snapshot.pipelineDispatch.lockPoolExhausted}`);
   for (const w of snapshot.workers) {
     const labels = `worker="${w.workerId}",status="${w.status}"`;
     lines.push(`is_worker_running_agents{${labels}} ${w.runningAgents}`);

@@ -68,7 +68,11 @@ import {
   resolveEnabledPipeline,
   slackThreadKey,
 } from "../runtime/dispatch";
-import { requirePipelines, type RuntimeDeps } from "../runtime/routes";
+import {
+  pipelineLockPoolExhausted,
+  requirePipelines,
+  type RuntimeDeps,
+} from "../runtime/routes";
 import {
   ingressUrlForToken,
   slackRedirectUri,
@@ -406,6 +410,14 @@ export function integrationsPlugin(deps: IntegrationDeps) {
             throw error;
           }
           if (!result.started) {
+            if (result.reason === "lock_pool_exhausted") {
+              // Transient capacity (the pipeline lock pool is pinned by live
+              // runs; nothing was created): a typed 503 so the sender's
+              // retry policy applies — never a 202 that reads as "dropped by
+              // policy".
+              runtime.metrics.recordTrigger(trigger.type, "failed");
+              throw pipelineLockPoolExhausted();
+            }
             logger.info("pipeline.overlap_skipped", {
               workspaceId: workflow.organizationId,
               workflowId: workflow.id,
@@ -839,6 +851,20 @@ export function integrationsPlugin(deps: IntegrationDeps) {
           origin: "slack",
         });
         if (!result.started) {
+          if (result.reason === "lock_pool_exhausted") {
+            // Transient capacity, not policy: the pipeline lock pool is
+            // pinned by live runs and nothing was created. Slack has no
+            // retry channel here, so the message is dropped LOUDLY and
+            // counted as a failed dispatch (the runner already logged the
+            // exhaustion).
+            runtime.metrics.recordTrigger("slack", "failed");
+            logger.warn("pipeline.lock_pool_exhausted_dropped", {
+              workspaceId: workflow.organizationId,
+              workflowId: workflow.id,
+              fields: { source: "slack", dropped: true },
+            });
+            continue;
+          }
           // `overlap: "skip"`: a run of this workflow is still live. The
           // message is dropped BY POLICY (never silently — the thread's next
           // message dispatches once the run settles).

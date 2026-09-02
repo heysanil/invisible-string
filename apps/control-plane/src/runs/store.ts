@@ -30,7 +30,8 @@ export interface RunStatusPatch {
    * live-tail Stop records it here so no window exists in which the row
    * reads canceled while nobody owes eve the confirmation (a crash between
    * two statements used to leave the accepted turn with no obligation at
-   * all). Only meaningful with `status: "canceled"`; cleared by
+   * all). Only meaningful with a TERMINAL status — `canceled` for a Stop,
+   * `failed` for the tail's wall-clock cap / shutdown; cleared by
    * {@link RunStore.clearRemoteCancelPending} on a CONFIRMED outcome only —
    * the run's own turn boundary on eve's stream, a session-terminal answer,
    * a proven successor, or a send that provably never happened.
@@ -45,20 +46,47 @@ export interface RunStatusPatch {
    * `turn.started`.
    */
   turnId?: string | null;
+  /**
+   * `runs.message_hash` — the turn correlator for the run's LATEST send
+   * (runs/message-hash.ts): the digest of the message text, or `null` for a
+   * content-less `inputResponses` send. Written by the dispatch-attempt CAS
+   * together with the marker and the `turnId: null` reset, so the three
+   * columns always describe the same send.
+   */
+  messageHash?: string | null;
 }
 
 /** One open remote-cancel obligation on a session (see listPendingRemoteCancels). */
 export interface PendingRemoteCancel {
   runId: string;
   /**
-   * The settled run's own turn id, when its `turn.started` has already been
-   * observed (a turn-QUALIFIED cancel can be issued for it); null when the
-   * turn has not been seen to start — the next unattributed `turn.started`
-   * on the session's stream is this run's, in send order.
+   * The settled run's own turn id, when its turn has already been attributed
+   * (a turn-QUALIFIED cancel can be issued for it); null when the turn has
+   * not been seen to start — a later turn on the session's stream is this
+   * run's iff its `message.received` matches `messageHash` (content-less
+   * turns match content-less senders, in send order).
    */
   turnId: string | null;
+  /** The correlator of the run's latest send (`runs.message_hash`). */
+  messageHash: string | null;
   /** When the obligation was recorded (the observation clock starts here). */
   pendingAt: Date;
+  /**
+   * Set when the observation window elapsed without confirmation
+   * (`runs.remote_cancel_unresolved_at`). Such an obligation STAYS
+   * attributable — a late turn matching its content still claims it and
+   * clears both columns on the boundary — but ranks after every pending one.
+   */
+  unresolvedAt: Date | null;
+  /** Row age (`runs.created_at`) — the tie-breaker among identical texts. */
+  createdAt: Date;
+}
+
+/** A live run on a session whose latest send has not been attributed a turn. */
+export interface UnattributedLiveRun {
+  runId: string;
+  messageHash: string | null;
+  createdAt: Date;
 }
 
 export interface RunStore {
@@ -107,6 +135,8 @@ export interface RunStore {
   getRunTurnState(runId: string): Promise<{
     status: RunStatus;
     turnId: string | null;
+    /** The correlator of the run's latest send (`runs.message_hash`). */
+    messageHash: string | null;
     remoteCancelPendingAt: Date | null;
   } | null>;
   /**
@@ -119,16 +149,30 @@ export interface RunStore {
    */
   setRunTurnId(runId: string, turnId: string): Promise<boolean>;
   /**
-   * The session's OPEN remote-cancel obligations — canceled runs carrying
-   * `remote_cancel_pending_at` and not yet declared unresolved — oldest
-   * first (`created_at`, i.e. send order). A tail attributes every
-   * `turn.started` it drains before its own turn to these, in order: the
-   * first obligation whose `turnId` is null owns the next unattributed turn
-   * (eve serializes turns and the platform sends in run order). A tail
-   * started in observation mode for one of these runs handles the whole
-   * list the same way.
+   * The session's OPEN remote-cancel obligations — runs carrying
+   * `remote_cancel_pending_at` (settled `canceled` by a Stop, or `failed` by
+   * the tail's wall-clock cap / shutdown), UNRESOLVED ones INCLUDED — in
+   * attribution priority: pending (not yet unresolved) before unresolved,
+   * oldest first within each. A tail attributes every turn it consumes by
+   * CONTENT — the first obligation with a null `turnId` whose `messageHash`
+   * equals the digest of the turn's `message.received` (or, for a
+   * content-less turn, whose `messageHash` is null) claims it; only when
+   * none matches may the turn be the tail's own, a live successor's, or
+   * foreign (runs/tailer.ts). A tail started in observation mode for one of
+   * these runs handles the whole list the same way.
    */
   listPendingRemoteCancels(agentSessionId: string): Promise<PendingRemoteCancel[]>;
+  /**
+   * Live (queued/running/waiting) runs on the session whose dispatch-attempt
+   * marker is set and whose latest send has no `turn_id` yet — a successor
+   * admitted after an observation tail attached, whose own tail has not yet
+   * taken the stream over. An observation tail that sees a content turn no
+   * obligation claims looks here: a hash match writes that run's `turn_id`
+   * (eve's proof it moved on — every obligation on the session is over) and
+   * the successor's tail then reads its own turn from the column instead of
+   * waiting for a `turn.started` that was drained under the observed run.
+   */
+  listUnattributedLiveRuns(agentSessionId: string): Promise<UnattributedLiveRun[]>;
   /**
    * Meet a run's remote-cancel obligation: clears `remote_cancel_pending_at`
    * AND `remote_cancel_unresolved_at` (a late confirmation resolves an
@@ -269,6 +313,9 @@ export function createDrizzleRunStore(db: Db): RunStore {
             ? { remoteCancelPendingAt: patch.remoteCancelPendingAt }
             : {}),
           ...(patch.turnId !== undefined ? { turnId: patch.turnId } : {}),
+          ...(patch.messageHash !== undefined
+            ? { messageHash: patch.messageHash }
+            : {}),
         })
         .where(
           and(
@@ -313,6 +360,7 @@ export function createDrizzleRunStore(db: Db): RunStore {
         .select({
           status: schema.runs.status,
           turnId: schema.runs.turnId,
+          messageHash: schema.runs.messageHash,
           remoteCancelPendingAt: schema.runs.remoteCancelPendingAt,
         })
         .from(schema.runs)
@@ -340,23 +388,53 @@ export function createDrizzleRunStore(db: Db): RunStore {
         .select({
           runId: schema.runs.id,
           turnId: schema.runs.turnId,
+          messageHash: schema.runs.messageHash,
           pendingAt: schema.runs.remoteCancelPendingAt,
+          unresolvedAt: schema.runs.remoteCancelUnresolvedAt,
+          createdAt: schema.runs.createdAt,
         })
         .from(schema.runs)
         .where(
           and(
             eq(schema.runs.agentSessionId, agentSessionId),
-            eq(schema.runs.status, "canceled"),
+            // The marker alone defines an obligation: a Stop settles the row
+            // `canceled`, the wall-clock cap / shutdown settle it `failed`
+            // — both owe eve the same confirmation. Unresolved rows stay in
+            // the list (still attributable), ranked last.
             isNotNull(schema.runs.remoteCancelPendingAt),
-            isNull(schema.runs.remoteCancelUnresolvedAt),
           ),
         )
-        .orderBy(asc(schema.runs.createdAt));
+        .orderBy(
+          sql`${schema.runs.remoteCancelUnresolvedAt} IS NOT NULL`,
+          asc(schema.runs.createdAt),
+        );
       return rows.map((row) => ({
         runId: row.runId,
         turnId: row.turnId,
+        messageHash: row.messageHash,
         pendingAt: row.pendingAt ?? new Date(0),
+        unresolvedAt: row.unresolvedAt,
+        createdAt: row.createdAt,
       }));
+    },
+
+    async listUnattributedLiveRuns(agentSessionId) {
+      return db
+        .select({
+          runId: schema.runs.id,
+          messageHash: schema.runs.messageHash,
+          createdAt: schema.runs.createdAt,
+        })
+        .from(schema.runs)
+        .where(
+          and(
+            eq(schema.runs.agentSessionId, agentSessionId),
+            inArray(schema.runs.status, ["queued", "running", "waiting"]),
+            isNotNull(schema.runs.startedAt),
+            isNull(schema.runs.turnId),
+          ),
+        )
+        .orderBy(asc(schema.runs.createdAt));
     },
 
     async clearRemoteCancelPending(runId) {

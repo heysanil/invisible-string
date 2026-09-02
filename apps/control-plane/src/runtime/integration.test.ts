@@ -76,6 +76,7 @@ import {
   rejectContinuationToken,
   stampEveEvent,
 } from "../testing/fake-eve";
+import { hashTurnMessage } from "../runs/message-hash";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const BASE_URL = "http://localhost:3000";
@@ -1806,7 +1807,7 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     }
     async function orphanRun(
       agentSessionId: string,
-      opts: { markerArmed?: boolean } = {},
+      opts: { markerArmed?: boolean; sentMessage?: string } = {},
     ) {
       const rows = await db
         .insert(schema.runs)
@@ -1824,8 +1825,19 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
           // The dispatch-attempt marker: every dispatch path arms it
           // strictly before the eve call, so a run that actually reached
           // eve always carries it — reconciliation treats it as the
-          // authority on whether there is a turn to tail at all.
-          ...(opts.markerArmed === false ? {} : { startedAt: new Date() }),
+          // authority on whether there is a turn to tail at all. The same
+          // CAS records the send's correlator (`message_hash`): a resumed
+          // tail attributes its turn by matching it against the turn's
+          // `message.received`, so an orphan that reached eve carries the
+          // hash of the message eve actually received.
+          ...(opts.markerArmed === false
+            ? {}
+            : {
+                startedAt: new Date(),
+                ...(opts.sentMessage !== undefined
+                  ? { messageHash: hashTurnMessage(opts.sentMessage) }
+                  : {}),
+              }),
         })
         .returning();
       return rows[0]!;
@@ -1864,7 +1876,12 @@ describe.skipIf(!TEST_DATABASE_URL)("runtime API integration", () => {
     // re-attached and drains eve's durable stream to a terminal (crash-safe
     // resume).
     const liveSession = await orphanSession("eve-sess-1", liveWorkerId);
-    const liveRun = await orphanRun(liveSession.id);
+    // The orphan's tail resumes eve-sess-1 from its own (empty) cursor, so
+    // the first turn on that stream — opened by the message the chat tests
+    // sent — is the one it must recognize as its own, by content.
+    const liveRun = await orphanRun(liveSession.id, {
+      sentMessage: fixture.sessions.get("eve-sess-1")!.receivedMessages[0]!,
+    });
     // Orphan B: nothing to resume from → failed with completedAt so the cap
     // slot frees and SSE terminates.
     const deadSession = await orphanSession("eve-gone", null);

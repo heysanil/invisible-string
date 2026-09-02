@@ -329,13 +329,18 @@ the full scope; the child receives that string as its task message.
   post-dispatch fence) settles its row `canceled` at once WITH a
   remote-cancel obligation (`runs.remote_cancel_pending_at`) that is met
   only by eve's own stream — the child's turn boundary observed after its
-  own `turn.started` (`runs.turn_id`, the acceptance proof; a turn-qualified
-  cancel is issued the moment it is known), a session-terminal answer, or a
-  newer run on the session whose `turn_id` is set — never by eve's 202 to a
-  pre-turn cancel; the child's tail stays on the stream in observation mode
-  (re-opened by the remote-cancel sweep after a crash, never a normal tail),
-  and past `REMOTE_CANCEL_OBSERVE_MS` an unconfirmed obligation is declared
-  unresolved on the row rather than silently cleared (runtime contract).
+  own turn was attributed (`runs.turn_id`, the acceptance proof, attributed
+  by CONTENT: the dispatch-attempt CAS stores `runs.message_hash` = sha256
+  of the rendered task message it sends, and the tail matches it against
+  the `message.received` that opens the turn — never by send order; a
+  turn-qualified cancel is issued the moment it is attributed), a
+  session-terminal answer, or a newer run on the session whose `turn_id`
+  is set — never by eve's 202 to a pre-turn cancel; the child's tail stays
+  on the stream in observation mode (re-opened by the remote-cancel sweep
+  after a crash, never a normal tail), the wall-clock cap settles the child
+  `failed` with the same obligation, and past `REMOTE_CANCEL_OBSERVE_MS` an
+  unconfirmed obligation is declared unresolved on the row rather than
+  silently cleared — still attributable by a later tail (runtime contract).
   The executor then returns `{status: "waiting", childRunId}` and
   the runner re-invokes with `ctx.childRunId`. While
   the child runs the executor waits on a RunEventBus subscription plus a

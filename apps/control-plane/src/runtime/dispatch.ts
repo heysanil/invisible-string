@@ -118,6 +118,8 @@
  */
 import { randomUUID } from "node:crypto";
 
+import { hashTurnMessage } from "../runs/message-hash";
+
 import {
   and,
   desc,
@@ -133,6 +135,7 @@ import {
 import { schema } from "@invisible-string/db";
 import {
   workflowConfigSchema,
+  type EveInputResponse,
   type EveSessionMode,
   type ModelProvider,
   type RunStatus,
@@ -368,16 +371,36 @@ export interface DispatchRenderedRunResult {
 export type DispatchArmResult = "armed" | "canceled" | "terminal";
 
 /**
+ * What the arming dispatch is about to hand eve — the SEND form (`{message}`:
+ * a chat message, a rendered task message, a thread continuation) or the
+ * RESPOND form (`{inputResponses}`: a HITL answer resuming a parked turn).
+ * The distinction is the turn correlator: eve echoes a sent message verbatim
+ * in the `message.received` that opens its turn, so the message is hashed
+ * onto the row (`runs.message_hash`, runs/message-hash.ts — the digest only,
+ * never the text); an input-response turn opens with NO `message.received`
+ * (spike fixture `mocked-resumed-events.ndjson`: `turn.started` straight to
+ * `step.started`), so it is recorded as content-less (`null`) and the tail
+ * attributes such turns only among content-less senders, in send order.
+ */
+export type DispatchSend =
+  | { message: string }
+  | { inputResponses: readonly EveInputResponse[] };
+
+/**
  * CAS-write the dispatch-attempt marker (`runs.started_at`) — MUST be awaited
  * strictly before the eve create/continue call, so that recovery can read
  * "marker absent ⇒ the eve call was never issued" (see the module doc). The
  * CAS doubles as the pre-eve cancel fence: a run already settled terminal
  * (the pipeline cancel route's `cancelChildRun` on a queued child) refuses
- * the write and the caller abandons instead of dispatching.
+ * the write and the caller abandons instead of dispatching. The same
+ * statement records the send's turn correlator ({@link DispatchSend}) and
+ * resets the acceptance proof, so marker, correlator and `turn_id` always
+ * describe ONE send.
  */
 export async function armDispatchAttempt(
   runStore: RunStore,
   runId: string,
+  send: DispatchSend,
   now: Date = new Date(),
 ): Promise<DispatchArmResult> {
   const marked = await runStore.markRun(runId, {
@@ -389,8 +412,11 @@ export async function armDispatchAttempt(
     startedAt: now,
     // The acceptance proof describes the LATEST send: reset it so a resumed
     // run (HITL answer → a new eve turn) reads "sent, turn not yet observed"
-    // until the tail attributes the new turn's `turn.started` to it.
+    // until the tail attributes the new turn to it.
     turnId: null,
+    // The correlator the tail matches the new turn's `message.received`
+    // against — content, never send order (runs/tailer.ts).
+    messageHash: "message" in send ? hashTurnMessage(send.message) : null,
   });
   if (marked) return "armed";
   const current = await runStore.getRunStatus(runId);
@@ -919,7 +945,9 @@ async function dispatchSerialized(
     // its absence as proof the call was never issued — and its CAS refuses a
     // run the cancel route already settled (a Stop landing during the long
     // ensure boot above aborts here instead of dispatching a canceled run).
-    const armed = await armDispatchAttempt(deps.runStore, run.id);
+    const armed = await armDispatchAttempt(deps.runStore, run.id, {
+      message: input.taskMessage,
+    });
     if (armed !== "armed" || input.signal?.aborted) {
       return await abandonCanceledBeforeEve(deps, input, session, run);
     }

@@ -12,6 +12,7 @@ import {
 import { mapIngressBody, shouldStartNewSlackSession } from "../integrations/routes";
 import { isRuntimeApiError } from "./errors";
 import { createMemoryRunStore } from "../pipeline/test-support";
+import { hashTurnMessage } from "../runs/message-hash";
 import {
   newStepId,
   type SlackInnerEvent,
@@ -65,25 +66,39 @@ describe("armDispatchAttempt (marker + pre-eve cancel fence)", () => {
     const store = createMemoryRunStore();
     store.setStatus("run-1", "queued");
     const at = new Date("2026-09-01T00:00:00Z");
-    expect(await armDispatchAttempt(store, "run-1", at)).toBe("armed");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" }, at)).toBe("armed");
     expect(store.statusLog).toHaveLength(1);
     expect(store.statusLog[0]).toMatchObject({
       runId: "run-1",
-      patch: { status: "queued", startedAt: at },
+      // Marker, acceptance-proof reset and the send's correlator (the digest
+      // of the exact message — never the text) land in ONE statement.
+      patch: { status: "queued", startedAt: at, turnId: null, messageHash: hashTurnMessage("hello") },
     });
+    expect(store.statusLog[0]!.patch.messageHash).not.toContain("hello");
+  });
+
+  test("an input-response send is CONTENT-LESS: the correlator is recorded null (eve echoes no message.received for that turn)", async () => {
+    const store = createMemoryRunStore();
+    store.setStatus("run-1", "queued");
+    expect(
+      await armDispatchAttempt(store, "run-1", {
+        inputResponses: [{ requestId: "req-1", optionId: "approve" }],
+      }),
+    ).toBe("armed");
+    expect(store.statusLog[0]!.patch).toMatchObject({ turnId: null, messageHash: null });
   });
 
   test("a run the cancel route already settled refuses the marker → 'canceled' (the dispatch abandons)", async () => {
     const store = createMemoryRunStore();
     store.setStatus("run-1", "canceled", "canceled by user");
-    expect(await armDispatchAttempt(store, "run-1")).toBe("canceled");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" })).toBe("canceled");
     expect(store.statusLog).toHaveLength(0); // the CAS never wrote
   });
 
   test("any other terminal status reads 'terminal' (equally not dispatchable)", async () => {
     const store = createMemoryRunStore();
     store.setStatus("run-1", "failed", "swept");
-    expect(await armDispatchAttempt(store, "run-1")).toBe("terminal");
+    expect(await armDispatchAttempt(store, "run-1", { message: "hello" })).toBe("terminal");
   });
 });
 

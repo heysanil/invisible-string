@@ -5,6 +5,7 @@
  * fakes (no DB, no network).
  */
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 import type {
@@ -42,8 +43,18 @@ interface MemoryStore extends RunStore {
   sessionStatus: AgentSessionStatus | null;
   /** `runs.turn_id` per run — eve's acceptance proof. */
   turnIds: Map<string, string>;
-  /** `remote_cancel_pending_at` / `remote_cancel_unresolved_at` per run, insertion = send order. */
-  obligations: Map<string, { pendingAt: Date; unresolvedAt: Date | null }>;
+  /** `runs.message_hash` per run — the turn correlator (null = content-less send). */
+  messageHashes: Map<string, string | null>;
+  /**
+   * `remote_cancel_pending_at` / `remote_cancel_unresolved_at` per run;
+   * `createdAt` (default = pendingAt) is the row age used as the identical-text
+   * tie-breaker, and insertion order otherwise stands in for send order.
+   */
+  obligations: Map<string, { pendingAt: Date; unresolvedAt: Date | null; createdAt?: Date }>;
+  /** Live runs on the session with a correlator and no turn yet (successor lookup). */
+  liveRuns: Array<{ runId: string; messageHash: string | null }>;
+  /** Record a run's latest send (the dispatch-attempt CAS's correlator write). */
+  sent(runId: string, message: string | null): void;
 }
 
 function memoryStore(): MemoryStore {
@@ -53,7 +64,12 @@ function memoryStore(): MemoryStore {
     runStatus: null,
     sessionStatus: null,
     turnIds: new Map(),
+    messageHashes: new Map(),
     obligations: new Map(),
+    liveRuns: [],
+    sent(runId, message) {
+      store.messageHashes.set(runId, message === null ? null : sha256(message));
+    },
     async appendEvent(runId, seq, event): Promise<StoredRunEvent> {
       if (store.events.some((e) => e.runId === runId && e.seq === seq)) {
         throw new Error(`duplicate seq ${seq} for run ${runId} (PK violation)`);
@@ -88,12 +104,14 @@ function memoryStore(): MemoryStore {
         store.obligations.set(runId, { pendingAt: patch.remoteCancelPendingAt, unresolvedAt: null });
       }
       if (patch.turnId === null) store.turnIds.delete(runId);
+      if (patch.messageHash !== undefined) store.messageHashes.set(runId, patch.messageHash);
       return true;
     },
     async getRunTurnState(runId) {
       return {
         status: store.runStatus ?? "queued",
         turnId: store.turnIds.get(runId) ?? null,
+        messageHash: store.messageHashes.get(runId) ?? null,
         remoteCancelPendingAt: store.obligations.get(runId)?.pendingAt ?? null,
       };
     },
@@ -104,13 +122,29 @@ function memoryStore(): MemoryStore {
       return true;
     },
     async listPendingRemoteCancels() {
+      // Mirror the drizzle store: unresolved rows INCLUDED, ranked last;
+      // oldest first within each band.
       return [...store.obligations.entries()]
-        .filter(([, o]) => o.unresolvedAt === null)
-        .map(([runId, o]) => ({
+        .map(([runId, o], index) => ({
           runId,
           turnId: store.turnIds.get(runId) ?? null,
+          messageHash: store.messageHashes.get(runId) ?? null,
           pendingAt: o.pendingAt,
-        }));
+          unresolvedAt: o.unresolvedAt,
+          createdAt: o.createdAt ?? new Date(o.pendingAt.getTime() + index),
+        }))
+        .sort((a, b) =>
+          (a.unresolvedAt === null) !== (b.unresolvedAt === null)
+            ? a.unresolvedAt === null
+              ? -1
+              : 1
+            : a.createdAt.getTime() - b.createdAt.getTime(),
+        );
+    },
+    async listUnattributedLiveRuns() {
+      return store.liveRuns
+        .filter((run) => !store.turnIds.has(run.runId))
+        .map((run, index) => ({ ...run, createdAt: new Date(index) }));
     },
     async clearRemoteCancelPending(runId) {
       return store.obligations.delete(runId);
@@ -226,8 +260,23 @@ function liveStream(): { open: OpenRunStream; push(line: string): void } {
   };
 }
 
+/** The messages the committed fixtures' turns were opened with (their correlators). */
+const PONG = "Reply with exactly: pong"; // mocked-turn-events.ndjson
+const PARKED = "Call the record_note tool with note: 'durability-proof'."; // mocked-parked-events.ndjson
+
+const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+
 const turnStarted = (turnId: string) =>
   JSON.stringify({ type: "turn.started", data: { sequence: 0, turnId } });
+/** eve's echo of the message that opened `turnId` — the turn's correlator. */
+const messageReceived = (turnId: string, message: string) =>
+  JSON.stringify({
+    type: "message.received",
+    data: { message, parts: [{ type: "text", text: message }], sequence: 0, turnId },
+  });
+/** The content-less opening of an input-response turn (no message.received). */
+const stepStarted = (turnId: string) =>
+  JSON.stringify({ type: "step.started", data: { sequence: 0, stepIndex: 0, turnId } });
 const turnCompleted = (turnId: string) =>
   JSON.stringify({ type: "turn.completed", data: { sequence: 0, turnId } });
 const turnCancelled = (turnId: string) =>
@@ -419,6 +468,7 @@ describe("tailRun", () => {
   test("full turn: persists every event with monotonic seq and marks the run succeeded", async () => {
     const lines = await fixtureLines("mocked-turn-events.ndjson");
     const store = memoryStore();
+    store.sent("run-1", PONG);
     const bus = new RunEventBus();
     const frames = collectFrames(bus, "run-1");
     const startIndexes: number[] = [];
@@ -495,6 +545,7 @@ describe("tailRun", () => {
   test("approval park: input.requested then session.waiting → run waiting, session waiting", async () => {
     const lines = await fixtureLines("mocked-parked-events.ndjson");
     const store = memoryStore();
+    store.sent("run-1", PARKED);
     const bus = new RunEventBus();
 
     const handle = tailRun({
@@ -516,6 +567,7 @@ describe("tailRun", () => {
   test("reconnects from the last consumed startIndex after a mid-stream drop", async () => {
     const lines = await fixtureLines("mocked-turn-events.ndjson");
     const store = memoryStore();
+    store.sent("run-1", PONG);
     const bus = new RunEventBus();
     const startIndexes: number[] = [];
 
@@ -572,6 +624,7 @@ describe("tailRun", () => {
     const store = memoryStore();
     const bus = new RunEventBus();
     const finishes: Array<{ lastAssistantMessage: string | null }> = [];
+    const seen: Array<{ turnId?: string } | undefined> = [];
 
     const handle = tailRun({
       runId: "run-1",
@@ -579,18 +632,30 @@ describe("tailRun", () => {
       openStream: async (_startIndex, signal) =>
         // Two events, then silence — the run never reaches a terminal event.
         ndjsonResponse(lines.slice(0, 2), { stayOpen: true, signal }),
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
       store,
       bus,
       maxWallClockMs: 60,
+      remoteCancelObserveMs: 40,
       onFinish: (info) => finishes.push(info),
     });
     await handle.done;
 
     expect(store.runStatus).toBe("failed");
     expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
-    expect(store.events).toHaveLength(2); // partial progress is preserved
+    // Partial progress is preserved — the `turn.started` is HELD until its
+    // correlator arrives (never did), so only the session.started landed.
+    expect(store.events.map((e) => e.event.type)).toEqual(["session.started"]);
     // No stop-message was seen → nothing for the delivery seam.
     expect(finishes[0]?.lastAssistantMessage).toBeNull();
+    // A turn that may still be running owes eve the same confirmation a
+    // Stop does: the obligation rides the failing CAS, observation followed
+    // it to its window, and the residual was declared — never a silent clear.
+    expect(store.runPatches.at(-1)?.remoteCancelPendingAt).toBeInstanceOf(Date);
+    expect(store.obligations.get("run-1")?.unresolvedAt).toBeInstanceOf(Date);
+    expect(seen).toHaveLength(0); // the turn was never attributed: nothing (unqualified) was sent
   });
 
   test("leftover events of a previous turn are persisted but never classify the NEW run as terminal", async () => {
@@ -611,6 +676,7 @@ describe("tailRun", () => {
       `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
     ];
     const store = memoryStore();
+    store.sent("run-2", "follow-up");
     const bus = new RunEventBus();
     const finishes: Array<{ lastAssistantMessage: string | null }> = [];
 
@@ -667,6 +733,7 @@ describe("tailRun", () => {
   test("an appendEvent failure retries the SAME event on reconnect (no silent loss)", async () => {
     const lines = await fixtureLines("mocked-turn-events.ndjson");
     const store = memoryStore();
+    store.sent("run-1", PONG);
     const bus = new RunEventBus();
     let failedOnce = false;
     const flakyStore = {
@@ -739,6 +806,7 @@ describe("tailRun — eve 0.31 plumbing", () => {
       `{"type":"session.waiting","data":{"wait":"next-user-message"}}`,
     ];
     const store = memoryStore();
+    store.sent("run-c", "hi");
     const bus = new RunEventBus();
     const finishes: Array<{ status: string; lastAssistantMessage: string | null }> = [];
 
@@ -803,6 +871,7 @@ describe("tailRun — eve 0.31 plumbing", () => {
       withId({ type: "session.waiting", data: { wait: "next-user-message" } }, "evt_D"),
     ];
     const store = memoryStore();
+    store.sent("run-d", "hi");
     let connects = 0;
     const handle = tailRun({
       runId: "run-d",
@@ -902,28 +971,72 @@ describe("tailRun — eve 0.31 plumbing", () => {
     expect(store.runStatus).toBe("succeeded");
   });
 
-  test("the wall-clock cap cancels eve's turn too, and a failing remote cancel never fails the run harder", async () => {
-    let attempted = 0;
+  test("the wall-clock cap BEFORE the turn is attributed sends NOTHING (never an unqualified cancel), settles `failed` WITH the obligation, and observes", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();
+    store.sent("run-wc", "slow work");
+    const stream = liveStream();
     const handle = tailRun({
       runId: "run-wc",
       agentSessionId: "sess-wc",
-      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
-      cancelRemoteTurn: async () => {
-        attempted += 1;
-        throw new Error("worker unreachable");
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
       },
       store,
       bus: new RunEventBus(),
       maxWallClockMs: 30,
     });
-    await handle.done;
+    await until(() => store.runStatus === "failed", "the cap to settle the row");
+    // Pre-fix: one UNQUALIFIED `{}` cancel went out here — a no-op at eve
+    // before `turn.started`, and a successor's turn killer if it arrived late.
+    expect(seen).toHaveLength(0);
+    expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
+    expect(store.runPatches.at(-1)?.remoteCancelPendingAt).toBeInstanceOf(Date);
+    expect(store.obligations.has("run-wc")).toBeTrue();
+    expect(handle.observing).toBeTrue();
 
-    expect(attempted).toBe(1);
+    // The turn starts late: attributed by content, cancelled QUALIFIED,
+    // cleared on its boundary — exactly like a Stop.
+    stream.push(turnStarted("turn_wc"));
+    stream.push(messageReceived("turn_wc", "slow work"));
+    await until(() => seen.length === 1, "the qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_wc" }]);
+    stream.push(turnCancelled("turn_wc"));
+    await handle.done;
+    expect(store.obligations.has("run-wc")).toBeFalse();
+    expect(store.runStatus).toBe("failed"); // never re-marked
+  });
+
+  test("the wall-clock cap AFTER the turn is attributed issues the QUALIFIED cancel, and a failing remote cancel never fails the run harder", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-wc2", "slow work");
+    const stream = liveStream();
+    stream.push(turnStarted("turn_wc2"));
+    stream.push(messageReceived("turn_wc2", "slow work"));
+    const handle = tailRun({
+      runId: "run-wc2",
+      agentSessionId: "sess-wc2",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+        throw new Error("worker unreachable");
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60,
+      remoteCancelObserveMs: 80,
+    });
+    await until(() => store.turnIds.get("run-wc2") === "turn_wc2", "the own turn");
+    await handle.done; // the cap fires, observation elapses (transport keeps failing)
+    expect(seen[0]).toEqual({ turnId: "turn_wc2" }); // qualified, never `{}`
+    expect(seen.every((o) => o?.turnId === "turn_wc2")).toBeTrue();
     expect(store.runStatus).toBe("failed");
     expect(store.runPatches.at(-1)?.error).toContain("wall-clock cap");
-    // A failed finalize owes eve nothing — the obligation is a user-cancel concept.
-    expect(store.runPatches.at(-1)?.remoteCancelPendingAt).toBeUndefined();
+    expect(store.runPatches.at(-1)?.remoteCancelPendingAt).toBeInstanceOf(Date);
+    // A transport failure never records the obligation as done.
+    expect(store.obligations.get("run-wc2")?.unresolvedAt).toBeInstanceOf(Date);
   });
 });
 
@@ -937,6 +1050,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
   test("a Stop BEFORE turn.started sends nothing (eve would consume it as a no-op), finalizes canceled WITH the obligation in the same patch, and stays on the stream; its own turn.started is then attributed, cancelled QUALIFIED, and the boundary clears the obligation", async () => {
     const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();
+    store.sent("run-pre", "stop me");
     const stream = liveStream();
     const handle = tailRun({
       runId: "run-pre",
@@ -972,6 +1086,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     // eve starts the run's own turn: the acceptance proof lands and the
     // qualified cancel goes out.
     stream.push(turnStarted("turn_9"));
+    stream.push(messageReceived("turn_9", "stop me"));
     await until(() => seen.length === 1, "the qualified cancel");
     expect(seen).toEqual([{ turnId: "turn_9" }]);
     expect(store.turnIds.get("run-pre")).toBe("turn_9");
@@ -984,14 +1099,20 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     await handle.done;
     expect(store.obligations.has("run-pre")).toBeFalse();
     expect(store.runStatus).toBe("canceled"); // never re-marked
-    expect(store.events.map((e) => e.event.type)).toEqual(["turn.started", "turn.cancelled"]);
+    expect(store.events.map((e) => e.event.type)).toEqual([
+      "turn.started",
+      "message.received",
+      "turn.cancelled",
+    ]);
   });
 
   test("a Stop AFTER turn.started issues the QUALIFIED cancel, still owes the boundary, and clears it on turn.completed", async () => {
     const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();
+    store.sent("run-post", "work");
     const stream = liveStream();
     stream.push(turnStarted("turn_7"));
+    stream.push(messageReceived("turn_7", "work"));
     const handle = tailRun({
       runId: "run-post",
       agentSessionId: "sess-post",
@@ -1028,6 +1149,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
 
   test("the acceptance proof is written BEFORE the turn.started event is persisted", async () => {
     const store = memoryStore();
+    store.sent("run-proof", PONG);
     let turnIdAtPersist: string | null | undefined;
     const appendEvent = store.appendEvent;
     store.appendEvent = async (runId, seq, event) => {
@@ -1051,8 +1173,10 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
 
   test("eve's session-terminal answer to the qualified cancel finalizes WITHOUT an obligation and ends the tail", async () => {
     const store = memoryStore();
+    store.sent("run-term", "work");
     const stream = liveStream();
     stream.push(turnStarted("turn_t"));
+    stream.push(messageReceived("turn_t", "work"));
     const handle = tailRun({
       runId: "run-term",
       agentSessionId: "sess-term",
@@ -1073,8 +1197,10 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
 
   test("a transport-FAILED qualified cancel keeps the obligation (never recorded as done); the turn's own boundary still clears it", async () => {
     const store = memoryStore();
+    store.sent("run-fail", "work");
     const stream = liveStream();
     stream.push(turnStarted("turn_f"));
+    stream.push(messageReceived("turn_f", "work"));
     const handle = tailRun({
       runId: "run-fail",
       agentSessionId: "sess-fail",
@@ -1135,6 +1261,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();
     store.runStatus = "canceled";
+    store.sent("run-A", "a");
     store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
     const stream = liveStream();
     const handle = tailRun({
@@ -1151,6 +1278,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     });
     expect(handle.observing).toBeTrue();
     stream.push(turnStarted("turn_A"));
+    stream.push(messageReceived("turn_A", "a"));
     await until(() => seen.length === 1, "the qualified cancel");
     expect(seen).toEqual([{ turnId: "turn_A" }]);
     expect(store.turnIds.get("run-A")).toBe("turn_A");
@@ -1158,7 +1286,11 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     await handle.done;
     expect(store.obligations.has("run-A")).toBeFalse();
     expect(store.runPatches).toHaveLength(0); // no adoption, no re-marking
-    expect(store.events.map((e) => e.event.type)).toEqual(["turn.started", "turn.completed"]);
+    expect(store.events.map((e) => e.event.type)).toEqual([
+      "turn.started",
+      "message.received",
+      "turn.completed",
+    ]);
   });
 
   test("a re-opened observation whose turn is already known re-issues the qualified cancel at once, and a session.waiting clears every OWNED obligation", async () => {
@@ -1210,6 +1342,8 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
   test("a successor's normal tail carries the session's obligations: the predecessor's turn is attributed to IT (never claimed as the successor's own), cancelled qualified, cleared on its boundary — and the successor's own turn is the next one", async () => {
     const seen: Array<{ turnId?: string } | undefined> = [];
     const store = memoryStore();
+    store.sent("run-A", "first");
+    store.sent("run-B", "second");
     store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
     const finished: Array<{ status: string; lastAssistantMessage: string | null }> = [];
     const stream = liveStream();
@@ -1229,6 +1363,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
 
     // A's turn (the pre-turn Stop's turn) drains first.
     stream.push(turnStarted("turn_A"));
+    stream.push(messageReceived("turn_A", "first"));
     await until(() => seen.length === 1, "A's qualified cancel");
     expect(seen).toEqual([{ turnId: "turn_A" }]);
     expect(store.turnIds.get("run-A")).toBe("turn_A");
@@ -1237,11 +1372,12 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     stream.push(turnCancelled("turn_A"));
     await until(() => !store.obligations.has("run-A"), "A's obligation to clear");
     stream.push(sessionWaiting());
-    await until(() => store.events.length === 4, "the leftover session.waiting to persist");
+    await until(() => store.events.length === 5, "the leftover session.waiting to persist");
     expect(store.runStatus).toBe("running"); // A's boundary never classifies B
 
     // B's own turn.
     stream.push(turnStarted("turn_B"));
+    stream.push(messageReceived("turn_B", "second"));
     await until(() => store.turnIds.get("run-B") === "turn_B", "B's own turn");
     stream.push(stopMessage("turn_B", "mine"));
     stream.push(turnCompleted("turn_B"));
@@ -1281,9 +1417,17 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     expect(store.turnIds.get("run-R")).toBe("turn_R");
   });
 
-  test("a resuming tail recovers a persisted own turn.started from before the column existed", async () => {
+  test("a resuming tail recovers its own persisted turn opening BY CONTENT when the proof never landed (never from a bare last turn.started, which may be foreign)", async () => {
     const store = memoryStore();
-    store.events.push({ runId: "run-P", seq: 0, event: JSON.parse(turnStarted("turn_P")) });
+    store.sent("run-P", "mine");
+    // A foreign opening persisted under this run, then the run's own —
+    // its proof write lost — followed by its correlator.
+    store.events.push(
+      { runId: "run-P", seq: 0, event: JSON.parse(turnStarted("turn_X")) },
+      { runId: "run-P", seq: 1, event: JSON.parse(messageReceived("turn_X", "theirs")) },
+      { runId: "run-P", seq: 2, event: JSON.parse(turnStarted("turn_P")) },
+      { runId: "run-P", seq: 3, event: JSON.parse(messageReceived("turn_P", "mine")) },
+    );
     const stream = liveStream();
     stream.push(turnCompleted("turn_P"));
     stream.push(sessionWaiting());
@@ -1300,7 +1444,7 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
     expect(store.runStatus).toBe("succeeded");
   });
 
-  test("an observation that sees a turn nobody pending owns has seen a SUCCESSOR start: every owned obligation is over", async () => {
+  test("an observation that sees a turn nobody owns start has seen eve SERIALIZE past its attributed turn: every attributed obligation is over (the foreign turn itself is never attributed)", async () => {
     const store = memoryStore();
     store.runStatus = "canceled";
     store.turnIds.set("run-S", "turn_S");
@@ -1317,9 +1461,11 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
       observe: { deadlineAt: Date.now() + 60_000 },
     });
     stream.push(turnStarted("turn_Z"));
+    stream.push(messageReceived("turn_Z", "somebody else's"));
     await handle.done;
     expect(store.obligations.has("run-S")).toBeFalse();
     expect(store.turnIds.get("run-S")).toBe("turn_S"); // never re-attributed
+    expect([...store.turnIds.values()]).not.toContain("turn_Z"); // foreign: nobody's
   });
 
   test("detach on an observation tail keeps the obligation (the sweeper re-opens it)", async () => {
@@ -1343,9 +1489,364 @@ describe("tailRun — the confirmed cancel (observation mode)", () => {
   });
 });
 
+describe("tailRun — turn attribution by CONTENT (never by send order)", () => {
+  const untilRunning = async (store: { runStatus: string | null }) => {
+    await until(() => store.runStatus === "running", "the tail to adopt the run");
+  };
+
+  test("(a) a never-sent obligation cannot steal a successor's turn: B's message.received attributes to B only, A never claims it, no cancel ever hits B", async () => {
+    // A was armed + canceled; its send failed (or crashed) before eve.
+    // B then sent DIFFERENT text on the same session. Pre-fix: A — the
+    // session's oldest open obligation with a null turn — claimed B's
+    // `turn.started` in send order and a qualified cancel killed B's turn.
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-A", "alpha");
+    store.sent("run-B", "beta");
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-B",
+      agentSessionId: "sess-ab",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    stream.push(turnStarted("turn_1"));
+    stream.push(messageReceived("turn_1", "beta"));
+    await until(() => store.turnIds.get("run-B") === "turn_1", "B's own turn by content");
+    expect(store.turnIds.has("run-A")).toBeFalse(); // pre-fix: "turn_1"
+    expect(seen).toHaveLength(0); // pre-fix: [{ turnId: "turn_1" }] — B's turn cancelled
+    // A newer run's proven turn supersedes A (eve is FIFO: A's message, had
+    // it arrived, would have run first) — nothing owed, nothing cancelled.
+    expect(store.obligations.has("run-A")).toBeFalse();
+    stream.push(stopMessage("turn_1", "done"));
+    stream.push(turnCompleted("turn_1"));
+    stream.push(sessionWaiting());
+    await handle.done;
+    expect(store.runStatus).toBe("succeeded");
+    expect(seen).toHaveLength(0);
+  });
+
+  test("(b) an UNRESOLVED obligation stays attributable: A's late turn (matching content) is attributed to A, cancelled qualified, and clears BOTH columns; B is untouched", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-A", "alpha");
+    store.sent("run-B", "beta");
+    store.obligations.set("run-A", {
+      pendingAt: new Date(Date.now() - 60_000),
+      unresolvedAt: new Date(Date.now() - 1_000), // past the window, declared
+    });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-B",
+      agentSessionId: "sess-ab",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    // A's turn arrives late (eve was slow), before B's.
+    stream.push(turnStarted("turn_A"));
+    stream.push(messageReceived("turn_A", "alpha"));
+    await until(() => seen.length === 1, "A's qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_A" }]);
+    expect(store.turnIds.get("run-A")).toBe("turn_A");
+    expect(store.turnIds.has("run-B")).toBeFalse(); // pre-fix: B claimed turn_A as its own
+    stream.push(turnCancelled("turn_A"));
+    await until(() => !store.obligations.has("run-A"), "A's obligation to clear (both columns)");
+    stream.push(sessionWaiting());
+    // B's own turn is the next one.
+    stream.push(turnStarted("turn_B"));
+    stream.push(messageReceived("turn_B", "beta"));
+    await until(() => store.turnIds.get("run-B") === "turn_B", "B's own turn");
+    stream.push(turnCompleted("turn_B"));
+    stream.push(sessionWaiting());
+    await handle.done;
+    expect(store.runStatus).toBe("succeeded");
+    expect(seen).toHaveLength(1); // B was never cancelled
+  });
+
+  test("identical texts on one session: the oldest matching obligation claims first (pending before unresolved), then the next, then the tail's own — the documented tie", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-old", "same");
+    store.sent("run-new", "same");
+    store.sent("run-unres", "same");
+    store.sent("run-B", "same");
+    // The unresolved one is the OLDEST row but ranks last.
+    store.obligations.set("run-unres", {
+      pendingAt: new Date(0),
+      unresolvedAt: new Date(),
+      createdAt: new Date(0),
+    });
+    store.obligations.set("run-old", { pendingAt: new Date(1_000), unresolvedAt: null, createdAt: new Date(1_000) });
+    store.obligations.set("run-new", { pendingAt: new Date(2_000), unresolvedAt: null, createdAt: new Date(2_000) });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-B",
+      agentSessionId: "sess-same",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    for (const turnId of ["t1", "t2", "t3", "t4"]) {
+      stream.push(turnStarted(turnId));
+      stream.push(messageReceived(turnId, "same"));
+      await until(() => [...store.turnIds.values()].includes(turnId), `${turnId} attributed`);
+      stream.push(turnCancelled(turnId));
+      stream.push(sessionWaiting());
+    }
+    expect(store.turnIds.get("run-old")).toBe("t1");
+    expect(store.turnIds.get("run-new")).toBe("t2");
+    expect(store.turnIds.get("run-unres")).toBe("t3");
+    expect(store.turnIds.get("run-B")).toBe("t4");
+    expect(seen).toEqual([{ turnId: "t1" }, { turnId: "t2" }, { turnId: "t3" }]);
+    await handle.done;
+    expect(store.runStatus).toBe("canceled"); // B's own turn was cancelled at eve
+    expect(store.obligations.size).toBe(0);
+  });
+
+  test("a FOREIGN turn (content nobody on the session sent) is persisted, never attributed, never cancelled, and never classifies the run", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-B", "beta");
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-B",
+      agentSessionId: "sess-f",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    stream.push(turnStarted("turn_x"));
+    stream.push(messageReceived("turn_x", "not ours"));
+    stream.push(turnCompleted("turn_x"));
+    stream.push(sessionWaiting());
+    await until(() => store.events.length === 4, "the foreign turn to persist");
+    expect(store.turnIds.size).toBe(0);
+    expect(seen).toHaveLength(0);
+    expect(store.runStatus).toBe("running"); // its boundary is not ours
+    stream.push(turnStarted("turn_b"));
+    stream.push(messageReceived("turn_b", "beta"));
+    stream.push(turnCompleted("turn_b"));
+    stream.push(sessionWaiting());
+    await handle.done;
+    expect(store.turnIds.get("run-B")).toBe("turn_b");
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("content-less turns (an inputResponses resume opens with NO message.received) are attributed among content-less senders only, in send order", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-A", null); // A's latest send was an input response, then it was stopped
+    store.sent("run-B", "beta"); // B sent a message
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-B",
+      agentSessionId: "sess-cl",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    // A's resumed turn: turn.started straight to step.started.
+    stream.push(turnStarted("turn_A"));
+    stream.push(stepStarted("turn_A"));
+    await until(() => seen.length === 1, "A's qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_A" }]);
+    expect(store.turnIds.get("run-A")).toBe("turn_A");
+    expect(store.turnIds.has("run-B")).toBeFalse(); // a message sender never claims a content-less turn
+    stream.push(turnCancelled("turn_A"));
+    stream.push(sessionWaiting());
+    stream.push(turnStarted("turn_B"));
+    stream.push(messageReceived("turn_B", "beta"));
+    stream.push(turnCompleted("turn_B"));
+    stream.push(sessionWaiting());
+    await handle.done;
+    expect(store.turnIds.get("run-B")).toBe("turn_B");
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("a follow tail whose OWN latest send was an input response claims the content-less turn as its own — and never a content turn", async () => {
+    const store = memoryStore();
+    store.sent("run-R", null);
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-R",
+      agentSessionId: "sess-r",
+      openStream: stream.open,
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    // Somebody's content turn first — not ours.
+    stream.push(turnStarted("turn_c"));
+    stream.push(messageReceived("turn_c", "text"));
+    stream.push(turnCompleted("turn_c"));
+    stream.push(sessionWaiting());
+    await until(() => store.events.length === 4, "the content turn to persist");
+    expect(store.turnIds.has("run-R")).toBeFalse();
+    expect(store.runStatus).toBe("running");
+    // The resumed turn.
+    stream.push(turnStarted("turn_r"));
+    stream.push(stepStarted("turn_r"));
+    stream.push(turnCompleted("turn_r"));
+    stream.push(sessionWaiting());
+    await handle.done;
+    expect(store.turnIds.get("run-R")).toBe("turn_r");
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("an observation tail that drains a LIVE successor's turn hands the successor its proof by content (turn_id written) and is superseded", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.runStatus = "canceled";
+    store.sent("run-S", "stopped");
+    store.sent("run-N", "next");
+    store.obligations.set("run-S", { pendingAt: new Date(), unresolvedAt: null });
+    store.liveRuns.push({ runId: "run-N", messageHash: sha256("next") });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-S",
+      agentSessionId: "sess-succ",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+      observe: { deadlineAt: Date.now() + 60_000 },
+    });
+    stream.push(turnStarted("turn_N"));
+    stream.push(messageReceived("turn_N", "next"));
+    await handle.done;
+    expect(store.turnIds.get("run-N")).toBe("turn_N"); // the successor reads its own turn from the row
+    expect(store.turnIds.has("run-S")).toBeFalse(); // never claimed by the never-started obligation
+    expect(store.obligations.has("run-S")).toBeFalse(); // superseded by a newer run's proven turn
+    expect(seen).toHaveLength(0);
+  });
+
+  test("a held turn.started survives a stream drop: it is never persisted before its correlator, and the reconnect re-reads it from the SAME cursor", async () => {
+    const store = memoryStore();
+    store.sent("run-H", "held");
+    const startIndexes: number[] = [];
+    let connects = 0;
+    const handle = tailRun({
+      runId: "run-H",
+      agentSessionId: "sess-h",
+      openStream: async (startIndex) => {
+        startIndexes.push(startIndex);
+        connects += 1;
+        // 1st connect: the opening alone, then the stream ends (a drop).
+        // 2nd connect: eve replays from the same cursor.
+        return ndjsonResponse(
+          connects === 1
+            ? [turnStarted("t1")]
+            : [turnStarted("t1"), messageReceived("t1", "held"), turnCompleted("t1"), sessionWaiting()],
+        );
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 5_000,
+      reconnectDelayMs: 1,
+    });
+    await handle.done;
+    expect(startIndexes).toEqual([0, 0]);
+    expect(store.events.map((e) => e.event.type)).toEqual([
+      "turn.started",
+      "message.received",
+      "turn.completed",
+      "session.waiting",
+    ]);
+    expect(store.turnIds.get("run-H")).toBe("t1");
+    expect(store.runStatus).toBe("succeeded");
+  });
+
+  test("shutdown settles `failed` WITH the obligation and a QUALIFIED cancel when the turn is known — never an unqualified one — and aborts (the next boot's sweeper observes)", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-sd", "work");
+    const stream = liveStream();
+    stream.push(turnStarted("turn_sd"));
+    stream.push(messageReceived("turn_sd", "work"));
+    const handle = tailRun({
+      runId: "run-sd",
+      agentSessionId: "sess-sd",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await until(() => store.turnIds.get("run-sd") === "turn_sd", "the own turn");
+    const outcome = await handle.cancel("control plane shutting down");
+    await handle.done;
+    expect(outcome).toBe("issued");
+    expect(seen).toEqual([{ turnId: "turn_sd" }]);
+    expect(store.runStatus).toBe("failed");
+    expect(store.runPatches.at(-1)?.remoteCancelPendingAt).toBeInstanceOf(Date);
+    expect(store.obligations.has("run-sd")).toBeTrue();
+    expect(handle.observing).toBeFalse();
+  });
+
+  test("shutdown BEFORE the turn is known sends nothing and still records the obligation", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.sent("run-sd2", "work");
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-sd2",
+      agentSessionId: "sess-sd2",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    expect(await handle.cancel("control plane shutting down")).toBe("pending");
+    await handle.done;
+    expect(seen).toHaveLength(0);
+    expect(store.runStatus).toBe("failed");
+    expect(store.obligations.has("run-sd2")).toBeTrue();
+  });
+});
+
 describe("RunTailerManager — one reader per session", () => {
   test("cancelRunGuarded resolves once the row is finalized, NOT when the observation ends; the observation keeps the tail registered until eve confirms", async () => {
     const store = memoryStore();
+    store.sent("run-1", "m");
     const manager = new RunTailerManager({ store, bus: new RunEventBus(), maxWallClockMs: 60_000 });
     const stream = liveStream();
     const seen: Array<{ turnId?: string } | undefined> = [];
@@ -1366,6 +1867,7 @@ describe("RunTailerManager — one reader per session", () => {
     // A duplicate Stop on an observation tail is a no-op.
     expect(await manager.cancelRunGuarded("run-1", "again", { awaitRemote: true })).toBeNull();
     stream.push(turnStarted("t1"));
+    stream.push(messageReceived("t1", "m"));
     stream.push(turnCancelled("t1"));
     stream.push(sessionWaiting());
     await handle.done;
@@ -1377,6 +1879,8 @@ describe("RunTailerManager — one reader per session", () => {
   test("observe() refuses a second reader on a session that already has a tail; start() on a session under observation detaches the observer and the new tail inherits its obligations", async () => {
     const store = memoryStore();
     const manager = new RunTailerManager({ store, bus: new RunEventBus(), maxWallClockMs: 60_000 });
+    store.sent("run-A", "a");
+    store.sent("run-B", "b");
     store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
     const seen: Array<{ turnId?: string } | undefined> = [];
     const cancelRemoteTurn = async (options?: { turnId?: string }) => {
@@ -1415,11 +1919,13 @@ describe("RunTailerManager — one reader per session", () => {
     expect(store.obligations.has("run-A")).toBeTrue();
     await until(() => store.runStatus === "running", "B to adopt after the handover");
     successorStream.push(turnStarted("turn_A"));
+    successorStream.push(messageReceived("turn_A", "a"));
     await until(() => seen.length === 1, "A's qualified cancel from B's tail");
     expect(seen).toEqual([{ turnId: "turn_A" }]);
     successorStream.push(turnCancelled("turn_A"));
     successorStream.push(sessionWaiting());
     successorStream.push(turnStarted("turn_B"));
+    successorStream.push(messageReceived("turn_B", "b"));
     successorStream.push(turnCompleted("turn_B"));
     successorStream.push(sessionWaiting());
     await successor.done;
@@ -1660,6 +2166,7 @@ describe("authorization latch (connectors plan-3 task 9)", () => {
 describe("RunTailerManager", () => {
   test("deduplicates tails per run and drops them when done", async () => {
     const store = memoryStore();
+    store.sent("run-1", PONG);
     const bus = new RunEventBus();
     const manager = new RunTailerManager({ store, bus, maxWallClockMs: 5_000 });
     const lines = await fixtureLines("mocked-turn-events.ndjson");

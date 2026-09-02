@@ -89,8 +89,11 @@ export function createMemoryRunStore(): MemoryRunStore {
     async getRunTurnState(runId) {
       const current = store.statuses.get(runId);
       return current
-        ? { status: current.status, turnId: null, remoteCancelPendingAt: null }
+        ? { status: current.status, turnId: null, messageHash: null, remoteCancelPendingAt: null }
         : null;
+    },
+    async listUnattributedLiveRuns() {
+      return [];
     },
     async setRunTurnId() {
       return true;
@@ -176,6 +179,7 @@ export function makeRunRow(overrides: Partial<RunRow> = {}): RunRow {
     completedAt: null,
     remoteCancelPendingAt: null,
     turnId: null,
+    messageHash: null,
     remoteCancelUnresolvedAt: null,
     error: null,
     createdAt: new Date(),

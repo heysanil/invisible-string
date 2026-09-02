@@ -67,22 +67,53 @@
  *   durably recorded THIS run's own `turn.started` before we attach, so the
  *   bound alone would swallow our own turn.
  *
- * TURN ATTRIBUTION AND THE ACCEPTANCE PROOF (`runs.turn_id`). Every
- * `turn.started` a tail consumes is attributed to exactly one run, in SEND
- * order — eve serializes turns and the platform sends one message per run
- * under the session's dispatch lock, so the k-th unattributed turn on the
- * stream belongs to the k-th run sent. The tail therefore loads the
- * session's OPEN remote-cancel obligations (canceled runs still owing eve a
- * confirmation, oldest first — {@link RunStore.listPendingRemoteCancels})
- * and hands each `turn.started` it drains BEFORE its own turn to the first
- * obligation whose turn has not started; only once none is left is a
- * `turn.started` the tail's OWN. The attributed id is written to that run's
- * `turn_id` (`setRunTurnId`) BEFORE the event is persisted — that column is
- * the ONLY evidence eve accepted a turn. Nothing local proves it: a
- * `running` status is synthesized when reconciliation re-tails an unsent
- * continuation, `run_events` under a run can be a predecessor's leftovers,
- * and eve's 202 on a pre-turn cancel is consumed as a no-op. A resuming tail
- * reads its own turn from the column (never from `seq > 0`).
+ * TURN ATTRIBUTION BY CONTENT, AND THE ACCEPTANCE PROOF (`runs.turn_id`).
+ * eve's 202 carries no turn id, so a send cannot be correlated with its turn
+ * at send time — but eve's STREAM carries an exact correlator: every content
+ * turn opens with `turn.started {turnId}` immediately followed by
+ * `message.received {message: <the exact text sent>, turnId}` (LIVE-OBSERVED,
+ * `EveMessageReceivedEvent`; spike fixture `task-output-schema-events.ndjson`).
+ * The dispatch-attempt CAS records `runs.message_hash` = sha256 of the exact
+ * message sent (runs/message-hash.ts — the digest, never the text) beside
+ * the marker, and the tail attributes a turn the moment its opening is
+ * complete: `turn.started` is HELD (not persisted, cursor not advanced — a
+ * drop re-reads it) until the next event, which either is that turn's
+ * `message.received` (a CONTENT turn, correlator = the hash of its message)
+ * or is not (a CONTENT-LESS turn: a HITL `inputResponses` resume opens with
+ * NO `message.received` — `turn.started` straight to `step.started`, spike
+ * fixture `mocked-resumed-events.ndjson` — and its sender's `message_hash`
+ * is null). The claimant is then, in order:
+ *
+ *   1. the session's open remote-cancel obligation whose `message_hash`
+ *      equals the correlator (content-less turns match null hashes) and
+ *      whose turn has not started — pending obligations before UNRESOLVED
+ *      ones (still attributable: a late match clears both columns on the
+ *      boundary), oldest first within each (identical texts sent on one
+ *      session are the documented tie: oldest wins);
+ *   2. (follow mode) this tail's own run, iff ITS `message_hash` equals the
+ *      correlator — a run that sent a message never claims a content-less
+ *      turn, and one that sent an input response never claims a content
+ *      turn;
+ *   3. (content turns) a LIVE run on the session with that hash and no
+ *      `turn_id` yet — a successor admitted while an observation tail was on
+ *      the stream, whose own tail has not taken over: its `turn_id` is
+ *      written so it reads its own turn from the column;
+ *   4. otherwise the turn is FOREIGN: persisted normally, never attributed,
+ *      never canceled, never classified as anyone's own.
+ *
+ * Send ORDER attributes nothing any more (content-less turns aside — among
+ * content-less senders only): a never-sent obligation cannot steal a
+ * successor's turn unless the two texts are identical — the residual. The
+ * attributed id is written to that run's `turn_id` (`setRunTurnId`) BEFORE
+ * the held `turn.started` is persisted — that column is the ONLY evidence
+ * eve accepted a turn. Nothing local proves it: a `running` status is
+ * synthesized when reconciliation re-tails an unsent continuation,
+ * `run_events` under a run can be a predecessor's leftovers, and eve's 202
+ * on a pre-turn cancel is consumed as a no-op. A resuming tail reads its own
+ * turn from the column (never from `seq > 0`). eve SERIALIZES turns, so any
+ * turn starting also proves every attributed obligation with another id
+ * over; a turn attributed to a NEWER run (own, or a live successor) proves
+ * every obligation on the session over (`classifySessionSuccessor`'s rule).
  *
  * THE CONFIRMED CANCEL (observation mode). A user Stop no longer aborts the
  * tail: the row is finalized `canceled` at once — WITH the durable
@@ -91,33 +122,32 @@
  * turn ended. If the run's turn had already started, the Stop issues a
  * turn-QUALIFIED cancel (`{turnId}`) first; if not, nothing is sent yet
  * (eve would consume it as a no-op) and the qualified cancel goes out the
- * moment the run's own `turn.started` is attributed. The obligation clears
- * ONLY on the run's own turn boundary (`turn.cancelled` / `turn.completed`
- * carrying its turn id, or the following `session.waiting` /
- * `session.completed`), a session-terminal answer from eve
- * (`session_not_active` / `no_active_turn` on the cancel, `session.failed`
- * on the stream), or — outside this tail — a NEWER run on the session whose
- * `turn_id` is set. A tail that finds a successor's turn starting while it
- * still holds owned obligations knows they are over (serialization) and
- * clears them. Observation is wall-clock bounded (`REMOTE_CANCEL_OBSERVE_MS`
- * from the obligation's timestamp): on expiry the run is declared
- * UNRESOLVED (`remote_cancel_unresolved_at`, marker retained, logged at
- * warn) — an honest, visible residual, never a silent clear. A crash ends
- * the observation but not the obligation: the periodic remote-cancel
- * sweeper re-opens an observation tail (`observe`) from the run's persisted
- * seq for any pending run with no live tail on its session — the SAME
- * primitive, with the same attribution rules — and a successor's normal tail
- * on that session takes the obligations over through its leftover drain (the
- * manager detaches an observation tail when a normal tail starts on the same
- * session: ONE reader per eve stream, always).
+ * moment the run's own turn is attributed. The obligation clears ONLY on the
+ * run's own turn boundary (`turn.cancelled` / `turn.completed` carrying its
+ * turn id, or the following `session.waiting` / `session.completed`), a
+ * session-terminal answer from eve (`session_not_active` / `no_active_turn`
+ * on the cancel, `session.failed` on the stream), or — outside this tail — a
+ * NEWER run on the session whose `turn_id` is set. Observation is wall-clock
+ * bounded (`REMOTE_CANCEL_OBSERVE_MS` from the obligation's timestamp): on
+ * expiry the run is declared UNRESOLVED (`remote_cancel_unresolved_at`,
+ * marker retained, logged at warn) — an honest, visible residual, never a
+ * silent clear, and still attributable by any later tail on the session. A
+ * crash ends the observation but not the obligation: the periodic
+ * remote-cancel sweeper re-opens an observation tail (`observe`) from the
+ * run's persisted seq for any pending run with no live tail on its session
+ * — the SAME primitive, with the same attribution rules — and a successor's
+ * normal tail on that session takes the obligations over through its
+ * leftover drain (the manager detaches an observation tail when a normal
+ * tail starts on the same session: ONE reader per eve stream, always).
  *
- * WALL-CLOCK CAP (task 6): MAX_RUN_WALL_CLOCK_MS starts when tailing starts;
- * expiry marks the run failed and aborts the tail. It is no longer merely
- * platform-side bookkeeping: eve 0.31 ships `POST /eve/v1/session/:id/cancel`,
- * so the tail issues a REAL remote cancel (`cancelRemoteTurn`) before it stops
- * reading — for the wall-clock cap and for shutdown alike (fire-and-forget,
- * qualified when the turn id is known; those finalize `failed` and owe eve
- * nothing further — the obligation is a user-cancel concept).
+ * WALL-CLOCK CAP AND SHUTDOWN owe the same confirmation. MAX_RUN_WALL_CLOCK_MS
+ * starts when tailing starts; expiry settles the run `failed` — WITH the
+ * obligation in the same CAS, exactly like a Stop — and the tail switches to
+ * observation: a turn-QUALIFIED cancel if the turn is known, NOTHING if not
+ * (an unqualified cancel is a no-op before `turn.started` and could only ever
+ * hit a successor's turn if it arrived late — the tail never sends one, for
+ * any cause). Shutdown settles the row the same way and aborts (the process
+ * cannot observe); the next boot's sweeper re-opens the observation.
  */
 import {
   EVE_STREAM_TAIL_INDEX_HEADER,
@@ -129,6 +159,7 @@ import {
 } from "@invisible-string/shared";
 
 import type { RunEventBus } from "./bus";
+import { hashTurnMessage } from "./message-hash";
 import type { RunStore } from "./store";
 
 /**
@@ -379,9 +410,11 @@ export type CancelRemoteTurn = (options?: {
    * The turn to cancel (`turn.started.data.turnId`), used as eve's
    * stale-request guard: a late request naming a finished turn is a no-op,
    * so a qualified cancel can never stop a successor's turn. The tail only
-   * ever issues UNQUALIFIED cancels for shutdown / the wall-clock cap (where
-   * the row is finalized `failed` and admission does not matter); a user
-   * Stop waits for the run's own turn id instead.
+   * ever issues QUALIFIED cancels — a Stop, the wall-clock cap and shutdown
+   * alike wait for the run's own turn id and send nothing before it (an
+   * unqualified cancel is a no-op before `turn.started` and could only ever
+   * hit a successor's turn if it arrived late). The option stays optional
+   * for the seam's shape; the tail never omits it.
    */
   turnId?: string;
 }) => Promise<RemoteCancelReply | void>;
@@ -403,7 +436,7 @@ export interface TailRunOptions {
    */
   remoteCancelObserveMs?: number;
   /**
-   * Start directly in OBSERVATION mode for an already-canceled run carrying
+   * Start directly in OBSERVATION mode for an already-settled run carrying
    * its obligation (the sweeper / boot reconciliation re-opening a crashed
    * observation, or the post-eve recheck handing a canceled dispatch to
    * observation). No adoption CAS, no status frames; the tail persists
@@ -446,10 +479,11 @@ const QUALIFIED_CANCEL_RETRY_DELAY_MS = 5_000;
 
 export interface CancelOptions {
   /**
-   * Terminal status to mark the run with. Default `failed` (wall-clock
-   * expiry / shutdown interruption — the tail aborts at once); the run-cancel
-   * API passes `canceled` so a user Stop is recorded as a clean cancellation
-   * AND the tail stays on the stream in observation mode.
+   * Terminal status to mark the run with. Default `failed` (shutdown — the
+   * row settles WITH its obligation if the turn may be live, and the tail
+   * aborts: the next boot's sweeper observes); the run-cancel API passes
+   * `canceled` so a user Stop is recorded as a clean cancellation AND the
+   * tail stays on the stream in observation mode.
    */
   status?: "failed" | "canceled";
   /**
@@ -461,14 +495,14 @@ export interface CancelOptions {
 }
 
 /**
- * What became of a user Stop's remote leg at the moment the row finalized:
+ * What became of a Stop's remote leg at the moment the row finalized:
  * `issued` (a turn-qualified cancel reached eve — 202; the turn boundary is
  * still owed and observation follows it), `pending` (the run's turn has not
  * started yet, so nothing was sent — observation issues the qualified cancel
- * when the turn starts), `failed` (the qualified cancel failed in transport —
- * observation retries it and still owes the boundary), `terminal` (eve
- * answered session-dead — nothing can be running; nothing owed),
- * `unavailable` (no remote seam — unit fixtures; nothing owed). Only
+ * when the turn is attributed), `failed` (the qualified cancel failed in
+ * transport — observation retries it and still owes the boundary),
+ * `terminal` (eve answered session-dead — nothing can be running; nothing
+ * owed), `unavailable` (no remote seam — unit fixtures; nothing owed). Only
  * `terminal` and `unavailable` finalize WITHOUT the durable obligation.
  */
 export type RemoteCancelOutcome =
@@ -481,7 +515,7 @@ export type RemoteCancelOutcome =
 export interface RunTailHandle {
   runId: string;
   agentSessionId: string;
-  /** True while the tail is in observation mode (its run is already canceled). */
+  /** True while the tail is in observation mode (its run is already settled). */
   readonly observing: boolean;
   /** Resolves when the tail has fully stopped (terminal, observation closed, or dead). */
   done: Promise<void>;
@@ -489,9 +523,11 @@ export interface RunTailHandle {
    * Stop the run. `status: "canceled"` (a user Stop) finalizes the row NOW —
    * with its obligation — and switches the tail to observation; the promise
    * resolves with the remote outcome once the row is finalized (NOT once
-   * observation ends — that is `done`). Any other status aborts the tail
-   * immediately (shutdown / wall clock). On an observation tail a non-user
-   * cancel is a detach (the obligation survives for the sweeper).
+   * observation ends — that is `done`). The default `failed` (shutdown)
+   * finalizes the row the same way — obligation included when the turn may
+   * be live, a qualified cancel if the turn is known, never an unqualified
+   * one — and aborts the tail. On an observation tail a non-user cancel is
+   * a detach (the obligation survives for the sweeper).
    */
   cancel(reason?: string, options?: CancelOptions): Promise<RemoteCancelOutcome>;
   /**
@@ -509,9 +545,26 @@ export interface RunTailHandle {
 interface Obligation {
   runId: string;
   turnId: string | null;
+  /** The correlator of the run's latest send (null = content-less). */
+  messageHash: string | null;
+  /** Declared unresolved — still attributable, ranked after pending ones. */
+  unresolved: boolean;
+  /** Row age (epoch ms) — the tie-breaker among identical texts. */
+  createdAt: number;
   /** This tail's own run (observation mode). */
   self: boolean;
 }
+
+/** Attribution priority: pending before unresolved, oldest first within each. */
+function byAttributionPriority(a: Obligation, b: Obligation): number {
+  if (a.unresolved !== b.unresolved) return a.unresolved ? 1 : -1;
+  return a.createdAt - b.createdAt;
+}
+
+/** The correlator a turn's opening presents: its message's hash, or null. */
+type TurnContent = { hash: string } | null;
+
+type TurnAttribution = "own" | "obligation" | "successor" | "foreign";
 
 function isTurnBoundaryEvent(
   event: EveStreamEvent,
@@ -548,16 +601,15 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * attributed. Function scope so it survives reconnects.
    */
   let ownTurnId: string | null = null;
+  /** `runs.message_hash` of this run's latest send (null = content-less). */
+  let ownMessageHash: string | null = null;
   // TERMINAL GATE: terminals only count once this run's own turn boundary
   // (`turn.started`) has been seen — everything before it is a previous
   // turn's leftover (see the module doc). Derived from the durable column,
   // never from `seq > 0` (leftovers persisted under this run satisfy that).
   let sawOwnTurn = false;
-  /** The session's open obligations this tail follows (send order). */
+  /** The session's open obligations this tail follows (attribution priority). */
   let obligations: Obligation[] = [];
-  // An ABORT-driven stop marks the run "failed" (wall-clock expiry / shutdown)
-  // unless a user cancel flipped this flag, which marks it "canceled".
-  let canceledByUser = false;
   let finished = mode === "observe";
   let observationClosed = false;
   // Final assistant reply of THIS run (see RunFinishedHook). Only tracked
@@ -593,7 +645,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       status,
       error: error ?? null,
       ...(status === "waiting" ? {} : { completedAt: now }),
-      // ONE statement: a canceled row is born carrying its obligation.
+      // ONE statement: a settled row is born carrying its obligation.
       ...extra,
     });
     if (!marked) {
@@ -612,27 +664,6 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       ...(error !== undefined ? { fields: { reason: error } } : {}),
     });
     return true;
-  };
-
-  /**
-   * Fire eve's turn cancel and forget it — shutdown and the wall-clock cap
-   * (the row finalizes `failed`; nothing is owed afterwards). Qualified when
-   * the turn id is known. Never allowed to reject into the tail.
-   */
-  const requestRemoteCancel = (why: string): void => {
-    if (!cancelRemoteTurn) return;
-    const turnId = ownTurnId;
-    void cancelRemoteTurn(turnId === null ? undefined : { turnId }).catch(
-      (error: unknown) => {
-        log?.warn("run.remote_cancel_failed", {
-          fields: {
-            why,
-            turnId,
-            reason: error instanceof Error ? error.message : String(error),
-          },
-        });
-      },
-    );
   };
 
   const closeObservation = () => {
@@ -707,7 +738,9 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
         if (mine) {
           // Explicit, visible residual — never a silent clear. Predecessor
           // obligations carried by this tail are bounded by the sweeper's
-          // own age check against their own timestamps.
+          // own age check against their own timestamps. The obligation
+          // stays attributable: a later tail on the session still matches
+          // its content and clears both columns on the boundary.
           let declared = false;
           try {
             declared = await store.markRemoteCancelUnresolved(runId);
@@ -738,58 +771,199 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     }, Math.max(0, deadlineAt - Date.now()));
   };
 
+  const isKnownTurn = (turnId: string): boolean =>
+    ownTurnId === turnId || obligations.some((o) => o.turnId === turnId);
+
   /**
-   * Attribute a `turn.started` (see the module doc): a re-read of a known
-   * id is idempotent; otherwise the oldest obligation whose turn has not
-   * started owns it; otherwise (follow mode) it is this run's own turn; an
-   * observation tail seeing a turn nobody pending owns has seen a SUCCESSOR
-   * start, which proves every owned obligation over.
+   * Attribute a turn by CONTENT (see the module doc) once its opening is
+   * complete: `content` is the hash of its `message.received`, or null for a
+   * content-less turn. A re-read of a known id is idempotent. Afterwards,
+   * serialization: the turn starting proves every attributed obligation
+   * with another id over, and a turn attributed to a NEWER run (own, or a
+   * live successor) proves every obligation on the session over.
    */
-  const attributeTurnStarted = async (
+  const attributeTurn = async (
     turnId: string,
-  ): Promise<"own" | "obligation" | "successor"> => {
-    if (ownTurnId === turnId) return "own";
-    if (obligations.some((o) => o.turnId === turnId)) return "obligation";
-    const unowned = obligations.find((o) => o.turnId === null);
-    if (unowned) {
-      unowned.turnId = turnId;
-      const written = await store.setRunTurnId(unowned.runId, turnId);
-      log?.info("run.remote_cancel_turn_attributed", {
-        fields: { obligationRunId: unowned.runId, turnId, written },
-      });
-      issueQualifiedCancel(unowned);
-      return "obligation";
+    content: TurnContent,
+  ): Promise<TurnAttribution> => {
+    const correlator = content?.hash ?? null;
+    const kind = content ? "content" : "content-less";
+    let result: TurnAttribution;
+    if (ownTurnId === turnId) {
+      result = "own";
+    } else if (obligations.some((o) => o.turnId === turnId)) {
+      result = "obligation";
+    } else {
+      const claimant = obligations
+        .filter((o) => o.turnId === null && o.messageHash === correlator)
+        .sort(byAttributionPriority)[0];
+      if (claimant) {
+        claimant.turnId = turnId;
+        const written = await store.setRunTurnId(claimant.runId, turnId);
+        log?.info("run.remote_cancel_turn_attributed", {
+          fields: {
+            obligationRunId: claimant.runId,
+            turnId,
+            written,
+            by: kind,
+            unresolved: claimant.unresolved,
+          },
+        });
+        issueQualifiedCancel(claimant);
+        result = "obligation";
+      } else if (mode === "follow" && ownMessageHash === correlator) {
+        // Written BEFORE the event is persisted (crash-safe: the proof lands
+        // first, the event is re-read on resume and recognized as own).
+        const written = await store.setRunTurnId(runId, turnId);
+        if (!written) {
+          log?.warn("run.turn_id_refused", {
+            fields: { turnId, reason: "a different turn id is already on the row" },
+          });
+        }
+        ownTurnId = turnId;
+        result = "own";
+      } else if (content) {
+        // A live successor whose own tail has not taken the stream over
+        // yet (its turn was drained here): hand it its acceptance proof.
+        const successor = (await store.listUnattributedLiveRuns(agentSessionId)).find(
+          (run) => run.runId !== runId && run.messageHash === content.hash,
+        );
+        if (successor) {
+          const written = await store.setRunTurnId(successor.runId, turnId);
+          log?.info("run.turn_attributed_successor", {
+            fields: { successorRunId: successor.runId, turnId, written },
+          });
+          result = "successor";
+        } else {
+          result = "foreign";
+        }
+      } else {
+        result = "foreign";
+      }
     }
-    if (mode === "follow") {
-      // Written BEFORE the event is persisted (crash-safe: the proof lands
-      // first, the event is re-read on resume and recognized as own).
-      const written = await store.setRunTurnId(runId, turnId);
-      if (!written) {
-        log?.warn("run.turn_id_refused", {
-          fields: { turnId, reason: "a different turn id is already on the row" },
+    if (result === "foreign") {
+      log?.info("run.turn_foreign", {
+        fields: {
+          turnId,
+          by: kind,
+          reason: "no run on the session sent this turn's content — persisted, never attributed, never canceled",
+        },
+      });
+    }
+    // SERIALIZATION. eve runs one turn at a time: this turn starting proves
+    // every attributed obligation with another id over. A turn attributed
+    // to a NEWER run (own in follow mode; a live successor) proves every
+    // obligation on the session over — `classifySessionSuccessor`'s rule,
+    // applied inline (every obligation predates a live run: admission
+    // forbids a new run while one is live).
+    const supersedesAll = result === "own" || result === "successor";
+    for (const obligation of [...obligations]) {
+      if (obligation.turnId === turnId) continue;
+      if (obligation.turnId !== null) {
+        await confirmObligation(obligation, "a later turn started");
+      } else if (supersedesAll) {
+        await confirmObligation(obligation, "superseded — a newer run's turn started");
+      }
+    }
+    return result;
+  };
+
+  /**
+   * Settle the row terminal WITH its obligation in one CAS — the shape every
+   * cause shares (a user Stop, the wall-clock cap, shutdown): a turn-QUALIFIED
+   * cancel if the turn is known, NOTHING if not; then observation (or, for
+   * shutdown, an abort — the obligation is durable and the next boot's
+   * sweeper observes). Returns the remote outcome once the row is finalized.
+   */
+  const settleAndObserve = async (
+    status: "canceled" | "failed",
+    reason: string,
+    settle: { awaitRemote?: boolean; observe: boolean },
+  ): Promise<RemoteCancelOutcome> => {
+    const turnId = ownTurnId;
+    let outcome: RemoteCancelOutcome;
+    if (!cancelRemoteTurn) {
+      outcome = "unavailable";
+    } else if (turnId === null) {
+      outcome = "pending";
+      log?.info("run.remote_cancel_pending", {
+        fields: {
+          reason: "turn not started yet — the qualified cancel follows its attribution",
+          cause: reason,
+        },
+      });
+    } else if (settle.awaitRemote) {
+      try {
+        const reply = await cancelRemoteTurn({ turnId });
+        outcome = reply === "terminal" ? "terminal" : "issued";
+      } catch (error) {
+        outcome = "failed";
+        log?.warn("run.remote_cancel_failed", {
+          fields: {
+            why: reason,
+            turnId,
+            reason: error instanceof Error ? error.message : String(error),
+          },
         });
       }
-      ownTurnId = turnId;
-      return "own";
+    } else {
+      void cancelRemoteTurn({ turnId }).catch((error: unknown) => {
+        log?.warn("run.remote_cancel_failed", {
+          fields: {
+            why: reason,
+            turnId,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        });
+      });
+      outcome = "issued";
     }
-    log?.info("run.observation_superseded", {
-      fields: { turnId, owned: obligations.map((o) => o.runId) },
+    // Finalize NOW, with the obligation in the same statement unless eve
+    // (or the absence of a seam) says nothing can be running.
+    const owes = outcome !== "unavailable" && outcome !== "terminal";
+    const now = new Date();
+    const marked = await finishRun(
+      status,
+      status === "canceled" ? "active" : null,
+      reason,
+      owes ? { remoteCancelPendingAt: now } : {},
+    );
+    if (!marked || !owes || !settle.observe) {
+      // Nothing to observe here: another actor already finalized the row
+      // (its own obligation, if any, is on it), nothing is owed, or the
+      // process is going down (the obligation is durable; the sweeper
+      // re-opens observation at the next boot).
+      abort.abort();
+      return outcome;
+    }
+    // OBSERVATION: stay on the stream for eve's own confirmation.
+    mode = "observe";
+    const mine: Obligation = {
+      runId,
+      turnId,
+      messageHash: ownMessageHash,
+      unresolved: false,
+      createdAt: now.getTime(),
+      self: true,
+    };
+    obligations = [...obligations, mine];
+    if (wallClockTimer) clearTimeout(wallClockTimer);
+    armObserveDeadline(now.getTime() + remoteCancelObserveMs);
+    if (outcome === "failed") issueQualifiedCancel(mine, 2);
+    log?.info("run.observing", {
+      fields: { turnId, outcome, observeMs: remoteCancelObserveMs, cause: reason },
     });
-    for (const obligation of [...obligations]) {
-      await confirmObligation(obligation, "a successor's turn started");
-    }
-    return "successor";
+    return outcome;
   };
 
   const wallClockTimer =
     mode === "follow"
       ? setTimeout(() => {
           cancelReason ??= `run exceeded the wall-clock cap (${maxWallClockMs}ms)`;
-          // Real enforcement now: stop eve's turn instead of only stopping
-          // to read it (which used to leave the turn burning tokens against
-          // nobody).
-          requestRemoteCancel("wall-clock cap");
-          abort.abort();
+          // Real enforcement: stop eve's turn — QUALIFIED if it is known,
+          // nothing if not (the qualified cancel follows attribution) — and
+          // owe eve the confirmation exactly like a Stop.
+          void settleAndObserve("failed", cancelReason, { observe: true });
         }, maxWallClockMs)
       : null;
 
@@ -813,14 +987,19 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     let requestTailIndex = true;
     let catchUpBound: number | null = null;
 
-    // The durable turn state: this run's own turn (a resume), and the
-    // session's open obligations in send order (see the module doc).
+    // The durable turn state: this run's own turn and correlator (a resume),
+    // and the session's open obligations in attribution priority (see the
+    // module doc).
     const turnState = await store.getRunTurnState(runId);
     ownTurnId = turnState?.turnId ?? null;
+    ownMessageHash = turnState?.messageHash ?? null;
     const pending = await store.listPendingRemoteCancels(agentSessionId);
     obligations = pending.map((p) => ({
       runId: p.runId,
       turnId: p.turnId,
+      messageHash: p.messageHash,
+      unresolved: p.unresolvedAt !== null,
+      createdAt: p.createdAt.getTime(),
       self: p.runId === runId,
     }));
     if (mode === "observe") {
@@ -848,21 +1027,39 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       obligations = obligations.filter((o) => !o.self);
       sawOwnTurn = ownTurnId !== null;
       if (!sawOwnTurn && seq > 0) {
-        // Rows persisted before the column existed, or a tail that persisted
-        // its own `turn.started` under a pre-column build: the own turn is
-        // the last persisted `turn.started` that no obligation owns.
+        // A tail that persisted its own turn's opening before the proof
+        // could land (or a row from before the column existed): recover the
+        // own turn from the persisted events BY CONTENT — a `message.received`
+        // whose message hashes to this run's correlator, or (a content-less
+        // send) a `turn.started` no `message.received` follows and no
+        // obligation owns. Never "the last turn.started" — that may be a
+        // foreign turn persisted under this run.
         const persisted = await store.listEventsAfter(runId, -1);
         const known = new Set(obligations.map((o) => o.turnId));
-        for (const stored of persisted) {
-          if (
-            stored.event.type === "turn.started" &&
-            !known.has(stored.event.data.turnId)
-          ) {
-            ownTurnId = stored.event.data.turnId;
+        let recovered: string | null = null;
+        for (let i = 0; i < persisted.length; i += 1) {
+          const stored = persisted[i]!.event;
+          if (stored.type === "message.received") {
+            if (
+              ownMessageHash !== null &&
+              !known.has(stored.data.turnId) &&
+              hashTurnMessage(stored.data.message) === ownMessageHash
+            ) {
+              recovered = stored.data.turnId;
+            }
+          } else if (stored.type === "turn.started" && ownMessageHash === null) {
+            const next = persisted[i + 1]?.event;
+            const contentLess =
+              next !== undefined &&
+              !(next.type === "message.received" && next.data.turnId === stored.data.turnId);
+            if (contentLess && !known.has(stored.data.turnId)) {
+              recovered = stored.data.turnId;
+            }
           }
         }
-        if (ownTurnId !== null) {
-          await store.setRunTurnId(runId, ownTurnId);
+        if (recovered !== null) {
+          await store.setRunTurnId(runId, recovered);
+          ownTurnId = recovered;
           sawOwnTurn = true;
         }
       }
@@ -886,19 +1083,16 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
         fields: {
           resumed: seq > 0,
           ownTurnId,
+          contentLess: ownMessageHash === null,
           obligations: obligations.map((o) => o.runId),
         },
       });
     }
 
-    /** The abort landed (Stop on a follow tail, close/expiry on observation, shutdown). */
+    /** The abort landed (close/expiry on observation, shutdown, a detach). */
     const finishAborted = async (): Promise<void> => {
       if (mode === "observe") return; // closed (confirmed / unresolved / detached)
-      await finishRun(
-        canceledByUser ? "canceled" : "failed",
-        canceledByUser ? "active" : null,
-        cancelReason ?? "run tail aborted",
-      );
+      await finishRun("failed", null, cancelReason ?? "run tail aborted");
     };
 
     let attempt = 0;
@@ -913,6 +1107,14 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           return;
         }
         let consumedThisConnect = 0;
+        // A `turn.started` HELD until the next event decides what the turn
+        // is (module doc). Per connect: a drop re-reads it — it was never
+        // persisted and the cursor never moved past it.
+        let held: {
+          event: Extract<EveStreamEvent, { type: "turn.started" }>;
+          eventId: string | undefined;
+          duplicate: boolean;
+        } | null = null;
         try {
           const response = await openStream(
             startIndex,
@@ -954,24 +1156,13 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               }
             }
           }
-          for await (const event of ndjsonEvents(response.body)) {
-            // Absolute index of THIS event in eve's session stream.
-            const eventIndex = startIndex;
-            const eventId = event.meta?.id;
-            // Reconnect-overlap guard. A re-read of an already-persisted
-            // event advances the cursor and still drives the latches (the
-            // classification may not have run before the drop) but is never
-            // written or published twice.
-            const duplicate = eventId !== undefined && seenEventIds.has(eventId);
 
-            // TURN ATTRIBUTION runs BEFORE the persist: the acceptance proof
-            // (`turn_id`) must be on the row before the event that proves it
-            // is durable, so a crash in between keeps the proof.
-            const attribution =
-              event.type === "turn.started"
-                ? await attributeTurnStarted(event.data.turnId)
-                : null;
-
+          /** Persist + publish one consumed event and advance both cursors. */
+          const persist = async (
+            event: EveStreamEvent,
+            eventId: string | undefined,
+            duplicate: boolean,
+          ) => {
             if (!duplicate) {
               // Persist FIRST, count after: if appendEvent throws (transient
               // Postgres error), the reconnect resumes from the same
@@ -993,18 +1184,77 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             }
             consumedThisConnect += 1;
             startIndex += 1;
+          };
 
-            if (attribution === "own") {
-              // This run's own turn boundary: leftover pending-input state
-              // from a drained previous turn is historical, not ours — and it
-              // ends the catch-up drain even if eve's tail index reached
-              // further (eve may already have recorded our own turn).
-              sawOwnTurn = true;
-              pendingInput = false;
-              pendingAuthorization = false;
-              canceledTurn = false;
-              catchUpBound = null;
+          /** The own turn's opening landed: reset the per-turn latches. */
+          const applyAttribution = (attribution: TurnAttribution) => {
+            if (attribution !== "own") return;
+            // This run's own turn boundary: leftover pending-input state
+            // from a drained previous turn is historical, not ours — and it
+            // ends the catch-up drain even if eve's tail index reached
+            // further (eve may already have recorded our own turn).
+            sawOwnTurn = true;
+            pendingInput = false;
+            pendingAuthorization = false;
+            canceledTurn = false;
+            catchUpBound = null;
+          };
+
+          for await (const event of ndjsonEvents(response.body)) {
+            const eventId = event.meta?.id;
+            // Reconnect-overlap guard. A re-read of an already-persisted
+            // event advances the cursor and still drives the latches (the
+            // classification may not have run before the drop) but is never
+            // written or published twice.
+            const duplicate = eventId !== undefined && seenEventIds.has(eventId);
+
+            if (event.type === "turn.started") {
+              // Two openings in a row cannot happen on eve's stream; if one
+              // ever does, the first was content-less.
+              if (held) {
+                const attribution = await attributeTurn(held.event.data.turnId, null);
+                await persist(held.event, held.eventId, held.duplicate);
+                held = null;
+                applyAttribution(attribution);
+              }
+              held = { event, eventId, duplicate };
+              continue;
             }
+
+            // Absolute index of THIS event in eve's session stream.
+            const eventIndex = held ? startIndex + 1 : startIndex;
+
+            // TURN ATTRIBUTION runs BEFORE the persist: the acceptance proof
+            // (`turn_id`) must be on the row before the events that prove it
+            // are durable, so a crash in between keeps the proof.
+            if (held) {
+              const heldTurnId = held.event.data.turnId;
+              const content: TurnContent =
+                event.type === "message.received" && event.data.turnId === heldTurnId
+                  ? { hash: hashTurnMessage(event.data.message) }
+                  : null;
+              const attribution = await attributeTurn(heldTurnId, content);
+              await persist(held.event, held.eventId, held.duplicate);
+              held = null;
+              applyAttribution(attribution);
+              if (mode === "observe" && observationClosed) return;
+            } else if (
+              event.type === "message.received" &&
+              !isKnownTurn(event.data.turnId)
+            ) {
+              // Resumed between a persisted opening and its correlator: the
+              // opening was persisted only after a decision, so this is a
+              // re-decision for a turn that matched nothing then (idempotent
+              // — it matches nothing now, or the ledger changed).
+              applyAttribution(
+                await attributeTurn(event.data.turnId, {
+                  hash: hashTurnMessage(event.data.message),
+                }),
+              );
+            }
+
+            await persist(event, eventId, duplicate);
+
             pendingInput = nextPendingInputRequest(pendingInput, event);
             pendingAuthorization = nextPendingAuthorization(
               pendingAuthorization,
@@ -1067,11 +1317,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             }
 
             // The catch-up window closes either at eve's attach-time tail
-            // index or at our own `turn.started`, whichever comes first. It is
-            // logged, not enforced: the TURN gate below is what actually
-            // suppresses classification, because eve may already have durably
-            // recorded this run's own turn before we attached — a bound-only
-            // rule would swallow our own terminal and hang the run.
+            // index or at our own turn, whichever comes first. It is logged,
+            // not enforced: the TURN gate below is what actually suppresses
+            // classification, because eve may already have durably recorded
+            // this run's own turn before we attached — a bound-only rule
+            // would swallow our own terminal and hang the run.
             if (catchUpBound !== null && eventIndex >= catchUpBound) {
               log?.info("run.catch_up_complete", {
                 fields: { drained: eventIndex - (catchUpBound ?? 0) + 1 },
@@ -1079,8 +1329,8 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
               catchUpBound = null;
             }
 
-            // LEFTOVER GATE: until this run's own `turn.started` lands, every
-            // event is a previous turn's leftover — persisted (counts stay
+            // LEFTOVER GATE: until this run's own turn lands, every event is
+            // a previous (or foreign) turn's — persisted (counts stay
             // aligned) but never classified, or the drained
             // `turn.completed`/`session.waiting` would instantly mark this run
             // succeeded. `session.failed` is session-fatal and always counts.
@@ -1104,6 +1354,7 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
           // Stream ended without a terminal event → treat like a drop.
           throw new Error("stream ended before a terminal event");
         } catch (error) {
+          held = null; // never persisted, cursor never advanced: re-read on reconnect
           if (detaching) return; // failover / handover: leave the row alone
           if (abort.signal.aborted) {
             await finishAborted();
@@ -1173,70 +1424,18 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
         return "pending";
       }
       if (options?.status !== "canceled") {
-        // Shutdown / wall clock: stop eve's turn (qualified when known) and
-        // abort; the row finalizes `failed` and owes nothing further.
-        requestRemoteCancel("shutdown");
-        abort.abort();
-        return cancelRemoteTurn ? "issued" : "unavailable";
+        // SHUTDOWN: settle the row `failed` WITH its obligation (a qualified
+        // cancel if the turn is known, nothing if not — never unqualified)
+        // and abort; the process cannot observe, the next boot's sweeper can.
+        return settleAndObserve("failed", cancelReason, { observe: false });
       }
-      // USER STOP. The remote leg is turn-QUALIFIED or not sent at all: an
-      // unqualified cancel before `turn.started` is consumed as a no-op by
-      // eve and could only ever hit a successor's turn if it arrived late.
-      canceledByUser = true;
-      const turnId = ownTurnId;
-      let outcome: RemoteCancelOutcome;
-      if (!cancelRemoteTurn) {
-        outcome = "unavailable";
-      } else if (turnId === null) {
-        outcome = "pending";
-        log?.info("run.remote_cancel_pending", {
-          fields: { reason: "turn not started yet — qualified cancel follows its turn.started" },
-        });
-      } else if (options?.awaitRemote) {
-        try {
-          const reply = await cancelRemoteTurn({ turnId });
-          outcome = reply === "terminal" ? "terminal" : "issued";
-        } catch (error) {
-          outcome = "failed";
-          log?.warn("run.remote_cancel_failed", {
-            fields: {
-              why: "user cancel",
-              turnId,
-              reason: error instanceof Error ? error.message : String(error),
-            },
-          });
-        }
-      } else {
-        requestRemoteCancel("user cancel");
-        outcome = "issued";
-      }
-      // Finalize NOW, with the obligation in the same statement unless eve
-      // (or the absence of a seam) says nothing can be running.
-      const owes = outcome !== "unavailable" && outcome !== "terminal";
-      const now = new Date();
-      const marked = await finishRun(
-        "canceled",
-        "active",
-        cancelReason,
-        owes ? { remoteCancelPendingAt: now } : {},
-      );
-      if (!marked || !owes) {
-        // Nothing to observe: another actor already finalized the row (its
-        // own obligation, if any, is on it), or nothing is owed.
-        abort.abort();
-        return outcome;
-      }
-      // OBSERVATION: stay on the stream for eve's own confirmation.
-      mode = "observe";
-      const mine: Obligation = { runId, turnId, self: true };
-      obligations = [...obligations, mine];
-      if (wallClockTimer) clearTimeout(wallClockTimer);
-      armObserveDeadline(now.getTime() + remoteCancelObserveMs);
-      if (outcome === "failed") issueQualifiedCancel(mine, 2);
-      log?.info("run.observing", {
-        fields: { turnId, outcome, observeMs: remoteCancelObserveMs },
+      // USER STOP: the remote leg is turn-QUALIFIED or not sent at all, the
+      // row finalizes `canceled` with the obligation, and the tail stays on
+      // the stream in observation mode.
+      return settleAndObserve("canceled", cancelReason, {
+        awaitRemote: options?.awaitRemote ?? false,
+        observe: true,
       });
-      return outcome;
     },
     detach,
   };
@@ -1335,7 +1534,7 @@ export class RunTailerManager {
   }
 
   /**
-   * Re-open OBSERVATION for a canceled run still owing eve a confirmation
+   * Re-open OBSERVATION for a settled run still owing eve a confirmation
    * (the sweeper, boot reconciliation, the post-eve recheck). Null when the
    * session already has a live tail — that tail carries the session's
    * obligations — so the caller counts it `observing`, never a second reader.

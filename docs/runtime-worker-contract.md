@@ -435,15 +435,39 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   drained by its first connect; and eve answers an UNQUALIFIED pre-turn
   cancel with 202 while consuming it as a no-op (above). So the platform no
   longer infers "eve accepted this turn" or "the turn was stopped" from any
-  of them. The proof is `runs.turn_id`: the tail attributes every
-  `turn.started` it consumes in SEND order — eve serializes turns and the
-  platform sends one message per run under the session lock — handing each
-  one drained before its own turn to the session's oldest open obligation
-  whose turn has not started (`RunStore.listPendingRemoteCancels`), and
-  only then claiming one as its OWN; the id is written to that run's
-  `turn_id` BEFORE the event is persisted (`runs/tailer.ts`). The
-  dispatch-attempt CAS resets the column, so it always describes the latest
-  send. A Stop on a LIVE tail (`POST /runs/:id/cancel`, the pipeline child
+  of them. The proof is `runs.turn_id`, and it is attributed by CONTENT —
+  never by send order. eve's 202 carries no turn id, but its stream does
+  carry an exact correlator: every content turn opens with `turn.started
+  {turnId}` immediately followed by `message.received {message: <the exact
+  text sent>, turnId}`. The dispatch-attempt CAS therefore records
+  `runs.message_hash` = sha256 of the exact message handed to eve (the
+  digest only — chat text is never persisted; pipeline task messages
+  already are) beside the marker and the `turn_id` reset, so the three
+  columns always describe one send. The tail HOLDS a `turn.started`
+  (unpersisted, cursor not advanced — a drop re-reads it) until the next
+  event, then attributes: a `message.received` for that turn makes it a
+  CONTENT turn whose correlator is the hash of its message; anything else
+  makes it CONTENT-LESS — a HITL `inputResponses` resume opens with NO
+  `message.received` (`turn.started` straight to `step.started`, spike
+  fixture `mocked-resumed-events.ndjson`), and its sender's `message_hash`
+  is null. The claimant, in order: **(1)** the session's open obligation
+  whose `message_hash` equals the correlator (content-less turns match null
+  hashes) and whose turn has not started — pending obligations before
+  UNRESOLVED ones, oldest first within each (`RunStore.listPendingRemoteCancels`);
+  **(2)** in follow mode, the tail's own run iff ITS `message_hash` equals
+  the correlator; **(3)** for content turns, a LIVE run on the session with
+  that hash and no `turn_id` yet (a successor admitted while an observation
+  tail held the stream — it gets its proof written and reads it from the
+  column); **(4)** otherwise the turn is FOREIGN: persisted, never
+  attributed, never cancelled, never classified as anyone's own. Send order
+  attributes nothing any more, content-less turns aside (among content-less
+  senders only): a never-sent obligation cannot steal a successor's turn
+  unless the two texts are identical — the documented residual (then the
+  oldest matching obligation wins). The id is written to the claimant's
+  `turn_id` BEFORE the held opening is persisted (`runs/tailer.ts`). eve
+  serializes turns, so any turn starting proves every attributed obligation
+  with another id over, and a turn attributed to a NEWER run (own, or a live
+  successor) proves every obligation on the session over. A Stop on a LIVE tail (`POST /runs/:id/cancel`, the pipeline child
   sweep — `cancelAgentRun`) issues a turn-QUALIFIED cancel if the turn is
   known (awaited, so its outcome is reported), sends NOTHING if not (the
   no-op 202 above; the qualified cancel goes out the moment the run's own
@@ -456,14 +480,16 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   the hold existed so an unqualified cancel could not land on a successor's
   turn, and the live tail never sends one now; admission may reopen the
   instant the row reads canceled. The obligation clears ONLY on: **(a)** the
-  run's own turn boundary after its own `turn.started` — `turn.cancelled` /
+  run's own turn boundary after its own turn was attributed — `turn.cancelled` /
   `turn.completed` carrying its turn id, or the following `session.waiting`
   / `session.completed` (a `session.failed` is session-terminal and clears
   every obligation); **(b)** a session-terminal answer from eve — 409
   `session_not_active` / 200 `no_active_turn` on the cancel (the tail's
   seam classifies both `terminal`), 409 `session_not_active` on a send
-  (`failEveDispatch`), 200 `no_active_session` on a context control
-  (`settleSessionRemoteCancelsTerminal`); **(c)** a PROVEN successor — a
+  (`failEveDispatch`), 200 `no_active_session` on a context control, and a
+  `reset` — which RETIRES the id — or `no_active_session` on it
+  (`settleSessionRemoteCancelsTerminal`, unresolved rows included: every
+  obligation on a retired session is met); **(c)** a PROVEN successor — a
   NEWER run on the session whose `turn_id` is set (`classifySessionSuccessor`:
   that and nothing else; a `queued`/`running`/`waiting` status, a terminal
   status, or persisted events without a `turn_id` are all unproven and
@@ -476,14 +502,25 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   `remote_cancel_pending_at`: on expiry the run is declared UNRESOLVED —
   `runs.remote_cancel_unresolved_at` set, the pending marker KEPT, a warn
   logged (`run.remote_cancel_unresolved`) — an explicit, visible residual,
-  never a silent clear; a late confirmation still resolves it (both columns
-  cleared). ONE reader per eve stream, always: the manager keys tails by
+  never a silent clear; an unresolved obligation STAYS attributable (ranked
+  after every pending one, content match still required), so a late turn
+  matching its content is still cancelled qualified and its boundary clears
+  BOTH columns. The wall-clock cap (`MAX_RUN_WALL_CLOCK_MS`) and shutdown
+  owe the same confirmation: the tail settles the row `failed` WITH the
+  obligation in the same CAS — a qualified cancel if the turn is known,
+  NOTHING if not; the tail never sends an unqualified cancel for any cause
+  — then observes (the cap) or aborts for the next boot's sweeper
+  (shutdown); the obligation predicates are keyed on the marker alone, not
+  on `canceled`. ONE reader per eve stream, always: the manager keys tails by
   session, detaches an observation tail when a successor's normal tail
   starts on the same session (that tail carries the session's obligations
-  through its leftover drain — attributing the predecessor's turn, issuing
-  its qualified cancel, clearing on its boundary — before it claims its own
-  turn), and refuses to open an observation on a session that already has
-  a tail. A crash ends the observation, not the obligation: the no-tail
+  through its leftover drain — attributing the predecessor's turn by
+  content, issuing its qualified cancel, clearing on its boundary — before
+  it claims its own turn), refuses to open an observation on a session that
+  already has a tail, and the context controls (clear/compact/reset) count a
+  live observation tail as NOT quiet — 409 `session_busy`, retry once the
+  Stop settles — so their drain is never a second reader. A crash ends the
+  observation, not the obligation: the no-tail
   settlement (`settleRemoteCancelGuarded`, under the session lock) applies
   (b)–(d) and otherwise RE-OPENS an observation tail from the run's
   persisted seq on the session's affinity worker (`startObservation` — the

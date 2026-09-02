@@ -44,7 +44,11 @@ import { createLogger } from "../log";
 import { runMigrations } from "../migrate";
 import { RunEventBus } from "../runs/bus";
 import { createDrizzleRunStore, type RunStore } from "../runs/store";
+import { hashTurnMessage } from "../runs/message-hash";
 import { RunTailerManager } from "../runs/tailer";
+
+/** The message every fake-streamed turn was opened with (its correlator). */
+const OBSERVED_MESSAGE = "observed turn";
 import { loadRuntimeConfig } from "./config";
 import { isRuntimeApiError } from "./errors";
 import { MetricsRegistry } from "./metrics";
@@ -142,9 +146,20 @@ class FakeWorkerClient {
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
         if (emitTurn) {
+          // The turn's opening AND its correlator: the tail attributes a turn
+          // by CONTENT (runs/tailer.ts), never by send order — runs inserted
+          // by this suite carry `message_hash` = sha256(OBSERVED_MESSAGE).
           controller.enqueue(
             encoder.encode(
               `${JSON.stringify({ type: "turn.started", data: { sequence: 0, turnId: "turn_observed" } })}\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `${JSON.stringify({
+                type: "message.received",
+                data: { message: OBSERVED_MESSAGE, sequence: 0, turnId: "turn_observed" },
+              })}\n`,
             ),
           );
         }
@@ -332,6 +347,7 @@ describe.skipIf(!GATE)("session dispatch lock recovery (D2, D3, D4, D5)", () => 
         triggerEvent: triggerEvent() as unknown as Record<string, unknown>,
         status: "queued",
         startedAt: new Date(),
+        messageHash: hashTurnMessage(OBSERVED_MESSAGE),
         ...over,
       })
       .returning();

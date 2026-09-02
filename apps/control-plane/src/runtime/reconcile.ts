@@ -47,9 +47,10 @@
  *    an eveless CHAT session (including a post-reset replacement row, which
  *    has no runs at all) stays continuable by design.
  *
- * 2b. PENDING REMOTE CANCELS — canceled agent runs still carrying
- *    `remote_cancel_pending_at` and not yet declared unresolved: a Stop
- *    settled the row (the marker is set in the same CAS) but eve's OWN
+ * 2b. PENDING REMOTE CANCELS — settled agent runs (a Stop's `canceled`, the
+ *    tail's wall-clock cap / shutdown `failed`) still carrying
+ *    `remote_cancel_pending_at` and not yet declared unresolved: the row was
+ *    settled (the marker is set in the same CAS) but eve's OWN
  *    confirmation that the turn ended was never observed — the process died
  *    while its tail was observing the stream, the settlement was refused
  *    (lock held, lock pool saturated), or no worker could serve the stream.
@@ -60,7 +61,8 @@
  *    never happened, or an eveless session that sweep 2 closed — and
  *    otherwise RE-OPENS an OBSERVATION tail from the run's persisted seq
  *    (runs/tailer.ts: the same primitive the live Stop uses — attribute the
- *    run's `turn.started`, issue the turn-qualified cancel, clear on the
+ *    run's turn by CONTENT (`runs.message_hash` against the turn's
+ *    `message.received`), issue the turn-qualified cancel, clear on the
  *    boundary), never a normal tail (which would re-drive/misclassify a
  *    canceled run) and never a second reader on a session that already has
  *    a live tail (that tail carries the obligations). An obligation older
@@ -328,7 +330,7 @@ export const DEFAULT_REMOTE_CANCEL_SWEEP_MS = 60_000;
 const REMOTE_CANCEL_SWEEP_LOCK_KEY = "remote-cancel-sweep";
 
 /**
- * Sweep 2b's body: every canceled agent run still carrying
+ * Sweep 2b's body: every settled agent run still carrying
  * `remote_cancel_pending_at` and not yet declared unresolved, each settled
  * through `settleRemoteCancelGuarded` under its session's dispatch lock.
  * `defer: true` (boot) lets a held lock spawn the bounded background attempt
@@ -353,7 +355,10 @@ export async function sweepPendingRemoteCancels(
     .where(
       and(
         eq(schema.runs.mode, "agent"),
-        eq(schema.runs.status, "canceled"),
+        // The marker alone defines an obligation: a Stop's `canceled`, or
+        // the tail's wall-clock cap / shutdown `failed` — same confirmation
+        // owed. Unresolved rows are skipped (declared; they stay attributable
+        // through any later tail on the session, never re-opened here).
         isNotNull(schema.runs.remoteCancelPendingAt),
         isNull(schema.runs.remoteCancelUnresolvedAt),
         isNotNull(schema.runs.agentSessionId),

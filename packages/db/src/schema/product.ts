@@ -737,10 +737,13 @@ export const runs = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
     /**
      * DURABLE remote-cancel obligation (agent runs). Set — in the SAME CAS
-     * statement that settles the row `canceled` — by every Stop (the live
-     * tail's own finalize, `POST /runs/:id/cancel` on a queued/waiting run,
-     * the pipeline cancel sweep over child runs, the post-eve recheck), and
-     * cleared ONLY on a CONFIRMED outcome: eve's OWN stream showed the run's
+     * statement that settles the row — by every Stop (the live tail's own
+     * finalize, `POST /runs/:id/cancel` on a queued/waiting run, the
+     * pipeline cancel sweep over child runs, the post-eve recheck) settling
+     * the row `canceled`, and by the tail's wall-clock cap / shutdown
+     * settling it `failed` (a turn that may still be running owes eve the
+     * same confirmation whatever the platform called the row). Cleared ONLY
+     * on a CONFIRMED outcome: eve's OWN stream showed the run's
      * turn boundary after its own `turn.started` (`turn.cancelled` /
      * `turn.completed` / the following `session.waiting`/`session.completed`
      * — observed by the tail that stays on the stream after a Stop, or by
@@ -757,9 +760,9 @@ export const runs = pgTable(
     /**
      * eve's OWN acceptance proof for this run's latest send: the `turnId` of
      * the run's own `turn.started`, written by the tail the moment it
-     * observes that event on eve's stream (turn attribution runs in send
-     * order, so a `turn.started` drained before the run's own is a pending
-     * predecessor's). NULL until then — and reset to NULL by every
+     * attributes that turn on eve's stream — by CONTENT (`message_hash`
+     * below matched against the turn's `message.received`), never by send
+     * order. NULL until then — and reset to NULL by every
      * dispatch-attempt CAS (`armDispatchAttempt`), so "marker set + turn_id
      * NULL" reads "sent, not yet started (or never)". This column is the ONLY
      * evidence that eve accepted a turn: a `running` status can be
@@ -769,6 +772,22 @@ export const runs = pgTable(
      * "superseded" only by a NEWER run whose `turn_id` is set.
      */
     turnId: text("turn_id"),
+    /**
+     * The turn CORRELATOR for the run's LATEST send: sha256 (hex) of the
+     * exact `message` string handed to eve, written by the dispatch-attempt
+     * CAS (`armDispatchAttempt`) in the same statement as the marker — never
+     * the text itself (chat messages are not persisted on the run; pipeline
+     * task messages already are, as `task_message`). eve's stream echoes
+     * that text verbatim in the `message.received` that immediately follows
+     * every content turn's `turn.started`, so the tail attributes a turn by
+     * CONTENT — the run on the session whose hash matches — never by send
+     * order. NULL = the latest send carried `inputResponses` (a HITL resume:
+     * eve opens that turn with NO `message.received`, so such a turn is
+     * content-less and attributable only among content-less senders, in
+     * send order) — or the row was armed before this column existed (dev
+     * ledgers only; read the same way). Reset on every arm.
+     */
+    messageHash: text("message_hash"),
     /**
      * The remote-cancel obligation's HONEST residual: set (with the pending
      * marker left in place) when `REMOTE_CANCEL_OBSERVE_MS` elapsed after

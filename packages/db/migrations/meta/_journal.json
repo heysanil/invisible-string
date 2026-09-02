@@ -127,6 +127,13 @@
       "when": 1788320865888,
       "tag": "0017_real_dagger",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1788324426333,
+      "tag": "0018_foamy_luckman",
+      "breakpoints": true
     }
   ]
 }

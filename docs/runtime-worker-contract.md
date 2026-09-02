@@ -383,8 +383,11 @@ started. The no-tail Stop's obligation settlement
 when a dispatch holds the lock the settlement is DEFERRED into the
 background (never dropped — the holder's recheck may have read the run
 before the Stop settled it) and re-runs the same under-lock decision once
-the holder releases. The lock is never held across a tail — the observation
-that follows a Stop included. The boot sweep
+the holder releases. The three context controls (clear/compact/reset) hold
+the lock too — from their quiet check through the eve call and the
+drain/settlement — so admission and a control never interleave. The lock is
+never held across a tail — the observation that follows a Stop included.
+The boot sweep
 skips a candidate whose lock is held and its guarded UPDATE re-asserts the
 ledger (`NOT EXISTS` a live run) atomically. Contention answers the
 transient `session_busy`; the lock dies with its connection on a crash, and
@@ -450,7 +453,23 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   makes it CONTENT-LESS — a HITL `inputResponses` resume opens with NO
   `message.received` (`turn.started` straight to `step.started`, spike
   fixture `mocked-resumed-events.ndjson`), and its sender's `message_hash`
-  is null. The claimant, in order: **(1)** the session's open obligation
+  is null. The obligations consulted are the session's CURRENT ones, never
+  a start-of-tail snapshot: the tail re-reads them from the store
+  (`RunStore.listPendingRemoteCancels`) at every turn opening (before the
+  claimant search), every turn/session boundary (before the owner match),
+  its own settlement, and on the manager's signal
+  (`RunTailerManager.refreshSessionObligations` — sent by the guarded
+  settlement and by an `observe()` refused for "the session already has a
+  reader") — adopting rows it did not follow (a continuation Stopped before
+  its own tail started, whose turn would otherwise have been persisted as
+  FOREIGN because the reader's list predated the Stop; an adopted row whose
+  turn is already known gets its qualified cancel at once) and dropping rows
+  another actor cleared. Attribution, settlement and that refresh run on ONE
+  per-tail serial queue: a Stop (or the wall-clock cap, or shutdown) never
+  snapshots `ownTurnId` while an attribution's `setRunTurnId` is in flight —
+  it settles after the attribution completes, re-reads the row's `turn_id`
+  after finalizing, and issues the qualified cancel immediately when the id
+  is known by then. The claimant, in order: **(1)** the session's open obligation
   whose `message_hash` equals the correlator (content-less turns match null
   hashes) and whose turn has not started — pending obligations before
   UNRESOLVED ones, oldest first within each (`RunStore.listPendingRemoteCancels`);
@@ -519,13 +538,25 @@ Four disciplines the lock's first cut violated, all now load-bearing:
   it claims its own turn), refuses to open an observation on a session that
   already has a tail, and the context controls (clear/compact/reset) count a
   live observation tail as NOT quiet — 409 `session_busy`, retry once the
-  Stop settles — so their drain is never a second reader. A crash ends the
+  Stop settles — so their drain is never a second reader. That quiet check
+  is a read, so the controls HOLD the session dispatch lock around it
+  (routes.ts `withQuietSessionControl`: lock → re-read the row under it →
+  quiet check → eve call → drain/settlement → release; a bounded
+  `SESSION_LOCK_ADMISSION_WAIT_MS` try, contended → 409 `session_busy`):
+  admission takes the same lock, so a follow-up can no longer be admitted
+  and sent between "the session is quiet" and the drain attaching (two
+  cursor owners on one stream, the same `(run_id, seq)` written twice), and
+  a reset can no longer retire a session underneath a dispatch it has just
+  admitted. A crash ends the
   observation, not the obligation: the no-tail
   settlement (`settleRemoteCancelGuarded`, under the session lock) applies
   (b)–(d) and otherwise RE-OPENS an observation tail from the run's
   persisted seq on the session's affinity worker (`startObservation` — the
   same primitive, never a normal tail, which would re-drive/misclassify a
-  canceled run), counted `observing`; nothing to act on (an armed eveless
+  canceled run), counted `observing` — and when the session already has a
+  live tail in this process, that tail is SIGNALED to re-read the session's
+  obligations (`refreshSessionObligations`) and counted `observing` too;
+  nothing to act on (an armed eveless
   session, no live worker) is `retained`; a held lock is `deferred`. The
   post-eve recheck (`recheckCanceledDuringEve`) applies the same rules: a
   run settled canceled while its eve call was in flight is `superseded`

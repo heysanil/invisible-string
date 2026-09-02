@@ -5,6 +5,7 @@
  * controls.
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
@@ -106,7 +107,7 @@ test("a member sees a read-only allowlist — no toggles, remove, or add", async
   await view.findByText("z-ai/glm-5.2");
 
   await waitFor(() => {
-    expect(view.queryByText("Add a model")).toBeNull();
+    expectAbsent(() => view.queryByText("Add a model"), "the add-model control");
   });
   expect(view.queryAllByRole("switch")).toHaveLength(0);
   expect(view.queryByRole("button", { name: /Remove/ })).toBeNull();

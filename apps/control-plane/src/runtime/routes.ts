@@ -1055,8 +1055,16 @@ export async function settleRemoteCancelGuarded(
         });
         return "unresolved";
       }
-      // 7. Owed: observe eve's stream.
-      if (deps.tailers.hasSessionTail(agentSessionId)) return "observing";
+      // 7. Owed: observe eve's stream. A tail already on the session (any
+      // mode) carries the obligation from here — but it loaded the session's
+      // obligations when IT started, so it is told to re-read them now: the
+      // run's turn, when it opens on that stream, must be attributed to
+      // this run by content (and cancelled qualified), never persisted as
+      // foreign because the reader's list predates this Stop.
+      if (deps.tailers.hasSessionTail(agentSessionId)) {
+        await deps.tailers.refreshSessionObligations(agentSessionId);
+        return "observing";
+      }
       let target: SessionControlTarget;
       try {
         target = await sessionControlTarget(deps, session.organizationId, session, { ensure: false });
@@ -1281,6 +1289,12 @@ export async function cancelChildRun(
  * — `session_busy`, exactly like the run it is following: the Stop is still
  * settling; wait (an observation ends on the turn boundary within seconds
  * normally, and at `REMOTE_CANCEL_OBSERVE_MS` at the latest), then retry.
+ *
+ * A CHECK, not a critical section: it reads the ledger and the in-process
+ * tails at one instant. The routes run it UNDER the session dispatch lock
+ * ({@link withQuietSessionControl}) so that instant lasts through the eve
+ * call and the drain — without the lock a dispatch could be admitted in
+ * between, and the drain would be a second reader on the stream.
  */
 export async function requireQuietControllableSession(
   deps: RuntimeDeps,
@@ -2305,25 +2319,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.sessionId,
         );
-        const eveSessionId = await requireQuietControllableSession(deps, session);
-        const target = await sessionControlTarget(
-          deps,
-          workspace.organizationId,
-          session,
-        );
-        const result = await deps.workerClient.clearEveSession(
-          target.workerAddress,
-          target.hash,
-          target.token,
-          eveSessionId,
-        );
-        return finishContextControl(
-          deps,
-          session,
-          result.status,
-          target,
-          eveSessionId,
-        );
+        return clearSession(deps, session);
       },
       { requireWorkspace: true },
     )
@@ -2335,30 +2331,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.sessionId,
         );
-        const eveSessionId = await requireQuietControllableSession(deps, session);
-        const target = await sessionControlTarget(
-          deps,
-          workspace.organizationId,
-          session,
-        );
-        // A compact over an EMPTY/already-cleared context emits no
-        // `compaction.*` events at all — the 202 is the only acknowledgement,
-        // and the drain in finishContextControl answers a null `marker`
-        // rather than inventing a boundary. Never wait on
-        // `compaction.requested` here.
-        const result = await deps.workerClient.compactEveSession(
-          target.workerAddress,
-          target.hash,
-          target.token,
-          eveSessionId,
-        );
-        return finishContextControl(
-          deps,
-          session,
-          result.status,
-          target,
-          eveSessionId,
-        );
+        return compactSession(deps, session);
       },
       { requireWorkspace: true },
     )
@@ -2411,67 +2384,157 @@ export async function resetSession(
   session: SessionRow,
   input: { reason?: string },
 ): Promise<ResetSessionResponse> {
-  const eveSessionId = await requireQuietControllableSession(deps, session);
-  const target = await sessionControlTarget(deps, session.organizationId, session);
-  // Reset is the ONE control route that never answers 202: BOTH outcomes
-  // are HTTP 200, and the id field is `previousSessionId`.
-  const result = await deps.workerClient.resetEveSession(
-    target.workerAddress,
-    target.hash,
-    target.token,
-    eveSessionId,
-    input.reason !== undefined ? { reason: input.reason } : {},
-  );
+  return withQuietSessionControl(deps, session, async (live, eveSessionId) => {
+    const target = await sessionControlTarget(deps, live.organizationId, live);
+    // Reset is the ONE control route that never answers 202: BOTH outcomes
+    // are HTTP 200, and the id field is `previousSessionId`.
+    const result = await deps.workerClient.resetEveSession(
+      target.workerAddress,
+      target.hash,
+      target.token,
+      eveSessionId,
+      input.reason !== undefined ? { reason: input.reason } : {},
+    );
 
-  // Either way the old eve id is unusable: `reset` retired it, and
-  // `no_active_session` means it was already dead. Close the row (which
-  // also releases any slack_thread_key) and settle its obligations — but
-  // only `reset` mints a replacement, so `no_active_session` leaves the
-  // caller on a closed row it must replace with a fresh chat.
-  await deps.runStore.markSession(session.id, "closed");
-  await settleSessionRemoteCancelsTerminal(
-    deps,
-    session.id,
-    result.status === "reset"
-      ? "eve: session retired by reset"
-      : "eve: no_active_session on reset",
-  );
-  const previousSession = sessionDto({ ...session, status: "closed" });
-  if (result.status !== "reset") {
-    return { status: "no_active_session", previousSession };
+    // Either way the old eve id is unusable: `reset` retired it, and
+    // `no_active_session` means it was already dead. Close the row (which
+    // also releases any slack_thread_key) and settle its obligations — but
+    // only `reset` mints a replacement, so `no_active_session` leaves the
+    // caller on a closed row it must replace with a fresh chat.
+    await deps.runStore.markSession(live.id, "closed");
+    await settleSessionRemoteCancelsTerminal(
+      deps,
+      live.id,
+      result.status === "reset"
+        ? "eve: session retired by reset"
+        : "eve: no_active_session on reset",
+    );
+    const previousSession = sessionDto({ ...live, status: "closed" });
+    if (result.status !== "reset") {
+      return { status: "no_active_session", previousSession };
+    }
+
+    const inserted = await deps.db
+      .insert(schema.agentSessions)
+      .values({
+        organizationId: live.organizationId,
+        agentId: live.agentId,
+        // Pinned version is inherited: a reset continues the SAME compiled
+        // artifact, it does not silently migrate the thread to a newer
+        // publish.
+        agentVersionId: live.agentVersionId,
+        workflowId: live.workflowId,
+        // The generated title IS carried over (spec D9): the replacement
+        // row is the same conversation to the user, and it starts with no
+        // messages — so a dropped title would leave the sidebar entry with
+        // nothing to fall back to.
+        title: live.title,
+        eveSessionId: null,
+        origin: live.origin,
+        principal: live.principal,
+        // The Slack thread key is deliberately NOT carried over: the old
+        // row just released it, and a fresh thread claim is made by the
+        // next inbound message under the advisory lock.
+        slackThreadKey: null,
+        affinityWorkerId: target.workerId,
+        status: "active",
+      })
+      .returning();
+    return {
+      status: "reset",
+      previousSession,
+      session: sessionDto(inserted[0]!),
+    };
+  });
+}
+
+/**
+ * `POST /sessions/:id/clear` — the route body, testable without Elysia. See
+ * {@link withQuietSessionControl} for the critical section it runs in and
+ * {@link finishContextControl} for the drain that follows eve's answer.
+ */
+export async function clearSession(
+  deps: RuntimeDeps,
+  session: SessionRow,
+): Promise<SessionContextControlResponse> {
+  return withQuietSessionControl(deps, session, async (live, eveSessionId) => {
+    const target = await sessionControlTarget(deps, live.organizationId, live);
+    const result = await deps.workerClient.clearEveSession(
+      target.workerAddress,
+      target.hash,
+      target.token,
+      eveSessionId,
+    );
+    return finishContextControl(deps, live, result.status, target, eveSessionId);
+  });
+}
+
+/**
+ * `POST /sessions/:id/compact` — the route body, testable without Elysia.
+ * A compact over an EMPTY/already-cleared context emits no `compaction.*`
+ * events at all — the 202 is the only acknowledgement, and the drain in
+ * {@link finishContextControl} answers a null `marker` rather than inventing
+ * a boundary. Never wait on `compaction.requested` here.
+ */
+export async function compactSession(
+  deps: RuntimeDeps,
+  session: SessionRow,
+): Promise<SessionContextControlResponse> {
+  return withQuietSessionControl(deps, session, async (live, eveSessionId) => {
+    const target = await sessionControlTarget(deps, live.organizationId, live);
+    const result = await deps.workerClient.compactEveSession(
+      target.workerAddress,
+      target.hash,
+      target.token,
+      eveSessionId,
+    );
+    return finishContextControl(deps, live, result.status, target, eveSessionId);
+  });
+}
+
+/**
+ * THE CONTEXT CONTROLS' CRITICAL SECTION. clear/compact/reset used to check
+ * "quiet" ({@link requireQuietControllableSession}: no live run, no tail) and
+ * then call eve and drain WITHOUT the session's dispatch lock — a
+ * read-then-act with a window in which a continuation could be admitted
+ * (the busy check saw nothing, the run was inserted, the message sent, its
+ * tail started) BEFORE the control's drain attached: two readers on one eve
+ * stream, the same `(run_id, seq)` written twice, and for reset a session
+ * retired underneath a run that had just been admitted into it.
+ *
+ * The controls now hold the session dispatch lock (session-lock.ts — the
+ * same critical section every eve-ward dispatch holds) from before the
+ * quiet check through the eve call and the drain/settlement, and re-read the
+ * session row UNDER it (the caller's row is a pre-lock snapshot; a row
+ * closed in between is refused as `session_not_continuable` by the check).
+ * Admission takes the same lock, so nothing can be admitted while a control
+ * is in flight, and a control cannot start while a dispatch is — contention
+ * is the platform's own TRANSIENT 409 `session_busy` (two-409s rule; bounded
+ * wait `SESSION_LOCK_ADMISSION_WAIT_MS`, same as admission's), and the
+ * recovery is the same: retry once the other side settles. Never acquired
+ * inside a transaction (lock-pool discipline).
+ */
+async function withQuietSessionControl<T>(
+  deps: RuntimeDeps,
+  session: SessionRow,
+  body: (session: SessionRow, eveSessionId: string) => Promise<T>,
+): Promise<T> {
+  const lock = await sessionDispatchLocksOf(deps).acquire(session.id, {
+    waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
+  });
+  if (!lock) throw errors.sessionBusy();
+  try {
+    const rows = await deps.db
+      .select()
+      .from(schema.agentSessions)
+      .where(eq(schema.agentSessions.id, session.id))
+      .limit(1);
+    const live = rows[0] ?? session;
+    const eveSessionId = await requireQuietControllableSession(deps, live);
+    return await body(live, eveSessionId);
+  } finally {
+    await lock.release();
   }
-
-  const inserted = await deps.db
-    .insert(schema.agentSessions)
-    .values({
-      organizationId: session.organizationId,
-      agentId: session.agentId,
-      // Pinned version is inherited: a reset continues the SAME compiled
-      // artifact, it does not silently migrate the thread to a newer
-      // publish.
-      agentVersionId: session.agentVersionId,
-      workflowId: session.workflowId,
-      // The generated title IS carried over (spec D9): the replacement
-      // row is the same conversation to the user, and it starts with no
-      // messages — so a dropped title would leave the sidebar entry with
-      // nothing to fall back to.
-      title: session.title,
-      eveSessionId: null,
-      origin: session.origin,
-      principal: session.principal,
-      // The Slack thread key is deliberately NOT carried over: the old
-      // row just released it, and a fresh thread claim is made by the
-      // next inbound message under the advisory lock.
-      slackThreadKey: null,
-      affinityWorkerId: target.workerId,
-      status: "active",
-    })
-    .returning();
-  return {
-    status: "reset",
-    previousSession,
-    session: sessionDto(inserted[0]!),
-  };
 }
 
 // ── follow-up message (the route body, testable without Elysia) ───────────
@@ -2949,8 +3012,10 @@ const CONTEXT_DRAIN_READ_TIMEOUT_MS = 1_500;
  * WHY THIS EXISTS. The thread's context divider is DERIVED from persisted
  * `run_events` (spec D4) — but both control routes require a QUIET session
  * ({@link requireQuietControllableSession}: no live run AND no tail on the
- * session, observation tails included), so by construction no tail is
- * attached when they fire — this drain is the stream's ONLY reader — and
+ * session, observation tails included) and hold the session dispatch lock
+ * from that check through this drain ({@link withQuietSessionControl}), so
+ * by construction no tail is attached when they fire and none can be
+ * started while they run — this drain is the stream's ONLY reader — and
  * nobody else would ever consume eve's `context.cleared` /
  * `compaction.completed`. Left alone those frames have two
  * effects, both wrong: no divider is persisted (so none survives a reload),

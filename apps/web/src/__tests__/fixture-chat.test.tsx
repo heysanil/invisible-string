@@ -11,6 +11,7 @@
  * a session-limit prompt must not masquerade as a tool approval.
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
@@ -144,7 +145,7 @@ test("fixture mode can actually stop a running run (backend-free preview)", asyn
   fireEvent.click(stop);
   expect(view.getByText(/You stopped this run/)).toBeTruthy();
   await waitFor(() =>
-    expect(view.queryByRole("button", { name: "Stop" })).toBeNull(),
+    expectAbsent(() => view.queryByRole("button", { name: "Stop" }), "the Stop button"),
   );
 });
 
@@ -229,7 +230,7 @@ test("sending the first message enters the thread immediately (fixture preview)"
 
   // The simulated create resolves onto one of that agent's canned threads.
   await waitFor(
-    () => expect(view.queryByText(/Starting Support triager/)).toBeNull(),
+    () => expectAbsent(() => view.queryByText(/Starting Support triager/), "the Starting affordance"),
     { timeout: 4000 },
   );
 }, 15_000);

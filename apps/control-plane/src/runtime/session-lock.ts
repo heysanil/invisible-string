@@ -14,9 +14,13 @@
  * session id, held by every dispatch that will call eve for that session
  * (create-on-session, continuation, post-reset create, HITL resume) from
  * before its admission/busy check through eve-return + persist +
- * terminal-recheck/abandon settlement — and TRY-acquired by every other
- * decision point (the guarded remote cancel, the boot sweeps). Under the
- * lock:
+ * terminal-recheck/abandon settlement — held likewise by the three context
+ * controls (clear/compact/reset, routes.ts `withQuietSessionControl`) from
+ * their quiet check through the eve call and the drain/settlement, so a
+ * dispatch can never be admitted between "the session is quiet" and the
+ * drain attaching (a second reader on one eve stream) — and TRY-acquired by
+ * every other decision point (the guarded remote cancel, the boot sweeps).
+ * Under the lock:
  *   - no successor can be admitted while a dispatch's abandon decision is in
  *     flight, so "a successor exists" and "the unqualified cancel might hit a
  *     successor's turn" are both impossible for lock-holding dispatches;

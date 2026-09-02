@@ -3,6 +3,7 @@
  * invite row; a plain member sees a read-only roster with role chips only.
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 import "../test/auth-mock";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -84,7 +85,7 @@ test("a member sees a read-only roster — chips, no selectors or invite", async
 
   await view.findByText("Ben Member");
   await waitFor(() => {
-    expect(view.queryByText("Invite a teammate")).toBeNull();
+    expectAbsent(() => view.queryByText("Invite a teammate"), "the invite control");
   });
   expect(view.queryByLabelText("Role for ben@acme.dev")).toBeNull();
   // Roles are still visible as chips.

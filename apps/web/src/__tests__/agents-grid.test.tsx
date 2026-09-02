@@ -5,6 +5,7 @@
  * (POST "Untitled agent" → navigate to the new editor).
  */
 import { ensureDomForThisFile } from "../test/setup";
+import { expectAbsent } from "../test/dom";
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -166,7 +167,7 @@ test("New agent POSTs an untitled draft and navigates into its editor", async ()
 
   // The router leaves the index screen for /agents/:id (stub route → blank).
   await waitFor(() => {
-    expect(view.queryByText("No agents yet")).toBeNull();
+    expectAbsent(() => view.queryByText("No agents yet"), "the empty state");
   });
 });
 

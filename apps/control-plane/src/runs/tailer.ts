@@ -539,6 +539,16 @@ export interface RunTailHandle {
    * row.
    */
   detach(): void;
+  /**
+   * Re-read the session's open obligations from the store and adopt any this
+   * tail does not follow yet (a Stop settled WITHOUT a tail while this tail
+   * held the session's stream — the guarded settlement counts it `observing`
+   * and signals the live tail through the manager). An adopted obligation
+   * whose turn is already known gets its qualified cancel at once. Runs
+   * through the tail's serial queue, so it never interleaves with an
+   * attribution or a settlement.
+   */
+  refreshObligations(): Promise<void>;
 }
 
 /** One open remote-cancel obligation this tail is following. */
@@ -621,6 +631,28 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   let detaching = false;
   let observeTimer: ReturnType<typeof setTimeout> | null = null;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  /**
+   * THE TAIL'S SERIAL QUEUE. Turn attribution (the consume loop), settlement
+   * (a Stop, the wall-clock cap, shutdown — each from its own timer or
+   * request) and an obligation refresh (the manager's signal) all mutate
+   * `ownTurnId` and `obligations` across awaits, and used to interleave: a
+   * settlement that snapshotted `ownTurnId === null` while an attribution's
+   * `setRunTurnId` was in flight installed a null-id obligation, so the
+   * qualified cancel was never sent and the turn's own boundary could not
+   * match it. Every such section now runs here, one at a time, in arrival
+   * order — a settlement runs strictly after any in-flight attribution has
+   * completed, and reads the turn id that attribution wrote.
+   */
+  let serial: Promise<void> = Promise.resolve();
+  const serialized = <T>(work: () => Promise<T>): Promise<T> => {
+    const run = serial.then(work, work);
+    serial = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
 
   const publishStatus = (status: RunStatus, error?: string | null) => {
     bus.publish(runId, {
@@ -775,17 +807,93 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     ownTurnId === turnId || obligations.some((o) => o.turnId === turnId);
 
   /**
+   * CURRENT obligations, not a start-of-tail snapshot. The list this tail
+   * follows was loaded once when it started, but obligations are created
+   * while it is live: a continuation admitted after an observation attached
+   * and then Stopped BEFORE its own tail started (the post-eve recheck, or
+   * `cancelAgentRun` with no tail) settles WITHOUT a tail, and the guarded
+   * settlement leaves it to "the live tail on the session" — which never
+   * loaded it. Its turn then matched nothing: the run is terminal, so the
+   * live-successor lookup excluded it too, and the turn was persisted as
+   * FOREIGN — no qualified cancel, the obligation left to age out
+   * unresolved. So the store is re-read at every point where an obligation
+   * can matter — each turn opening (before the claimant search), each
+   * boundary (before the owner match), a settlement, and the manager's
+   * signal — and merged: new rows are adopted (with their turn id, when a
+   * previous reader already attributed it — the qualified cancel goes out
+   * at once), known rows keep this tail's more recent turn id, and rows
+   * another actor has cleared (a session-terminal answer on a route, the
+   * guarded settlement) are dropped. Cheap: a few rows by session id.
+   * Callers hold the serial queue.
+   */
+  const refreshObligationsUnlocked = async (why: string): Promise<void> => {
+    const current = await store.listPendingRemoteCancels(agentSessionId);
+    const next: Obligation[] = [];
+    const adopted: string[] = [];
+    for (const row of current) {
+      // A follow tail's own live run owes nothing (its marker, if any, is
+      // written only by the settlement that flips this tail to observe).
+      if (mode === "follow" && row.runId === runId) continue;
+      const known = obligations.find((o) => o.runId === row.runId);
+      if (known) {
+        known.unresolved = row.unresolvedAt !== null;
+        if (known.turnId === null && row.turnId !== null) {
+          // The row learned its turn from another reader (or from this
+          // tail's own attribution, in the settlement re-read): the
+          // qualified cancel was owed the moment the id existed.
+          known.turnId = row.turnId;
+          if (known.self) ownTurnId = row.turnId;
+          issueQualifiedCancel(known);
+        }
+        next.push(known);
+        continue;
+      }
+      const obligation: Obligation = {
+        runId: row.runId,
+        turnId: row.turnId,
+        messageHash: row.messageHash,
+        unresolved: row.unresolvedAt !== null,
+        createdAt: row.createdAt.getTime(),
+        self: row.runId === runId,
+      };
+      next.push(obligation);
+      adopted.push(obligation.runId);
+      if (obligation.turnId !== null) issueQualifiedCancel(obligation);
+    }
+    const dropped = obligations.filter((o) => !current.some((row) => row.runId === o.runId));
+    obligations = next;
+    if (adopted.length > 0 || dropped.length > 0) {
+      log?.info("run.obligations_refreshed", {
+        fields: {
+          why,
+          adopted,
+          dropped: dropped.map((o) => o.runId),
+          following: obligations.map((o) => o.runId),
+        },
+      });
+    }
+    if (mode === "observe" && obligations.length === 0) closeObservation();
+  };
+
+  /**
    * Attribute a turn by CONTENT (see the module doc) once its opening is
    * complete: `content` is the hash of its `message.received`, or null for a
    * content-less turn. A re-read of a known id is idempotent. Afterwards,
    * serialization: the turn starting proves every attributed obligation
    * with another id over, and a turn attributed to a NEWER run (own, or a
    * live successor) proves every obligation on the session over.
+   *
+   * Runs on the tail's serial queue (never interleaves with a settlement),
+   * and consults the store's CURRENT obligations before the claimant search.
    */
-  const attributeTurn = async (
+  const attributeTurn = (turnId: string, content: TurnContent): Promise<TurnAttribution> =>
+    serialized(() => attributeTurnUnlocked(turnId, content));
+
+  const attributeTurnUnlocked = async (
     turnId: string,
     content: TurnContent,
   ): Promise<TurnAttribution> => {
+    await refreshObligationsUnlocked("turn opened");
     const correlator = content?.hash ?? null;
     const kind = content ? "content" : "content-less";
     let result: TurnAttribution;
@@ -874,8 +982,21 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
    * cancel if the turn is known, NOTHING if not; then observation (or, for
    * shutdown, an abort — the obligation is durable and the next boot's
    * sweeper observes). Returns the remote outcome once the row is finalized.
+   *
+   * Runs on the tail's serial queue: it starts only after any in-flight
+   * attribution has completed (so the `ownTurnId` it reads is the one that
+   * attribution wrote), and after finalizing it re-reads the row's `turn_id`
+   * through the obligation refresh — an id that is known by then gets its
+   * qualified cancel immediately, never "at the next attribution".
    */
-  const settleAndObserve = async (
+  const settleAndObserve = (
+    status: "canceled" | "failed",
+    reason: string,
+    settle: { awaitRemote?: boolean; observe: boolean },
+  ): Promise<RemoteCancelOutcome> =>
+    serialized(() => settleAndObserveUnlocked(status, reason, settle));
+
+  const settleAndObserveUnlocked = async (
     status: "canceled" | "failed",
     reason: string,
     settle: { awaitRemote?: boolean; observe: boolean },
@@ -950,8 +1071,20 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
     if (wallClockTimer) clearTimeout(wallClockTimer);
     armObserveDeadline(now.getTime() + remoteCancelObserveMs);
     if (outcome === "failed") issueQualifiedCancel(mine, 2);
+    // Re-read AFTER finalization: the row's `turn_id` is the authority. If
+    // it is known now (this tail's attribution landed before this settlement
+    // was queued but after the preamble's load, or another reader wrote it),
+    // the qualified cancel goes out here — never deferred to an attribution
+    // that has already happened. The same read adopts obligations settled
+    // without a tail while this tail was live.
+    await refreshObligationsUnlocked("settled");
     log?.info("run.observing", {
-      fields: { turnId, outcome, observeMs: remoteCancelObserveMs, cause: reason },
+      fields: {
+        turnId: obligations.find((o) => o.self)?.turnId ?? turnId,
+        outcome,
+        observeMs: remoteCancelObserveMs,
+        cause: reason,
+      },
     });
     return outcome;
   };
@@ -1296,20 +1429,29 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
             // carrying an owned obligation's turn id meets it; a session
             // boundary means no turn is in flight, so every OWNED obligation
             // is over — and a dead session (`session.completed`/`failed`)
-            // can never start an unowned one either.
+            // can never start an unowned one either. The owner match reads
+            // the CURRENT obligations (an obligation settled without a tail
+            // whose turn a previous reader attributed is owned too), on the
+            // serial queue so no settlement interleaves with it.
             if (isTurnBoundaryEvent(event)) {
-              const owned = obligations.find((o) => o.turnId === event.data.turnId);
-              if (owned) await confirmObligation(owned, event.type);
+              await serialized(async () => {
+                await refreshObligationsUnlocked("turn boundary");
+                const owned = obligations.find((o) => o.turnId === event.data.turnId);
+                if (owned) await confirmObligation(owned, event.type);
+              });
             } else if (
               event.type === "session.waiting" ||
               event.type === "session.completed" ||
               event.type === "session.failed"
             ) {
-              for (const obligation of [...obligations]) {
-                if (obligation.turnId !== null || event.type !== "session.waiting") {
-                  await confirmObligation(obligation, event.type);
+              await serialized(async () => {
+                await refreshObligationsUnlocked("session boundary");
+                for (const obligation of [...obligations]) {
+                  if (obligation.turnId !== null || event.type !== "session.waiting") {
+                    await confirmObligation(obligation, event.type);
+                  }
                 }
-              }
+              });
             }
             if (mode === "observe") {
               if (observationClosed) return;
@@ -1438,6 +1580,11 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
       });
     },
     detach,
+    refreshObligations: () =>
+      serialized(async () => {
+        if (abort.signal.aborted) return;
+        await refreshObligationsUnlocked("signaled");
+      }),
   };
 }
 
@@ -1542,7 +1689,13 @@ export class RunTailerManager {
   observe(options: StartTailOptions & { deadlineAt: number }): RunTailHandle | null {
     const existing = this.handles.get(options.runId);
     if (existing) return existing;
-    if (this.sessionHandles.has(options.agentSessionId)) return null;
+    if (this.sessionHandles.has(options.agentSessionId)) {
+      // The live tail carries this run's obligation from here on — tell it
+      // (fire-and-forget: the store re-read at its next turn opening or
+      // boundary is the guarantee; the signal is the fast path).
+      void this.refreshSessionObligations(options.agentSessionId);
+      return null;
+    }
     const { deadlineAt, ...rest } = options;
     const handle = tailRun({ ...this.defaults, ...rest, observe: { deadlineAt } });
     this.register(handle);
@@ -1556,6 +1709,29 @@ export class RunTailerManager {
   /** Is any tail (follow or observation) live on this session in this process? */
   hasSessionTail(agentSessionId: string): boolean {
     return this.sessionHandles.has(agentSessionId);
+  }
+
+  /**
+   * Signal the session's live tail (any mode) that the session's open
+   * obligations changed — a Stop settled without a tail while this tail
+   * holds the stream (the guarded settlement's `observing` verdict). The
+   * tail re-reads the store and adopts the new obligation, issuing its
+   * qualified cancel at once when the turn is already known. Resolves false
+   * when no tail is live on the session in this process.
+   */
+  async refreshSessionObligations(agentSessionId: string): Promise<boolean> {
+    const handle = this.sessionHandles.get(agentSessionId);
+    if (!handle) return false;
+    try {
+      await handle.refreshObligations();
+    } catch (error) {
+      this.defaults.logger?.warn("run.obligations_refresh_failed", {
+        runId: handle.runId,
+        sessionId: agentSessionId,
+        fields: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    return true;
   }
 
   /**

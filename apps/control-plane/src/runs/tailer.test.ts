@@ -1955,6 +1955,211 @@ describe("RunTailerManager — one reader per session", () => {
   });
 });
 
+describe("tailRun — current obligations and serialized settlement (round 12: R1, R2)", () => {
+  interface Deferred {
+    promise: Promise<void>;
+    resolve: () => void;
+  }
+  const deferred = (): Deferred => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  test("R1 — an obligation created AFTER the observation loaded its list (a continuation Stopped before its own tail started) is adopted at the turn opening: attributed by hash, cancelled QUALIFIED, cleared on its boundary — never persisted as foreign", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    store.runStatus = "canceled";
+    store.sent("run-A", "a");
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-A",
+      agentSessionId: "sess-r1",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+      observe: { deadlineAt: Date.now() + 60_000 },
+    });
+    await sleep(10); // the observation is on the stream with [A] loaded
+
+    // B: admitted while A observed, sent, and Stopped with NO tail of its
+    // own — its marker lands after A's tail loaded its list, and B is
+    // terminal, so the live-successor lookup cannot see it either.
+    store.sent("run-B", "b");
+    store.obligations.set("run-B", {
+      pendingAt: new Date(),
+      unresolvedAt: null,
+      createdAt: new Date(Date.now() + 1),
+    });
+    stream.push(turnStarted("turn_B"));
+    stream.push(messageReceived("turn_B", "b"));
+    // Pre-fix: B's turn matched nothing in A's stale list, was persisted
+    // FOREIGN, no cancel was ever sent, and B aged out unresolved.
+    await until(() => seen.length === 1, "B's qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_B" }]);
+    expect(store.turnIds.get("run-B")).toBe("turn_B");
+    expect(store.turnIds.has("run-A")).toBeFalse(); // A never claims B's text
+    expect(store.events.map((e) => e.event.type)).toEqual(["turn.started", "message.received"]);
+
+    stream.push(turnCancelled("turn_B"));
+    await until(() => !store.obligations.has("run-B"), "B's obligation cleared on its boundary");
+    // A's own turn never started: still owed, the observation goes on.
+    expect(store.obligations.has("run-A")).toBeTrue();
+    expect(handle.observing).toBeTrue();
+    handle.detach();
+    await handle.done;
+  });
+
+  test("R1 — the manager's observe() refusal SIGNALS the live tail: an obligation whose turn a previous reader already attributed is adopted with its id and cancelled QUALIFIED at once", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    const manager = new RunTailerManager({ store, bus: new RunEventBus(), maxWallClockMs: 60_000 });
+    store.runStatus = "canceled";
+    store.sent("run-A", "a");
+    store.obligations.set("run-A", { pendingAt: new Date(), unresolvedAt: null });
+    const cancelRemoteTurn = async (options?: { turnId?: string }) => {
+      seen.push(options);
+    };
+    const stream = liveStream();
+    const observer = manager.observe({
+      runId: "run-A",
+      agentSessionId: "s",
+      openStream: stream.open,
+      cancelRemoteTurn,
+      deadlineAt: Date.now() + 60_000,
+    });
+    expect(observer).not.toBeNull();
+    await sleep(10);
+
+    // B's turn was attributed by an earlier reader (its id is on the row);
+    // then B was Stopped without a tail, and the settlement asked to
+    // observe it — refused (one reader), which now signals A's tail.
+    store.sent("run-B", "b");
+    store.turnIds.set("run-B", "turn_B");
+    store.obligations.set("run-B", {
+      pendingAt: new Date(),
+      unresolvedAt: null,
+      createdAt: new Date(Date.now() + 1),
+    });
+    expect(
+      manager.observe({
+        runId: "run-B",
+        agentSessionId: "s",
+        openStream: liveStream().open,
+        cancelRemoteTurn,
+        deadlineAt: Date.now() + 60_000,
+      }),
+    ).toBeNull();
+    // Pre-fix: nothing happened here — B's qualified cancel waited for a
+    // turn opening that had already gone by.
+    await until(() => seen.length === 1, "B's qualified cancel from the signaled tail");
+    expect(seen).toEqual([{ turnId: "turn_B" }]);
+
+    stream.push(turnCancelled("turn_B"));
+    await until(() => !store.obligations.has("run-B"), "B cleared on its boundary");
+    expect(store.obligations.has("run-A")).toBeTrue();
+    expect(await manager.refreshSessionObligations("s")).toBeTrue();
+    expect(await manager.refreshSessionObligations("nobody")).toBeFalse();
+    await manager.stopAll();
+  });
+
+  /** A store whose FIRST `setRunTurnId` parks until released (attribution in flight). */
+  function gatedStore(runId: string, message: string) {
+    const store = memoryStore();
+    store.sent(runId, message);
+    const gate = deferred();
+    let reached = false;
+    const real = store.setRunTurnId;
+    store.setRunTurnId = async (id, turnId) => {
+      if (!reached) {
+        reached = true;
+        await gate.promise;
+      }
+      return real(id, turnId);
+    };
+    return { store, gate, reached: () => reached };
+  }
+
+  test("R2 — a Stop landing while the attribution's setRunTurnId is in flight waits for it and issues the QUALIFIED cancel with the attributed id (never a null-id obligation the boundary cannot match)", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const { store, gate, reached } = gatedStore("run-R", "race");
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-R",
+      agentSessionId: "sess-r2",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await until(() => store.runStatus === "running", "the tail to adopt the run");
+    stream.push(turnStarted("turn_R"));
+    stream.push(messageReceived("turn_R", "race"));
+    await until(reached, "the attribution to reach setRunTurnId");
+
+    // The Stop lands with the attribution parked mid-write.
+    const stop = handle.cancel("stopped by user", { status: "canceled", awaitRemote: true });
+    expect(await settled(stop)).toBeFalse(); // waits for the attribution
+    gate.resolve();
+    // Pre-fix: the settlement snapshotted `ownTurnId === null`, answered
+    // `pending`, installed a null-id obligation, and the qualified cancel
+    // was never sent.
+    expect(await stop).toBe("issued");
+    expect(seen).toEqual([{ turnId: "turn_R" }]);
+    expect(store.turnIds.get("run-R")).toBe("turn_R");
+    expect(store.runStatus).toBe("canceled");
+    expect(store.obligations.has("run-R")).toBeTrue();
+    expect(handle.observing).toBeTrue();
+
+    // eve's own confirmation matches the attributed id and ends observation.
+    stream.push(turnCancelled("turn_R"));
+    await handle.done;
+    expect(store.obligations.has("run-R")).toBeFalse();
+  });
+
+  test("R2 — the wall-clock cap firing while the attribution is in flight settles AFTER it and issues the QUALIFIED cancel with the attributed id", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const { store, gate, reached } = gatedStore("run-W", "capped");
+    const stream = liveStream();
+    const handle = tailRun({
+      runId: "run-W",
+      agentSessionId: "sess-r2w",
+      openStream: stream.open,
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 120,
+    });
+    await until(() => store.runStatus === "running", "the tail to adopt the run");
+    stream.push(turnStarted("turn_W"));
+    stream.push(messageReceived("turn_W", "capped"));
+    await until(reached, "the attribution to reach setRunTurnId");
+    await sleep(200); // the cap has fired; its settlement is queued behind the attribution
+    expect(store.runStatus).toBe("running"); // pre-fix: already `failed` with a null-id obligation
+    gate.resolve();
+    await until(() => store.runStatus === "failed", "the cap's settlement");
+    await until(() => seen.length === 1, "the qualified cancel");
+    expect(seen).toEqual([{ turnId: "turn_W" }]);
+    expect(store.obligations.has("run-W")).toBeTrue();
+    stream.push(turnCompleted("turn_W"));
+    await handle.done;
+    expect(store.obligations.has("run-W")).toBeFalse();
+  });
+});
+
 describe("authorization latch (connectors plan-3 task 9)", () => {
   // NOTE: `authorization.required` is DORMANT on eve 0.31.3 for the
   // platform's getToken-only connections (spike REPORT finding 34 — a mid-run

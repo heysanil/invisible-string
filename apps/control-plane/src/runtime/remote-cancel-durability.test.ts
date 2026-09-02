@@ -73,7 +73,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import type { Logger, StructuredLogEvent, TriggerEvent } from "@invisible-string/shared";
 
@@ -93,6 +93,8 @@ import { createPgSessionDispatchLocks } from "./session-lock";
 import { isRuntimeApiError } from "./errors";
 import {
   cancelAgentRun,
+  clearSession,
+  postSessionMessage,
   requireQuietControllableSession,
   resetSession,
   settleSessionRemoteCancelsTerminal,
@@ -133,6 +135,18 @@ async function until<T>(
 type CancelMode = "ok" | "transport" | "not_active" | "no_active_turn";
 type ResetMode = "reset" | "no_active_session";
 
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 /** The message the harness's runs are armed with — the correlator every fake turn echoes. */
 const TASK = "durability probe";
 const turnStarted = (turnId: string) => ({ type: "turn.started", data: { sequence: 0, turnId } });
@@ -159,6 +173,18 @@ class FakeWorkerClient {
   cancelMode: CancelMode = "ok";
   resetMode: ResetMode = "reset";
   readonly resets: string[] = [];
+  /** Clears reached (R3); `clearGate` holds the NEXT clear in flight until released. */
+  readonly clears: string[] = [];
+  clearGate: Deferred | null = null;
+  /** Continues reached (R3); `continueGate` holds the NEXT continue in flight. */
+  readonly continues: string[] = [];
+  continueGate: Deferred | null = null;
+  /**
+   * `x-eve-stream-tail-index` per session (default -1 = empty): the context
+   * drain refuses to read while eve's tail index sits below its cursor, so
+   * a test that wants the drain to consume frames sets the index it claims.
+   */
+  readonly tailIndex = new Map<string, number>();
   private readonly streams = new Map<
     string,
     { controller: ReadableStreamDefaultController<Uint8Array> | null; backlog: string[] }
@@ -188,6 +214,30 @@ class FakeWorkerClient {
   }
 
   async ensureAgent(): Promise<void> {}
+  async clearEveSession(
+    _addr: string,
+    _hash: string,
+    _jwt: string,
+    eveSessionId: string,
+  ): Promise<{ ok: true; sessionId: string; status: "accepted" }> {
+    this.clears.push(eveSessionId);
+    const gate = this.clearGate;
+    this.clearGate = null;
+    if (gate) await gate.promise;
+    return { ok: true, sessionId: eveSessionId, status: "accepted" };
+  }
+  async continueEveSession(
+    _addr: string,
+    _hash: string,
+    _jwt: string,
+    eveSessionId: string,
+  ): Promise<{ sessionId: string; status: "accepted" }> {
+    this.continues.push(eveSessionId);
+    const gate = this.continueGate;
+    this.continueGate = null;
+    if (gate) await gate.promise;
+    return { sessionId: eveSessionId, status: "accepted" };
+  }
   async resetEveSession(
     _addr: string,
     _hash: string,
@@ -254,7 +304,7 @@ class FakeWorkerClient {
     });
     return new Response(stream, {
       status: 200,
-      headers: { "x-eve-stream-tail-index": "-1" },
+      headers: { "x-eve-stream-tail-index": String(this.tailIndex.get(eveSessionId) ?? -1) },
     });
   }
 }
@@ -450,7 +500,14 @@ describe.skipIf(!GATE)("remote-cancel durability (P1–P7, G1, N2)", () => {
   }
 
   async function runEvents(id: string) {
-    return handle.db.select().from(schema.runEvents).where(eq(schema.runEvents.runId, id));
+    // ORDER BY seq: without it Postgres returns heap order, which matches
+    // insertion order only on a quiet heap — the full gated lane's churned
+    // tables handed back permutations (a CI-only flake in P1, and in R3).
+    return handle.db
+      .select()
+      .from(schema.runEvents)
+      .where(eq(schema.runEvents.runId, id))
+      .orderBy(asc(schema.runEvents.seq));
   }
 
   async function freshHeartbeat() {
@@ -607,6 +664,146 @@ describe.skipIf(!GATE)("remote-cancel durability (P1–P7, G1, N2)", () => {
     await runStore.markSession(session.id, "closed");
   }, 20_000);
 
+  // ── R1 / R3 (round 12): current obligations, lock-held context controls ──
+
+  test("R1 — a continuation Stopped WITHOUT a tail while an observation holds the session's stream: the observer is told, adopts the new obligation, attributes its turn by content, cancels it QUALIFIED, and clears it on the boundary (pre-fix: the stale list persisted the turn as foreign and the Stop aged out unresolved)", async () => {
+    await freshHeartbeat();
+    const session = await insertSession();
+    const eveId = session.eveSessionId!;
+    // A: Stopped on a live tail → observation on the stream, [A] loaded.
+    const a = await insertRun(session.id, { status: "queued", startedAt: null });
+    startLiveTail(a, session);
+    await until(
+      async () => ((await runRow(a.id)).status === "running" ? true : undefined),
+      "A's tail to adopt the run",
+    );
+    await cancelAgentRun(deps, { id: a.id, status: "running" }, session, "stopped A");
+    await untilObserving(a.id);
+
+    // B: admitted after the observation attached, sent (marker + hash), and
+    // Stopped before its own tail started — settled with NO tail, so the
+    // guarded settlement leaves it to the live observer.
+    const B_TEXT = "continuation b";
+    const b = await insertRun(session.id, {
+      status: "queued",
+      startedAt: new Date(),
+      messageHash: hashTurnMessage(B_TEXT),
+    });
+    await cancelAgentRun(deps, { id: b.id, status: "queued" }, session, "stopped B");
+    expect((await runRow(b.id)).status).toBe("canceled");
+    expect((await runRow(b.id)).remoteCancelPendingAt).not.toBeNull();
+    expect(deps.tailers.get(a.id)?.observing).toBeTrue(); // still the one reader
+    expect(deps.tailers.get(b.id)).toBeUndefined();
+
+    // eve opens B's turn on the stream A observes.
+    openTurn(eveId, "turn_b", B_TEXT);
+    await until(
+      () => (attemptsFor(eveId).some((c) => c.turnId === "turn_b") ? true : undefined),
+      "B's qualified cancel from the observer",
+    );
+    expect(attemptsFor(eveId).map((c) => c.turnId)).toEqual(["turn_b"]);
+    expect((await runRow(b.id)).turnId).toBe("turn_b");
+    expect((await runRow(a.id)).turnId).toBeNull();
+    fakeWorker.push(eveId, turnCancelled("turn_b"));
+    await until(
+      async () => ((await runRow(b.id)).remoteCancelPendingAt === null ? true : undefined),
+      "B's obligation cleared on its boundary",
+    );
+    // A is still owed (its turn never started); end the observation.
+    expect((await runRow(a.id)).remoteCancelPendingAt).not.toBeNull();
+    await endTail(a.id);
+    await runStore.markSession(session.id, "closed");
+  }, 20_000);
+
+  test("R3 — the context controls hold the session dispatch lock: a follow-up racing a clear is refused `session_busy` (never admitted under the drain), a clear racing an in-flight dispatch is refused the same way, and every persisted (run_id, seq) stays unique (pre-fix: the follow-up was admitted between the quiet check and the drain — two readers on one stream)", async () => {
+    await freshHeartbeat();
+    const session = await insertSession();
+    const eveId = session.eveSessionId!;
+    const prior = await insertRun(session.id, {
+      status: "succeeded",
+      completedAt: new Date(),
+      turnId: "turn_p",
+    });
+    const runsOnSession = async () =>
+      handle.db.select().from(schema.runs).where(eq(schema.runs.agentSessionId, session.id));
+
+    // (1) A clear whose eve call is in flight holds the lock: a follow-up
+    // landing meanwhile is refused, and NOTHING of it reaches eve.
+    fakeWorker.clearGate = deferred();
+    const gate = fakeWorker.clearGate;
+    fakeWorker.tailIndex.set(eveId, 1); // the two frames the clear emits
+    fakeWorker.push(eveId, { type: "context.cleared", data: {} });
+    fakeWorker.push(eveId, sessionWaiting());
+    const clearing = clearSession(deps, await sessionRow(session.id));
+    await until(() => (fakeWorker.clears.includes(eveId) ? true : undefined), "the clear to reach eve");
+    let thrown: unknown;
+    try {
+      await postSessionMessage(deps, {
+        organizationId: orgId,
+        userId,
+        session: await sessionRow(session.id),
+        message: "while clearing",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isRuntimeApiError(thrown) && thrown.code === "session_busy").toBeTrue();
+    expect(fakeWorker.continues.filter((id) => id === eveId)).toHaveLength(0);
+    expect(await runsOnSession()).toHaveLength(1); // never admitted
+    gate.resolve();
+    const cleared = await clearing;
+    expect(cleared.status).toBe("accepted");
+    expect(cleared.marker).toEqual({ kind: "cleared", runId: prior.id });
+    // ONE reader: the drain's own open, and no tail on the session.
+    expect(fakeWorker.opens.filter((o) => o.eveSessionId === eveId)).toHaveLength(1);
+    expect(deps.tailers.hasSessionTail(session.id)).toBeFalse();
+
+    // (2) A dispatch whose eve call is in flight holds the lock: a clear
+    // landing meanwhile is refused the same way.
+    fakeWorker.continueGate = deferred();
+    const continueGate = fakeWorker.continueGate;
+    const sending = postSessionMessage(deps, {
+      organizationId: orgId,
+      userId,
+      session: await sessionRow(session.id),
+      message: "while dispatching",
+    });
+    await until(
+      () => (fakeWorker.continues.includes(eveId) ? true : undefined),
+      "the continue to reach eve",
+    );
+    thrown = undefined;
+    try {
+      await clearSession(deps, await sessionRow(session.id));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isRuntimeApiError(thrown) && thrown.code === "session_busy").toBeTrue();
+    expect(fakeWorker.clears.filter((id) => id === eveId)).toHaveLength(1); // the first clear only
+    continueGate.resolve();
+    const { run } = await sending;
+    // The successor's tail is the stream's reader now; let its turn finish.
+    fakeWorker.tailIndex.set(eveId, 1);
+    openTurn(eveId, "turn_s", "while dispatching");
+    fakeWorker.push(eveId, turnCompleted("turn_s"));
+    fakeWorker.push(eveId, sessionWaiting());
+    await until(
+      async () => ((await runRow(run.id)).status === "succeeded" ? true : undefined),
+      "the follow-up run to finish",
+    );
+    // Every (run_id, seq) written once: the drain's frames under the prior
+    // run, the follow-up's under its own, nothing twice.
+    for (const id of [prior.id, run.id]) {
+      const seqs = (await runEvents(id)).map((e) => e.seq);
+      expect(new Set(seqs).size).toBe(seqs.length);
+    }
+    expect((await runEvents(prior.id)).map((e) => (e.event as { type: string }).type)).toEqual([
+      "context.cleared",
+      "session.waiting",
+    ]);
+    await runStore.markSession(session.id, "closed");
+  }, 30_000);
+
   test("A4 — reset RETIRES the eve id: every obligation on the row (unresolved ones included) is settled as session-terminal, the row is closed, a replacement is minted; `no_active_session` on reset settles the same way without a replacement", async () => {
     await freshHeartbeat();
     for (const mode of ["reset", "no_active_session"] as const) {
@@ -744,6 +941,19 @@ describe.skipIf(!GATE)("remote-cancel durability (P1–P7, G1, N2)", () => {
 
   test("P2 — supersession needs the successor's OWN turn_id: a synthesized `running` successor and a successor with leftover events do NOT clear the marker; the successor's turn_id does (pre-fix: cleared on either)", async () => {
     await freshHeartbeat();
+    const sweeper = createRemoteCancelSweeper(deps, { intervalMs: 60_000 });
+    // WARM-UP TICK, before this test's rows exist. The sweep's counters are
+    // GLOBAL — it scans every `runs` row carrying a marker, across every
+    // suite sharing this database — and CI runs the whole gated lane in one
+    // process against ONE database in filesystem order (ext4 hash order,
+    // not APFS's sorted order): `integrations/ingress.test.ts` leaves a
+    // Stopped child behind whose observation persisted its own turn
+    // boundary before the stack closed, and the first tick here settled it
+    // ("own turn boundary already persisted") — `settled: 1` before this
+    // test had inserted anything. A warm-up tick settles, observes or
+    // retains whatever the lane left behind so the ticks below count only
+    // what THIS test creates; the assertions are unchanged.
+    await sweeper.tick();
     const session = await insertSession();
     const settled = await insertRun(session.id, {
       status: "canceled",
@@ -753,7 +963,6 @@ describe.skipIf(!GATE)("remote-cancel durability (P1–P7, G1, N2)", () => {
     // (a) the successor reconciliation re-tailed: `running`, marker set, NO
     // turn observed — exactly what an unsent continuation looks like.
     const successor = await insertRun(session.id, { status: "running", startedAt: new Date() });
-    const sweeper = createRemoteCancelSweeper(deps, { intervalMs: 60_000 });
     let outcome = await sweeper.tick();
     expect(outcome).not.toBeNull();
     expect(outcome!.settled).toBe(0);

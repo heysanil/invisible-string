@@ -90,8 +90,40 @@
  * take the same lock. Contention is the transient `session_busy`. A crash
  * releases the lock with its connection, and the marker/busy-arm predicates
  * remain as its crash-safe shadow.
+ *
+ * LOCK-BEFORE-CLAIM, AND WHAT THE LOCK PROVES. A NEW session's id is
+ * PRE-MINTED app-side (`randomUUID()`) so its lock is taken BEFORE the claim
+ * transaction — a lock timeout then means nothing was created and there is
+ * nothing to undo (the old claim→lock window let a timed-out creator fail
+ * its run and close its session WITHOUT the lock while a follow-up holding
+ * it inserted a run from a stale snapshot and wrote the closed row back to
+ * active). A CONTINUATION re-reads its session UNDER the lock before
+ * admitting a run ({@link requireLiveSessionUnderLock}) — the caller's
+ * snapshot may predate a close — and every session status write is a CAS
+ * against a still-live row, never a blind write. And because a HOLDER is the
+ * session's exclusive owner, a holder that finds the session eveless with a
+ * terminal, marker-set newest run KNOWS no dispatch is in flight (the lock
+ * proves it): it closes that abandoned session inline
+ * ({@link healAbandonedEvelessSession}) — releasing the thread claim — and
+ * answers the PERMANENT `session_not_active` so the caller mints a fresh
+ * session, instead of answering `session_busy` until the next boot sweep.
+ * `countDispatchingRuns`' canceled+marker-set+eveless arm therefore only ever
+ * bites callers that do NOT hold the lock.
  */
-import { and, desc, eq, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+
+import {
+  and,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  notExists,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 import {
   workflowConfigSchema,
@@ -413,6 +445,188 @@ const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
   "canceled",
 ]);
 
+// ── Abandoned eveless sessions (shared by dispatch + boot reconciliation) ────
+
+/**
+ * The ABANDONED-EVELESS nomination: a non-terminal session with NO eve id
+ * whose NEWEST run is terminal with the dispatch-attempt marker SET — the
+ * residue of a dispatch whose eve create raced a Stop or crashed between the
+ * marker write and the id persist. Read UNDER the session's dispatch lock
+ * (so no lock-honoring dispatch can change the ledger before the close);
+ * the close itself re-asserts everything atomically.
+ */
+export async function isAbandonedEvelessSession(
+  db: DbClient,
+  agentSessionId: string,
+): Promise<boolean> {
+  const sessions = await db
+    .select({
+      status: schema.agentSessions.status,
+      eveSessionId: schema.agentSessions.eveSessionId,
+    })
+    .from(schema.agentSessions)
+    .where(eq(schema.agentSessions.id, agentSessionId))
+    .limit(1);
+  const session = sessions[0];
+  if (
+    !session ||
+    session.eveSessionId !== null ||
+    session.status === "closed" ||
+    session.status === "error"
+  ) {
+    return false;
+  }
+  const newest = await db
+    .select({ status: schema.runs.status, startedAt: schema.runs.startedAt })
+    .from(schema.runs)
+    .where(eq(schema.runs.agentSessionId, agentSessionId))
+    .orderBy(desc(schema.runs.createdAt))
+    .limit(1);
+  const run = newest[0];
+  return (
+    run !== undefined &&
+    run.startedAt !== null &&
+    TERMINAL_RUN_STATUSES.has(run.status)
+  );
+}
+
+/**
+ * The abandoned-eveless close as an ATOMIC GUARDED UPDATE. The snapshot that
+ * nominated the candidate is STALE by the time the close runs — boot
+ * reconciliation is fired after the server starts listening (index.ts), so
+ * live traffic can give a snapshotted session its eve id (and finish a run
+ * on it) between selection and close. Closing on the snapshot's say-so would
+ * kill a healthy session; instead the eveless + non-terminal predicate is
+ * re-asserted INSIDE the UPDATE's WHERE — AND so is the LEDGER: a
+ * `NOT EXISTS` on any non-terminal run of the session, because the condition
+ * that NOMINATED the candidate (newest run terminal + marker-set) can also go
+ * stale — a run admitted between nomination and close would otherwise let
+ * the close fire and release a thread claim mid-dispatch. So a now-healthy
+ * row is untouched by construction (the row and its ledger are re-read under
+ * the UPDATE's lock, never trusted from the snapshot). The thread-key
+ * release rides the same statement, mirroring markSession's terminal
+ * transition. Returns true iff THIS call closed the row — callers count only
+ * rows actually updated.
+ */
+export async function closeEvelessSessionIfStillAbandoned(
+  db: DbClient,
+  agentSessionId: string,
+): Promise<boolean> {
+  const closed = await db
+    .update(schema.agentSessions)
+    .set({ status: "closed", slackThreadKey: null })
+    .where(
+      and(
+        eq(schema.agentSessions.id, agentSessionId),
+        isNull(schema.agentSessions.eveSessionId),
+        notInArray(schema.agentSessions.status, ["closed", "error"]),
+        // The atomic ledger guard: no live run may exist on the session at
+        // the instant of the close (nomination staleness — see the doc).
+        notExists(
+          db
+            .select({ id: schema.runs.id })
+            .from(schema.runs)
+            .where(
+              and(
+                eq(schema.runs.agentSessionId, agentSessionId),
+                inArray(schema.runs.status, ["queued", "running", "waiting"]),
+              ),
+            ),
+        ),
+      ),
+    )
+    .returning({ id: schema.agentSessions.id });
+  return closed.length > 0;
+}
+
+/**
+ * Nominate-then-close, for a caller that HOLDS the session's dispatch lock
+ * (the lock is what makes the nomination trustworthy: no dispatch is in
+ * flight on the session this instant, so a terminal marker-set newest run on
+ * an eveless row can only be residue — its create either never reached eve
+ * or was accepted with the id lost, the documented at-most-once residual).
+ * True iff the session was abandoned AND this call closed it (releasing any
+ * Slack thread claim). Used by a lock-holding dispatch to self-heal instead
+ * of answering `session_busy` (module doc), and by the boot sweep.
+ */
+export async function healAbandonedEvelessSession(
+  deps: Pick<RuntimeDeps, "db" | "logger">,
+  agentSessionId: string,
+): Promise<boolean> {
+  if (!(await isAbandonedEvelessSession(deps.db, agentSessionId))) return false;
+  const closed = await closeEvelessSessionIfStillAbandoned(deps.db, agentSessionId);
+  if (closed) {
+    deps.logger.warn("dispatch.abandoned_eveless_session_closed", {
+      sessionId: agentSessionId,
+      fields: {
+        reason:
+          "newest run terminal with the dispatch-attempt marker set and no eve id persisted — closed under the session's dispatch lock",
+      },
+    });
+  }
+  return closed;
+}
+
+/**
+ * A CONTINUATION's session, re-read UNDER its dispatch lock. The caller's
+ * row is a snapshot taken before the lock (a thread lookup, the route's
+ * ownership load) and may predate a close — dispatching on it would insert a
+ * run onto a closed row and a later blind status write would resurrect it
+ * (the D6 stale-snapshot resurrection). A closed/error row answers the
+ * PERMANENT `session_not_active` — the same recovery as eve's own dead-
+ * session 409: release the claim (already released by the close) and mint a
+ * fresh session. An abandoned eveless row is healed first (the lock proves
+ * no dispatch is in flight) and answers the same code.
+ */
+export async function requireLiveSessionUnderLock(
+  deps: Pick<RuntimeDeps, "db" | "logger">,
+  agentSessionId: string,
+): Promise<SessionRow> {
+  const rows = await deps.db
+    .select()
+    .from(schema.agentSessions)
+    .where(eq(schema.agentSessions.id, agentSessionId))
+    .limit(1);
+  const session = rows[0];
+  if (!session || session.status === "closed" || session.status === "error") {
+    throw errors.sessionNotActive();
+  }
+  if (session.eveSessionId === null && (await healAbandonedEvelessSession(deps, session.id))) {
+    throw errors.sessionNotActive();
+  }
+  return session;
+}
+
+/**
+ * Every session STATUS write on the dispatch path is a CAS against a
+ * still-live row — a closed/error session is never written back to
+ * active/waiting from a snapshot. Returns true iff a row was updated; a
+ * false is logged by the caller (under the lock it cannot happen: nothing
+ * closes a session while its lock is held and a queued run is on it).
+ */
+export async function casSessionLive(
+  db: DbClient,
+  agentSessionId: string,
+  patch: Partial<
+    Pick<
+      typeof schema.agentSessions.$inferInsert,
+      "status" | "eveSessionId" | "affinityWorkerId"
+    >
+  >,
+): Promise<boolean> {
+  const updated = await db
+    .update(schema.agentSessions)
+    .set(patch)
+    .where(
+      and(
+        eq(schema.agentSessions.id, agentSessionId),
+        notInArray(schema.agentSessions.status, ["closed", "error"]),
+      ),
+    )
+    .returning({ id: schema.agentSessions.id });
+  return updated.length > 0;
+}
+
 /**
  * Dispatch one rendered task message: create (or continue) the session + a
  * run, re-validate the allowlist, ensure-agent the version on a live worker,
@@ -429,10 +643,11 @@ export async function dispatchRenderedRun(
   input: DispatchRenderedRunInput,
 ): Promise<DispatchRenderedRunResult> {
   // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts): the lock is
-  // acquired inside dispatchSerialized (a continuation's before its admission
-  // transaction; a new session's immediately after its claim transaction —
-  // the id exists only then) and held through eve-return + persist +
-  // terminal-recheck/abandon settlement. Under it, no successor can be
+  // acquired inside dispatchSerialized — BEFORE the admission/claim
+  // transaction in both shapes (a continuation locks its existing session; a
+  // new session's id is pre-minted so its lock exists before the row does)
+  // and held through eve-return + persist + terminal-recheck/abandon
+  // settlement. Under it, no successor can be
   // admitted while this dispatch's abandon decision is in flight — so the
   // post-eve recheck's unqualified session-level cancel can only ever reach
   // THIS run's accepted turn, and an accepted turn can never be leaked to a
@@ -470,23 +685,46 @@ async function dispatchSerialized(
   // cancels, the boot sweep), so its dispatch lock is taken BEFORE the
   // admission transaction — the busy check and the run insert happen under
   // it. Contention answers the platform's own TRANSIENT `session_busy`
-  // (nothing has been created yet; the caller retries).
+  // (nothing has been created yet; the caller retries). Once held, the
+  // session is RE-READ under the lock (the caller's snapshot may predate a
+  // close) and an abandoned eveless row is healed — the lock proves no
+  // dispatch is in flight — instead of being reported busy forever.
+  //
+  // A NEW session PRE-MINTS its id and takes that id's lock before the claim
+  // transaction: the lock exists before the row does, so a timeout creates
+  // nothing. An eveless, abandoned thread-claim HOLDER is healed first
+  // (under ITS lock, try-acquired; a held lock means a live dispatch owns it
+  // and the claim transaction below treats it as busy, as before).
   const locks = sessionDispatchLocksOf(deps);
+  let existingSession: SessionRow | undefined;
+  let mintedSessionId: string | undefined;
   if (input.existingSession) {
     lockBox.lock = await locks.acquire(input.existingSession.id, {
       waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
     });
     if (!lockBox.lock) throw errors.sessionBusy();
+    existingSession = await requireLiveSessionUnderLock(deps, input.existingSession.id);
+  } else {
+    if (input.newSessionSlackThreadKey && input.workflowId) {
+      await healAbandonedThreadHolder(
+        deps,
+        input.workflowId,
+        input.newSessionSlackThreadKey,
+      );
+    }
+    mintedSessionId = randomUUID();
+    lockBox.lock = await acquireFreshSessionDispatchLock(deps, mintedSessionId);
   }
 
   // Session + run rows land BEFORE the eve dispatch (202-async window: a crash
   // mid-dispatch leaves a visible failed run, never an untracked, uncapped eve
   // session), inside one advisory-locked transaction so the per-workspace cap
-  // is atomic and a busy session cannot double-dispatch.
+  // is atomic and a busy session cannot double-dispatch. The session lock is
+  // already held (never acquired inside a transaction — lock-pool discipline).
   const { session, run } = await db.transaction(async (tx: DbClient) => {
     await lockWorkspaceRunCap(tx, input.organizationId);
-    if (input.existingSession) {
-      if ((await countDispatchingRuns(tx, input.existingSession.id)) > 0) {
+    if (existingSession) {
+      if ((await countDispatchingRuns(tx, existingSession.id)) > 0) {
         throw errors.sessionBusy();
       }
     }
@@ -496,7 +734,7 @@ async function dispatchSerialized(
       runtime.maxConcurrentRunsPerWorkspace,
     );
 
-    let sessionRow = input.existingSession;
+    let sessionRow = existingSession;
     if (!sessionRow) {
       const principal = {
         ...input.triggerEvent.principal,
@@ -582,6 +820,9 @@ async function dispatchSerialized(
       const inserted = await tx
         .insert(schema.agentSessions)
         .values({
+          // Pre-minted so the dispatch lock could be taken before this row
+          // existed (lock-before-claim, module doc).
+          id: mintedSessionId!,
           organizationId: input.organizationId,
           agentId: version.agentId,
           agentVersionId: version.id,
@@ -617,15 +858,7 @@ async function dispatchSerialized(
     return { session: sessionRow, run: runRow };
   });
 
-  const isNewSession = input.existingSession === undefined;
-
-  // A NEW session's id exists only now — take its dispatch lock immediately
-  // after commit, strictly before any eve-ward step
-  // ({@link acquireFreshSessionDispatchLock}: a timeout settles the queued
-  // run + born-here session and reports the transient busy).
-  if (isNewSession) {
-    lockBox.lock = await acquireFreshSessionDispatchLock(deps, session.id, run.id);
-  }
+  const isNewSession = existingSession === undefined;
 
   // EARLY CANCEL FENCE: a Stop that raced the claim transaction (the abort
   // fired after the link hook's own in-transaction check passed) must not pay
@@ -680,7 +913,7 @@ async function dispatchSerialized(
     // 0.31: a session is continuable iff it HAS an eve session id and this
     // dispatch is a continuation — the old continuation-token term must not
     // come back (the column is never written; see routes.ts).
-    if (isNewSession || !input.existingSession?.eveSessionId) {
+    if (isNewSession || !existingSession?.eveSessionId) {
       // New session (or a session eve never acked): the task message opens
       // the eve session (202 async), carrying the caller's create options —
       // `mode: "task"` (+ outputSchema) for fresh agent-step children.
@@ -706,14 +939,22 @@ async function dispatchSerialized(
       // way. The reverse order (read status, then persist) left a window
       // where a cancel read an eveless session — its remote cancel no-oped —
       // the id then persisted, and the accepted turn ran unobserved.
-      await db
-        .update(schema.agentSessions)
-        .set({
+      // CAS against a still-live row (never a blind snapshot write): under
+      // the lock, with a queued run on the session, nothing can have closed
+      // it — a miss is logged as the impossible it should be.
+      if (
+        !(await casSessionLive(db, session.id, {
           eveSessionId: created.sessionId,
           status: "active",
           affinityWorkerId: worker.id,
-        })
-        .where(eq(schema.agentSessions.id, session.id));
+        }))
+      ) {
+        deps.logger.warn("dispatch.session_persist_refused", {
+          runId: run.id,
+          sessionId: session.id,
+          fields: { reason: "session no longer live under the dispatch lock" },
+        });
+      }
       session.eveSessionId = created.sessionId;
       // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal WHILE
       // the create was in flight — the marker fence has already passed and
@@ -735,7 +976,7 @@ async function dispatchSerialized(
       // session API. Addressed by id alone; the body is exactly `{message}`
       // (send XOR respond, and a stray `continuationToken` key would be a
       // hard 400).
-      eveSessionId = input.existingSession.eveSessionId;
+      eveSessionId = existingSession.eveSessionId;
       await deps.workerClient.continueEveSession(
         worker.address,
         hash,
@@ -746,10 +987,18 @@ async function dispatchSerialized(
       // PERSIST-THEN-RECHECK (the continuation twin of the create branch
       // above — same ordering discipline; here the session already carries
       // its id, so only the liveness update precedes the recheck).
-      await db
-        .update(schema.agentSessions)
-        .set({ status: "active", affinityWorkerId: worker.id })
-        .where(eq(schema.agentSessions.id, session.id));
+      if (
+        !(await casSessionLive(db, session.id, {
+          status: "active",
+          affinityWorkerId: worker.id,
+        }))
+      ) {
+        deps.logger.warn("dispatch.session_persist_refused", {
+          runId: run.id,
+          sessionId: session.id,
+          fields: { reason: "session no longer live under the dispatch lock" },
+        });
+      }
       // POST-EVE CANCEL RECHECK: a Stop that landed while the continue was
       // in flight means the accepted turn must be told to stop here — no
       // tail will follow it, and the caller's cancelChildRun no-ops on the
@@ -949,6 +1198,56 @@ async function abandonCanceledDuringEve(
     dispatched: false,
     canceledBeforeDispatch: true,
   };
+}
+
+/**
+ * Pre-claim self-heal for a NEW slack session: the thread's current claim
+ * HOLDER may be an abandoned eveless row (a dispatch that armed the marker
+ * and died before its id persisted — a Stop racing the create, or a crash).
+ * The claim transaction treats a marker-SET eveless holder as LIVE (it may
+ * be mid-dispatch) and answers `session_busy`; without this step that busy
+ * lasted until a boot sweep ran with the holder's lock free. Here the
+ * holder's lock is TRY-acquired outside any transaction (lock-pool
+ * discipline): held ⇒ a dispatch really is in flight, leave it to the claim
+ * transaction's busy verdict; free ⇒ the lock proves nothing is in flight,
+ * so the abandoned row is closed (releasing the claim) and the claim below
+ * evicts nothing — it simply finds no holder.
+ */
+async function healAbandonedThreadHolder(
+  deps: RuntimeDeps,
+  workflowId: string,
+  threadKey: string,
+): Promise<void> {
+  const holders = await deps.db
+    .select({
+      id: schema.agentSessions.id,
+      status: schema.agentSessions.status,
+      eveSessionId: schema.agentSessions.eveSessionId,
+    })
+    .from(schema.agentSessions)
+    .where(
+      and(
+        eq(schema.agentSessions.workflowId, workflowId),
+        eq(schema.agentSessions.slackThreadKey, threadKey),
+      ),
+    )
+    .limit(1);
+  const holder = holders[0];
+  if (
+    !holder ||
+    holder.eveSessionId !== null ||
+    holder.status === "closed" ||
+    holder.status === "error"
+  ) {
+    return;
+  }
+  const lock = await sessionDispatchLocksOf(deps).acquire(holder.id);
+  if (!lock) return;
+  try {
+    await healAbandonedEvelessSession(deps, holder.id);
+  } finally {
+    await lock.release();
+  }
 }
 
 // ── Slack thread ↔ session mapping ───────────────────────────────────────────

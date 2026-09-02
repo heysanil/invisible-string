@@ -15,11 +15,16 @@
  * (create-on-session, continuation, post-reset create, HITL resume) from
  * before its admission/busy check through eve-return + persist +
  * terminal-recheck/abandon settlement — and TRY-acquired by every other
- * decision point (the guarded remote cancel, the boot sweep's eveless close).
- * Under the lock:
+ * decision point (the guarded remote cancel, the boot sweeps). Under the
+ * lock:
  *   - no successor can be admitted while a dispatch's abandon decision is in
  *     flight, so "a successor exists" and "the unqualified cancel might hit a
  *     successor's turn" are both impossible for lock-holding dispatches;
+ *   - a HOLDER is the session's exclusive owner: whatever the row predicates
+ *     say, no other dispatch is in flight on it this instant — which is what
+ *     lets a lock-holding dispatch close an abandoned eveless session inline
+ *     instead of answering `session_busy` forever (dispatch.ts
+ *     `healAbandonedEvelessSession`);
  *   - the sweep can never close a session whose dispatch is mid-flight (and
  *     its guarded UPDATE additionally re-asserts the ledger atomically).
  *
@@ -31,7 +36,25 @@
  * dies with its connection, so a crashed control plane self-heals: the row
  * state the crash left behind is then owned by boot reconciliation, whose
  * predicates (dispatch-attempt marker, `countDispatchingRuns`' canceled-mid-
- * dispatch arm) deliberately survive as the lock's crash-safe shadow.
+ * dispatch arm, the `remote_cancel_pending_at` obligation) deliberately
+ * survive as the lock's crash-safe shadow.
+ *
+ * POOL DISCIPLINE (the D1 deadlock). The reserved connection comes from the
+ * DEDICATED LOCK POOL (`Db.$lockClient`, db.ts) — never the root pool. A
+ * holder pins its connection for the whole eve round-trip while its own
+ * admission/marker/persist queries keep drawing from the ROOT pool; on one
+ * shared pool, `max` concurrent dispatches reserved every connection and
+ * then each waited for a `max+1`th that could never come — none reached its
+ * `finally`. Two rules follow, both enforced here:
+ *   1. the lock factory refuses to fall back onto `$client` (a `Db` without
+ *      a lock pool gets a NO-OP factory, which only single-threaded fake-db
+ *      unit fixtures ever see);
+ *   2. `acquire()` MUST be called with NO open root-pool transaction — every
+ *      caller takes the lock strictly before its `db.transaction(...)`. The
+ *      reserve wait is BOUNDED (`SESSION_LOCK_RESERVE_TIMEOUT_MS`) and a
+ *      saturated lock pool reads as contention (null → the caller's
+ *      transient `session_busy`), never as a queue a root connection could
+ *      be waiting in.
  *
  * Contention answers the platform's own TRANSIENT 409 `session_busy` (the
  * two-409s rule): the lock only widens what "busy" means — "a dispatch or its
@@ -40,7 +63,10 @@
  *
  * Scope discipline: the lock is held across the eve call and its settlement
  * ONLY — never across a tail (startTail registers and returns; the tail runs
- * lock-free).
+ * lock-free). The one exception is the live-tail STOP: the cancel route
+ * holds the lock while the tail's remote cancel is AWAITED and the row
+ * finalized, so admission stays closed until the settled turn's cancel has
+ * reached eve (routes.ts `cancelAgentRun`).
  */
 import type postgres from "postgres";
 import type { Logger } from "@invisible-string/shared";
@@ -53,7 +79,11 @@ export interface SessionDispatchLock {
 export interface SessionDispatchLockFactory {
   /**
    * Acquire the session's dispatch lock, waiting up to `waitMs` (default 0 —
-   * a pure try). Null when the lock is still held at the deadline.
+   * a pure try). Null when the lock is still held at the deadline, OR when
+   * the lock pool could not hand out a connection within
+   * {@link SESSION_LOCK_RESERVE_TIMEOUT_MS} (capacity exhaustion is
+   * transient and reads as contention). MUST be called outside any root-pool
+   * transaction (module doc, pool discipline rule 2).
    */
   acquire(
     agentSessionId: string,
@@ -70,11 +100,11 @@ export interface SessionDispatchLockFactory {
 export const SESSION_LOCK_ADMISSION_WAIT_MS = 250;
 
 /**
- * How long a NEW-session dispatch waits for its own just-inserted session's
- * lock. Contenders here can only be dispatchers that found the fresh row
- * (e.g. via its Slack thread key) after commit; each fails its own busy check
- * against the queued run and releases within one transaction, so a couple of
- * seconds is generous.
+ * How long a NEW-session dispatch waits for its PRE-MINTED session's lock.
+ * The id is minted app-side and nobody else can know it before the claim
+ * transaction commits, so the lock is uncontended by construction — only
+ * lock-pool pressure can delay it, and a timeout means NOTHING was created
+ * (the caller answers the transient `session_busy` with nothing to undo).
  */
 export const SESSION_LOCK_FRESH_SESSION_WAIT_MS = 2_000;
 
@@ -82,9 +112,19 @@ export const SESSION_LOCK_FRESH_SESSION_WAIT_MS = 2_000;
  * How long a DEFERRED guarded remote cancel keeps trying in the background
  * when a dispatch holds the session (routes.ts `cancelEveTurnGuarded`). Must
  * outlast the longest lock hold: ensure-agent (2 × 60 s cold boot) + the eve
- * call (60 s) + settlement.
+ * call (60 s) + settlement. The obligation is ALSO durable
+ * (`runs.remote_cancel_pending_at`), so a crash mid-deferral is finished by
+ * boot reconciliation — the background chase is the fast path, not the
+ * guarantee.
  */
 export const SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS = 5 * 60 * 1000;
+
+/**
+ * Bound on ONE `reserve()` against the lock pool. Exhaustion (every lock
+ * connection pinned by a holder) is transient — holders release at
+ * settlement — so a waiter answers `session_busy` rather than queueing.
+ */
+export const SESSION_LOCK_RESERVE_TIMEOUT_MS = 2_000;
 
 const DEFAULT_POLL_MS = 25;
 
@@ -92,16 +132,47 @@ function lockKey(agentSessionId: string): string {
   return `session-dispatch:${agentSessionId}`;
 }
 
+type Reserved = Awaited<ReturnType<postgres.Sql["reserve"]>>;
+
+/**
+ * `sql.reserve()` bounded by `timeoutMs`. postgres-js queues reservations
+ * indefinitely when the pool is exhausted; here a late reservation is
+ * released the moment it arrives and the caller sees null instead.
+ */
+async function reserveBounded(
+  sql: postgres.Sql,
+  timeoutMs: number,
+): Promise<Reserved | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const pending = sql.reserve();
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    const won = await Promise.race([pending, timeout]);
+    if (won !== null) return won;
+    // Lost the race: whenever the queued reservation lands, hand it straight
+    // back — nobody is waiting for it any more.
+    void pending.then((late) => late.release()).catch(() => {});
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * The production factory: `pg_try_advisory_lock(hashtext(key)::bigint)` on a
- * reserved postgres-js connection, polled until acquired or the deadline
+ * reserved connection of the LOCK pool, polled until acquired or the deadline
  * passes. The reservation is released the moment acquisition fails, and on
  * `release()` after the unlock.
  */
 export function createPgSessionDispatchLocks(
-  sql: postgres.Sql,
+  lockSql: postgres.Sql,
   logger?: Logger,
+  options: { reserveTimeoutMs?: number } = {},
 ): SessionDispatchLockFactory {
+  const reserveTimeoutMs =
+    options.reserveTimeoutMs ?? SESSION_LOCK_RESERVE_TIMEOUT_MS;
   return {
     async acquire(agentSessionId, options) {
       const waitMs = options?.waitMs ?? 0;
@@ -109,12 +180,19 @@ export function createPgSessionDispatchLocks(
       const key = lockKey(agentSessionId);
       const deadline = Date.now() + waitMs;
       // Reserve PER ATTEMPT, not for the whole wait: a waiter (notably the
-      // guarded cancel's deferred background chase) must not pin a pool
+      // guarded cancel's deferred background chase) must not pin a lock-pool
       // connection for the minutes a lock hold can last — only the WINNING
       // attempt keeps its reservation, for the lock's lifetime.
-      let reserved: Awaited<ReturnType<postgres.Sql["reserve"]>> | null = null;
+      let reserved: Reserved | null = null;
       for (;;) {
-        const attempt = await sql.reserve();
+        const attempt = await reserveBounded(lockSql, reserveTimeoutMs);
+        if (!attempt) {
+          logger?.warn("session.dispatch_lock_pool_exhausted", {
+            sessionId: agentSessionId,
+            fields: { reserveTimeoutMs },
+          });
+          return null;
+        }
         let locked = false;
         try {
           const rows =
@@ -167,20 +245,30 @@ const NOOP_LOCKS: SessionDispatchLockFactory = {
   },
 };
 
+/** One pg factory per lock pool (the deps object is rebuilt per test). */
+const FACTORIES = new WeakMap<postgres.Sql, SessionDispatchLockFactory>();
+
 /**
  * The dispatch surface's lock source: the pg factory over the runtime deps'
- * own postgres-js client. Focused unit fixtures that cast a fake `db` into
- * `RuntimeDeps` (no `$client.reserve`) get a NO-OP factory — they are
- * single-threaded fakes with no concurrency to serialize; every DB-gated and
- * production path carries a real `Db`, whose type guarantees `$client`.
+ * DEDICATED lock pool (`Db.$lockClient`, attached by db.ts `createDb`). A
+ * `db` without a lock pool — focused unit fixtures that cast a fake `db`
+ * into `RuntimeDeps` — gets a NO-OP factory: they are single-threaded fakes
+ * with no concurrency to serialize. Deliberately NO fallback onto
+ * `$client`: locks on the root pool are the D1 deadlock (module doc).
  */
 export function sessionDispatchLocksOf(deps: {
   db: unknown;
   logger: Logger;
 }): SessionDispatchLockFactory {
-  const client = (deps.db as { $client?: postgres.Sql } | undefined)?.$client;
-  if (client && typeof client.reserve === "function") {
-    return createPgSessionDispatchLocks(client, deps.logger);
+  const lockClient = (deps.db as { $lockClient?: postgres.Sql } | undefined)
+    ?.$lockClient;
+  if (lockClient && typeof lockClient.reserve === "function") {
+    let factory = FACTORIES.get(lockClient);
+    if (!factory) {
+      factory = createPgSessionDispatchLocks(lockClient, deps.logger);
+      FACTORIES.set(lockClient, factory);
+    }
+    return factory;
   }
   return NOOP_LOCKS;
 }

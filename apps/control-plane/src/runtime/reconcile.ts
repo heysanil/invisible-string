@@ -33,15 +33,30 @@
  *    under its per-session DISPATCH LOCK (session-lock.ts — a held lock
  *    means a dispatch is mid-flight this instant and the candidate is
  *    skipped), the nomination is re-read under that lock, and the close is
- *    an atomic guarded UPDATE ({@link closeEvelessSessionIfStillAbandoned})
- *    that re-asserts eveless + non-terminal AND the ledger (NOT EXISTS a
- *    live run) in its WHERE — a candidate that gained its eve id, or a run,
- *    between snapshot and close stays untouched. Closing
- *    releases any Slack thread-key claim the thread-claim eviction now
- *    deliberately refuses to evict for marker-SET holders (see dispatch.ts).
- *    Marker-NULL eveless holders are left alone: the claim eviction handles
- *    theirs lazily, and an eveless CHAT session (including a post-reset
- *    replacement row, which has no runs at all) stays continuable by design.
+ *    an atomic guarded UPDATE (dispatch.ts `healAbandonedEvelessSession` →
+ *    `closeEvelessSessionIfStillAbandoned`) that re-asserts eveless +
+ *    non-terminal AND the ledger (NOT EXISTS a live run) in its WHERE — a
+ *    candidate that gained its eve id, or a run, between snapshot and close
+ *    stays untouched. Closing releases any Slack thread-key claim the
+ *    thread-claim eviction deliberately refuses to evict for marker-SET
+ *    holders (see dispatch.ts). Skipping a held lock is HARMLESS: the
+ *    dispatch holding it is the session's exclusive owner and heals an
+ *    abandoned row itself (the same primitive, under its own lock) instead
+ *    of answering `session_busy` until the next boot. Marker-NULL eveless
+ *    holders are left alone: the claim eviction handles theirs lazily, and
+ *    an eveless CHAT session (including a post-reset replacement row, which
+ *    has no runs at all) stays continuable by design.
+ *
+ * 2b. PENDING REMOTE CANCELS — canceled agent runs still carrying
+ *    `remote_cancel_pending_at`: a Stop settled the row (the marker is set
+ *    in the same CAS) but the process died before its guarded remote leg
+ *    ran — the accepted eve turn would otherwise keep running forever. Each
+ *    is finished through `cancelEveTurnGuarded` (routes.ts): under the
+ *    session's dispatch lock it chases eve, or skips as superseded when a
+ *    newer run owns the session, or finds nothing to chase — and clears the
+ *    marker; a held lock defers it into the background exactly as the live
+ *    route does. After sweep 2 on purpose: a session that sweep just closed
+ *    has no eve id, so its pending cancels settle as "nothing to chase".
  *
  * 3. INTERRUPTED PIPELINE RUNS — `mode: 'pipeline'` runs (which have no
  *    session or worker to re-tail) are re-driven from their `run_steps`
@@ -58,73 +73,34 @@
  *    owed). Runs only when a DeliveryService is wired (the integrations
  *    config may be absent).
  */
-import { and, desc, eq, inArray, isNull, notExists, notInArray } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, notInArray } from "drizzle-orm";
 import { schema } from "@invisible-string/db";
 
-import type { Db } from "../db";
 import {
   recoverPipelineRuns,
   type PipelineRecoveryOutcome,
 } from "../pipeline/recovery";
 import type { PipelineRunner } from "../pipeline/runner";
 import type { DeliveryService } from "../runs/delivery";
-import { startTail, type RuntimeDeps } from "./routes";
+import { healAbandonedEvelessSession } from "./dispatch";
+import { cancelEveTurnGuarded, startTail, type RuntimeDeps } from "./routes";
 import { isWorkerLive, toSchedulableWorker } from "./scheduler";
 import { sessionDispatchLocksOf } from "./session-lock";
 
-/**
- * Sweep-2 close as an ATOMIC GUARDED UPDATE. The snapshot that nominated the
- * candidate is STALE by the time the close runs — boot reconciliation is
- * fired after the server starts listening (index.ts), so live traffic can
- * give a snapshotted session its eve id (and finish a run on it) between
- * selection and close. Closing on the snapshot's say-so would kill a healthy
- * session; instead the eveless + non-terminal predicate is re-asserted
- * INSIDE the UPDATE's WHERE — AND so is the LEDGER: a `NOT EXISTS` on any
- * non-terminal run of the session, because the condition that NOMINATED the
- * candidate (newest run terminal + marker-set) can also go stale — a run
- * admitted between nomination and close would otherwise let the close fire
- * and release a thread claim mid-dispatch. So a now-healthy row is untouched
- * by construction (the row and its ledger are re-read under the UPDATE's
- * lock, never trusted from the snapshot). The thread-key release rides the
- * same statement, mirroring markSession's terminal transition. Returns true
- * iff THIS call closed the row — callers count only rows actually updated.
- */
-export async function closeEvelessSessionIfStillAbandoned(
-  db: Db,
-  agentSessionId: string,
-): Promise<boolean> {
-  const closed = await db
-    .update(schema.agentSessions)
-    .set({ status: "closed", slackThreadKey: null })
-    .where(
-      and(
-        eq(schema.agentSessions.id, agentSessionId),
-        isNull(schema.agentSessions.eveSessionId),
-        notInArray(schema.agentSessions.status, ["closed", "error"]),
-        // The atomic ledger guard: no live run may exist on the session at
-        // the instant of the close (nomination staleness — see the doc).
-        notExists(
-          db
-            .select({ id: schema.runs.id })
-            .from(schema.runs)
-            .where(
-              and(
-                eq(schema.runs.agentSessionId, agentSessionId),
-                inArray(schema.runs.status, ["queued", "running", "waiting"]),
-              ),
-            ),
-        ),
-      ),
-    )
-    .returning({ id: schema.agentSessions.id });
-  return closed.length > 0;
-}
+// The guarded close lives beside the dispatch path that shares it
+// (dispatch.ts); re-exported so existing importers keep resolving.
+export { closeEvelessSessionIfStillAbandoned } from "./dispatch";
 
 export interface ReconcileOutcome {
   resumed: number;
   failed: number;
   /** Abandoned eveless sessions closed by sweep 2 (thread claims released). */
   sessionsClosed: number;
+  /**
+   * Pending remote cancels (sweep 2b): settled synchronously under the
+   * session lock vs deferred into the background because a dispatch held it.
+   */
+  remoteCancels: { settled: number; deferred: number };
   /** Pipeline-run sweep tally (zeros when no PipelineRunner is wired). */
   pipelines: PipelineRecoveryOutcome;
   /** Stranded-delivery sweep tally (zeros when no DeliveryService is wired). */
@@ -178,6 +154,7 @@ export async function reconcileInterruptedRuns(
     resumed: 0,
     failed: 0,
     sessionsClosed: 0,
+    remoteCancels: { settled: 0, deferred: 0 },
     pipelines: { resumed: 0, locked: 0, failed: 0 },
     deliveries: { delivered: 0, failed: 0, skipped: 0 },
   };
@@ -265,26 +242,35 @@ export async function reconcileInterruptedRuns(
       continue;
     }
     try {
-      const newest = await deps.db
-        .select({ status: schema.runs.status, startedAt: schema.runs.startedAt })
-        .from(schema.runs)
-        .where(eq(schema.runs.agentSessionId, candidate.id))
-        .orderBy(desc(schema.runs.createdAt))
-        .limit(1);
-      const run = newest[0];
-      if (
-        run &&
-        run.startedAt !== null &&
-        (run.status === "succeeded" ||
-          run.status === "failed" ||
-          run.status === "canceled")
-      ) {
-        if (await closeEvelessSessionIfStillAbandoned(deps.db, candidate.id)) {
-          outcome.sessionsClosed += 1;
-        }
+      if (await healAbandonedEvelessSession(deps, candidate.id)) {
+        outcome.sessionsClosed += 1;
       }
     } finally {
       await lock.release();
+    }
+  }
+
+  // Sweep 2b — PENDING REMOTE CANCELS (module doc): canceled agent runs
+  // whose durable remote-cancel obligation was never met. The guarded chase
+  // clears the marker itself; a held lock defers it (the marker stays until
+  // the deferred attempt completes, or the next boot).
+  const pendingCancels = await deps.db
+    .select({ runId: schema.runs.id, sessionId: schema.runs.agentSessionId })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.mode, "agent"),
+        eq(schema.runs.status, "canceled"),
+        isNotNull(schema.runs.remoteCancelPendingAt),
+        isNotNull(schema.runs.agentSessionId),
+      ),
+    );
+  for (const pending of pendingCancels) {
+    if (!pending.sessionId) continue;
+    if (await cancelEveTurnGuarded(deps, pending.sessionId, pending.runId)) {
+      outcome.remoteCancels.settled += 1;
+    } else {
+      outcome.remoteCancels.deferred += 1;
     }
   }
 

@@ -48,6 +48,8 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+
 import { Elysia } from "elysia";
 import { decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
@@ -106,8 +108,10 @@ import {
 import type { RuntimeConfig } from "./config";
 import {
   armDispatchAttempt,
+  casSessionLive,
   publishedPipelineConfigOf,
   recheckCanceledDuringEve,
+  requireLiveSessionUnderLock,
   PIPELINE_TRIGGER_AGENT_ID,
 } from "./dispatch";
 import { getAccessToken, type TokenLifecycleDeps } from "../oauth/tokens";
@@ -721,6 +725,62 @@ async function cancelEveTurnBestEffort(
 }
 
 /**
+ * Settle an agent run `canceled` AND record its DURABLE remote-cancel
+ * obligation in ONE CAS statement: `remote_cancel_pending_at` is set in the
+ * same UPDATE that flips the status, so there is no window in which the row
+ * reads canceled while nothing — neither this process nor boot recovery —
+ * owes eve the cancel. Terminal statuses are sticky exactly as in
+ * `RunStore.markRun` (only a queued/running/waiting row is settled; the
+ * return value says whether THIS call did it). The marker is cleared by
+ * {@link cancelEveTurnGuarded} once the remote leg has run under the
+ * session's dispatch lock, and swept at boot for runs it never reached.
+ */
+export async function settleRunCanceledPendingRemote(
+  db: DbClient,
+  runId: string,
+  reason: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const updated = await db
+    .update(schema.runs)
+    .set({
+      status: "canceled",
+      error: reason,
+      completedAt: now,
+      remoteCancelPendingAt: now,
+    })
+    .where(
+      and(
+        eq(schema.runs.id, runId),
+        inArray(schema.runs.status, ["queued", "running", "waiting"]),
+      ),
+    )
+    .returning({ id: schema.runs.id });
+  return updated.length > 0;
+}
+
+/** Record a remote-cancel obligation on an ALREADY-canceled run (the live-tail
+ *  Stop that could not take the session lock and skipped its unqualified
+ *  remote leg). No-op unless the row is canceled. */
+export async function markRemoteCancelPending(
+  db: DbClient,
+  runId: string,
+  now: Date = new Date(),
+): Promise<void> {
+  await db
+    .update(schema.runs)
+    .set({ remoteCancelPendingAt: now })
+    .where(and(eq(schema.runs.id, runId), eq(schema.runs.status, "canceled")));
+}
+
+async function clearRemoteCancelPending(db: DbClient, runId: string): Promise<void> {
+  await db
+    .update(schema.runs)
+    .set({ remoteCancelPendingAt: null })
+    .where(eq(schema.runs.id, runId));
+}
+
+/**
  * The GUARDED remote leg of a no-tail cancel: the settle-then-remote window
  * closed (crash-window review family). The unqualified session-level cancel
  * must only fire while it can be certain of hitting the settled run's own
@@ -731,7 +791,9 @@ async function cancelEveTurnBestEffort(
  *   - lock free → acquire; no live run besides the settled one may exist
  *     (admission needs the same lock), so re-read the session (the caller's
  *     row can be stale — the eve id may have been persisted since), skip if
- *     a successor sneaked in before the lock was taken, else chase eve.
+ *     a successor sneaked in before the lock was taken (eve serializes
+ *     turns, so the settled turn is already over — superseded), else chase
+ *     eve.
  *   - lock HELD → a dispatch for this session is mid-flight. Its own
  *     post-eve recheck (which runs under the lock) normally settles the
  *     accepted turn — but it may already have read the run BEFORE this Stop
@@ -742,14 +804,24 @@ async function cancelEveTurnBestEffort(
  *     kill a newer run's turn; a duplicate cancel of an already-settled turn
  *     is an idempotent no-op at eve.
  *
- * Best-effort like every remote cancel: the run row was settled FIRST and is
- * authoritative; failures here are logged, never surfaced.
+ * DURABLE: the settled run carries `remote_cancel_pending_at` (set by the
+ * same CAS that settled it) until an attempt has run to completion under the
+ * lock — issued, superseded, or nothing to chase — at which point it is
+ * cleared. A crash mid-deferral therefore leaves the obligation on the row
+ * for boot reconciliation to finish (the in-process deferral is only the
+ * fast path). Best-effort like every remote cancel: the run row was settled
+ * FIRST and is authoritative; a remote failure is logged, never surfaced —
+ * and still clears the marker (the cancel was ISSUED; eve's cooperative
+ * cancel has no stronger acknowledgement to wait for).
+ *
+ * Returns true when the obligation was settled in this call (synchronously),
+ * false when it was deferred to the background chase.
  */
 export async function cancelEveTurnGuarded(
   deps: RuntimeDeps,
   agentSessionId: string,
   settledRunId: string,
-): Promise<void> {
+): Promise<boolean> {
   const locks = sessionDispatchLocksOf(deps);
   const attempt = async (waitMs: number, pollMs?: number): Promise<boolean> => {
     const lock = await locks.acquire(agentSessionId, { waitMs, ...(pollMs ? { pollMs } : {}) });
@@ -763,28 +835,31 @@ export async function cancelEveTurnGuarded(
         .where(eq(schema.agentSessions.id, agentSessionId))
         .limit(1);
       const session = rows[0];
-      if (!session || !session.eveSessionId) return true; // nothing to chase
-      if (
-        (await countDispatchingRuns(deps.db, agentSessionId, {
-          excludeRunId: settledRunId,
-        })) > 0
-      ) {
-        deps.logger.debug("run.cancel_remote_skipped", {
-          runId: settledRunId,
-          fields: {
-            sessionId: agentSessionId,
-            reason: "a newer run owns the session",
-          },
-        });
-        return true;
+      if (session?.eveSessionId) {
+        if (
+          (await countDispatchingRuns(deps.db, agentSessionId, {
+            excludeRunId: settledRunId,
+          })) > 0
+        ) {
+          deps.logger.debug("run.cancel_remote_skipped", {
+            runId: settledRunId,
+            fields: {
+              sessionId: agentSessionId,
+              reason: "a newer run owns the session — the settled turn is superseded",
+            },
+          });
+        } else {
+          await cancelEveTurnBestEffort(deps, session);
+        }
       }
-      await cancelEveTurnBestEffort(deps, session);
+      // Issued, superseded, or nothing to chase: the obligation is met.
+      await clearRemoteCancelPending(deps.db, settledRunId);
       return true;
     } finally {
       await lock.release();
     }
   };
-  if (await attempt(0)) return;
+  if (await attempt(0)) return true;
   deps.logger.debug("run.cancel_remote_deferred", {
     runId: settledRunId,
     fields: {
@@ -795,6 +870,7 @@ export async function cancelEveTurnGuarded(
   void attempt(SESSION_LOCK_DEFERRED_CANCEL_WAIT_MS, 250)
     .then((done) => {
       if (!done) {
+        // The durable marker stays set: boot reconciliation finishes it.
         deps.logger.warn("run.cancel_remote_abandoned", {
           runId: settledRunId,
           fields: { sessionId: agentSessionId },
@@ -810,46 +886,137 @@ export async function cancelEveTurnGuarded(
         },
       });
     });
+  return false;
 }
 
 /**
- * Take a just-inserted session's dispatch lock (the fresh-session flavor of
- * the per-session critical section — the id exists only after the claim
- * transaction, so the lock follows the insert; dispatch.ts module doc).
- * Contenders can only be dispatchers that found the fresh row after commit;
- * each fails its own busy check against the queued run and releases within
- * one transaction, so the bounded wait is generous and a timeout is
- * pathological: the queued run and the born-here session are settled (they
- * must not outlive the refused dispatch) and the caller gets the transient
- * `session_busy`.
+ * Take a PRE-MINTED session's dispatch lock — the fresh-session flavor of
+ * the per-session critical section, acquired strictly BEFORE the claim
+ * transaction (lock-before-claim, dispatch.ts module doc). The id is minted
+ * app-side and unknown to every other actor until the row commits, so the
+ * lock is uncontended by construction; only lock-pool pressure can delay
+ * it, and a timeout means NOTHING was created — the caller answers the
+ * transient `session_busy` with nothing to undo. (The old post-claim
+ * acquisition failed the queued run and closed the session WITHOUT the lock
+ * — the D6 stale-snapshot resurrection.) MUST be called outside any
+ * transaction (lock-pool discipline).
  */
 export async function acquireFreshSessionDispatchLock(
   deps: RuntimeDeps,
   agentSessionId: string,
-  runId: string,
 ): Promise<SessionDispatchLock> {
   const lock = await sessionDispatchLocksOf(deps).acquire(agentSessionId, {
     waitMs: SESSION_LOCK_FRESH_SESSION_WAIT_MS,
   });
   if (lock) return lock;
-  await deps.runStore.markRun(runId, {
-    status: "failed",
-    error: "the session's dispatch lock could not be acquired",
-    completedAt: new Date(),
+  deps.logger.warn("dispatch.fresh_session_lock_unavailable", {
+    sessionId: agentSessionId,
+    fields: { reason: "lock pool saturated — nothing was created" },
   });
-  await deps.runStore.markSession(agentSessionId, "closed");
   throw errors.sessionBusy();
 }
 
+/** Terminal run statuses (sticky). */
+function isTerminalRunStatus(status: RunRow["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "canceled";
+}
+
 /**
- * Cancel one AGENT-mode run by id without a live tail requirement — the
- * pipeline cancel path uses this on the parent's linked CHILD runs (an
- * agent step's eve turn must not outlive the user's Stop), and the agent
- * step's post-dispatch cancel fence uses it on a child whose dispatch was
- * racing the Stop (pipeline/steps/agent.ts). Mirrors the cancel route's
- * no-tail branch: settle the row first, then chase eve best-effort.
- * Idempotent (terminal children are left alone), so the route's snapshot and
- * the executor's fence may both call it. The terminal no-op is safe even for
+ * Cancel ONE agent-mode run — the single Stop primitive behind
+ * `POST /runs/:id/cancel` (agent runs), the pipeline cancel route's child
+ * sweep, and the agent step's post-dispatch fence ({@link cancelChildRun}).
+ * Idempotent: a terminal run is left alone. Two shapes:
+ *
+ * LIVE TAIL (the run is `running` in this process). The tail owns the remote
+ * cancel, but it used to FIRE it without awaiting — unqualified when eve's
+ * `turn.started` had not been observed yet — then finalize the row, which
+ * reopened admission: a follow-up B was admitted and A's late `{}` cancel
+ * killed B's turn. Now the Stop takes the session's DISPATCH LOCK (bounded)
+ * and, holding it, has the tail issue and AWAIT the remote cancel
+ * (turn-qualified when the tail knows the turnId) and THEN finalize the
+ * row — admission stays closed until the settled turn's cancel has reached
+ * eve. If the lock cannot be had within the bound (a dispatch is settling
+ * this instant), the tail finalizes with ONLY a turn-qualified cancel (safe
+ * without the lock: it can never hit another turn); an unqualified one is
+ * SKIPPED and recorded as a durable obligation ({@link markRemoteCancelPending})
+ * that the guarded chase — deferred now, or boot reconciliation after a
+ * crash — finishes under the lock.
+ *
+ * NO TAIL (`queued`/`waiting`, or a tail that ended between the check and
+ * the cancel). Settle the ROW FIRST — with the durable obligation in the
+ * same CAS ({@link settleRunCanceledPendingRemote}) — then chase eve through
+ * {@link cancelEveTurnGuarded}. The platform side is authoritative for the
+ * run row, so the user's Stop is never held behind a slow or unreachable
+ * remote leg. Ownership is the caller's problem.
+ */
+export async function cancelAgentRun(
+  deps: RuntimeDeps,
+  run: Pick<RunRow, "id" | "status">,
+  session: Pick<SessionRow, "id"> | null,
+  reason: string,
+): Promise<void> {
+  if (isTerminalRunStatus(run.status)) return;
+
+  if (deps.tailers.get(run.id)) {
+    const locks = sessionDispatchLocksOf(deps);
+    const lock = session
+      ? await locks.acquire(session.id, { waitMs: SESSION_LOCK_ADMISSION_WAIT_MS })
+      : null;
+    if (lock) {
+      try {
+        // Under the lock: the remote cancel (qualified or not) can only reach
+        // THIS run's turn, and it is awaited before the row finalizes.
+        await deps.tailers.cancelRunGuarded(run.id, reason, {
+          awaitRemote: true,
+          allowUnqualifiedRemote: true,
+        });
+      } finally {
+        await lock.release();
+      }
+    } else {
+      const outcome = await deps.tailers.cancelRunGuarded(run.id, reason, {
+        awaitRemote: true,
+        allowUnqualifiedRemote: false,
+      });
+      if (outcome === "skipped" && session) {
+        // The unqualified leg could not be issued safely: make the
+        // obligation durable, then chase it (deferred while the lock is
+        // held; boot recovery finishes it after a crash).
+        await markRemoteCancelPending(deps.db, run.id);
+        await cancelEveTurnGuarded(deps, session.id, run.id);
+      }
+    }
+    // A tail that ended as `waiting` (parked) leaves a live row behind — fall
+    // through to the no-tail settle; anything terminal is done.
+    const current = await deps.runStore.getRunStatus(run.id);
+    if (!current || isTerminalRunStatus(current.status)) return;
+  }
+
+  // NO TAIL: settle + durable obligation in one CAS, then the guarded chase.
+  const settled = await settleRunCanceledPendingRemote(deps.db, run.id, reason);
+  if (!settled) return; // another actor finalized it first
+  // No tail ⇒ no tailer hook ⇒ settle a pending outbound-reply marker here
+  // (canceled runs owe no reply; deliver() no-ops for runs owing nothing).
+  await deps.delivery?.deliver({
+    runId: run.id,
+    status: "canceled",
+    lastAssistantMessage: null,
+  });
+  deps.bus.publish(run.id, {
+    kind: "status",
+    frame: { runId: run.id, status: "canceled", error: reason },
+  });
+  if (session) await cancelEveTurnGuarded(deps, session.id, run.id);
+}
+
+/**
+ * Cancel one AGENT-mode run by id — the pipeline cancel path uses this on
+ * the parent's linked CHILD runs (an agent step's eve turn must not outlive
+ * the user's Stop), and the agent step's post-dispatch cancel fence uses it
+ * on a child whose dispatch was racing the Stop (pipeline/steps/agent.ts).
+ * Loads the rows and delegates to {@link cancelAgentRun}; idempotent
+ * (terminal children are left alone), so the route's snapshot and the
+ * executor's fence may both call it. The terminal no-op is safe even for
  * the cancel-during-create race — a child whose run settled terminal while
  * its dispatch's createEveSession was still in flight has no eve id HERE to
  * chase, but the dispatch's own post-eve recheck re-reads the run when the
@@ -874,29 +1041,7 @@ export async function cancelChildRun(
     .limit(1);
   const row = rows[0];
   if (!row) return;
-  if (
-    row.run.status === "succeeded" ||
-    row.run.status === "failed" ||
-    row.run.status === "canceled"
-  ) {
-    return;
-  }
-  const hadTail = await deps.tailers.cancelRun(childRunId, reason);
-  if (hadTail) return;
-  await deps.runStore.markRun(childRunId, {
-    status: "canceled",
-    error: reason,
-    completedAt: new Date(),
-  });
-  deps.bus.publish(childRunId, {
-    kind: "status",
-    frame: { runId: childRunId, status: "canceled", error: reason },
-  });
-  // Guarded remote leg (settle-then-remote window closed): the unqualified
-  // session-level cancel runs under the session's dispatch lock with an
-  // under-lock successor check — deferred, never dropped, when the child's
-  // own dispatch still holds the lock.
-  if (row.session) await cancelEveTurnGuarded(deps, row.session.id, childRunId);
+  await cancelAgentRun(deps, row.run, row.session, reason);
 }
 
 /**
@@ -1408,6 +1553,15 @@ export function runtimePlugin(deps: RuntimeDeps) {
           principal,
         };
 
+        // FRESH-SESSION DISPATCH LOCK (session-lock.ts; dispatch.ts module
+        // doc, lock-before-claim): the session id is PRE-MINTED so its lock
+        // is taken BEFORE the claim transaction — a timeout creates nothing
+        // — and held through eve-return + persist + recheck, so no successor
+        // admission or remote-cancel decision can race this dispatch. The
+        // tail runs lock-free.
+        const sessionId = randomUUID();
+        const lock = await acquireFreshSessionDispatchLock(deps, sessionId);
+        try {
         // Session + run rows land BEFORE the eve dispatch (202-async window:
         // a crash mid-dispatch leaves a visible failed run, never an
         // untracked, uncapped eve session), inside one advisory-locked
@@ -1422,6 +1576,7 @@ export function runtimePlugin(deps: RuntimeDeps) {
           const sessionRows = await tx
             .insert(schema.agentSessions)
             .values({
+              id: sessionId,
               organizationId: workspace.organizationId,
               agentId: agent.id,
               agentVersionId: ready.version.id,
@@ -1451,13 +1606,6 @@ export function runtimePlugin(deps: RuntimeDeps) {
           return { session: sessionRows[0]!, run: runRows[0]! };
         });
 
-        // FRESH-SESSION DISPATCH LOCK (session-lock.ts; dispatch.ts module
-        // doc): taken immediately after the claim transaction — the id
-        // exists only now — and held through eve-return + persist + recheck,
-        // so no successor admission or remote-cancel decision can race this
-        // dispatch. The tail runs lock-free.
-        const lock = await acquireFreshSessionDispatchLock(deps, session.id, run.id);
-        try {
           const hash = ready.version.contentHash;
           const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
           let created;
@@ -1499,11 +1647,15 @@ export function runtimePlugin(deps: RuntimeDeps) {
 
           // PERSIST-THEN-RECHECK (dispatch.ts's post-eve ordering): the eve id
           // lands on the session row BEFORE the terminal recheck, so a Stop
-          // landing from here on finds it and chases eve itself.
-          await db
-            .update(schema.agentSessions)
-            .set({ eveSessionId: created.sessionId })
-            .where(eq(schema.agentSessions.id, session.id));
+          // landing from here on finds it and chases eve itself. CAS against a
+          // still-live row — never a blind snapshot write.
+          if (!(await casSessionLive(db, session.id, { eveSessionId: created.sessionId }))) {
+            deps.logger.warn("dispatch.session_persist_refused", {
+              runId: run.id,
+              sessionId: session.id,
+              fields: { reason: "session no longer live under the dispatch lock" },
+            });
+          }
           session.eveSessionId = created.sessionId;
 
           // POST-EVE CANCEL RECHECK: a Stop can settle the run terminal while
@@ -1630,183 +1782,19 @@ export function runtimePlugin(deps: RuntimeDeps) {
       "/sessions/:sessionId/messages",
       async ({ workspace, params, body, set }) => {
         const { message } = parseBody(postMessageRequestSchema, body);
-        deps.metrics.recordTrigger("manual", "received");
         const session = await loadSessionOwned(
           db,
           workspace.organizationId,
           params.sessionId,
         );
-        // 0.31: continuable iff the row is not terminal. A `continuationToken`
-        // term here would reject EVERY follow-up (the column is never written
-        // anymore) — chat would be dead after the first message.
-        //
-        // A row with NO eve session id is continuable too: it is the state a
-        // `reset` leaves behind (the retired eve id can never take another
-        // message, so the replacement row starts empty). This message OPENS
-        // its eve session, exactly as dispatch.ts's create branch does.
-        if (session.status === "closed" || session.status === "error") {
-          throw errors.sessionNotContinuable();
-        }
-        // Sessions pin their agent version at creation — a follow-up always
-        // rides the SAME compiled artifact, even after a republish.
-        const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
-        const { worker } = await selectWorker(db, {
-          heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
-          defaultMaxAgents: runtime.maxAgentsPerWorker,
-          versionHash: ready.version.contentHash,
-          affinityWorkerId: session.affinityWorkerId,
-        });
-
-        const triggerEvent: TriggerEvent = {
-          agentId: session.agentId,
-          workflowId: session.workflowId,
-          triggerType: "manual",
+        const result = await postSessionMessage(deps, {
+          organizationId: workspace.organizationId,
+          userId: workspace.userId,
+          session,
           message,
-          data: {},
-          principal: {
-            workspaceId: workspace.organizationId,
-            userId: workspace.userId,
-            source: "chat",
-          },
-        };
-
-        // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts;
-        // dispatch.ts module doc): this continuation (or post-reset create)
-        // targets a session other actors can reach, so its dispatch lock is
-        // taken BEFORE the admission transaction and held through eve-return
-        // + persist + recheck. Contention is the platform's own TRANSIENT
-        // `session_busy` — same recovery as the in-transaction busy check
-        // below, which stays as the lock's crash-safe shadow.
-        const locks = sessionDispatchLocksOf(deps);
-        const lock = await locks.acquire(session.id, {
-          waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
         });
-        if (!lock) throw errors.sessionBusy();
-        try {
-          // One advisory-locked transaction: session-serialization guard (two
-          // tails on ONE eve NDJSON stream corrupt run_events and resume
-          // points — refuse with 409 while a run is queued/running), atomic
-          // per-workspace cap, and the run row BEFORE the eve dispatch.
-          const run = await db.transaction(async (tx) => {
-            await lockWorkspaceRunCap(tx, workspace.organizationId);
-            if ((await countDispatchingRuns(tx, session.id)) > 0) {
-              throw errors.sessionBusy();
-            }
-            await assertUnderRunCap(
-              tx,
-              workspace.organizationId,
-              runtime.maxConcurrentRunsPerWorkspace,
-            );
-            const runRows = await tx
-              .insert(schema.runs)
-              .values({
-                agentSessionId: session.id,
-                // Own workspace scope on every new run (pipelines redesign).
-                organizationId: workspace.organizationId,
-                triggerEvent: triggerEvent as unknown as Record<string, unknown>,
-                status: "queued",
-              })
-              .returning();
-            return runRows[0]!;
-          });
-
-          const hash = ready.version.contentHash;
-          const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
-          let eveSessionId: string;
-          try {
-            await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
-            // DISPATCH-ATTEMPT MARKER (dispatch.ts module doc): armed strictly
-            // before the eve call. Matters MOST here — this session already
-            // carries an eve id from earlier turns, so without the marker a
-            // crash between the run insert and the send would leave boot
-            // reconciliation tailing a turn that was never sent. The CAS also
-            // fences a run settled terminal during the agent boot; the session
-            // belongs to the user's thread and stays open.
-            if ((await armDispatchAttempt(deps.runStore, run.id)) !== "armed") {
-              const current = await deps.runStore.getRunStatus(run.id);
-              set.status = 201;
-              return {
-                run: runDto({
-                  ...run,
-                  status: current?.status ?? "canceled",
-                  error: current?.error ?? run.error,
-                }),
-              };
-            }
-            if (session.eveSessionId) {
-              // "send" form — `{message}` alone. eve rejects a body carrying
-              // BOTH message and inputResponses, and 400s on a
-              // `continuationToken` key.
-              eveSessionId = session.eveSessionId;
-              await deps.workerClient.continueEveSession(
-                worker.address,
-                hash,
-                await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-                eveSessionId,
-                { message },
-              );
-            } else {
-              // Post-reset (or never-acked) row: open a fresh eve session.
-              const created = await deps.workerClient.createEveSession(
-                worker.address,
-                hash,
-                await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-                { message },
-              );
-              eveSessionId = created.sessionId;
-              // PERSIST-THEN-RECHECK (dispatch.ts's post-eve ordering): the id
-              // lands BEFORE the recheck below, so a Stop landing from here on
-              // finds it on the row and chases eve itself.
-              await db
-                .update(schema.agentSessions)
-                .set({ eveSessionId })
-                .where(eq(schema.agentSessions.id, session.id));
-              session.eveSessionId = eveSessionId;
-            }
-          } catch (error) {
-            deps.metrics.recordTrigger("manual", "failed");
-            // A terminal/reset eve session surfaces as the typed, PERMANENT
-            // `session_not_active` (and closes the row) rather than a 502 the
-            // client would retry forever.
-            await failEveDispatch(deps, run.id, session.id, error);
-            throw error; // unreachable — failEveDispatch always throws
-          }
-          await db
-            .update(schema.agentSessions)
-            .set({ status: "active", affinityWorkerId: worker.id })
-            .where(eq(schema.agentSessions.id, session.id));
-
-          // POST-EVE CANCEL RECHECK (both forms — the continue above, and the
-          // post-reset create): a Stop that settled the run terminal while the
-          // eve call was in flight means the accepted turn is remote-canceled
-          // here and NO tail starts. The session belongs to the user's thread
-          // and stays open either way.
-          const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
-            workerAddress: worker.address,
-            hash,
-            jwt,
-            eveSessionId,
-          });
-          if (recheck !== "live") {
-            const current = await deps.runStore.getRunStatus(run.id);
-            set.status = 201;
-            return {
-              run: runDto({
-                ...run,
-                status: current?.status ?? "canceled",
-                error: current?.error ?? run.error,
-              }),
-            };
-          }
-
-          startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
-          deps.metrics.recordTrigger("manual", "dispatched");
-
-          set.status = 201;
-          return { run: runDto(run) };
-        } finally {
-          await lock.release();
-        }
+        set.status = 201;
+        return result;
       },
       { requireWorkspace: true },
     )
@@ -1840,127 +1828,12 @@ export function runtimePlugin(deps: RuntimeDeps) {
           workspace.organizationId,
           params.runId,
         );
-        // A PIPELINE parent run has no session and never parks on input
-        // itself — its `waiting` mirrors a CHILD run's park, and the answer
-        // goes to the child run's id (run_steps.child_run_id names it).
-        if (!session) throw errors.noPendingInput();
-        // Same 0.31 predicate as the follow-up route: an eve session id and a
-        // non-terminal row. Gating on a continuation token would 409 every
-        // HITL answer and park every gated run permanently.
-        if (
-          !session.eveSessionId ||
-          session.status === "closed" ||
-          session.status === "error"
-        ) {
-          throw errors.sessionNotContinuable();
-        }
-        const eveSessionId = session.eveSessionId;
-        const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
-        const { worker } = await selectWorker(db, {
-          heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
-          defaultMaxAgents: runtime.maxAgentsPerWorker,
-          versionHash: ready.version.contentHash,
-          affinityWorkerId: session.affinityWorkerId,
+        return resumeRunInput(deps, {
+          organizationId: workspace.organizationId,
+          run,
+          session,
+          input,
         });
-
-        // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts): the HITL
-        // answer is a continuation of this session's eve stream, so it holds
-        // the same dispatch lock as every other eve-ward call — from before
-        // the waiting→queued flip through the continue + recheck. Contention
-        // is the transient `session_busy`, same as the in-transaction guard.
-        const locks = sessionDispatchLocksOf(deps);
-        const lock = await locks.acquire(session.id, {
-          waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
-        });
-        if (!lock) throw errors.sessionBusy();
-        try {
-          // Only a run parked on input (status `waiting`) is resolvable. Flip it
-          // to queued inside the advisory lock so a double POST cannot
-          // double-dispatch the same answer; the run row is REUSED (no cap
-          // change — a waiting run already holds its slot). One-writer guard:
-          // no OTHER run of this session may be dispatching — resuming this run
-          // while another tails the same eve stream would double-read it.
-          const resumed = await db.transaction(async (tx) => {
-            await lockWorkspaceRunCap(tx, workspace.organizationId);
-            const rows = await tx
-              .select({ status: schema.runs.status })
-              .from(schema.runs)
-              .where(eq(schema.runs.id, run.id))
-              .limit(1);
-            if (rows[0]?.status !== "waiting") return false;
-            if (
-              (await countDispatchingRuns(tx, session.id, {
-                excludeRunId: run.id,
-              })) > 0
-            ) {
-              throw errors.sessionBusy();
-            }
-            await tx
-              .update(schema.runs)
-              .set({ status: "queued", error: null })
-              .where(eq(schema.runs.id, run.id));
-            return true;
-          });
-          if (!resumed) throw errors.noPendingInput();
-
-          const hash = ready.version.contentHash;
-          const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
-          const inputResponses: EveInputResponse[] = [
-            {
-              requestId: input.requestId,
-              ...(input.optionId !== undefined ? { optionId: input.optionId } : {}),
-              ...(input.text !== undefined ? { text: input.text } : {}),
-            },
-          ];
-          try {
-            await ensureAgentOnWorker(deps, worker, ready, workspace.organizationId);
-            // "respond" form — `{inputResponses}` alone. 0.31 made send and
-            // respond mutually exclusive: a body carrying `message` too is a
-            // 400, as is any `continuationToken` key.
-            await deps.workerClient.continueEveSession(
-              worker.address,
-              hash,
-              await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
-              eveSessionId,
-              { inputResponses },
-            );
-          } catch (error) {
-            await failEveDispatch(deps, run.id, session.id, error);
-            throw error; // unreachable — failEveDispatch always throws
-          }
-          await db
-            .update(schema.agentSessions)
-            .set({ status: "active", affinityWorkerId: worker.id })
-            .where(eq(schema.agentSessions.id, session.id));
-
-          // POST-EVE CANCEL RECHECK (dispatch.ts): a Stop that settled this
-          // run terminal while the continue was in flight had its remote leg
-          // deferred to THIS dispatch (the guarded cancel skips while the
-          // lock is held), so the recheck settles the resumed turn here —
-          // and no tail starts on the terminal row. The session belongs to
-          // the user's thread and stays open either way.
-          const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
-            workerAddress: worker.address,
-            hash,
-            jwt,
-            eveSessionId,
-          });
-          if (recheck === "live") {
-            // Resume tailing the SAME run — its pre-park events stay; new
-            // events append at the next seq (SSE Last-Event-ID resume is
-            // seamless).
-            startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
-          }
-
-          const updated = await db
-            .select()
-            .from(schema.runs)
-            .where(eq(schema.runs.id, run.id))
-            .limit(1);
-          return { run: runDto(updated[0] ?? run) };
-        } finally {
-          await lock.release();
-        }
       },
       { requireWorkspace: true },
     )
@@ -2093,48 +1966,13 @@ export function runtimePlugin(deps: RuntimeDeps) {
           return { run: runDto(updatedPipeline[0] ?? run) };
         }
 
-        // A live tail (running run) is aborted and marked canceled by the
-        // tailer (which owns the remote cancel); a parked (`waiting`) or
-        // not-yet-tailed (`queued`) run has no live tail — mark it canceled
-        // directly and make a best-effort remote cancel ourselves so a turn
-        // eve is still running for this session does not outlive the run row.
-        const hadTail = await deps.tailers.cancelRun(run.id, reason);
-        if (!hadTail) {
-          // Settle the ROW FIRST, then chase eve. The platform side is
-          // authoritative for the run row, so the user's Stop must not be
-          // held behind a remote leg that can be slow or unreachable — and
-          // the remote cancel is best-effort anyway. (Ordering matters here:
-          // when this ran first, a Stop on a reaped agent paid a full boot
-          // before the run was marked canceled.)
-          await deps.runStore.markRun(run.id, {
-            status: "canceled",
-            error: reason,
-            completedAt: new Date(),
-          });
-          // No tail ⇒ no tailer hook ⇒ settle a pending outbound-reply
-          // marker here (canceled runs owe no reply; deliver() no-ops for
-          // runs owing nothing).
-          await deps.delivery?.deliver({
-            runId: run.id,
-            status: "canceled",
-            lastAssistantMessage: null,
-          });
-          deps.bus.publish(run.id, {
-            kind: "status",
-            frame: { runId: run.id, status: "canceled", error: reason },
-          });
-          // Best-effort: stop a turn eve may still be running for this
-          // session so it cannot outlive the run row. Never boots the agent
-          // (see sessionControlTarget's `ensure: false`). Agent-mode runs
-          // always have a session; the null check is the LEFT-join type.
-          // GUARDED (settle-then-remote window closed): the unqualified
-          // session-level cancel runs under the session's dispatch lock with
-          // an under-lock successor check, so a message admitted after this
-          // Stop can never have ITS turn killed by the late remote leg —
-          // and when the canceled run's own dispatch still holds the lock,
-          // the chase is deferred (never dropped) past its settlement.
-          if (session) await cancelEveTurnGuarded(deps, session.id, run.id);
-        }
+        // AGENT run: one Stop primitive (cancelAgentRun) — a live tail is
+        // stopped under the session's dispatch lock with its remote cancel
+        // AWAITED before the row finalizes (no late unqualified cancel can
+        // reach a successor's turn); a parked/queued run is settled first
+        // (with its durable remote-cancel obligation) and then chased
+        // through the guarded remote leg.
+        await cancelAgentRun(deps, run, session, reason);
 
         const updated = await db
           .select()
@@ -2318,6 +2156,402 @@ export function runtimePlugin(deps: RuntimeDeps) {
       },
       { requireWorkspace: true },
     );
+}
+
+// ── follow-up message (the route body, testable without Elysia) ───────────
+
+/**
+ * `POST /sessions/:id/messages`: an ID-addressed follow-up as a NEW run on
+ * the session — the continuation twin of dispatch.ts's create branch for
+ * chat. Holds the session's dispatch lock from before admission through
+ * eve-return + persist + recheck (session-lock.ts), re-reads the session
+ * UNDER the lock ({@link requireLiveSessionUnderLock}: the caller's row is a
+ * pre-lock snapshot; a closed row answers the permanent
+ * `session_not_continuable`, and an abandoned eveless row is healed first —
+ * the lock proves no dispatch is in flight — instead of answering
+ * `session_busy` until the next boot), and writes session status only by
+ * CAS against a still-live row.
+ */
+export async function postSessionMessage(
+  deps: RuntimeDeps,
+  args: {
+    organizationId: string;
+    userId: string;
+    session: SessionRow;
+    message: string;
+  },
+): Promise<{ run: RunDto }> {
+  const { db, runtime } = deps;
+  const { organizationId, message } = args;
+  deps.metrics.recordTrigger("manual", "received");
+  // 0.31: continuable iff the row is not terminal. A `continuationToken`
+  // term here would reject EVERY follow-up (the column is never written
+  // anymore) — chat would be dead after the first message.
+  //
+  // A row with NO eve session id is continuable too: it is the state a
+  // `reset` leaves behind (the retired eve id can never take another
+  // message, so the replacement row starts empty). This message OPENS
+  // its eve session, exactly as dispatch.ts's create branch does.
+  if (args.session.status === "closed" || args.session.status === "error") {
+    throw errors.sessionNotContinuable();
+  }
+  // Sessions pin their agent version at creation — a follow-up always
+  // rides the SAME compiled artifact, even after a republish.
+  const ready = await requireReadyAgentVersion(deps, args.session.agentVersionId);
+  const { worker } = await selectWorker(db, {
+    heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
+    defaultMaxAgents: runtime.maxAgentsPerWorker,
+    versionHash: ready.version.contentHash,
+    affinityWorkerId: args.session.affinityWorkerId,
+  });
+
+  // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts; dispatch.ts
+  // module doc): this continuation (or post-reset create) targets a session
+  // other actors can reach, so its dispatch lock is taken BEFORE the
+  // admission transaction and held through eve-return + persist + recheck.
+  // Contention is the platform's own TRANSIENT `session_busy` — same
+  // recovery as the in-transaction busy check below, which stays as the
+  // lock's crash-safe shadow. Never acquired inside a transaction.
+  const locks = sessionDispatchLocksOf(deps);
+  const lock = await locks.acquire(args.session.id, {
+    waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
+  });
+  if (!lock) throw errors.sessionBusy();
+  try {
+    // The session as it is NOW, under the lock — never the pre-lock
+    // snapshot. A row closed in between (a Stop's eveless close, a reset,
+    // eve's own dead-session eviction) is the permanent
+    // `session_not_continuable`; a stale-snapshot dispatch would insert a
+    // run onto a closed row and resurrect it (D6).
+    let session: SessionRow;
+    try {
+      session = await requireLiveSessionUnderLock(deps, args.session.id);
+    } catch (error) {
+      if (isRuntimeApiError(error) && error.code === "session_not_active") {
+        throw errors.sessionNotContinuable();
+      }
+      throw error;
+    }
+
+    const triggerEvent: TriggerEvent = {
+      agentId: session.agentId,
+      workflowId: session.workflowId,
+      triggerType: "manual",
+      message,
+      data: {},
+      principal: {
+        workspaceId: organizationId,
+        userId: args.userId,
+        source: "chat",
+      },
+    };
+
+    // One advisory-locked transaction: session-serialization guard (two
+    // tails on ONE eve NDJSON stream corrupt run_events and resume
+    // points — refuse with 409 while a run is queued/running), atomic
+    // per-workspace cap, and the run row BEFORE the eve dispatch.
+    const run = await db.transaction(async (tx) => {
+      await lockWorkspaceRunCap(tx, organizationId);
+      if ((await countDispatchingRuns(tx, session.id)) > 0) {
+        throw errors.sessionBusy();
+      }
+      await assertUnderRunCap(
+        tx,
+        organizationId,
+        runtime.maxConcurrentRunsPerWorkspace,
+      );
+      const runRows = await tx
+        .insert(schema.runs)
+        .values({
+          agentSessionId: session.id,
+          // Own workspace scope on every new run (pipelines redesign).
+          organizationId,
+          triggerEvent: triggerEvent as unknown as Record<string, unknown>,
+          status: "queued",
+        })
+        .returning();
+      return runRows[0]!;
+    });
+
+    const hash = ready.version.contentHash;
+    const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
+    let eveSessionId: string;
+    try {
+      await ensureAgentOnWorker(deps, worker, ready, organizationId);
+      // DISPATCH-ATTEMPT MARKER (dispatch.ts module doc): armed strictly
+      // before the eve call. Matters MOST here — this session already
+      // carries an eve id from earlier turns, so without the marker a
+      // crash between the run insert and the send would leave boot
+      // reconciliation tailing a turn that was never sent. The CAS also
+      // fences a run settled terminal during the agent boot; the session
+      // belongs to the user's thread and stays open.
+      if ((await armDispatchAttempt(deps.runStore, run.id)) !== "armed") {
+        const current = await deps.runStore.getRunStatus(run.id);
+        return {
+          run: runDto({
+            ...run,
+            status: current?.status ?? "canceled",
+            error: current?.error ?? run.error,
+          }),
+        };
+      }
+      if (session.eveSessionId) {
+        // "send" form — `{message}` alone. eve rejects a body carrying
+        // BOTH message and inputResponses, and 400s on a
+        // `continuationToken` key.
+        eveSessionId = session.eveSessionId;
+        await deps.workerClient.continueEveSession(
+          worker.address,
+          hash,
+          await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+          eveSessionId,
+          { message },
+        );
+      } else {
+        // Post-reset (or never-acked) row: open a fresh eve session.
+        const created = await deps.workerClient.createEveSession(
+          worker.address,
+          hash,
+          await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+          { message },
+        );
+        eveSessionId = created.sessionId;
+        // PERSIST-THEN-RECHECK (dispatch.ts's post-eve ordering): the id
+        // lands BEFORE the recheck below, so a Stop landing from here on
+        // finds it on the row and chases eve itself. CAS on a live row.
+        if (!(await casSessionLive(db, session.id, { eveSessionId }))) {
+          deps.logger.warn("dispatch.session_persist_refused", {
+            runId: run.id,
+            sessionId: session.id,
+            fields: { reason: "session no longer live under the dispatch lock" },
+          });
+        }
+        session.eveSessionId = eveSessionId;
+      }
+    } catch (error) {
+      deps.metrics.recordTrigger("manual", "failed");
+      // A terminal/reset eve session surfaces as the typed, PERMANENT
+      // `session_not_active` (and closes the row) rather than a 502 the
+      // client would retry forever.
+      await failEveDispatch(deps, run.id, session.id, error);
+      throw error; // unreachable — failEveDispatch always throws
+    }
+    if (
+      !(await casSessionLive(db, session.id, {
+        status: "active",
+        affinityWorkerId: worker.id,
+      }))
+    ) {
+      deps.logger.warn("dispatch.session_persist_refused", {
+        runId: run.id,
+        sessionId: session.id,
+        fields: { reason: "session no longer live under the dispatch lock" },
+      });
+    }
+
+    // POST-EVE CANCEL RECHECK (both forms — the continue above, and the
+    // post-reset create): a Stop that settled the run terminal while the
+    // eve call was in flight means the accepted turn is remote-canceled
+    // here and NO tail starts. The session belongs to the user's thread
+    // and stays open either way.
+    const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+      workerAddress: worker.address,
+      hash,
+      jwt,
+      eveSessionId,
+    });
+    if (recheck !== "live") {
+      const current = await deps.runStore.getRunStatus(run.id);
+      return {
+        run: runDto({
+          ...run,
+          status: current?.status ?? "canceled",
+          error: current?.error ?? run.error,
+        }),
+      };
+    }
+
+    startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
+    deps.metrics.recordTrigger("manual", "dispatched");
+    return { run: runDto(run) };
+  } finally {
+    await lock.release();
+  }
+}
+
+// ── HITL resume (the route body, testable without Elysia) ─────────────────
+
+/**
+ * `POST /runs/:id/input`: answer a parked `input.requested` by resuming the
+ * SAME run. Two fences close the two windows a Stop can land in:
+ *
+ *   1. the waiting→queued flip is a CAS (`WHERE status = 'waiting'`) — a
+ *      Stop that settled the run `canceled` between the route's load and
+ *      this statement makes it a 0-row update and the answer is 409
+ *      `no_pending_input`, never a dispatch. (The old read-then-update-by-id
+ *      wrote the canceled row back to `queued` and started a tail on it.)
+ *   2. after the (possibly long) ensure-agent boot and strictly BEFORE the
+ *      continue call, the dispatch-attempt marker CAS
+ *      ({@link armDispatchAttempt}) re-reads terminality — the same pre-eve
+ *      fence every other dispatch path uses — so a Stop landing during the
+ *      boot abandons instead of resuming a canceled run.
+ *
+ * Holds the session's dispatch lock throughout (a HITL answer is a
+ * continuation of the session's eve stream), never acquired inside a
+ * transaction.
+ */
+export async function resumeRunInput(
+  deps: RuntimeDeps,
+  args: {
+    organizationId: string;
+    run: RunRow;
+    session: SessionRow | null;
+    input: { requestId: string; optionId?: string; text?: string };
+  },
+): Promise<{ run: RunDto }> {
+  const { db, runtime } = deps;
+  const { organizationId, run, session, input } = args;
+  // A PIPELINE parent run has no session and never parks on input
+  // itself — its `waiting` mirrors a CHILD run's park, and the answer
+  // goes to the child run's id (run_steps.child_run_id names it).
+  if (!session) throw errors.noPendingInput();
+  // Same 0.31 predicate as the follow-up route: an eve session id and a
+  // non-terminal row. Gating on a continuation token would 409 every
+  // HITL answer and park every gated run permanently.
+  if (
+    !session.eveSessionId ||
+    session.status === "closed" ||
+    session.status === "error"
+  ) {
+    throw errors.sessionNotContinuable();
+  }
+  const eveSessionId = session.eveSessionId;
+  const ready = await requireReadyAgentVersion(deps, session.agentVersionId);
+  const { worker } = await selectWorker(db, {
+    heartbeatTtlMs: runtime.workerHeartbeatTtlMs,
+    defaultMaxAgents: runtime.maxAgentsPerWorker,
+    versionHash: ready.version.contentHash,
+    affinityWorkerId: session.affinityWorkerId,
+  });
+
+  // PER-SESSION DISPATCH CRITICAL SECTION (session-lock.ts): the HITL
+  // answer is a continuation of this session's eve stream, so it holds
+  // the same dispatch lock as every other eve-ward call — from before
+  // the waiting→queued flip through the continue + recheck. Contention
+  // is the transient `session_busy`, same as the in-transaction guard.
+  const locks = sessionDispatchLocksOf(deps);
+  const lock = await locks.acquire(session.id, {
+    waitMs: SESSION_LOCK_ADMISSION_WAIT_MS,
+  });
+  if (!lock) throw errors.sessionBusy();
+  try {
+    // Only a run parked on input (status `waiting`) is resolvable. The flip
+    // to queued is a CAS on `status = 'waiting'` inside the advisory lock, so
+    // a double POST cannot double-dispatch the same answer and a Stop that
+    // already settled the row can never be overwritten back to queued; the
+    // run row is REUSED (no cap change — a waiting run already holds its
+    // slot). One-writer guard: no OTHER run of this session may be
+    // dispatching — resuming this run while another tails the same eve
+    // stream would double-read it.
+    const resumed = await db.transaction(async (tx) => {
+      await lockWorkspaceRunCap(tx, organizationId);
+      if (
+        (await countDispatchingRuns(tx, session.id, {
+          excludeRunId: run.id,
+        })) > 0
+      ) {
+        throw errors.sessionBusy();
+      }
+      const flipped = await tx
+        .update(schema.runs)
+        .set({ status: "queued", error: null })
+        .where(and(eq(schema.runs.id, run.id), eq(schema.runs.status, "waiting")))
+        .returning({ id: schema.runs.id });
+      return flipped.length > 0;
+    });
+    if (!resumed) throw errors.noPendingInput();
+
+    const hash = ready.version.contentHash;
+    const jwt = agentJwtParams(runtime.platformJwtSecret, hash);
+    const inputResponses: EveInputResponse[] = [
+      {
+        requestId: input.requestId,
+        ...(input.optionId !== undefined ? { optionId: input.optionId } : {}),
+        ...(input.text !== undefined ? { text: input.text } : {}),
+      },
+    ];
+    try {
+      await ensureAgentOnWorker(deps, worker, ready, organizationId);
+      // PRE-EVE TERMINAL RECHECK (the marker fence): a Stop that landed
+      // during the agent boot above settled the row `canceled`; the CAS
+      // refuses it and the resume abandons instead of sending an answer
+      // for a run nobody follows. (The queued→queued marker re-stamp on a
+      // resumed run is harmless — its tail already stamped started_at.)
+      if ((await armDispatchAttempt(deps.runStore, run.id)) !== "armed") {
+        const current = await deps.runStore.getRunStatus(run.id);
+        return {
+          run: runDto({
+            ...run,
+            status: current?.status ?? "canceled",
+            error: current?.error ?? run.error,
+          }),
+        };
+      }
+      // "respond" form — `{inputResponses}` alone. 0.31 made send and
+      // respond mutually exclusive: a body carrying `message` too is a
+      // 400, as is any `continuationToken` key.
+      await deps.workerClient.continueEveSession(
+        worker.address,
+        hash,
+        await mintPlatformJwt(jwt.secret, { audience: jwt.audience }),
+        eveSessionId,
+        { inputResponses },
+      );
+    } catch (error) {
+      await failEveDispatch(deps, run.id, session.id, error);
+      throw error; // unreachable — failEveDispatch always throws
+    }
+    if (
+      !(await casSessionLive(db, session.id, {
+        status: "active",
+        affinityWorkerId: worker.id,
+      }))
+    ) {
+      deps.logger.warn("dispatch.session_persist_refused", {
+        runId: run.id,
+        sessionId: session.id,
+        fields: { reason: "session no longer live under the dispatch lock" },
+      });
+    }
+
+    // POST-EVE CANCEL RECHECK (dispatch.ts): a Stop that settled this
+    // run terminal while the continue was in flight had its remote leg
+    // deferred to THIS dispatch (the guarded cancel skips while the
+    // lock is held), so the recheck settles the resumed turn here —
+    // and no tail starts on the terminal row. The session belongs to
+    // the user's thread and stays open either way.
+    const recheck = await recheckCanceledDuringEve(deps, run.id, session.id, {
+      workerAddress: worker.address,
+      hash,
+      jwt,
+      eveSessionId,
+    });
+    if (recheck === "live") {
+      // Resume tailing the SAME run — its pre-park events stay; new
+      // events append at the next seq (SSE Last-Event-ID resume is
+      // seamless).
+      startTail(deps, worker.address, hash, eveSessionId, run.id, session.id);
+    }
+
+    const updated = await db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.id, run.id))
+      .limit(1);
+    return { run: runDto(updated[0] ?? run) };
+  } finally {
+    await lock.release();
+  }
 }
 
 /**

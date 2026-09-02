@@ -18,7 +18,12 @@ import type { ConnectorCatalogEntry, Logger } from "@invisible-string/shared";
 
 import { createAuth, type Auth } from "./auth";
 import { loadConfig, type Config } from "./config";
-import { createDb, type DbHandle } from "./db";
+import {
+  createDb,
+  lockPoolSizeFromEnv,
+  poolSizeFromEnv,
+  type DbHandle,
+} from "./db";
 import { healthPlugin, type DeepHealthDeps } from "./health";
 import { createLogger } from "./log";
 import { requestLoggerPlugin } from "./request-log";
@@ -424,7 +429,14 @@ export function createAppStack(
 ): AppStack {
   const config = loadConfig(env);
   const logger = createLogger({ env });
-  const dbHandle = createDb(config.databaseUrl);
+  // Two pools (db.ts): the root pool for every query, and a dedicated lock
+  // pool for the per-session dispatch critical section — a holder pins one
+  // lock connection for its whole eve round-trip, and on a shared pool
+  // `max` such holders deadlock the control plane waiting for a `max+1`th.
+  const dbHandle = createDb(config.databaseUrl, {
+    max: poolSizeFromEnv(env),
+    lockMax: lockPoolSizeFromEnv(env),
+  });
   // The seeded-workspace publish kick needs the runtime graph, which is built
   // AFTER auth (workspace deps wrap the auth instance) — late-bind via a slot.
   const runtimeSlot: { current: RuntimeDeps | null } = { current: null };
@@ -765,19 +777,21 @@ if (import.meta.main) {
       delivery: stack.runtime.delivery,
       ...(stack.pipelines ? { pipelines: stack.pipelines } : {}),
     })
-      .then(({ resumed, failed, sessionsClosed, pipelines, deliveries }) => {
+      .then(({ resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries }) => {
         if (
           resumed > 0 ||
           failed > 0 ||
           sessionsClosed > 0 ||
+          remoteCancels.settled > 0 ||
+          remoteCancels.deferred > 0 ||
           pipelines.resumed > 0 ||
           pipelines.failed > 0 ||
           deliveries.delivered > 0 ||
           deliveries.failed > 0
         ) {
           logger.info("run.reconciled", {
-            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
-            fields: { resumed, failed, sessionsClosed, pipelines, deliveries },
+            msg: `run reconciliation: resumed ${resumed} tail(s), failed ${failed} orphaned run(s), closed ${sessionsClosed} abandoned eveless session(s), finished ${remoteCancels.settled} pending remote cancel(s) (${remoteCancels.deferred} deferred), re-drove ${pipelines.resumed} pipeline run(s), recovered ${deliveries.delivered} stranded deliver(y/ies)`,
+            fields: { resumed, failed, sessionsClosed, remoteCancels, pipelines, deliveries },
           });
         }
       })

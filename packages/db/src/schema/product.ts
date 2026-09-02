@@ -735,12 +735,34 @@ export const runs = pgTable(
     deliveryError: text("delivery_error"),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    /**
+     * DURABLE remote-cancel obligation (agent runs). Set — in the SAME CAS
+     * statement that settles the row `canceled` — by every no-tail Stop
+     * (`POST /runs/:id/cancel` on a queued/waiting run, the pipeline cancel
+     * sweep over child runs, the live-tail Stop that could not take the
+     * session's dispatch lock), and cleared once the guarded remote cancel
+     * (`cancelEveTurnGuarded`) has run under the session's dispatch lock:
+     * issued to eve, skipped because a successor already owns the session
+     * (eve serializes turns, so the settled turn is over), or found nothing
+     * to chase. A control-plane crash between the settle and the deferred
+     * remote leg used to leave the accepted eve turn running forever; boot
+     * reconciliation now sweeps canceled runs carrying this marker and
+     * finishes the cancel. NULL = nothing owed.
+     */
+    remoteCancelPendingAt: timestamp("remote_cancel_pending_at", {
+      withTimezone: true,
+    }),
     error: text("error"),
     createdAt,
     updatedAt,
   },
   (table) => [
     index("runs_agent_session_id_idx").on(table.agentSessionId),
+    // Boot sweep over runs still owing a remote cancel — partial, so it
+    // stays the size of the (normally empty) pending set.
+    index("runs_remote_cancel_pending_idx")
+      .on(table.remoteCancelPendingAt)
+      .where(sql`${table.remoteCancelPendingAt} IS NOT NULL`),
     // Workspace cap + list scans for pipeline runs, which have no session row
     // to reach organization scope through.
     index("runs_organization_id_idx").on(table.organizationId),

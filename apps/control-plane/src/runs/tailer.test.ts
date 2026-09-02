@@ -860,6 +860,114 @@ describe("tailRun — eve 0.31 plumbing", () => {
     expect(seen).toEqual([undefined]);
   });
 
+  // Polled in a helper so TypeScript's control-flow narrowing of
+  // `store.runStatus` does not leak into the assertions that follow.
+  const untilRunning = async (store: { runStatus: string | null }) => {
+    while (store.runStatus !== "running") {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  };
+
+  test("an AWAITED cancel issues the remote cancel and finalizes the run only after it resolves (the cancel route's lock-held shape)", async () => {
+    // Regression (D3): finalizing the row reopens session admission, so an
+    // unqualified cancel still airborne when a follow-up's turn starts would
+    // stop THAT turn. Under the session lock the route awaits the request
+    // before the tail aborts.
+    let releaseRemote!: () => void;
+    const remoteHeld = new Promise<void>((resolve) => {
+      releaseRemote = resolve;
+    });
+    let remoteEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      remoteEntered = resolve;
+    });
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-await",
+      agentSessionId: "sess-await",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        remoteEntered();
+        await remoteHeld;
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    const canceling = handle.cancel("canceled by user", {
+      status: "canceled",
+      awaitRemote: true,
+      allowUnqualifiedRemote: true,
+    });
+    await entered;
+    // The remote request is in flight: the tail is still following and the
+    // row is NOT finalized yet.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(store.runStatus).toBe("running");
+    releaseRemote();
+    expect(await canceling).toBe("issued");
+    await handle.done;
+    expect(store.runStatus).toBe("canceled");
+  });
+
+  test("with unqualified cancels disallowed and no turn observed, the remote cancel is SKIPPED (reported, never fired) and the run still finalizes", async () => {
+    let remoteCancels = 0;
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-skip",
+      agentSessionId: "sess-skip",
+      openStream: async (_i, signal) => ndjsonResponse([], { stayOpen: true, signal }),
+      cancelRemoteTurn: async () => {
+        remoteCancels += 1;
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    await untilRunning(store);
+    const outcome = await handle.cancel("canceled by user", {
+      status: "canceled",
+      awaitRemote: true,
+      allowUnqualifiedRemote: false,
+    });
+    await handle.done;
+    expect(outcome).toBe("skipped");
+    expect(remoteCancels).toBe(0);
+    expect(store.runStatus).toBe("canceled");
+  });
+
+  test("with unqualified cancels disallowed but a turn observed, the QUALIFIED cancel is still issued", async () => {
+    const seen: Array<{ turnId?: string } | undefined> = [];
+    const store = memoryStore();
+    const handle = tailRun({
+      runId: "run-qual",
+      agentSessionId: "sess-qual",
+      openStream: async (_i, signal) =>
+        ndjsonResponse(
+          [`{"type":"turn.started","data":{"sequence":0,"turnId":"turn_q"}}`],
+          { stayOpen: true, signal },
+        ),
+      cancelRemoteTurn: async (options) => {
+        seen.push(options);
+      },
+      store,
+      bus: new RunEventBus(),
+      maxWallClockMs: 60_000,
+    });
+    while (!store.events.some((e) => e.event.type === "turn.started")) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const outcome = await handle.cancel("canceled by user", {
+      status: "canceled",
+      awaitRemote: true,
+      allowUnqualifiedRemote: false,
+    });
+    await handle.done;
+    expect(outcome).toBe("issued");
+    expect(seen).toEqual([{ turnId: "turn_q" }]);
+  });
+
   test("the wall-clock cap cancels eve's turn too, and a failing remote cancel never fails the run harder", async () => {
     let attempted = 0;
     const store = memoryStore();

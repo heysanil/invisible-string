@@ -73,9 +73,20 @@
  * so the tail issues a REAL remote cancel (`cancelRemoteTurn`) before it stops
  * reading — for the wall-clock cap and for a user Stop alike. That cancel is
  * cooperative (it lands at the next durable step boundary, and an in-flight
- * tool call still runs to completion), so it is fired and not awaited: the run
- * row is finalized immediately and eve's trailing `turn.cancelled` /
+ * tool call still runs to completion); eve's trailing `turn.cancelled` /
  * `session.waiting` are drained by the next tail on this session.
+ *
+ * AWAITED vs FIRED (the wrong-turn race). A user Stop through the cancel
+ * route holds the session's dispatch lock and asks the tail to AWAIT its
+ * remote cancel before finalizing the row (`cancel(…, {awaitRemote: true})`):
+ * finalizing reopens admission, and an unqualified cancel (no `turn.started`
+ * observed yet, so no turnId to scope it) still airborne when a follow-up's
+ * turn started would kill THAT turn instead. When the route could not take
+ * the lock, it asks for a turn-QUALIFIED cancel only
+ * (`allowUnqualifiedRemote: false`) — safe without the lock — and an
+ * unqualified one is SKIPPED and reported, so the route can record the
+ * obligation durably for the guarded chase. Shutdown and the wall-clock cap
+ * keep the fire-and-forget shape (the row is finalized immediately).
  */
 import {
   EVE_STREAM_TAIL_INDEX_HEADER,
@@ -377,14 +388,42 @@ export interface CancelOptions {
    * not a failure.
    */
   status?: "failed" | "canceled";
+  /**
+   * AWAIT the remote cancel's request before aborting the tail (and so
+   * before the row finalizes). Used by the cancel route while it holds the
+   * session's dispatch lock, so admission cannot reopen under an airborne
+   * cancel. Default false: fire-and-forget (shutdown, wall-clock cap).
+   */
+  awaitRemote?: boolean;
+  /**
+   * Whether an UNQUALIFIED remote cancel (no `turn.started` observed yet —
+   * no turnId to scope it to) may be issued. Default true. The cancel route
+   * passes false when it does NOT hold the session lock: unscoped, a late
+   * cancel can stop a successor's turn; the outcome `skipped` tells the
+   * route to record the obligation durably instead.
+   */
+  allowUnqualifiedRemote?: boolean;
 }
+
+/**
+ * What became of the remote cancel: `issued` (request completed, or fired
+ * when not awaited), `failed` (awaited and rejected — logged, best-effort),
+ * `skipped` (unqualified and not allowed), `unavailable` (no remote seam).
+ */
+export type RemoteCancelOutcome = "issued" | "failed" | "skipped" | "unavailable";
 
 export interface RunTailHandle {
   runId: string;
   /** Resolves when the tail has fully stopped (terminal, canceled, or dead). */
   done: Promise<void>;
-  /** Stop tailing and mark the run (`canceled` UI action or shutdown). */
-  cancel(reason?: string, options?: CancelOptions): void;
+  /**
+   * Stop tailing and mark the run (`canceled` UI action or shutdown). The
+   * abort is immediate unless `awaitRemote` is set, in which case the remote
+   * cancel request is awaited first; the returned promise resolves with the
+   * remote outcome once the abort has been issued. Callers that do not care
+   * (shutdown) may ignore it.
+   */
+  cancel(reason?: string, options?: CancelOptions): Promise<RemoteCancelOutcome>;
   /**
    * Stop tailing WITHOUT marking the run terminal — used by the dead-worker
    * sweeper to detach a stale tail (its worker died) so the run can be
@@ -763,15 +802,46 @@ export function tailRun(options: TailRunOptions): RunTailHandle {
   return {
     runId,
     done,
-    cancel(reason, options) {
+    async cancel(reason, options) {
       cancelReason ??= reason ?? "run canceled";
       if (options?.status === "canceled") canceledByUser = true;
-      // Stop eve's turn for real (0.31), not just our reading of it. Fired
-      // before the abort so the request is issued even though the tail stops
+      const why = options?.status === "canceled" ? "user cancel" : "shutdown";
+      // Stop eve's turn for real (0.31), not just our reading of it. Issued
+      // BEFORE the abort so the request goes out even though the tail stops
       // immediately; the trailing `turn.cancelled` → `session.waiting` are
-      // drained by the next tail on this session.
-      requestRemoteCancel(options?.status === "canceled" ? "user cancel" : "shutdown");
+      // drained by the next tail on this session. Read the turn id at CALL
+      // time so a cancel after the turn boundary is scoped to it.
+      const turnId = observedTurnId;
+      let outcome: RemoteCancelOutcome;
+      if (!cancelRemoteTurn) {
+        outcome = "unavailable";
+      } else if (turnId === null && options?.allowUnqualifiedRemote === false) {
+        // Unscoped and the caller holds no lock: a late delivery could stop
+        // a successor's turn. Leave it to the guarded chase.
+        outcome = "skipped";
+        log?.info("run.remote_cancel_skipped", {
+          fields: { why, reason: "unqualified cancel without the session lock" },
+        });
+      } else if (options?.awaitRemote) {
+        try {
+          await cancelRemoteTurn(turnId === null ? undefined : { turnId });
+          outcome = "issued";
+        } catch (error) {
+          outcome = "failed";
+          log?.warn("run.remote_cancel_failed", {
+            fields: {
+              why,
+              turnId,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
+      } else {
+        requestRemoteCancel(why);
+        outcome = "issued";
+      }
       abort.abort();
+      return outcome;
     },
     detach() {
       detaching = true;
@@ -863,9 +933,27 @@ export class RunTailerManager {
   async cancelRun(runId: string, reason?: string): Promise<boolean> {
     const handle = this.handles.get(runId);
     if (!handle) return false;
-    handle.cancel(reason, { status: "canceled" });
+    void handle.cancel(reason, { status: "canceled" });
     await handle.done;
     return true;
+  }
+
+  /**
+   * The cancel route's shape of {@link cancelRun}: the remote cancel is
+   * awaited (or skipped when unqualified and disallowed — see
+   * {@link CancelOptions}) BEFORE the tail aborts and the row finalizes, and
+   * the remote outcome is reported. Null when the run had no live tail.
+   */
+  async cancelRunGuarded(
+    runId: string,
+    reason: string,
+    options: Pick<CancelOptions, "awaitRemote" | "allowUnqualifiedRemote">,
+  ): Promise<RemoteCancelOutcome | null> {
+    const handle = this.handles.get(runId);
+    if (!handle) return null;
+    const outcome = await handle.cancel(reason, { status: "canceled", ...options });
+    await handle.done;
+    return outcome;
   }
 
   /** Number of live tails (observability/tests). */
@@ -875,7 +963,7 @@ export class RunTailerManager {
 
   async stopAll(reason = "control plane shutting down"): Promise<void> {
     const all = [...this.handles.values()];
-    for (const handle of all) handle.cancel(reason);
+    for (const handle of all) void handle.cancel(reason);
     await Promise.allSettled(all.map((handle) => handle.done));
   }
 }

@@ -155,6 +155,7 @@ export function makeRunRow(overrides: Partial<RunRow> = {}): RunRow {
     deliveryError: null,
     startedAt: null,
     completedAt: null,
+    remoteCancelPendingAt: null,
     error: null,
     createdAt: new Date(),
     updatedAt: new Date(),

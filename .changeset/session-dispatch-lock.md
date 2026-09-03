@@ -1,5 +1,0 @@
----
-"@invisible-string/control-plane": patch
----
-
-Serialize each agent session's dispatch decisions under a per-session Postgres advisory lock (held across the eve call and its settlement, released by a crash with its connection): admission, the canceled-dispatch abandon, and the boot sweep's eveless close no longer race as separate read-then-acts — a canceled dispatch's accepted turn is always remote-canceled instead of leaking when a successor slipped in, the unqualified session-level cancel can never land after a successor's turn started (the cancel routes' remote leg is lock-guarded and deferred, never dropped, while a dispatch is in flight), the sweep skips lock-held candidates and its guarded UPDATE atomically re-asserts the ledger, and an eve create that fails after arming the dispatch-attempt marker (a client timeout racing eve's 202 included) closes the still-eveless session on any terminal outcome so the next message mints a fresh session instead of a second live turn beside an unobservable one.
